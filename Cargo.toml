@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "crates/bootinfo",
+    "tools/xtask",
+]
+
+default-members = ["tools/xtask"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ilya Shishov"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
