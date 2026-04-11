@@ -130,7 +130,7 @@ pub unsafe fn enable_cpu_irq() {
     }
 }
 
-pub fn on_timer_irq() {
+pub fn on_timer_irq(frame_words: *mut u64) {
     // Periodic mode on generic timer requires explicit re-arm each IRQ.
     // Reload value is precomputed during init for deterministic IRQ path.
     let reload = unsafe { BOOT_TIMER_RELOAD_TICKS as u32 };
@@ -138,5 +138,5 @@ pub fn on_timer_irq() {
         write_tval(reload);
     }
 
-    kernel::on_tick_interrupt();
+    kernel::on_tick_interrupt(frame_words);
 }

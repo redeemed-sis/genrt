@@ -95,8 +95,12 @@ trap_current_spx_sync:
 
 trap_current_sp0_irq:
 trap_current_spx_irq:
-    // Save full GPR context before calling Rust IRQ dispatcher.
-    sub sp, sp, #256
+    // TrapFrame layout:
+    // - x0..x30  at 0..240
+    // - sp       at 248
+    // - elr      at 256
+    // - spsr     at 264
+    sub sp, sp, #272
     stp x0,  x1,  [sp, #0]
     stp x2,  x3,  [sp, #16]
     stp x4,  x5,  [sp, #32]
@@ -112,27 +116,54 @@ trap_current_spx_irq:
     stp x24, x25, [sp, #192]
     stp x26, x27, [sp, #208]
     stp x28, x29, [sp, #224]
-    stp x30, xzr, [sp, #240]
+    str x30, [sp, #240]
 
+    add x9, sp, #272
+    str x9, [sp, #248]
+    mrs x9, ELR_EL1
+    str x9, [sp, #256]
+    mrs x9, SPSR_EL1
+    str x9, [sp, #264]
+
+    mov x0, sp
     bl irq_entry
 
-    ldp x30, xzr, [sp, #240]
-    ldp x28, x29, [sp, #224]
-    ldp x26, x27, [sp, #208]
-    ldp x24, x25, [sp, #192]
-    ldp x22, x23, [sp, #176]
-    ldp x20, x21, [sp, #160]
-    ldp x18, x19, [sp, #144]
-    ldp x16, x17, [sp, #128]
-    ldp x14, x15, [sp, #112]
-    ldp x12, x13, [sp, #96]
-    ldp x10, x11, [sp, #80]
-    ldp x8,  x9,  [sp, #64]
-    ldp x6,  x7,  [sp, #48]
-    ldp x4,  x5,  [sp, #32]
-    ldp x2,  x3,  [sp, #16]
-    ldp x0,  x1,  [sp, #0]
-    add sp, sp, #256
+    b trap_restore_and_eret
+
+.global arch_enter_task_frame
+.type arch_enter_task_frame, %function
+arch_enter_task_frame:
+    mov sp, x0
+
+trap_restore_and_eret:
+    mov x9, sp
+
+    ldr x10, [x9, #248]
+    ldr x11, [x9, #256]
+    msr ELR_EL1, x11
+    ldr x11, [x9, #264]
+    msr SPSR_EL1, x11
+
+    ldp x0,  x1,  [x9, #0]
+    ldp x2,  x3,  [x9, #16]
+    ldp x4,  x5,  [x9, #32]
+    ldp x6,  x7,  [x9, #48]
+    ldr x8,  [x9, #64]
+    ldr x11, [x9, #88]
+    ldp x12, x13, [x9, #96]
+    ldp x14, x15, [x9, #112]
+    ldp x16, x17, [x9, #128]
+    ldp x18, x19, [x9, #144]
+    ldp x20, x21, [x9, #160]
+    ldp x22, x23, [x9, #176]
+    ldp x24, x25, [x9, #192]
+    ldp x26, x27, [x9, #208]
+    ldp x28, x29, [x9, #224]
+    ldr x30, [x9, #240]
+
+    mov sp, x10
+    ldr x10, [x9, #80]
+    ldr x9,  [x9, #72]
     eret
 
 trap_current_sp0_fiq:
