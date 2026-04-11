@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "kernel",
+    "arch/aarch64",
     "crates/bootinfo",
     "tools/xtask",
 ]
@@ -10,9 +11,10 @@ default-members = ["tools/xtask"]
 
 [workspace.package]
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 authors = ["Ilya Shishov"]
 
 [workspace.dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+cc = "1.1"
