@@ -138,5 +138,5 @@ pub fn on_timer_irq() {
         write_tval(reload);
     }
 
-    kernel::time::on_tick_interrupt();
+    kernel::on_tick_interrupt();
 }
