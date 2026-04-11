@@ -2,6 +2,7 @@
 
 use core::cell::UnsafeCell;
 
+pub mod arch_consts;
 pub mod boot;
 pub mod console;
 pub mod debug;
@@ -11,7 +12,6 @@ pub mod time;
 
 use bootinfo::BootInfo;
 
-pub const TEST_TASK_ID: sched::TaskId = 1;
 pub const TEST_PRIORITY: u8 = 10;
 
 struct SchedulerCell(UnsafeCell<sched::Scheduler>);
@@ -33,24 +33,92 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
         console::puts("  dtb=absent\r\n");
     }
 
-    scheduler_mut().init();
-    if scheduler_mut()
-        .add_for_scheduling(TEST_TASK_ID, TEST_PRIORITY)
-        .is_err()
-    {
-        console::puts("[genrt] sched: failed to add test task\r\n");
-    }
-    console::puts("[genrt] sched: fixed-priority skeleton initialized\r\n");
+    let sched = scheduler_mut();
 
+    if sched.bootstrap(idle_task).is_err() {
+        fatal("[genrt] sched: failed to bootstrap scheduler\r\n");
+    }
+
+    if sched.add_task(TEST_PRIORITY, test_task_1).is_err() {
+        fatal("[genrt] sched: failed to add test task\r\n");
+    }
+
+    if sched.add_task(TEST_PRIORITY, test_task_2).is_err() {
+        fatal("[genrt] sched: failed to add test task\r\n");
+    }
+
+    console::puts("[genrt] sched: irq-return preemptive switching initialized\r\n");
+
+    // Enters the running task through architecture trap-frame restore and never returns.
+    sched.enter_running_task()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn on_tick_interrupt(frame_words: *mut u64) {
+    if frame_words.is_null() {
+        return;
+    }
+
+    time::on_tick_interrupt();
+    scheduler_mut().preempt_on_tick(frame_words);
+}
+
+fn idle_task() -> ! {
+    let mut last_log_tick = 0u64;
     loop {
+        let now = time::ticks();
+        if now.wrapping_sub(last_log_tick) >= 500 {
+            last_log_tick = now;
+            console::puts("[idle] alive\r\n");
+        }
         core::hint::spin_loop();
     }
 }
 
-#[inline(always)]
-pub fn on_tick_interrupt() {
-    time::on_tick_interrupt();
-    scheduler_mut().on_tick();
+fn test_task_1() -> ! {
+    let mut last_log_tick = 0u64;
+    loop {
+        let now = time::ticks();
+        if now.wrapping_sub(last_log_tick) >= 500 {
+            last_log_tick = now;
+            console::puts("[task1] alive\r\n");
+        }
+        core::hint::spin_loop();
+    }
+}
+
+fn test_task_2() -> ! {
+    let mut last_log_tick = 0u64;
+    scheduler_mut()
+        .add_task(TEST_PRIORITY, test_task_3)
+        .unwrap();
+    loop {
+        let now = time::ticks();
+        if now.wrapping_sub(last_log_tick) >= 500 {
+            last_log_tick = now;
+            console::puts("[task2] alive\r\n");
+        }
+        core::hint::spin_loop();
+    }
+}
+
+fn test_task_3() -> ! {
+    let mut last_log_tick = 0u64;
+    loop {
+        let now = time::ticks();
+        if now.wrapping_sub(last_log_tick) >= 500 {
+            last_log_tick = now;
+            console::puts("[task3] from another task is alive\r\n");
+        }
+        core::hint::spin_loop();
+    }
+}
+
+fn fatal(msg: &str) -> ! {
+    console::puts(msg);
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 #[inline(always)]
