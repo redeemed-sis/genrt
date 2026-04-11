@@ -1,0 +1,29 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "genrt aarch64 qemu gdb",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/aarch64-unknown-none/debug/genrt-aarch64.elf",
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/aarch64-linux-gnu-gdb",
+            "miDebuggerServerAddress": "127.0.0.1:1234",
+            "stopAtEntry": true,
+            "externalConsole": false,
+            "setupCommands": [
+                {
+                    "description": "Enable pretty printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set architecture",
+                    "text": "set architecture aarch64",
+                    "ignoreFailures": true
+                }
+            ]
+        }
+    ]
+}
