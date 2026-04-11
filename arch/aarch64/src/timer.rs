@@ -1,18 +1,10 @@
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Minimal generic-timer bring-up target:
-/// - read CNTFRQ_EL0
-/// - program CNTP_TVAL_EL0
-/// - enable CNTP_CTL_EL0
-///
-/// We deliberately stop here for this phase. Delivering the interrupt to EL1
-/// still requires the GIC/IRQ path, which comes next.
 const CNTP_CTL_ENABLE: u32 = 1 << 0;
 const CNTP_CTL_ISTATUS: u32 = 1 << 2;
 
-/// Early bring-up default: 1 ms periodic tick.
-pub const EARLY_TICK_HZ: u64 = 1000;
+/// System tick frequency for scheduler-facing kernel time base.
+pub const SYSTEM_TICK_HZ: u64 = 100;
 pub const TIMER_IRQ_ID_PHYS: u32 = 30;
 
 #[unsafe(no_mangle)]
@@ -23,8 +15,6 @@ pub static mut BOOT_TIMER_RELOAD_TICKS: u64 = 0;
 pub static mut BOOT_TIMER_CTL: u64 = 0;
 #[unsafe(no_mangle)]
 pub static mut BOOT_TIMER_COUNTER: u64 = 0;
-#[unsafe(no_mangle)]
-pub static BOOT_TIMER_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 pub fn frequency_hz() -> u64 {
@@ -106,13 +96,6 @@ pub unsafe fn arm_in_ticks(ticks: u32) {
     }
 }
 
-#[inline(always)]
-pub unsafe fn disable() {
-    unsafe {
-        write_ctl(0);
-    }
-}
-
 /// Early timer programming used before the full interrupt stack exists.
 ///
 /// This is intentionally simple and observable from GDB:
@@ -122,7 +105,7 @@ pub unsafe fn disable() {
 /// - BOOT_TIMER_COUNTER
 pub unsafe fn early_init() {
     let freq = frequency_hz();
-    let reload = ticks_from_hz(freq, EARLY_TICK_HZ);
+    let reload = ticks_from_hz(freq, SYSTEM_TICK_HZ);
 
     unsafe {
         BOOT_TIMER_FREQ_HZ = freq;
@@ -147,16 +130,13 @@ pub unsafe fn enable_cpu_irq() {
     }
 }
 
-#[inline(always)]
-pub fn irq_count() -> u64 {
-    BOOT_TIMER_IRQ_COUNT.load(Ordering::Relaxed)
-}
-
 pub fn on_timer_irq() {
-    BOOT_TIMER_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
-
-    // For first bring-up keep it one-shot to avoid IRQ storm.
+    // Periodic mode on generic timer requires explicit re-arm each IRQ.
+    // Reload value is precomputed during init for deterministic IRQ path.
+    let reload = unsafe { BOOT_TIMER_RELOAD_TICKS as u32 };
     unsafe {
-        disable();
+        write_tval(reload);
     }
+
+    kernel::time::on_tick_interrupt();
 }

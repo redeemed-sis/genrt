@@ -35,11 +35,6 @@ pub extern "C" fn irq_entry() {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn arch_timer_irq_count() -> u64 {
-    timer::irq_count()
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn rust_entry(dtb_pa: usize) -> ! {
     unsafe {
         gic::init_controller_minimal();
