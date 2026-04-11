@@ -1,11 +1,15 @@
-use std::{env, path::Path, process::Command};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "xtask")]
-#[command(about = "Engineering workflow helper for hardrt")]
+#[command(about = "Engineering workflow helper for genrt")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -24,6 +28,9 @@ enum Commands {
         #[arg(long, value_enum)]
         arch: Arch,
     },
+    BuildAarch64,
+    RunAarch64,
+    DebugAarch64,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -42,6 +49,9 @@ fn main() -> Result<()> {
         Commands::RepoTree => repo_tree(),
         Commands::QemuCmd { arch } => qemu_cmd(arch),
         Commands::GdbCmd { arch } => gdb_cmd(arch),
+        Commands::BuildAarch64 => build_aarch64(),
+        Commands::RunAarch64 => run_aarch64(false),
+        Commands::DebugAarch64 => run_aarch64(true),
     }
 }
 
@@ -52,6 +62,8 @@ fn doctor() -> Result<()> {
         "just",
         "qemu-system-aarch64",
         "gdb",
+        "aarch64-linux-gnu-gdb",
+        "ld.lld",
     ];
 
     println!("== tool availability ==");
@@ -104,20 +116,22 @@ fn phase0_check() -> Result<()> {
         "tools/xtask/src/main.rs",
         "kernel/src/lib.rs",
         "crates/bootinfo/src/lib.rs",
+        "arch/aarch64/src/boot.s",
+        "arch/aarch64/link/qemu-virt.ld",
     ];
 
-    println!("== phase 0 week 1 checklist ==");
+    println!("== phase 0 week 1 + week 2 checklist ==");
     for path in required_paths {
         ensure_exists(path)?;
         println!("[ok] {path}");
     }
 
-    println!("\nPhase 0 / Week 1 scaffold is present.");
+    println!("\nPhase 0 / Week 1 scaffold and Week 2 AArch64 bring-up files are present.");
     Ok(())
 }
 
 fn repo_tree() -> Result<()> {
-    println!("hardrt/");
+    println!("genrt/");
     for line in [
         "├── AGENTS.md",
         "├── Cargo.toml",
@@ -146,6 +160,7 @@ fn qemu_cmd(arch: Arch) -> Result<()> {
             println!("  -cpu cortex-a72 \\");
             println!("  -nographic \\");
             println!("  -serial mon:stdio \\");
+            println!("  -kernel target/aarch64-unknown-none/debug/genrt-aarch64.elf \\");
             println!("  -S -s");
         }
         Arch::X8664 => {
@@ -161,9 +176,10 @@ fn qemu_cmd(arch: Arch) -> Result<()> {
 fn gdb_cmd(arch: Arch) -> Result<()> {
     match arch {
         Arch::Aarch64 => {
-            println!("aarch64-linux-gnu-gdb");
-            println!("(gdb) file target/aarch64-unknown-none/debug/kernel");
+            println!("aarch64-linux-gnu-gdb target/aarch64-unknown-none/debug/genrt-aarch64.elf");
             println!("(gdb) target remote :1234");
+            println!("(gdb) break _start");
+            println!("(gdb) break rust_entry");
             println!("(gdb) break kernel_main");
             println!("(gdb) continue");
         }
@@ -177,6 +193,108 @@ fn gdb_cmd(arch: Arch) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn build_aarch64() -> Result<()> {
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "genrt-arch-aarch64",
+            "--target",
+            "aarch64-unknown-none",
+        ])
+        .status()
+        .context("failed to invoke cargo build")?;
+
+    if !status.success() {
+        bail!("cargo build failed for genrt-arch-aarch64")
+    }
+
+    let final_elf = final_elf_path();
+    if let Some(parent) = final_elf.parent() {
+        fs::create_dir_all(parent).context("failed to create output directory for final elf")?;
+    }
+
+    let staticlib = locate_staticlib()?;
+    let link_status = Command::new("ld.lld")
+        .args(["-T", "arch/aarch64/link/qemu-virt.ld", "-e", "_start", "-o"])
+        .arg(&final_elf)
+        .args(["--whole-archive"])
+        .arg(&staticlib)
+        .args(["--no-whole-archive"])
+        .status()
+        .context("failed to invoke ld.lld")?;
+
+    if !link_status.success() {
+        bail!("ld.lld failed to produce final AArch64 ELF")
+    }
+
+    println!("built {}", final_elf.display());
+    Ok(())
+}
+
+fn run_aarch64(wait_for_gdb: bool) -> Result<()> {
+    build_aarch64()?;
+
+    let mut cmd = Command::new("qemu-system-aarch64");
+    cmd.args([
+        "-machine",
+        "virt",
+        "-cpu",
+        "cortex-a72",
+        "-nographic",
+        "-serial",
+        "mon:stdio",
+        "-kernel",
+    ])
+    .arg(final_elf_path())
+    .stdout(Stdio::inherit())
+    .stderr(Stdio::inherit());
+
+    if wait_for_gdb {
+        cmd.args(["-S", "-s"]);
+    }
+
+    let status = cmd
+        .status()
+        .context("failed to invoke qemu-system-aarch64")?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("QEMU exited with a non-zero status")
+    }
+}
+
+fn final_elf_path() -> PathBuf {
+    PathBuf::from("target/aarch64-unknown-none/debug/genrt-aarch64.elf")
+}
+
+fn locate_staticlib() -> Result<PathBuf> {
+    let direct = PathBuf::from("target/aarch64-unknown-none/debug/libgenrt_arch_aarch64.a");
+    if direct.exists() {
+        return Ok(direct);
+    }
+
+    let deps = Path::new("target/aarch64-unknown-none/debug/deps");
+    if deps.is_dir() {
+        let mut candidates = Vec::new();
+        for entry in fs::read_dir(deps).context("failed to scan target deps directory")? {
+            let entry = entry.context("failed to read target deps entry")?;
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                if name.starts_with("libgenrt_arch_aarch64") && name.ends_with(".a") {
+                    candidates.push(path);
+                }
+            }
+        }
+        candidates.sort();
+        if let Some(last) = candidates.pop() {
+            return Ok(last);
+        }
+    }
+
+    bail!("unable to locate libgenrt_arch_aarch64.a after cargo build")
 }
 
 fn ensure_exists(path: &str) -> Result<()> {
