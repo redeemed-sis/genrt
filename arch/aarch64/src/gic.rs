@@ -9,14 +9,14 @@ const GICD_BASE: usize = 0x0800_0000;
 const GICC_BASE: usize = 0x0801_0000;
 
 // GICD_CTLR: distributor enable.
-const GICD_CTLR: usize = GICD_BASE + 0x000;
+const GICD_CTLR: usize = GICD_BASE;
 // GICD_ISENABLERn: set-enable bits for interrupt IDs (32 IDs per register).
 const GICD_ISENABLER0: usize = GICD_BASE + 0x100;
 // GICD_IPRIORITYRn: 8-bit priority field per interrupt ID.
 const GICD_IPRIORITYR: usize = GICD_BASE + 0x400;
 
 // GICC_CTLR: CPU interface enable.
-const GICC_CTLR: usize = GICC_BASE + 0x000;
+const GICC_CTLR: usize = GICC_BASE;
 // GICC_PMR: priority mask (interrupts with priority <= PMR are signaled).
 const GICC_PMR: usize = GICC_BASE + 0x004;
 // GICC_IAR: interrupt acknowledge register (read returns active INTID).
