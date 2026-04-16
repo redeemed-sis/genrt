@@ -18,14 +18,14 @@ qemu-cmd-aarch64:
 gdb-cmd-aarch64:
     cargo xtask gdb-cmd --arch aarch64
 
-build-aarch64:
-    cargo xtask build-aarch64
+build-aarch64 log="":
+    cargo xtask build-aarch64 {{ if log != "" { "--log-level " + log } else { "" } }}
 
-run-aarch64:
-    cargo xtask run-aarch64
+run-aarch64 log="":
+    cargo xtask run-aarch64 {{ if log != "" { "--log-level " + log } else { "" } }}
 
-debug-aarch64:
-    cargo xtask debug-aarch64
+debug-aarch64 log="debug":
+    cargo xtask debug-aarch64 --log-level {{ log }}
 
 gdb-aarch64:
     aarch64-linux-gnu-gdb target/aarch64-unknown-none/debug/genrt-aarch64.elf \

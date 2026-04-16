@@ -28,9 +28,18 @@ enum Commands {
         #[arg(long, value_enum)]
         arch: Arch,
     },
-    BuildAarch64,
-    RunAarch64,
-    DebugAarch64,
+    BuildAarch64 {
+        #[arg(long, value_enum)]
+        log_level: Option<LogLevel>,
+    },
+    RunAarch64 {
+        #[arg(long, value_enum)]
+        log_level: Option<LogLevel>,
+    },
+    DebugAarch64 {
+        #[arg(long, value_enum)]
+        log_level: Option<LogLevel>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -38,6 +47,27 @@ enum Arch {
     Aarch64,
     X8664,
     Riscv64,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    fn feature_name(self) -> &'static str {
+        match self {
+            Self::Error => "log-level-error",
+            Self::Warn => "log-level-warn",
+            Self::Info => "log-level-info",
+            Self::Debug => "log-level-debug",
+            Self::Trace => "log-level-trace",
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -49,9 +79,11 @@ fn main() -> Result<()> {
         Commands::RepoTree => repo_tree(),
         Commands::QemuCmd { arch } => qemu_cmd(arch),
         Commands::GdbCmd { arch } => gdb_cmd(arch),
-        Commands::BuildAarch64 => build_aarch64(),
-        Commands::RunAarch64 => run_aarch64(false),
-        Commands::DebugAarch64 => run_aarch64(true),
+        Commands::BuildAarch64 { log_level } => build_aarch64(log_level),
+        Commands::RunAarch64 { log_level } => run_aarch64(false, log_level),
+        Commands::DebugAarch64 { log_level } => {
+            run_aarch64(true, Some(log_level.unwrap_or(LogLevel::Debug)))
+        }
     }
 }
 
@@ -195,17 +227,21 @@ fn gdb_cmd(arch: Arch) -> Result<()> {
     Ok(())
 }
 
-fn build_aarch64() -> Result<()> {
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            "genrt-arch-aarch64",
-            "--target",
-            "aarch64-unknown-none",
-        ])
-        .status()
-        .context("failed to invoke cargo build")?;
+fn build_aarch64(log_level: Option<LogLevel>) -> Result<()> {
+    let mut build = Command::new("cargo");
+    build.args([
+        "build",
+        "-p",
+        "genrt-arch-aarch64",
+        "--target",
+        "aarch64-unknown-none",
+    ]);
+
+    if let Some(log_level) = log_level {
+        build.args(["-p", "kernel", "--features", log_level.feature_name()]);
+    }
+
+    let status = build.status().context("failed to invoke cargo build")?;
 
     if !status.success() {
         bail!("cargo build failed for genrt-arch-aarch64")
@@ -234,8 +270,8 @@ fn build_aarch64() -> Result<()> {
     Ok(())
 }
 
-fn run_aarch64(wait_for_gdb: bool) -> Result<()> {
-    build_aarch64()?;
+fn run_aarch64(wait_for_gdb: bool, log_level: Option<LogLevel>) -> Result<()> {
+    build_aarch64(log_level)?;
 
     let mut cmd = Command::new("qemu-system-aarch64");
     cmd.args([
