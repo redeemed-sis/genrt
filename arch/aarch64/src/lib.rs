@@ -1,10 +1,12 @@
 #![no_std]
 
-use core::arch::global_asm;
+use core::arch::{asm, global_asm};
 
 use bootinfo::BootInfo;
 
 mod console;
+mod esr;
+mod exception;
 mod gic;
 mod mmio;
 mod timer;
@@ -13,32 +15,10 @@ mod trap_frame;
 use trap_frame::TrapFrame;
 
 global_asm!(include_str!("boot.s"));
+global_asm!(include_str!("exceptions.s"));
 
 #[unsafe(no_mangle)]
 pub static mut BOOT_CURRENT_EL: u64 = 0;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn trap_record(_esr: u64, _far: u64, _elr: u64) -> ! {
-    loop {
-        core::hint::spin_loop();
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn irq_entry(frame: *mut TrapFrame) {
-    // SAFETY: `boot.s` IRQ entry passes a valid pointer to a live trap frame.
-    let frame_words = frame as *mut u64;
-
-    let iar = gic::acknowledge_irq();
-    let irq_id = gic::irq_id_from_iar(iar);
-
-    if !gic::is_spurious(irq_id) {
-        if irq_id == timer::TIMER_IRQ_ID_PHYS {
-            timer::on_timer_irq(frame_words);
-        }
-        gic::end_irq(iar);
-    }
-}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_entry(dtb_pa: usize) -> ! {
@@ -75,4 +55,23 @@ pub extern "C" fn arch_init_task_frame(
     frame.sp = (stack_top as u64) & !0xF;
     frame.elr = bootstrap_pc as u64;
     frame.spsr = TrapFrame::EL1H;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_hard_fault() -> ! {
+    // SAFETY: this path is terminal by contract; IRQ/FIQ/SError are masked first.
+    unsafe {
+        asm!(
+            "msr daifset, #0xf",
+            options(nomem, nostack, preserves_flags)
+        );
+        asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+
+    loop {
+        // SAFETY: WFE loop is a deterministic hard-stop in early bring-up.
+        unsafe {
+            asm!("wfe", options(nomem, nostack, preserves_flags));
+        }
+    }
 }
