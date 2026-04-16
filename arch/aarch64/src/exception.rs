@@ -14,9 +14,7 @@ pub extern "C" fn irq_entry(frame: *mut TrapFrame) {
         if irq_id == timer::TIMER_IRQ_ID_PHYS {
             timer::on_timer_irq(frame_words);
         } else {
-            puts("[irq] unexpected id=0x");
-            put_hex_u32(irq_id);
-            puts("\n");
+            kernel::warn!("irq: unexpected id=0x{irq_id:08x}");
         }
         gic::end_irq(iar);
     }
@@ -42,69 +40,44 @@ pub extern "C" fn exception_entry(vector: u64, frame: *const TrapFrame) -> ! {
     let ec = esr::ec(raw_esr);
     let iss = esr::iss(raw_esr);
 
-    puts("\n[exception] fatal\n");
-    puts("[exception] source=");
-    puts(source);
-    puts(" kind=");
-    puts(kind);
-    puts("\n");
-
-    puts("[exception] CurrentEL=0x");
-    put_hex_u64(raw_current_el);
-    puts(" EL=");
-    put_hex_u64((raw_current_el >> 2) & 0x3);
-    puts("\n");
-
-    puts("[exception] ESR_EL1=0x");
-    put_hex_u64(raw_esr);
-    puts(" EC=0x");
-    put_hex_u64(ec as u64);
-    puts(" (");
-    puts(esr::ec_name(ec));
-    puts(") ISS=0x");
-    put_hex_u32(iss);
-    puts("\n");
-
-    puts("[exception] FAR_EL1=0x");
-    put_hex_u64(raw_far);
-    puts("\n");
-
-    puts("[exception] ELR_EL1=0x");
-    put_hex_u64(read_elr_el1());
-    puts("\n");
-
-    puts("[exception] SPSR_EL1=0x");
-    put_hex_u64(raw_spsr);
-    puts("\n");
+    kernel::kprintln!();
+    kernel::error!("exception: fatal");
+    kernel::kprintln!("exception: source={source} kind={kind}");
+    kernel::kprintln!(
+        "exception: CurrentEL=0x{raw_current_el:016x} EL={}",
+        (raw_current_el >> 2) & 0x3
+    );
+    kernel::kprintln!(
+        "exception: ESR_EL1=0x{raw_esr:016x} EC=0x{ec:02x} ({}) ISS=0x{iss:08x}",
+        esr::ec_name(ec)
+    );
+    kernel::kprintln!("exception: FAR_EL1=0x{raw_far:016x}");
+    kernel::kprintln!("exception: ELR_EL1=0x{:016x}", read_elr_el1());
+    kernel::kprintln!("exception: SPSR_EL1=0x{raw_spsr:016x}");
 
     if frame.is_null() {
-        puts("[exception] trap_frame=<null>\n");
+        kernel::kprintln!("exception: trap_frame=<null>");
     } else {
         // SAFETY: exception entry assembly passes a live saved trap frame.
         let tf = unsafe { &*frame };
-        puts("[exception] tf.x0=0x");
-        put_hex_u64(tf.x[0]);
-        puts(" tf.x1=0x");
-        put_hex_u64(tf.x[1]);
-        puts(" tf.x2=0x");
-        put_hex_u64(tf.x[2]);
-        puts(" tf.x3=0x");
-        put_hex_u64(tf.x[3]);
-        puts("\n");
-
-        puts("[exception] tf.x29=0x");
-        put_hex_u64(tf.x[29]);
-        puts(" tf.x30=0x");
-        put_hex_u64(tf.x[30]);
-        puts("\n");
-
-        puts("[exception] tf.sp=0x");
-        put_hex_u64(tf.sp);
-        puts(" tf.elr=0x");
-        put_hex_u64(tf.elr);
-        puts(" tf.spsr=0x");
-        put_hex_u64(tf.spsr);
-        puts("\n");
+        kernel::kprintln!(
+            "exception: tf.x0=0x{:016x} tf.x1=0x{:016x} tf.x2=0x{:016x} tf.x3=0x{:016x}",
+            tf.x[0],
+            tf.x[1],
+            tf.x[2],
+            tf.x[3]
+        );
+        kernel::kprintln!(
+            "exception: tf.x29=0x{:016x} tf.x30=0x{:016x}",
+            tf.x[29],
+            tf.x[30]
+        );
+        kernel::kprintln!(
+            "exception: tf.sp=0x{:016x} tf.elr=0x{:016x} tf.spsr=0x{:016x}",
+            tf.sp,
+            tf.elr,
+            tf.spsr
+        );
     }
 
     crate::arch_hard_fault()
@@ -201,42 +174,4 @@ fn read_current_el() -> u64 {
         );
     }
     value
-}
-
-#[inline(always)]
-fn puts(s: &str) {
-    for b in s.bytes() {
-        putc(b);
-    }
-}
-
-#[inline(always)]
-fn putc(c: u8) {
-    crate::console::arch_console_init_once();
-    if c == b'\n' {
-        crate::console::arch_console_putc_raw(b'\r');
-    }
-    crate::console::arch_console_putc_raw(c);
-}
-
-#[inline(always)]
-fn put_hex_u32(value: u32) {
-    put_hex(value as u64, 8);
-}
-
-#[inline(always)]
-fn put_hex_u64(value: u64) {
-    put_hex(value, 16);
-}
-
-#[inline(always)]
-fn put_hex(value: u64, digits: usize) {
-    for shift in (0..digits).rev() {
-        let nibble = ((value >> (shift * 4)) & 0xF) as u8;
-        putc(if nibble < 10 {
-            b'0' + nibble
-        } else {
-            b'a' + (nibble - 10)
-        });
-    }
 }
