@@ -5,7 +5,7 @@ use core::cell::UnsafeCell;
 pub mod arch_consts;
 pub mod boot;
 pub mod console;
-pub mod debug;
+pub mod log;
 pub mod panic;
 pub mod sched;
 pub mod time;
@@ -27,31 +27,30 @@ static SCHEDULER: SchedulerCell = SchedulerCell(UnsafeCell::new(sched::Scheduler
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
-    console::puts("[genrt] kernel_main: entered\r\n");
-    console::puts("[genrt] bootinfo:\r\n");
-    console::puts("  arch=aarch64\r\n");
+    crate::info!("kernel_main entered");
+    crate::info!("bootinfo: arch=aarch64");
 
     if boot.dtb_pa != 0 {
-        console::puts("  dtb=present\r\n");
+        crate::info!("bootinfo: dtb=present");
     } else {
-        console::puts("  dtb=absent\r\n");
+        crate::info!("bootinfo: dtb=absent");
     }
 
     let sched = scheduler_mut();
 
     if sched.bootstrap(idle_task).is_err() {
-        fatal("[genrt] sched: failed to bootstrap scheduler\r\n");
+        fatal("sched: failed to bootstrap scheduler");
     }
 
     if sched.add_task(TEST_PRIORITY, test_task_1).is_err() {
-        fatal("[genrt] sched: failed to add test task\r\n");
+        fatal("sched: failed to add test task");
     }
 
     if sched.add_task(TEST_PRIORITY, test_task_2).is_err() {
-        fatal("[genrt] sched: failed to add test task\r\n");
+        fatal("sched: failed to add test task");
     }
 
-    console::puts("[genrt] sched: irq-return preemptive switching initialized\r\n");
+    crate::info!("sched: irq-return preemptive switching initialized");
 
     // Enters the running task through architecture trap-frame restore and never returns.
     sched.enter_running_task()
@@ -73,7 +72,7 @@ fn idle_task() -> ! {
         let now = time::ticks();
         if now.wrapping_sub(last_log_tick) >= 500 {
             last_log_tick = now;
-            console::puts("[idle] alive\r\n");
+            crate::trace!("idle: alive");
         }
         core::hint::spin_loop();
     }
@@ -85,7 +84,7 @@ fn test_task_1() -> ! {
         let now = time::ticks();
         if now.wrapping_sub(last_log_tick) >= 500 {
             last_log_tick = now;
-            console::puts("[task1] alive\r\n");
+            crate::kprintln!("task1: alive");
         }
         core::hint::spin_loop();
     }
@@ -100,7 +99,7 @@ fn test_task_2() -> ! {
         let now = time::ticks();
         if now.wrapping_sub(last_log_tick) >= 500 {
             last_log_tick = now;
-            console::puts("[task2] alive\r\n");
+            crate::kprintln!("task2: alive");
         }
         core::hint::spin_loop();
     }
@@ -112,14 +111,14 @@ fn test_task_3() -> ! {
         let now = time::ticks();
         if now.wrapping_sub(last_log_tick) >= 500 {
             last_log_tick = now;
-            console::puts("[task3] from another task is alive\r\n");
+            crate::kprintln!("task3: from another task is alive");
         }
         core::hint::spin_loop();
     }
 }
 
 fn fatal(msg: &str) -> ! {
-    console::puts(msg);
+    crate::error!("{msg}");
     // SAFETY: kernel fatal path is terminal and should converge with panic behavior.
     unsafe { arch_hard_fault() }
 }

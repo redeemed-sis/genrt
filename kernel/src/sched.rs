@@ -165,6 +165,7 @@ impl Scheduler {
         );
         copy_words(active_frame_words, self.tasks[next].frame.as_words_ptr());
         self.commit_switch(current, next);
+        log_switch(current, next);
     }
 
     pub(crate) fn enter_running_task(&mut self) -> ! {
@@ -341,12 +342,6 @@ extern "C" fn task_entry_bootstrap(entry_addr: usize) -> ! {
     }
 }
 
-#[allow(dead_code)]
-#[cfg(debug_assertions)]
 fn log_switch(prev: usize, next: usize) {
-    crate::console::puts("[switch] prev=");
-    crate::debug::put_usize_dec(prev);
-    crate::console::puts(" next=");
-    crate::debug::put_usize_dec(next);
-    crate::console::puts("\r\n");
+    crate::trace!("sched: prev={prev} next={next}");
 }

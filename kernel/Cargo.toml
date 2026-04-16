@@ -7,5 +7,13 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+log-level-error = []
+log-level-warn = []
+log-level-info = []
+log-level-debug = []
+log-level-trace = []
+
 [dependencies]
 bootinfo = { path = "../crates/bootinfo" }

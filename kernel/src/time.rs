@@ -22,7 +22,5 @@ pub fn ticks() -> u64 {
 
 #[cfg(debug_assertions)]
 fn log_tick(n: u64) {
-    crate::console::puts("[tick] n=");
-    crate::debug::put_u64_dec(n);
-    crate::console::puts("\r\n");
+    crate::debug!("tick={n}");
 }
