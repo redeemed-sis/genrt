@@ -237,21 +237,72 @@ cargo xtask gdb-cmd --arch aarch64
 
 ---
 
+## Logging
+
+genrt now has a minimal allocation-free kernel logging path built on top of the
+raw console backend.
+
+Available macros:
+- `kprint!` / `kprintln!` for plain formatted output
+- `error!`, `warn!`, `info!`, `debug!`, `trace!` for level-tagged logging
+
+Available levels:
+- `Error`
+- `Warn`
+- `Info`
+- `Debug`
+- `Trace`
+
+The active threshold is compile-time controlled:
+- default builds use `Info`
+
+You can override the threshold explicitly with Cargo features on the `kernel`
+crate:
+- `log-level-error`
+- `log-level-warn`
+- `log-level-info`
+- `log-level-debug`
+- `log-level-trace`
+
+Example:
+
+```bash
+cargo build -p kernel --target aarch64-unknown-none --features log-level-debug
+```
+
+For normal repo workflow, `just` can pass log levels through `xtask`:
+
+```bash
+just build-aarch64 trace
+just run-aarch64 trace
+just debug-aarch64
+just debug-aarch64 trace
+```
+
+`debug-aarch64` defaults to `debug` logging when no explicit level is passed.
+
+The raw console path (`console::putc` / `console::puts`) still exists for panic
+fallbacks, very early boot, and emergency diagnostics.
+
+Trace logging is allocation-free and simple enough for occasional use in IRQ and
+scheduler paths during bring-up, but high-volume trace output will perturb
+timing and should remain debug-oriented.
+
 ## Expected bring-up output
 
 The exact output evolves with the codebase, but current bring-up output typically includes messages such as:
 
 ```text
-[genrt] kernel_main: entered
-[genrt] bootinfo:
-  arch=aarch64
-  dtb=present
-[genrt] sched: fixed-priority skeleton initialized
-[tick] n=100
-[sched] current=1 prio=10
+[INFO ] kernel_main entered
+[INFO ] bootinfo: arch=aarch64
+[INFO ] bootinfo: dtb=present
+[INFO ] sched: irq-return preemptive switching initialized
+[DEBUG] tick=100
+[TRACE] sched: prev=0 next=1
 ```
 
-Debug tick and scheduler messages are currently intended for bring-up observability and may change as tracing becomes more structured.
+Debug and trace messages are intended for bring-up observability and may change
+as the kernel grows more structured tracing support.
 
 ---
 
