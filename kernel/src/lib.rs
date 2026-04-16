@@ -14,6 +14,10 @@ use bootinfo::BootInfo;
 
 pub const TEST_PRIORITY: u8 = 10;
 
+unsafe extern "C" {
+    fn arch_hard_fault() -> !;
+}
+
 struct SchedulerCell(UnsafeCell<sched::Scheduler>);
 
 // SAFETY: genrt currently runs scheduler mutations only on a single core.
@@ -116,9 +120,8 @@ fn test_task_3() -> ! {
 
 fn fatal(msg: &str) -> ! {
     console::puts(msg);
-    loop {
-        core::hint::spin_loop();
-    }
+    // SAFETY: kernel fatal path is terminal and should converge with panic behavior.
+    unsafe { arch_hard_fault() }
 }
 
 #[inline(always)]

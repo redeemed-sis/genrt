@@ -1,5 +1,9 @@
 use core::panic::PanicInfo;
 
+unsafe extern "C" {
+    fn arch_hard_fault() -> !;
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     crate::console::puts("[genrt] PANIC\r\n");
@@ -9,7 +13,6 @@ fn panic(info: &PanicInfo) -> ! {
         crate::console::puts("\r\n");
     }
 
-    loop {
-        core::hint::spin_loop();
-    }
+    // SAFETY: panic is terminal; architecture hard-fault path halts deterministically.
+    unsafe { arch_hard_fault() }
 }
