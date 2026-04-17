@@ -1,6 +1,7 @@
 // AArch64 EL1 vector + trap frame save/restore path.
 // Contract with Rust:
 // - `irq_entry(*mut TrapFrame)` may update active frame for IRQ-return switching.
+// - `sync_entry(vector_id, *mut TrapFrame)` handles controlled synchronous kernel traps.
 // - `exception_entry(vector_id, *const TrapFrame)` is fatal and does not return.
 //
 // TrapFrame ABI (must match `trap_frame.rs`):
@@ -50,6 +51,8 @@
 .set TF_ELR, 256
 .set TF_SPSR,264
 .set TF_SIZE,272
+
+.set VECTOR_CURRENT_EL_SPX_SYNC, 4
 
 .macro VEC_ENTRY target
     b \target
@@ -132,6 +135,14 @@
     b 1b
 .endm
 
+.macro KERNEL_SYNC_VECTOR vec_id
+    SAVE_TRAPFRAME
+    mov x0, #\vec_id
+    mov x1, sp
+    bl sync_entry
+    b trap_restore_and_eret
+.endm
+
 .section .text.exceptions, "ax"
 
 .align 11
@@ -177,7 +188,7 @@ trap_current_sp0_serror:
     FATAL_VECTOR 3
 
 trap_current_spx_sync:
-    FATAL_VECTOR 4
+    KERNEL_SYNC_VECTOR VECTOR_CURRENT_EL_SPX_SYNC
 
 trap_current_spx_irq:
     SAVE_TRAPFRAME

@@ -38,6 +38,22 @@ pub extern "C" fn arch_irq_enable() {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn arch_sleep_until(deadline: u64) {
+    // SAFETY: `svc #0` raises a synchronous exception at the current EL.
+    // The EL1 vector path saves the current TrapFrame, routes the request
+    // through `sync_entry()`, lets the scheduler block this task, and
+    // eventually resumes another task with `eret`. When the sleeping task is
+    // woken later, execution continues after this instruction.
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x0") deadline,
+            options(nostack)
+        );
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn arch_init_task_frame(
     frame_words: *mut u64,
     stack_top: usize,

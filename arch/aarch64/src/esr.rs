@@ -1,3 +1,5 @@
+pub const EC_SVC_AARCH64: u8 = 0b010101;
+
 #[inline(always)]
 pub fn ec(raw_esr: u64) -> u8 {
     ((raw_esr >> 26) & 0x3f) as u8
