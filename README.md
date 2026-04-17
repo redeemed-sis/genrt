@@ -25,6 +25,7 @@ The current AArch64 path already has:
 * static per-task stacks
 * round-robin scheduling for runnable kernel tasks
 * scheduler ownership isolated to kernel bootstrap and timer IRQ paths
+* timer-driven sleep/wakeup with blocked tasks and automatic wake on tick
 * minimal allocation-free formatted logging with log levels
 * improved fatal exception diagnostics
 
@@ -37,7 +38,6 @@ In one sentence:
 * MMU / virtual memory
 * EL0 / user mode
 * SMP scheduling
-* sleep/wakeup queues
 * bounded IPC/mailboxes
 * driver model
 * low-overhead buffered tracing
@@ -60,6 +60,7 @@ Timer IRQ
   -> rearm timer
   -> kernel::on_tick_interrupt(frame)
     -> update ticks
+    -> wake sleeping blocked tasks with an O(N) scan
     -> scheduler selects next task
     -> active frame may be replaced
   -> restore selected TrapFrame
@@ -76,6 +77,7 @@ Key milestone already reached:
 * EL1 kernel threads only
 * no MMU
 * direct-to-UART logging
+* sleep/wakeup uses a simple O(N) task-table scan per tick
 * scheduler/task management still in early-kernel form
 * platform-specific MMIO mapping still partly lives in the AArch64 layer
 
@@ -136,10 +138,9 @@ cargo xtask run-aarch64 --log-level trace
 
 The best next steps are:
 
-1. sleep/wakeup on top of the timer tick
-2. bounded mailbox/queue IPC
-3. lightweight trace buffering
-4. only then MMU and isolation work
+1. bounded mailbox/queue IPC
+2. lightweight trace buffering
+3. only then MMU and isolation work
 
 ## Documentation
 

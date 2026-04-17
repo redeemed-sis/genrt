@@ -55,38 +55,30 @@ fn idle_task() -> ! {
 }
 
 fn test_task_1() -> ! {
-    let mut last_log_tick = 0u64;
+    let mut cycle = 0u64;
     loop {
-        let now = time::ticks();
-        if now.wrapping_sub(last_log_tick) >= 500 {
-            last_log_tick = now;
-            crate::kprintln!("task1: alive");
+        cycle = cycle.wrapping_add(1);
+        let log_cycle = cycle.is_multiple_of(8);
+
+        if log_cycle {
+            crate::kprintln!("task1: sleeping for 20 ticks");
         }
-        core::hint::spin_loop();
+        sched::sleep_ticks(20);
+        if log_cycle {
+            crate::kprintln!("task1: woke");
+        }
     }
 }
 
 fn test_task_2() -> ! {
-    let mut last_log_tick = 0u64;
     loop {
-        let now = time::ticks();
-        if now.wrapping_sub(last_log_tick) >= 500 {
-            last_log_tick = now;
-            crate::kprintln!("task2: alive");
-        }
-        core::hint::spin_loop();
+        sched::sleep_ticks(40);
     }
 }
 
 fn test_task_3() -> ! {
-    let mut last_log_tick = 0u64;
     loop {
-        let now = time::ticks();
-        if now.wrapping_sub(last_log_tick) >= 500 {
-            last_log_tick = now;
-            crate::kprintln!("task3: from another task is alive");
-        }
-        core::hint::spin_loop();
+        sched::sleep_ticks(60);
     }
 }
 
