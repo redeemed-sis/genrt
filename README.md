@@ -24,6 +24,7 @@ The current AArch64 path already has:
 * **IRQ-return-based preemptive task switching**
 * static per-task stacks
 * round-robin scheduling for runnable kernel tasks
+* scheduler ownership isolated to kernel bootstrap and timer IRQ paths
 * minimal allocation-free formatted logging with log levels
 * improved fatal exception diagnostics
 
@@ -135,11 +136,10 @@ cargo xtask run-aarch64 --log-level trace
 
 The best next steps are:
 
-1. scheduler/preemption hardening
-2. sleep/wakeup on top of the timer tick
-3. bounded mailbox/queue IPC
-4. lightweight trace buffering
-5. only then MMU and isolation work
+1. sleep/wakeup on top of the timer tick
+2. bounded mailbox/queue IPC
+3. lightweight trace buffering
+4. only then MMU and isolation work
 
 ## Documentation
 
