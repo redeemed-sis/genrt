@@ -6,13 +6,15 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 const TICK_LOG_EVERY: u64 = 100;
 
 #[inline(always)]
-pub fn on_tick_interrupt() {
+pub fn on_tick_interrupt() -> u64 {
     let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
 
     #[cfg(debug_assertions)]
     if n.is_multiple_of(TICK_LOG_EVERY) {
         log_tick(n);
     }
+
+    n
 }
 
 #[inline(always)]

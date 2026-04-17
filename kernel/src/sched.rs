@@ -19,6 +19,7 @@ unsafe extern "C" {
         bootstrap_pc: usize,
     );
     fn arch_enter_task_frame(frame_words: *const u64) -> !;
+    fn arch_sleep_until(deadline: u64);
 }
 
 struct SchedulerCell(UnsafeCell<Scheduler>);
@@ -44,6 +45,8 @@ impl StaticTask {
 // - Running: the sole task whose saved frame matches the scheduler's committed resume target.
 // - Ready: runnable and owns a valid saved frame, but is not the current resume target.
 // - Blocked: not runnable and not considered during round-robin selection.
+//   In the first sleep/wakeup implementation, a blocked task may carry a wake deadline and is
+//   made Ready again by the timer tick's O(N) task-table scan.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum TaskState {
     Ready,
@@ -102,6 +105,7 @@ struct Task {
     id: TaskId,
     priority: u8,
     state: TaskState,
+    wake_tick: Option<u64>,
     entry: TaskEntry,
     stack_top: usize,
     frame: TaskFrameStorage,
@@ -128,14 +132,39 @@ pub(crate) fn bootstrap(idle_entry: TaskEntry, tasks: &[StaticTask]) -> Result<(
     sched.bootstrap(idle_entry, tasks)
 }
 
+pub fn sleep_ticks(ticks: u64) {
+    if ticks == 0 {
+        return;
+    }
+
+    let deadline = crate::time::ticks().wrapping_add(ticks);
+    sleep_until(deadline);
+}
+
+pub fn sleep_until(deadline: u64) {
+    if deadline <= crate::time::ticks() {
+        return;
+    }
+
+    // SAFETY: `arch_sleep_until()` enters a controlled synchronous exception path that
+    // saves the current task frame and hands ownership back to the scheduler.
+    unsafe { arch_sleep_until(deadline) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn on_tick_interrupt(active_frame_words: *mut u64) {
     if active_frame_words.is_null() {
         return;
     }
 
-    crate::time::on_tick_interrupt();
-    scheduler_mut().preempt_on_tick(active_frame_words);
+    let now = crate::time::on_tick_interrupt();
+    let sched = scheduler_mut();
+    sched.wake_sleeping_tasks(now);
+    sched.preempt_on_tick(active_frame_words);
+}
+
+pub fn on_sleep_sync(active_frame_words: *mut u64, deadline: u64) {
+    scheduler_mut().block_current_until(active_frame_words, deadline);
 }
 
 pub(crate) fn enter_running_task() -> ! {
@@ -221,6 +250,24 @@ impl Scheduler {
         log_switch(current, next);
     }
 
+    fn block_current_until(&mut self, active_frame_words: *mut u64, deadline: u64) {
+        let current = self
+            .running_task()
+            .unwrap_or_else(|| panic!("sleep requested without a running task"));
+        let next = self.select_next_excluding(current);
+
+        // Save the current task's post-SVC resume frame before making it unrunnable.
+        copy_words(
+            self.tasks[current].frame.as_mut_words_ptr(),
+            active_frame_words as *const u64,
+        );
+
+        copy_words(active_frame_words, self.tasks[next].frame.as_words_ptr());
+        self.commit_block(current, next, deadline);
+        crate::trace!("sched: task {current} sleeping until {deadline}");
+        log_switch(current, next);
+    }
+
     pub(crate) fn enter_running_task(&mut self) -> ! {
         let running = self
             .running_task()
@@ -242,6 +289,7 @@ impl Scheduler {
             task.id = id;
             task.priority = 0;
             task.state = TaskState::Blocked;
+            task.wake_tick = None;
             task.entry = parked_task;
             task.stack_top = self.stacks[id].top();
             task.frame.clear();
@@ -256,7 +304,7 @@ impl Scheduler {
     fn set_idle_task(&mut self, entry: TaskEntry) {
         self.tasks[IDLE_TASK_ID].entry = entry;
         self.tasks[IDLE_TASK_ID].priority = IDLE_PRIORITY;
-        self.tasks[IDLE_TASK_ID].state = TaskState::Ready;
+        self.make_ready(IDLE_TASK_ID);
     }
 
     fn add_ready_task(&mut self, priority: u8, entry: TaskEntry) -> Result<TaskId> {
@@ -267,7 +315,7 @@ impl Scheduler {
         self.tasks[id].id = id;
         self.tasks[id].priority = priority;
         self.tasks[id].entry = entry;
-        self.tasks[id].state = TaskState::Ready;
+        self.make_ready(id);
         Ok(id)
     }
 
@@ -276,10 +324,11 @@ impl Scheduler {
             return Err(SchedError::InvalidTaskId);
         }
 
-        let task = &mut self.tasks[id];
-        if task.state == TaskState::Blocked {
+        if self.is_free_slot(id) {
             return Err(SchedError::AlreadyScheduled);
         }
+
+        let task = &mut self.tasks[id];
 
         // SAFETY: scheduler owns frame storage, stack top and entry pointer are validated by task table setup.
         unsafe {
@@ -306,16 +355,24 @@ impl Scheduler {
             return Err(SchedError::AlreadyScheduled);
         }
 
-        self.tasks[IDLE_TASK_ID].state = TaskState::Ready;
-        self.tasks[id].state = TaskState::Running;
-        self.current = Some(id);
+        self.make_ready(IDLE_TASK_ID);
+        self.make_running(id);
         debug_assert_eq!(self.tasks[id].state, TaskState::Running);
         debug_assert_eq!(self.current, Some(id));
         Ok(())
     }
 
     fn select_next(&self) -> TaskId {
-        self.pick_next().unwrap_or(IDLE_TASK_ID)
+        self.pick_next_excluding(self.current.unwrap_or(IDLE_TASK_ID), None)
+            .unwrap_or(IDLE_TASK_ID)
+    }
+
+    // Round-robin continuation used when the current running task is about to
+    // stop being runnable (for example, it goes to sleep). We continue the scan
+    // after the current slot, but explicitly skip selecting that task again.
+    fn select_next_excluding(&self, excluded: TaskId) -> TaskId {
+        self.pick_next_excluding(self.current.unwrap_or(IDLE_TASK_ID), Some(excluded))
+            .unwrap_or(IDLE_TASK_ID)
     }
 
     fn commit_switch(&mut self, prev: TaskId, next: TaskId) {
@@ -327,25 +384,56 @@ impl Scheduler {
         debug_assert_eq!(self.tasks[prev].state, TaskState::Running);
         debug_assert_ne!(self.tasks[next].state, TaskState::Blocked);
 
-        if self.tasks[prev].state == TaskState::Running {
-            self.tasks[prev].state = TaskState::Ready;
-        }
-
-        self.tasks[next].state = TaskState::Running;
-        self.current = Some(next);
+        self.make_ready(prev);
+        self.make_running(next);
         debug_assert_eq!(self.current, Some(next));
         debug_assert_eq!(self.tasks[next].state, TaskState::Running);
         debug_assert_eq!(self.tasks[prev].state, TaskState::Ready);
     }
+
+    fn commit_block(&mut self, blocked: TaskId, next: TaskId, deadline: u64) {
+        debug_assert_eq!(self.current, Some(blocked));
+        debug_assert_eq!(self.tasks[blocked].state, TaskState::Running);
+        debug_assert_ne!(self.tasks[next].state, TaskState::Blocked);
+
+        self.make_blocked_until(blocked, deadline);
+        self.make_running(next);
+
+        debug_assert_eq!(self.current, Some(next));
+        debug_assert_eq!(self.tasks[blocked].state, TaskState::Blocked);
+        debug_assert_eq!(self.tasks[next].state, TaskState::Running);
+    }
 }
 
 impl Scheduler {
-    fn pick_next(&self) -> Option<TaskId> {
-        let start = self.current.unwrap_or(IDLE_TASK_ID);
+    fn wake_sleeping_tasks(&mut self, now: u64) {
+        // First sleep/wakeup pass intentionally uses an O(N) scan over the static task table.
+        for id in (IDLE_TASK_ID + 1)..MAX_TASKS {
+            if self.tasks[id].state != TaskState::Blocked {
+                continue;
+            }
 
+            let Some(deadline) = self.tasks[id].wake_tick else {
+                continue;
+            };
+
+            if now < deadline {
+                continue;
+            }
+
+            self.make_ready(id);
+            crate::trace!("sched: task {id} woke at tick {now}");
+        }
+    }
+
+    fn pick_next_excluding(&self, start: TaskId, excluded: Option<TaskId>) -> Option<TaskId> {
         for offset in 1..=MAX_TASKS {
             let id = (start + offset) % MAX_TASKS;
             if id == IDLE_TASK_ID {
+                continue;
+            }
+
+            if Some(id) == excluded {
                 continue;
             }
 
@@ -358,7 +446,34 @@ impl Scheduler {
     }
 
     fn find_free_task_slot(&self) -> Option<TaskId> {
-        ((IDLE_TASK_ID + 1)..MAX_TASKS).find(|&id| self.tasks[id].state == TaskState::Blocked)
+        ((IDLE_TASK_ID + 1)..MAX_TASKS).find(|&id| self.is_free_slot(id))
+    }
+
+    fn make_ready(&mut self, id: TaskId) {
+        self.tasks[id].state = TaskState::Ready;
+        self.tasks[id].wake_tick = None;
+    }
+
+    fn make_running(&mut self, id: TaskId) {
+        self.tasks[id].state = TaskState::Running;
+        self.tasks[id].wake_tick = None;
+        self.current = Some(id);
+    }
+
+    fn make_blocked(&mut self, id: TaskId) {
+        self.tasks[id].state = TaskState::Blocked;
+    }
+
+    fn make_blocked_until(&mut self, id: TaskId, deadline: u64) {
+        self.make_blocked(id);
+        self.tasks[id].wake_tick = Some(deadline);
+    }
+
+    fn is_free_slot(&self, id: TaskId) -> bool {
+        let task = &self.tasks[id];
+        task.state == TaskState::Blocked
+            && task.wake_tick.is_none()
+            && task.entry as usize == parked_task as usize
     }
 }
 
@@ -374,6 +489,7 @@ impl Task {
             id,
             priority: 0,
             state: TaskState::Blocked,
+            wake_tick: None,
             entry: parked_task,
             stack_top: 0,
             frame: TaskFrameStorage::zeroed(),
