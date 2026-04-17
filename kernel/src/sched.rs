@@ -1,4 +1,4 @@
-use core::mem;
+use core::{cell::UnsafeCell, mem};
 
 pub(crate) type TaskId = usize;
 pub(crate) type TaskEntry = fn() -> !;
@@ -21,7 +21,30 @@ unsafe extern "C" {
     fn arch_enter_task_frame(frame_words: *const u64) -> !;
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
+struct SchedulerCell(UnsafeCell<Scheduler>);
+
+// SAFETY: genrt currently mutates scheduler state only on a single core.
+unsafe impl Sync for SchedulerCell {}
+
+static SCHEDULER: SchedulerCell = SchedulerCell(UnsafeCell::new(Scheduler::new()));
+
+#[derive(Copy, Clone)]
+pub(crate) struct StaticTask {
+    priority: u8,
+    entry: TaskEntry,
+}
+
+impl StaticTask {
+    pub(crate) const fn new(priority: u8, entry: TaskEntry) -> Self {
+        Self { priority, entry }
+    }
+}
+
+// Task-state semantics:
+// - Running: the sole task whose saved frame matches the scheduler's committed resume target.
+// - Ready: runnable and owns a valid saved frame, but is not the current resume target.
+// - Blocked: not runnable and not considered during round-robin selection.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum TaskState {
     Ready,
     Running,
@@ -94,8 +117,35 @@ pub(crate) enum SchedError {
 pub(crate) struct Scheduler {
     tasks: [Task; MAX_TASKS],
     stacks: [TaskStack; MAX_TASKS],
+    // `current` is the scheduler's committed CPU-resume target. Once task execution starts,
+    // it must match the frame that IRQ return or `arch_enter_task_frame()` will resume.
     current: Option<TaskId>,
     entered_running_task: bool,
+}
+
+pub(crate) fn bootstrap(idle_entry: TaskEntry, tasks: &[StaticTask]) -> Result<()> {
+    let sched = scheduler_mut();
+    sched.bootstrap(idle_entry, tasks)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn on_tick_interrupt(active_frame_words: *mut u64) {
+    if active_frame_words.is_null() {
+        return;
+    }
+
+    crate::time::on_tick_interrupt();
+    scheduler_mut().preempt_on_tick(active_frame_words);
+}
+
+pub(crate) fn enter_running_task() -> ! {
+    scheduler_mut().enter_running_task()
+}
+
+#[inline(always)]
+fn scheduler_mut() -> &'static mut Scheduler {
+    // SAFETY: Access is single-writer in the current single-core bring-up model.
+    unsafe { &mut *SCHEDULER.0.get() }
 }
 
 impl Scheduler {
@@ -128,18 +178,16 @@ impl Scheduler {
 }
 
 impl Scheduler {
-    pub(crate) fn bootstrap(&mut self, idle_entry: TaskEntry) -> Result<()> {
+    fn bootstrap(&mut self, idle_entry: TaskEntry, tasks: &[StaticTask]) -> Result<()> {
         self.init();
         self.set_idle_task(idle_entry);
         self.initialize_task_frame(IDLE_TASK_ID)?;
+        for task in tasks {
+            let id = self.add_ready_task(task.priority, task.entry)?;
+            self.initialize_task_frame(id)?;
+        }
         self.mark_initial_running(IDLE_TASK_ID)?;
         Ok(())
-    }
-
-    pub(crate) fn add_task(&mut self, priority: u8, entry: TaskEntry) -> Result<TaskId> {
-        let id = self.add_for_scheduling(priority, entry)?;
-        self.initialize_task_frame(id)?;
-        Ok(id)
     }
 
     pub(crate) fn preempt_on_tick(&mut self, active_frame_words: *mut u64) {
@@ -157,8 +205,13 @@ impl Scheduler {
             return;
         }
 
-        // Switch commit path: persist interrupted frame, install next frame,
-        // then update scheduler state to match the actual IRQ return target.
+        // Switch-commit invariant:
+        // 1. persist the interrupted running task frame
+        // 2. install the selected next frame into the live IRQ-return slot
+        // 3. only then update logical task-state bookkeeping
+        //
+        // This keeps the scheduler's `Running` state aligned with the actual
+        // CPU resume target at the handoff point.
         copy_words(
             self.tasks[current].frame.as_mut_words_ptr(),
             active_frame_words as *const u64,
@@ -175,6 +228,8 @@ impl Scheduler {
         let frame_words = self.tasks[running].frame.as_words_ptr();
 
         self.entered_running_task = true;
+        debug_assert_eq!(self.current, Some(running));
+        debug_assert_eq!(self.tasks[running].state, TaskState::Running);
         // SAFETY: scheduler bootstrap prepared the running task trap frame.
         unsafe { arch_enter_task_frame(frame_words) }
     }
@@ -204,7 +259,7 @@ impl Scheduler {
         self.tasks[IDLE_TASK_ID].state = TaskState::Ready;
     }
 
-    fn add_for_scheduling(&mut self, priority: u8, entry: TaskEntry) -> Result<TaskId> {
+    fn add_ready_task(&mut self, priority: u8, entry: TaskEntry) -> Result<TaskId> {
         let id = self
             .find_free_task_slot()
             .ok_or(SchedError::NoFreeTaskSlot)?;
@@ -254,6 +309,8 @@ impl Scheduler {
         self.tasks[IDLE_TASK_ID].state = TaskState::Ready;
         self.tasks[id].state = TaskState::Running;
         self.current = Some(id);
+        debug_assert_eq!(self.tasks[id].state, TaskState::Running);
+        debug_assert_eq!(self.current, Some(id));
         Ok(())
     }
 
@@ -266,14 +323,23 @@ impl Scheduler {
             return;
         }
 
+        debug_assert_eq!(self.current, Some(prev));
+        debug_assert_eq!(self.tasks[prev].state, TaskState::Running);
+        debug_assert_ne!(self.tasks[next].state, TaskState::Blocked);
+
         if self.tasks[prev].state == TaskState::Running {
             self.tasks[prev].state = TaskState::Ready;
         }
 
         self.tasks[next].state = TaskState::Running;
         self.current = Some(next);
+        debug_assert_eq!(self.current, Some(next));
+        debug_assert_eq!(self.tasks[next].state, TaskState::Running);
+        debug_assert_eq!(self.tasks[prev].state, TaskState::Ready);
     }
+}
 
+impl Scheduler {
     fn pick_next(&self) -> Option<TaskId> {
         let start = self.current.unwrap_or(IDLE_TASK_ID);
 

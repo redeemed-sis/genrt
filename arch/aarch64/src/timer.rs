@@ -138,5 +138,5 @@ pub fn on_timer_irq(frame_words: *mut u64) {
         write_tval(reload);
     }
 
-    kernel::on_tick_interrupt(frame_words);
+    kernel::sched::on_tick_interrupt(frame_words);
 }
