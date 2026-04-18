@@ -1,5 +1,10 @@
 use core::{cell::UnsafeCell, mem};
 
+use crate::{
+    arch_consts::TASK_FRAME_WORDS,
+    time::{TimeHandlers, TimedEvent, TimedTaskId},
+};
+
 pub(crate) type TaskId = usize;
 pub(crate) type TaskEntry = fn() -> !;
 pub(crate) type Result<T> = core::result::Result<T, SchedError>;
@@ -8,8 +13,6 @@ pub(crate) const MAX_TASKS: usize = 8;
 const TASK_STACK_SIZE: usize = 4096;
 const IDLE_TASK_ID: TaskId = 0;
 const IDLE_PRIORITY: u8 = 0;
-
-use crate::arch_consts::TASK_FRAME_WORDS;
 
 unsafe extern "C" {
     fn arch_init_task_frame(
@@ -45,8 +48,8 @@ impl StaticTask {
 // - Running: the sole task whose saved frame matches the scheduler's committed resume target.
 // - Ready: runnable and owns a valid saved frame, but is not the current resume target.
 // - Blocked: not runnable and not considered during round-robin selection.
-//   In the first sleep/wakeup implementation, a blocked task may carry a wake deadline and is
-//   made Ready again by the timer tick's O(N) task-table scan.
+//   Wakeup deadlines live in `kernel::time`; the scheduler only observes the
+//   resulting `WakeTask(task_id)` timed event and restores the task to `Ready`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum TaskState {
     Ready,
@@ -105,7 +108,6 @@ struct Task {
     id: TaskId,
     priority: u8,
     state: TaskState,
-    wake_tick: Option<u64>,
     entry: TaskEntry,
     stack_top: usize,
     frame: TaskFrameStorage,
@@ -124,43 +126,71 @@ pub(crate) struct Scheduler {
     // `current` is the scheduler's committed CPU-resume target. Once task execution starts,
     // it must match the frame that IRQ return or `arch_enter_task_frame()` will resume.
     current: Option<TaskId>,
+    rr_quantum_ms: u64,
+    // Set when `kernel::time` dispatches `QuantumExpired(current_task)`.
+    // The actual switch decision is still committed only in the scheduler's
+    // frame-handoff path.
+    resched_requested: bool,
     entered_running_task: bool,
 }
 
-pub(crate) fn bootstrap(idle_entry: TaskEntry, tasks: &[StaticTask]) -> Result<()> {
+pub(crate) fn bootstrap(
+    idle_entry: TaskEntry,
+    tasks: &[StaticTask],
+    rr_quantum_ms: u64,
+) -> Result<()> {
     let sched = scheduler_mut();
-    sched.bootstrap(idle_entry, tasks)
+    sched.bootstrap(idle_entry, tasks, rr_quantum_ms)
 }
 
-pub fn sleep_ticks(ticks: u64) {
-    if ticks == 0 {
+pub fn usleep(us: u64) {
+    if us == 0 {
         return;
     }
 
-    let deadline = crate::time::ticks().wrapping_add(ticks);
-    sleep_until(deadline);
+    let deadline = crate::time::now_counter().wrapping_add(crate::time::us_to_counts(us));
+    sleep_until_counter(deadline);
 }
 
-pub fn sleep_until(deadline: u64) {
-    if deadline <= crate::time::ticks() {
+pub fn msleep(ms: u64) {
+    if ms == 0 {
+        return;
+    }
+
+    let deadline = crate::time::now_counter().wrapping_add(crate::time::ms_to_counts(ms));
+    sleep_until_counter(deadline);
+}
+
+pub fn sleep_until_counter(deadline: u64) {
+    if deadline <= crate::time::now_counter() {
         return;
     }
 
     // SAFETY: `arch_sleep_until()` enters a controlled synchronous exception path that
     // saves the current task frame and hands ownership back to the scheduler.
+    // The deadline is expressed in hardware counter units.
     unsafe { arch_sleep_until(deadline) }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn on_tick_interrupt(active_frame_words: *mut u64) {
+#[inline(always)]
+pub fn sleep_until(deadline: u64) {
+    sleep_until_counter(deadline);
+}
+
+fn on_wake_task(task_id: TimedTaskId) {
+    scheduler_mut().wake_task(task_id);
+}
+
+fn on_quantum_expired(task_id: TimedTaskId) {
+    scheduler_mut().note_quantum_expired(task_id);
+}
+
+fn finish_timer_interrupt(active_frame_words: *mut u64, now: u64) {
     if active_frame_words.is_null() {
         return;
     }
 
-    let now = crate::time::on_tick_interrupt();
-    let sched = scheduler_mut();
-    sched.wake_sleeping_tasks(now);
-    sched.preempt_on_tick(active_frame_words);
+    scheduler_mut().finish_timer_interrupt(active_frame_words, now);
 }
 
 pub fn on_sleep_sync(active_frame_words: *mut u64, deadline: u64) {
@@ -201,25 +231,40 @@ impl Scheduler {
                 TaskStack::zeroed(),
             ],
             current: None,
+            rr_quantum_ms: 10,
+            resched_requested: false,
             entered_running_task: false,
         }
     }
 }
 
 impl Scheduler {
-    fn bootstrap(&mut self, idle_entry: TaskEntry, tasks: &[StaticTask]) -> Result<()> {
-        self.init();
+    fn bootstrap(
+        &mut self,
+        idle_entry: TaskEntry,
+        tasks: &[StaticTask],
+        rr_quantum_ms: u64,
+    ) -> Result<()> {
+        crate::time::init(TimeHandlers {
+            finish_timer_interrupt,
+            wake_task: on_wake_task,
+            quantum_expired: on_quantum_expired,
+        });
+        self.init(rr_quantum_ms);
         self.set_idle_task(idle_entry);
         self.initialize_task_frame(IDLE_TASK_ID)?;
         for task in tasks {
             let id = self.add_ready_task(task.priority, task.entry)?;
             self.initialize_task_frame(id)?;
         }
-        self.mark_initial_running(IDLE_TASK_ID)?;
+        let first = self
+            .pick_next_excluding(IDLE_TASK_ID, None)
+            .unwrap_or(IDLE_TASK_ID);
+        self.mark_initial_running(first)?;
         Ok(())
     }
 
-    pub(crate) fn preempt_on_tick(&mut self, active_frame_words: *mut u64) {
+    fn finish_timer_interrupt(&mut self, active_frame_words: *mut u64, now: u64) {
         if !self.entered_running_task {
             return;
         }
@@ -228,26 +273,37 @@ impl Scheduler {
             Some(id) => id,
             None => return,
         };
+        let must_leave_idle = current == IDLE_TASK_ID && self.has_runnable_peer(current);
+        let mut replaced_quantum_event = false;
 
-        let next = self.select_next();
-        if next == current {
-            return;
+        if self.resched_requested || must_leave_idle {
+            let next = self.select_next();
+            if next != current {
+                // Switch-commit invariant:
+                // 1. persist the interrupted running task frame
+                // 2. install the selected next frame into the live IRQ-return slot
+                // 3. only then update logical task-state bookkeeping
+                //
+                // This keeps the scheduler's `Running` state aligned with the actual
+                // CPU resume target at the handoff point.
+                copy_words(
+                    self.tasks[current].frame.as_mut_words_ptr(),
+                    active_frame_words as *const u64,
+                );
+                copy_words(active_frame_words, self.tasks[next].frame.as_words_ptr());
+                self.commit_switch(current, next);
+                log_switch(current, next);
+            }
+
+            self.replace_quantum_event(now, current);
+            replaced_quantum_event = true;
         }
 
-        // Switch-commit invariant:
-        // 1. persist the interrupted running task frame
-        // 2. install the selected next frame into the live IRQ-return slot
-        // 3. only then update logical task-state bookkeeping
-        //
-        // This keeps the scheduler's `Running` state aligned with the actual
-        // CPU resume target at the handoff point.
-        copy_words(
-            self.tasks[current].frame.as_mut_words_ptr(),
-            active_frame_words as *const u64,
-        );
-        copy_words(active_frame_words, self.tasks[next].frame.as_words_ptr());
-        self.commit_switch(current, next);
-        log_switch(current, next);
+        if !replaced_quantum_event {
+            self.ensure_quantum_event(now);
+        }
+
+        self.resched_requested = false;
     }
 
     fn block_current_until(&mut self, active_frame_words: *mut u64, deadline: u64) {
@@ -263,9 +319,14 @@ impl Scheduler {
         );
 
         copy_words(active_frame_words, self.tasks[next].frame.as_words_ptr());
-        self.commit_block(current, next, deadline);
-        crate::trace!("sched: task {current} sleeping until {deadline}");
-        log_switch(current, next);
+        self.commit_block(current, next);
+        let now = crate::time::now_counter();
+        crate::time::schedule_event(deadline, TimedEvent::WakeTask(current));
+        self.replace_quantum_event(now, current);
+        crate::trace!("sched: task {current} sleeping until counter {deadline}");
+        if next != current {
+            log_switch(current, next);
+        }
     }
 
     pub(crate) fn enter_running_task(&mut self) -> ! {
@@ -273,8 +334,10 @@ impl Scheduler {
             .running_task()
             .unwrap_or_else(|| panic!("scheduler has no running task"));
         let frame_words = self.tasks[running].frame.as_words_ptr();
+        let now = crate::time::now_counter();
 
         self.entered_running_task = true;
+        self.ensure_quantum_event(now);
         debug_assert_eq!(self.current, Some(running));
         debug_assert_eq!(self.tasks[running].state, TaskState::Running);
         // SAFETY: scheduler bootstrap prepared the running task trap frame.
@@ -283,13 +346,12 @@ impl Scheduler {
 }
 
 impl Scheduler {
-    fn init(&mut self) {
+    fn init(&mut self, rr_quantum_ms: u64) {
         for id in 0..MAX_TASKS {
             let task = &mut self.tasks[id];
             task.id = id;
             task.priority = 0;
             task.state = TaskState::Blocked;
-            task.wake_tick = None;
             task.entry = parked_task;
             task.stack_top = self.stacks[id].top();
             task.frame.clear();
@@ -298,6 +360,8 @@ impl Scheduler {
         self.tasks[IDLE_TASK_ID].priority = IDLE_PRIORITY;
         self.tasks[IDLE_TASK_ID].state = TaskState::Ready;
         self.current = None;
+        self.rr_quantum_ms = rr_quantum_ms.max(1);
+        self.resched_requested = false;
         self.entered_running_task = false;
     }
 
@@ -391,12 +455,12 @@ impl Scheduler {
         debug_assert_eq!(self.tasks[prev].state, TaskState::Ready);
     }
 
-    fn commit_block(&mut self, blocked: TaskId, next: TaskId, deadline: u64) {
+    fn commit_block(&mut self, blocked: TaskId, next: TaskId) {
         debug_assert_eq!(self.current, Some(blocked));
         debug_assert_eq!(self.tasks[blocked].state, TaskState::Running);
         debug_assert_ne!(self.tasks[next].state, TaskState::Blocked);
 
-        self.make_blocked_until(blocked, deadline);
+        self.make_blocked(blocked);
         self.make_running(next);
 
         debug_assert_eq!(self.current, Some(next));
@@ -406,23 +470,25 @@ impl Scheduler {
 }
 
 impl Scheduler {
-    fn wake_sleeping_tasks(&mut self, now: u64) {
-        // First sleep/wakeup pass intentionally uses an O(N) scan over the static task table.
-        for id in (IDLE_TASK_ID + 1)..MAX_TASKS {
-            if self.tasks[id].state != TaskState::Blocked {
-                continue;
-            }
+    fn wake_task(&mut self, task_id: TaskId) {
+        if task_id >= MAX_TASKS {
+            return;
+        }
 
-            let Some(deadline) = self.tasks[id].wake_tick else {
-                continue;
-            };
+        if self.is_free_slot(task_id) {
+            return;
+        }
 
-            if now < deadline {
-                continue;
-            }
+        if self.tasks[task_id].state == TaskState::Blocked {
+            self.make_ready(task_id);
+            crate::trace!("sched: task {task_id} moved to Ready");
+        }
+    }
 
-            self.make_ready(id);
-            crate::trace!("sched: task {id} woke at tick {now}");
+    fn note_quantum_expired(&mut self, task_id: TaskId) {
+        if self.current == Some(task_id) {
+            self.resched_requested = true;
+            crate::trace!("sched: quantum expired task {task_id}");
         }
     }
 
@@ -451,12 +517,10 @@ impl Scheduler {
 
     fn make_ready(&mut self, id: TaskId) {
         self.tasks[id].state = TaskState::Ready;
-        self.tasks[id].wake_tick = None;
     }
 
     fn make_running(&mut self, id: TaskId) {
         self.tasks[id].state = TaskState::Running;
-        self.tasks[id].wake_tick = None;
         self.current = Some(id);
     }
 
@@ -464,16 +528,51 @@ impl Scheduler {
         self.tasks[id].state = TaskState::Blocked;
     }
 
-    fn make_blocked_until(&mut self, id: TaskId, deadline: u64) {
-        self.make_blocked(id);
-        self.tasks[id].wake_tick = Some(deadline);
-    }
-
     fn is_free_slot(&self, id: TaskId) -> bool {
         let task = &self.tasks[id];
-        task.state == TaskState::Blocked
-            && task.wake_tick.is_none()
-            && task.entry as usize == parked_task as usize
+        task.state == TaskState::Blocked && task.entry as usize == parked_task as usize
+    }
+
+    fn has_runnable_peer(&self, current: TaskId) -> bool {
+        for id in 0..MAX_TASKS {
+            if id == current || id == IDLE_TASK_ID {
+                continue;
+            }
+
+            if self.tasks[id].state != TaskState::Blocked {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn ensure_quantum_event(&mut self, now: u64) {
+        let Some(current) = self.current else {
+            return;
+        };
+
+        let event = TimedEvent::QuantumExpired(current);
+        if !self.has_runnable_peer(current) {
+            crate::time::cancel_event(event);
+            return;
+        }
+
+        if crate::time::event_pending(event) {
+            return;
+        }
+
+        let deadline = now.wrapping_add(crate::time::ms_to_counts(self.rr_quantum_ms));
+        crate::time::schedule_event(deadline, event);
+        crate::trace!(
+            "sched: task {current} quantum={}ms until counter {deadline}",
+            self.rr_quantum_ms
+        );
+    }
+
+    fn replace_quantum_event(&mut self, now: u64, obsolete_task: TaskId) {
+        crate::time::cancel_event(TimedEvent::QuantumExpired(obsolete_task));
+        self.ensure_quantum_event(now);
     }
 }
 
@@ -489,7 +588,6 @@ impl Task {
             id,
             priority: 0,
             state: TaskState::Blocked,
-            wake_tick: None,
             entry: parked_task,
             stack_top: 0,
             frame: TaskFrameStorage::zeroed(),

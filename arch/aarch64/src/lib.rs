@@ -38,6 +38,28 @@ pub extern "C" fn arch_irq_enable() {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn arch_counter_now() -> u64 {
+    timer::counter()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_counter_freq_hz() -> u64 {
+    timer::frequency_hz()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_timer_arm_deadline(deadline: u64) {
+    // SAFETY: kernel passes an absolute architected-counter deadline.
+    unsafe { timer::arm_deadline(deadline) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_timer_disarm() {
+    // SAFETY: kernel explicitly disables the timer when no deadlines are pending.
+    unsafe { timer::disable() }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn arch_sleep_until(deadline: u64) {
     // SAFETY: `svc #0` raises a synchronous exception at the current EL.
     // The EL1 vector path saves the current TrapFrame, routes the request

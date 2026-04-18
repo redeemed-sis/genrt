@@ -11,6 +11,7 @@ pub mod time;
 use bootinfo::BootInfo;
 
 pub const TEST_PRIORITY: u8 = 10;
+pub const TEST_RR_QUANTUM_MS: u64 = 10;
 const DEMO_TASKS: [sched::StaticTask; 3] = [
     sched::StaticTask::new(TEST_PRIORITY, test_task_1),
     sched::StaticTask::new(TEST_PRIORITY, test_task_2),
@@ -32,7 +33,7 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
         crate::info!("bootinfo: dtb=absent");
     }
 
-    if sched::bootstrap(idle_task, &DEMO_TASKS).is_err() {
+    if sched::bootstrap(idle_task, &DEMO_TASKS, TEST_RR_QUANTUM_MS).is_err() {
         fatal("sched: failed to bootstrap scheduler");
     }
 
@@ -43,42 +44,50 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
 }
 
 fn idle_task() -> ! {
-    let mut last_log_tick = 0u64;
+    let mut last_log_ms = 0u64;
     loop {
-        let now = time::ticks();
-        if now.wrapping_sub(last_log_tick) >= 500 {
-            last_log_tick = now;
-            crate::trace!("idle: alive");
+        let now_ms = time::uptime_ms();
+        if now_ms.wrapping_sub(last_log_ms) >= 5_000 {
+            last_log_ms = now_ms;
+            crate::trace!("idle: alive at {now_ms} ms");
         }
         core::hint::spin_loop();
     }
 }
 
 fn test_task_1() -> ! {
-    let mut cycle = 0u64;
+    let mut last_log_ms = 0u64;
     loop {
-        cycle = cycle.wrapping_add(1);
-        let log_cycle = cycle.is_multiple_of(8);
-
-        if log_cycle {
-            crate::kprintln!("task1: sleeping for 20 ticks");
+        let now_ms = time::uptime_ms();
+        if now_ms.wrapping_sub(last_log_ms) >= 1_000 {
+            last_log_ms = now_ms;
+            crate::kprintln!("task1: cpu-bound at {now_ms} ms");
         }
-        sched::sleep_ticks(20);
-        if log_cycle {
-            crate::kprintln!("task1: woke");
-        }
+        core::hint::spin_loop();
     }
 }
 
 fn test_task_2() -> ! {
+    let mut cycle = 0u64;
+    let sleep_ms = 2_000;
     loop {
-        sched::sleep_ticks(40);
+        cycle = cycle.wrapping_add(1);
+
+        crate::kprintln!("task2: sleeping for {sleep_ms} ms, cycle {cycle}");
+        sched::msleep(sleep_ms);
+        crate::kprintln!("task2: woke, cycle {cycle}");
     }
 }
 
 fn test_task_3() -> ! {
+    let mut cycle = 0u64;
+    let sleep_ms = 6_000;
     loop {
-        sched::sleep_ticks(60);
+        cycle = cycle.wrapping_add(1);
+
+        crate::kprintln!("task3: sleeping for {sleep_ms} ms, cycle {cycle}");
+        sched::msleep(sleep_ms);
+        crate::kprintln!("task3: woke, cycle {cycle}");
     }
 }
 
