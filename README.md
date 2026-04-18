@@ -18,14 +18,16 @@ The current AArch64 path already has:
 * early PL011 UART output
 * `BootInfo` handoff into Rust
 * GICv2 initialization
-* periodic architected timer interrupts
-* kernel tick accounting
+* architected timer in one-shot nearest-deadline mode
+* monotonic hardware counter timebase
 * full trap-frame save/restore on IRQ
 * **IRQ-return-based preemptive task switching**
 * static per-task stacks
 * round-robin scheduling for runnable kernel tasks
-* scheduler ownership isolated to kernel bootstrap and timer IRQ paths
-* timer-driven sleep/wakeup with blocked tasks and automatic wake on tick
+* scheduler ownership isolated to bootstrap, timed-event dispatch, and frame handoff
+* `kernel::time` owns timed events and one-shot timer rearming
+* sleep wakeups and scheduler quantum both delivered as typed timed events
+* round-robin quantum configured as a duration at scheduler bootstrap
 * minimal allocation-free formatted logging with log levels
 * improved fatal exception diagnostics
 
@@ -50,18 +52,20 @@ High-level flow:
 _start (boot.S)
   -> early arch init
   -> GICv2 init
-  -> periodic timer init
+  -> one-shot timer init
   -> kernel_main()
   -> start first task from prepared trap frame
 
 Timer IRQ
   -> save full TrapFrame
   -> identify timer interrupt
-  -> rearm timer
-  -> kernel::on_tick_interrupt(frame)
-    -> update ticks
-    -> wake sleeping blocked tasks with an O(N) scan
-    -> scheduler selects next task
+  -> kernel::time::on_timer_interrupt(frame)
+    -> read monotonic counter
+    -> collect all expired timed events
+    -> dispatch WakeTask / QuantumExpired
+    -> scheduler may select next task
+    -> compute nearest next deadline
+    -> reprogram one-shot timer
     -> active frame may be replaced
   -> restore selected TrapFrame
   -> eret into selected task
@@ -77,7 +81,7 @@ Key milestone already reached:
 * EL1 kernel threads only
 * no MMU
 * direct-to-UART logging
-* sleep/wakeup uses a simple O(N) task-table scan per tick
+* deadline handling uses a simple O(N) task-table scan
 * scheduler/task management still in early-kernel form
 * platform-specific MMIO mapping still partly lives in the AArch64 layer
 
@@ -138,7 +142,7 @@ cargo xtask run-aarch64 --log-level trace
 
 The best next steps are:
 
-1. bounded mailbox/queue IPC
+1. bounded mailbox/queue IPC with timeout integration
 2. lightweight trace buffering
 3. only then MMU and isolation work
 
@@ -149,3 +153,6 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0001-architecture-strategy.md`
 * `ai-docs/decision-records/ADR-0002-aarch64-irq-path-gicv2-timer.md`
 * `ai-docs/decision-records/ADR-0003-aarch64-preemptive-irq-return-switching.md`
+* `ai-docs/decision-records/ADR-0004-aarch64-boot-exception-separation-and-fatal-path.md`
+* `ai-docs/decision-records/ADR-0005-one-shot-timer-deadline-engine.md`
+* `ai-docs/decision-records/ADR-0006-time-owned-timed-events.md`
