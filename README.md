@@ -5,6 +5,7 @@
 Current active target:
 
 * **AArch64**
+* **Rust target `aarch64-unknown-none-softfloat`**
 * **QEMU `virt`**
 * **single-core EL1 kernel threads**
 * **QEMU-first bring-up and debugging**
@@ -17,6 +18,11 @@ The current AArch64 path already has:
 * `VBAR_EL1` exception-vector setup
 * early PL011 UART output
 * `BootInfo` handoff into Rust
+* DTB-seeded physical memory discovery
+* generated-and-embedded QEMU `virt` DTB fallback for ELF boot
+* internal physical memory map with reserved-range carving
+* page-aligned usable frame ranges
+* minimal free-list physical frame allocator
 * GICv2 initialization
 * architected timer in one-shot nearest-deadline mode
 * monotonic hardware counter timebase
@@ -34,6 +40,11 @@ The current AArch64 path already has:
 In one sentence:
 
 > genrt is currently an early **single-core preemptive EL1 kernel prototype** on AArch64/QEMU.
+
+The AArch64 build currently uses the Rust target `aarch64-unknown-none-softfloat`.
+This is intentional for the current kernel stage: the scheduler/trap path does not
+yet own FP/SIMD state, so the build avoids implicit hard-float/AdvSIMD assumptions
+in ordinary Rust code.
 
 ## What is not implemented yet
 
@@ -53,7 +64,9 @@ _start (boot.S)
   -> early arch init
   -> GICv2 init
   -> one-shot timer init
+  -> BootInfo + DTB memory discovery
   -> kernel_main()
+  -> physical memory init
   -> start first task from prepared trap frame
 
 Timer IRQ
@@ -80,8 +93,10 @@ Key milestone already reached:
 * single-core only
 * EL1 kernel threads only
 * no MMU
+* no heap allocator yet
 * direct-to-UART logging
 * deadline handling uses a simple O(N) task-table scan
+* frame allocator is single-page free-list only
 * scheduler/task management still in early-kernel form
 * platform-specific MMIO mapping still partly lives in the AArch64 layer
 
@@ -142,9 +157,9 @@ cargo xtask run-aarch64 --log-level trace
 
 The best next steps are:
 
-1. bounded mailbox/queue IPC with timeout integration
-2. lightweight trace buffering
-3. only then MMU and isolation work
+1. minimal kernel heap allocator on top of page frames
+2. page-table allocation groundwork
+3. bounded mailbox/queue IPC with timeout integration
 
 ## Documentation
 
@@ -156,3 +171,4 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0004-aarch64-boot-exception-separation-and-fatal-path.md`
 * `ai-docs/decision-records/ADR-0005-one-shot-timer-deadline-engine.md`
 * `ai-docs/decision-records/ADR-0006-time-owned-timed-events.md`
+* `ai-docs/decision-records/ADR-0007-dtb-memory-map-and-frame-allocator.md`
