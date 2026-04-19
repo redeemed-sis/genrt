@@ -5,7 +5,7 @@
             "name": "genrt aarch64 qemu gdb",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/target/aarch64-unknown-none/debug/genrt-aarch64.elf",
+            "program": "${workspaceFolder}/target/aarch64-unknown-none-softfloat/debug/genrt-aarch64.elf",
             "cwd": "${workspaceFolder}",
             "MIMode": "gdb",
             "miDebuggerPath": "/usr/bin/aarch64-linux-gnu-gdb",
