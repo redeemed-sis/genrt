@@ -1,6 +1,6 @@
 #![no_std]
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[repr(C)]
 pub struct MemoryRegion {
     pub start: u64,
@@ -8,7 +8,7 @@ pub struct MemoryRegion {
     pub kind: MemoryRegionKind,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
 pub enum MemoryRegionKind {
     Usable = 0,
@@ -21,6 +21,7 @@ pub enum MemoryRegionKind {
 pub struct BootInfo {
     pub boot_cpu_id: u64,
     pub dtb_pa: u64,
+    pub dtb_size: u64,
     pub rsdp_pa: u64,
     pub memory_map: &'static [MemoryRegion],
 }
@@ -30,6 +31,7 @@ impl BootInfo {
         Self {
             boot_cpu_id: 0,
             dtb_pa: 0,
+            dtb_size: 0,
             rsdp_pa: 0,
             memory_map: &[],
         }

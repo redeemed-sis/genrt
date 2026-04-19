@@ -3,7 +3,9 @@
 pub mod arch_consts;
 pub mod boot;
 pub mod console;
+mod dtb;
 pub mod log;
+pub mod memory;
 pub mod panic;
 pub mod sched;
 pub mod time;
@@ -28,9 +30,13 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
     crate::info!("bootinfo: arch=aarch64");
 
     if boot.dtb_pa != 0 {
-        crate::info!("bootinfo: dtb=present");
+        crate::info!("bootinfo: dtb=present size={} bytes", boot.dtb_size);
     } else {
         crate::info!("bootinfo: dtb=absent");
+    }
+
+    if memory::init(boot).is_err() {
+        fatal("memory: failed to initialize physical memory subsystem");
     }
 
     if sched::bootstrap(idle_task, &DEMO_TASKS, TEST_RR_QUANTUM_MS).is_err() {
