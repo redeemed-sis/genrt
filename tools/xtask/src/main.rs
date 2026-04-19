@@ -7,6 +7,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
+const AARCH64_TARGET: &str = "aarch64-unknown-none-softfloat";
+
 #[derive(Parser)]
 #[command(name = "xtask")]
 #[command(about = "Engineering workflow helper for genrt")]
@@ -118,7 +120,7 @@ fn doctor() -> Result<()> {
         .context("failed to query rustup targets")?;
     let installed = String::from_utf8_lossy(&output.stdout);
     for target in [
-        "aarch64-unknown-none",
+        AARCH64_TARGET,
         "x86_64-unknown-none",
         "riscv64gc-unknown-none-elf",
     ] {
@@ -192,7 +194,7 @@ fn qemu_cmd(arch: Arch) -> Result<()> {
             println!("  -cpu cortex-a72 \\");
             println!("  -nographic \\");
             println!("  -serial mon:stdio \\");
-            println!("  -kernel target/aarch64-unknown-none/debug/genrt-aarch64.elf \\");
+            println!("  -kernel target/{AARCH64_TARGET}/debug/genrt-aarch64.elf \\");
             println!("  -S -s");
         }
         Arch::X8664 => {
@@ -208,7 +210,7 @@ fn qemu_cmd(arch: Arch) -> Result<()> {
 fn gdb_cmd(arch: Arch) -> Result<()> {
     match arch {
         Arch::Aarch64 => {
-            println!("aarch64-linux-gnu-gdb target/aarch64-unknown-none/debug/genrt-aarch64.elf");
+            println!("aarch64-linux-gnu-gdb target/{AARCH64_TARGET}/debug/genrt-aarch64.elf");
             println!("(gdb) target remote :1234");
             println!("(gdb) break _start");
             println!("(gdb) break rust_entry");
@@ -228,14 +230,17 @@ fn gdb_cmd(arch: Arch) -> Result<()> {
 }
 
 fn build_aarch64(log_level: Option<LogLevel>) -> Result<()> {
+    let dtb_path = generate_qemu_virt_dtb()?;
+
     let mut build = Command::new("cargo");
     build.args([
         "build",
         "-p",
         "genrt-arch-aarch64",
         "--target",
-        "aarch64-unknown-none",
+        AARCH64_TARGET,
     ]);
+    build.env("GENRT_AARCH64_DTB_PATH", &dtb_path);
 
     if let Some(log_level) = log_level {
         build.args(["-p", "kernel", "--features", log_level.feature_name()]);
@@ -272,6 +277,7 @@ fn build_aarch64(log_level: Option<LogLevel>) -> Result<()> {
 
 fn run_aarch64(wait_for_gdb: bool, log_level: Option<LogLevel>) -> Result<()> {
     build_aarch64(log_level)?;
+    let dtb_path = qemu_virt_dtb_path()?;
 
     let mut cmd = Command::new("qemu-system-aarch64");
     cmd.args([
@@ -285,6 +291,8 @@ fn run_aarch64(wait_for_gdb: bool, log_level: Option<LogLevel>) -> Result<()> {
         "-kernel",
     ])
     .arg(final_elf_path())
+    .arg("-dtb")
+    .arg(dtb_path)
     .stdout(Stdio::inherit())
     .stderr(Stdio::inherit());
 
@@ -303,16 +311,55 @@ fn run_aarch64(wait_for_gdb: bool, log_level: Option<LogLevel>) -> Result<()> {
 }
 
 fn final_elf_path() -> PathBuf {
-    PathBuf::from("target/aarch64-unknown-none/debug/genrt-aarch64.elf")
+    PathBuf::from(format!("target/{AARCH64_TARGET}/debug/genrt-aarch64.elf"))
+}
+
+fn qemu_virt_dtb_path() -> Result<PathBuf> {
+    Ok(env::current_dir()
+        .context("failed to query current directory")?
+        .join(format!("target/{AARCH64_TARGET}/debug/qemu-virt.dtb")))
+}
+
+fn generate_qemu_virt_dtb() -> Result<PathBuf> {
+    let dtb_path = qemu_virt_dtb_path()?;
+    if let Some(parent) = dtb_path.parent() {
+        fs::create_dir_all(parent).context("failed to create DTB output directory")?;
+    }
+
+    let status = Command::new("qemu-system-aarch64")
+        .arg("-machine")
+        .arg(format!("virt,dumpdtb={}", dtb_path.display()))
+        .args([
+            "-cpu",
+            "cortex-a72",
+            "-display",
+            "none",
+            "-serial",
+            "none",
+            "-monitor",
+            "none",
+            "-nodefaults",
+        ])
+        .status()
+        .context("failed to invoke qemu-system-aarch64 for DTB generation")?;
+
+    if !status.success() {
+        bail!("qemu-system-aarch64 failed to generate virt DTB")
+    }
+
+    Ok(dtb_path)
 }
 
 fn locate_staticlib() -> Result<PathBuf> {
-    let direct = PathBuf::from("target/aarch64-unknown-none/debug/libgenrt_arch_aarch64.a");
+    let direct = PathBuf::from(format!(
+        "target/{AARCH64_TARGET}/debug/libgenrt_arch_aarch64.a"
+    ));
     if direct.exists() {
         return Ok(direct);
     }
 
-    let deps = Path::new("target/aarch64-unknown-none/debug/deps");
+    let deps_buf = PathBuf::from(format!("target/{AARCH64_TARGET}/debug/deps"));
+    let deps = deps_buf.as_path();
     if deps.is_dir() {
         let mut candidates = Vec::new();
         for entry in fs::read_dir(deps).context("failed to scan target deps directory")? {

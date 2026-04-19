@@ -28,7 +28,7 @@ debug-aarch64 log="debug":
     cargo xtask debug-aarch64 --log-level {{ log }}
 
 gdb-aarch64:
-    aarch64-linux-gnu-gdb target/aarch64-unknown-none/debug/genrt-aarch64.elf \
+    aarch64-linux-gnu-gdb target/aarch64-unknown-none-softfloat/debug/genrt-aarch64.elf \
       -ex "target remote :1234" \
       -ex "break _start" \
       -ex "break rust_entry" \

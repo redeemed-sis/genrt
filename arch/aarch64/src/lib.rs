@@ -17,6 +17,14 @@ use trap_frame::TrapFrame;
 global_asm!(include_str!("boot.s"));
 global_asm!(include_str!("exceptions.s"));
 
+#[repr(align(8))]
+struct AlignedBytes<const N: usize>([u8; N]);
+
+// Keep the fallback DTB itself aligned in the kernel image so early boot code
+// does not depend on byte-addressed parsing alone.
+static EMBEDDED_DTB: AlignedBytes<{ include_bytes!(env!("GENRT_AARCH64_EMBEDDED_DTB")).len() }> =
+    AlignedBytes(*include_bytes!(env!("GENRT_AARCH64_EMBEDDED_DTB")));
+
 #[unsafe(no_mangle)]
 pub static mut BOOT_CURRENT_EL: u64 = 0;
 
@@ -27,6 +35,15 @@ pub extern "C" fn rust_entry(dtb_pa: usize) -> ! {
         gic::enable_irq(timer::TIMER_IRQ_ID_PHYS, 0x40);
         timer::early_init();
     }
+    let dtb_pa = if dtb_pa != 0 {
+        dtb_pa
+    } else {
+        let fallback = effective_dtb_pa(0);
+        if fallback != 0 {
+            kernel::debug!("arch: using embedded qemu DTB fallback");
+        }
+        fallback
+    };
     let bootinfo: &'static BootInfo = unsafe { kernel::boot::init_bootinfo(dtb_pa) };
     kernel::kernel_main(bootinfo)
 }
@@ -112,4 +129,17 @@ pub extern "C" fn arch_hard_fault() -> ! {
             asm!("wfe", options(nomem, nostack, preserves_flags));
         }
     }
+}
+
+#[inline(always)]
+fn effective_dtb_pa(dtb_pa: usize) -> usize {
+    if dtb_pa != 0 {
+        return dtb_pa;
+    }
+
+    if EMBEDDED_DTB.0.is_empty() {
+        return 0;
+    }
+
+    EMBEDDED_DTB.0.as_ptr() as usize
 }

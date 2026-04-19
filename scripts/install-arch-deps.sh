@@ -20,7 +20,7 @@ Then initialize the Rust toolchain:
 
   rustup default stable
   rustup component add rust-src rustfmt clippy
-  rustup target add aarch64-unknown-none x86_64-unknown-none riscv64gc-unknown-none-elf
+  rustup target add aarch64-unknown-none-softfloat x86_64-unknown-none riscv64gc-unknown-none-elf
 
 Optional but useful later:
 
