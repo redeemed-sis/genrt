@@ -6,12 +6,7 @@ unsafe extern "C" {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    crate::console::puts("[genrt] PANIC\r\n");
-
-    if let Some(msg) = info.message().as_str() {
-        crate::console::puts(msg);
-        crate::console::puts("\r\n");
-    }
+    crate::error!("panic: {info}");
 
     // SAFETY: panic is terminal; architecture hard-fault path halts deterministically.
     unsafe { arch_hard_fault() }

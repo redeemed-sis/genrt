@@ -23,6 +23,8 @@ The current AArch64 path already has:
 * internal physical memory map with reserved-range carving
 * page-aligned usable frame ranges
 * minimal free-list physical frame allocator
+* fixed-size bootstrap kernel heap on `linked_list_allocator`
+* working `alloc` container smoke tests (`Vec`, `VecDeque`, `BinaryHeap`, `BTreeMap`)
 * GICv2 initialization
 * architected timer in one-shot nearest-deadline mode
 * monotonic hardware counter timebase
@@ -93,10 +95,10 @@ Key milestone already reached:
 * single-core only
 * EL1 kernel threads only
 * no MMU
-* no heap allocator yet
+* heap is currently a fixed-size `16 MiB` bootstrap region
 * direct-to-UART logging
 * deadline handling uses a simple O(N) task-table scan
-* frame allocator is single-page free-list only
+* heap does not grow from arbitrary frames yet
 * scheduler/task management still in early-kernel form
 * platform-specific MMIO mapping still partly lives in the AArch64 layer
 
@@ -129,6 +131,22 @@ Available levels:
 
 The logger is allocation-free and intended for kernel bring-up. It is useful for diagnostics, but high-volume UART logging still perturbs timing.
 
+## Heap
+
+The kernel heap is currently initialized from one contiguous `16 MiB` region
+allocated out of the physical frame allocator during early memory bootstrap.
+
+Initialization order is:
+
+1. parse and normalize physical memory regions
+2. initialize the frame allocator on usable page ranges
+3. allocate one contiguous heap range via `alloc_contiguous`
+4. initialize `linked_list_allocator`
+5. run heap-backed smoke tests
+
+This keeps heap ownership unambiguous: once the bootstrap heap region is
+allocated, it is no longer part of the frame allocator free list.
+
 ## Build and run
 
 ```bash
@@ -157,9 +175,9 @@ cargo xtask run-aarch64 --log-level trace
 
 The best next steps are:
 
-1. minimal kernel heap allocator on top of page frames
-2. page-table allocation groundwork
-3. bounded mailbox/queue IPC with timeout integration
+1. page-table allocation groundwork
+2. bounded mailbox/queue IPC with timeout integration
+3. growable heap design on top of frame allocation
 
 ## Documentation
 
@@ -172,3 +190,5 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0005-one-shot-timer-deadline-engine.md`
 * `ai-docs/decision-records/ADR-0006-time-owned-timed-events.md`
 * `ai-docs/decision-records/ADR-0007-dtb-memory-map-and-frame-allocator.md`
+* `ai-docs/decision-records/ADR-0008-aarch64-softfloat-kernel-target.md`
+* `ai-docs/decision-records/ADR-0009-bootstrap-kernel-heap-on-frame-allocator.md`
