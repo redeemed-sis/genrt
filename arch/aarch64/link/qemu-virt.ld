@@ -28,7 +28,7 @@ SECTIONS
 
     .boot_stack (NOLOAD) : ALIGN(16) {
         __boot_stack_bottom = .;
-        . = . + 0x4000;
+        . = . + 0x8000;
         __boot_stack_top = .;
     }
 

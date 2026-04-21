@@ -1,5 +1,7 @@
 #![no_std]
 
+extern crate alloc;
+
 pub mod arch_consts;
 pub mod boot;
 pub mod console;
@@ -20,10 +22,6 @@ const DEMO_TASKS: [sched::StaticTask; 3] = [
     sched::StaticTask::new(TEST_PRIORITY, test_task_3),
 ];
 
-unsafe extern "C" {
-    fn arch_hard_fault() -> !;
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
     crate::info!("kernel_main entered");
@@ -35,14 +33,18 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
         crate::info!("bootinfo: dtb=absent");
     }
 
-    if memory::init(boot).is_err() {
-        fatal("memory: failed to initialize physical memory subsystem");
+    if let Err(err) = memory::init(boot) {
+        crate::error!("memory: init failed: {:?}", err);
+        panic!("memory: failed to initialize physical memory subsystem");
     }
+
+    log_bootstrap_stack_usage("after memory init");
 
     if sched::bootstrap(idle_task, &DEMO_TASKS, TEST_RR_QUANTUM_MS).is_err() {
-        fatal("sched: failed to bootstrap scheduler");
+        panic!("sched: failed to bootstrap scheduler");
     }
 
+    log_bootstrap_stack_usage("before first task");
     crate::info!("sched: irq-return preemptive switching initialized");
 
     // Enters the running task through architecture trap-frame restore and never returns.
@@ -97,8 +99,13 @@ fn test_task_3() -> ! {
     }
 }
 
-fn fatal(msg: &str) -> ! {
-    crate::error!("{msg}");
-    // SAFETY: kernel fatal path is terminal and should converge with panic behavior.
-    unsafe { arch_hard_fault() }
+fn log_bootstrap_stack_usage(stage: &str) {
+    let usage = boot::bootstrap_stack_usage();
+    crate::info!(
+        "boot stack: stage={stage} used={}B unused={}B total={}B low=0x{:x}",
+        usage.used_bytes,
+        usage.unused_bytes,
+        usage.total_bytes,
+        usage.lowest_used_addr
+    );
 }

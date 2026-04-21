@@ -14,10 +14,25 @@ _start:
     b 0b
 
 1:
-    // set up boot stack
-    adrp x2, __boot_stack_top
-    add  x2, x2, :lo12:__boot_stack_top
-    mov  sp, x2
+    // Fill the bootstrap stack with a repeated 0xA5 canary pattern before it
+    // becomes active. This lets Rust measure the high-water mark later.
+    adrp x2, __boot_stack_bottom
+    add  x2, x2, :lo12:__boot_stack_bottom
+    adrp x3, __boot_stack_top
+    add  x3, x3, :lo12:__boot_stack_top
+    movz x4, #0xA5A5
+    movk x4, #0xA5A5, lsl #16
+    movk x4, #0xA5A5, lsl #32
+    movk x4, #0xA5A5, lsl #48
+
+fill_boot_stack:
+    cmp  x2, x3
+    b.hs boot_stack_ready
+    str  x4, [x2], #8
+    b    fill_boot_stack
+
+boot_stack_ready:
+    mov  sp, x3
 
     // zero .bss
     adrp x3, __bss_start

@@ -18,3 +18,4 @@ log-level-trace = []
 [dependencies]
 bootinfo = { path = "../crates/bootinfo" }
 fdt-raw = { version = "0.3.0", default-features = false }
+linked_list_allocator = "0.10.5"

@@ -3,6 +3,7 @@ use core::cell::UnsafeCell;
 use bootinfo::BootInfo;
 
 mod frame_alloc;
+pub mod heap;
 mod map;
 mod types;
 
@@ -16,6 +17,7 @@ pub use types::{
     VirtAddr, VirtRange, VirtRegion,
 };
 
+const KERNEL_HEAP_BOOTSTRAP_SIZE: usize = 16 * 1024 * 1024;
 const MAX_RAM_RANGES: usize = 16;
 const MAX_RESERVED_RANGES: usize = 32;
 const MAX_PHYS_REGIONS: usize = 64;
@@ -33,8 +35,11 @@ pub(crate) type Result<T> = core::result::Result<T, MemoryError>;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MemoryError {
     NoUsableRam,
+    NoBootstrapHeapRange,
     TooManyRanges,
     AddressOutOfRange,
+    HeapInit(heap::HeapInitError),
+    HeapSmokeTest(heap::HeapSmokeError),
 }
 
 struct PhysFrameStorage;
@@ -67,6 +72,7 @@ struct MemoryState {
     phys_region_count: usize,
     usable_ranges: [FrameRange; MAX_USABLE_RANGES],
     usable_range_count: usize,
+    heap_range: Option<FrameRange>,
     allocator: FrameAllocator<PhysAddr, PhysFrameStorage>,
 }
 
@@ -81,6 +87,7 @@ impl MemoryState {
             phys_region_count: 0,
             usable_ranges: [FrameRange::empty(); MAX_USABLE_RANGES],
             usable_range_count: 0,
+            heap_range: None,
             allocator: FrameAllocator::new(),
         }
     }
@@ -89,6 +96,7 @@ impl MemoryState {
         self.initialized = false;
         self.phys_region_count = 0;
         self.usable_range_count = 0;
+        self.heap_range = None;
         self.allocator.reset();
         for region in &mut self.phys_regions {
             *region = PhysRegion {
@@ -186,12 +194,38 @@ pub(crate) fn init(boot: &'static BootInfo) -> Result<()> {
     }
 
     state.allocator.init_from_ranges(usable, PAGE_SIZE);
+    // The bootstrap heap is allocated from the frame allocator before the rest
+    // of the kernel starts using heap-backed containers. Ownership is therefore
+    // transferred from the frame allocator to the heap subsystem at this point,
+    // even though `usable_ranges()` still describes the broader usable RAM set.
+    crate::debug!("memory: allocating bootstrap heap from frame allocator");
+    let bootstrap_heap_range = state
+        .allocator
+        .alloc_contiguous(KERNEL_HEAP_BOOTSTRAP_SIZE / PAGE_SIZE, PAGE_SIZE)
+        .ok_or(MemoryError::NoBootstrapHeapRange)?;
+    crate::debug!(
+        "memory: bootstrap heap allocated {:?}",
+        bootstrap_heap_range
+    );
+    state.heap_range = Some(bootstrap_heap_range);
+
+    crate::debug!("memory: initializing linked_list_allocator heap");
+    heap::init_heap(
+        bootstrap_heap_range.start,
+        bootstrap_heap_range.end - bootstrap_heap_range.start,
+    )
+    .map_err(MemoryError::HeapInit)?;
+    crate::debug!("memory: running heap smoke tests");
+    heap::run_heap_smoke_tests().map_err(MemoryError::HeapSmokeTest)?;
+    crate::debug!("memory: heap smoke tests completed");
     state.initialized = true;
 
     crate::info!(
-        "memory: initialized usable_ranges={} free_frames={}",
+        "memory: initialized usable_ranges={} free_frames={} heap_kib={} heap_range={:?}",
         state.usable_range_count,
-        state.allocator.free_frames()
+        state.allocator.free_frames(),
+        KERNEL_HEAP_BOOTSTRAP_SIZE / 1024,
+        bootstrap_heap_range
     );
     run_allocator_self_check(state)?;
     Ok(())
@@ -243,6 +277,10 @@ pub fn usable_ranges() -> &'static [FrameRange] {
     let state = memory_ref();
     // SAFETY: usable ranges are immutable after memory initialization.
     unsafe { core::slice::from_raw_parts(state.usable_ranges.as_ptr(), state.usable_range_count) }
+}
+
+pub fn heap_range() -> Option<FrameRange> {
+    memory_ref().heap_range
 }
 
 fn run_allocator_self_check(state: &mut MemoryState) -> Result<()> {
