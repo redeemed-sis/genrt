@@ -22,7 +22,7 @@ allocator.
 ## Decision
 
 The kernel now uses a fixed-size bootstrap heap implemented with
-`linked_list_allocator::LockedHeap`.
+`linked_list_allocator::Heap` behind a kernel-owned wrapper.
 
 Key points:
 
@@ -32,6 +32,8 @@ Key points:
   frame allocator via `alloc_contiguous`
 * the heap region is therefore removed from the frame allocator free list before
   general kernel code starts using `alloc`
+* allocator locking and IRQ-reentrancy policy are documented separately in
+  ADR-0010
 * runtime smoke tests validate `Vec`, `VecDeque`, `BinaryHeap<Reverse<_>>`, and
   `BTreeMap`
 

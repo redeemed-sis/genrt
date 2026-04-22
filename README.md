@@ -24,6 +24,7 @@ The current AArch64 path already has:
 * page-aligned usable frame ranges
 * minimal free-list physical frame allocator
 * fixed-size bootstrap kernel heap on `linked_list_allocator`
+* single-core IRQ-safe heap lock for task-context allocation/free
 * working `alloc` container smoke tests (`Vec`, `VecDeque`, `BinaryHeap`, `BTreeMap`)
 * GICv2 initialization
 * architected timer in one-shot nearest-deadline mode
@@ -147,6 +148,13 @@ Initialization order is:
 This keeps heap ownership unambiguous: once the bootstrap heap region is
 allocated, it is no longer part of the frame allocator free list.
 
+Allocation policy for the current kernel stage:
+
+* heap allocation/free is allowed during bootstrap and in ordinary task context
+* heap allocation/free is protected against local IRQ reentrancy on the current single core
+* heap allocation/free remains forbidden in timer IRQ, scheduler handoff, time fast-path dispatch, exception fast paths, and high-frequency tracing
+* dynamic containers used by those IRQ-critical paths must be preallocated or otherwise bounded before entering the fast path
+
 ## Build and run
 
 ```bash
@@ -192,3 +200,4 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0007-dtb-memory-map-and-frame-allocator.md`
 * `ai-docs/decision-records/ADR-0008-aarch64-softfloat-kernel-target.md`
 * `ai-docs/decision-records/ADR-0009-bootstrap-kernel-heap-on-frame-allocator.md`
+* `ai-docs/decision-records/ADR-0010-irq-safe-kernel-heap-lock-and-allocation-policy.md`
