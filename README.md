@@ -31,10 +31,11 @@ The current AArch64 path already has:
 * monotonic hardware counter timebase
 * full trap-frame save/restore on IRQ
 * **IRQ-return-based preemptive task switching**
-* static per-task stacks
+* heap-backed task table with stable boxed stacks and saved frames
+* preallocated heap-backed ready queue for runnable tasks
 * round-robin scheduling for runnable kernel tasks
 * scheduler ownership isolated to bootstrap, timed-event dispatch, and frame handoff
-* `kernel::time` owns timed events and one-shot timer rearming
+* `kernel::time` owns a preallocated heap-backed deadline queue and one-shot timer rearming
 * sleep wakeups and scheduler quantum both delivered as typed timed events
 * round-robin quantum configured as a duration at scheduler bootstrap
 * minimal allocation-free formatted logging with log levels
@@ -98,7 +99,7 @@ Key milestone already reached:
 * no MMU
 * heap is currently a fixed-size `16 MiB` bootstrap region
 * direct-to-UART logging
-* deadline handling uses a simple O(N) task-table scan
+* scheduler/time dynamic containers are preallocated at bootstrap and must not grow in IRQ paths
 * heap does not grow from arbitrary frames yet
 * scheduler/task management still in early-kernel form
 * platform-specific MMIO mapping still partly lives in the AArch64 layer
@@ -155,6 +156,12 @@ Allocation policy for the current kernel stage:
 * heap allocation/free remains forbidden in timer IRQ, scheduler handoff, time fast-path dispatch, exception fast paths, and high-frequency tracing
 * dynamic containers used by those IRQ-critical paths must be preallocated or otherwise bounded before entering the fast path
 
+The scheduler and time subsystem now follow that rule explicitly:
+
+* the task table, saved frames, task stacks, ready queue, and deadline queue are heap-backed
+* all of those containers are allocated and reserved during bootstrap
+* timer IRQ and scheduler handoff only perform bounded operations on already allocated storage
+
 ## Build and run
 
 ```bash
@@ -200,4 +207,4 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0007-dtb-memory-map-and-frame-allocator.md`
 * `ai-docs/decision-records/ADR-0008-aarch64-softfloat-kernel-target.md`
 * `ai-docs/decision-records/ADR-0009-bootstrap-kernel-heap-on-frame-allocator.md`
-* `ai-docs/decision-records/ADR-0010-irq-safe-kernel-heap-lock-and-allocation-policy.md`
+* `ai-docs/decision-records/ADR-0011-dynamic-preallocated-scheduler-and-time-structures.md`
