@@ -55,6 +55,33 @@ pub extern "C" fn arch_irq_enable() {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn arch_local_irq_save_and_disable() -> u64 {
+    let saved_daif: u64;
+    unsafe {
+        asm!(
+            "mrs {saved_daif}, DAIF",
+            "msr daifset, #2",
+            "isb",
+            saved_daif = out(reg) saved_daif,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    saved_daif
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_local_irq_restore(saved_daif: u64) {
+    unsafe {
+        asm!(
+            "msr DAIF, {saved_daif}",
+            "isb",
+            saved_daif = in(reg) saved_daif,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn arch_counter_now() -> u64 {
     timer::counter()
 }

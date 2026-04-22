@@ -269,6 +269,10 @@ impl Scheduler {
             return;
         }
 
+        // Scheduler IRQ-return handoff policy: this path must remain heap-free.
+        // The kernel heap is IRQ-safe for task-context allocation, but the
+        // timer/scheduler fast path must continue to run on preallocated state.
+
         let current = match self.running_task() {
             Some(id) => id,
             None => return,

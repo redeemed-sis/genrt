@@ -223,6 +223,10 @@ pub fn on_timer_interrupt(active_frame_words: *mut u64) {
         return;
     }
 
+    // Timer IRQ fast-path policy: do not allocate here. The heap is protected
+    // against local IRQ reentrancy for ordinary task-context allocations, but
+    // timed-event dispatch itself must stay on preallocated, bounded state.
+
     let now = now_counter();
     let expired = {
         let time = time_mut();
