@@ -1,4 +1,7 @@
+use alloc::vec::Vec;
 use core::cell::UnsafeCell;
+
+use crate::task::TaskId;
 
 unsafe extern "C" {
     fn arch_counter_now() -> u64;
@@ -7,19 +10,22 @@ unsafe extern "C" {
     fn arch_timer_disarm();
 }
 
-// Current static system shape:
-// - up to 8 tasks,
-// - one wake event per sleeping task,
-// - one outstanding quantum event per runnable task at most.
-const MAX_TIMED_EVENTS: usize = 16;
-pub(crate) type TimedTaskId = usize;
 type FinishTimerInterruptHandler = fn(*mut u64, u64);
-type TimedTaskHandler = fn(TimedTaskId);
+type TimedTaskHandler = fn(TaskId);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TimedEvent {
-    WakeTask(TimedTaskId),
-    QuantumExpired(TimedTaskId),
+    WakeTask(TaskId),
+    QuantumExpired(TaskId),
+}
+
+impl TimedEvent {
+    fn sort_key(self) -> (u8, usize) {
+        match self {
+            Self::WakeTask(task_id) => (0, task_id.index()),
+            Self::QuantumExpired(task_id) => (1, task_id.index()),
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -31,110 +37,199 @@ pub(crate) struct TimeHandlers {
     pub quantum_expired: TimedTaskHandler,
 }
 
-#[derive(Copy, Clone)]
-struct TimedSlot {
-    event: Option<TimedEvent>,
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct DeadlineEntry {
     deadline: u64,
+    event: TimedEvent,
 }
 
-impl TimedSlot {
-    const fn empty() -> Self {
-        Self {
-            event: None,
-            deadline: 0,
+struct DeadlineQueue {
+    entries: Vec<DeadlineEntry>,
+}
+
+impl DeadlineQueue {
+    fn with_capacity(capacity: usize) -> Self {
+        let mut entries = Vec::new();
+        entries.reserve_exact(capacity);
+        Self { entries }
+    }
+
+    fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+
+    fn reset(&mut self) {
+        self.entries.clear();
+    }
+
+    fn schedule(&mut self, deadline: u64, event: TimedEvent) {
+        if let Some(index) = self.find_event_index(event) {
+            let old_deadline = self.entries[index].deadline;
+            self.entries[index].deadline = deadline;
+            if deadline < old_deadline {
+                self.sift_up(index);
+            } else if deadline > old_deadline {
+                self.sift_down(index);
+            }
+            return;
         }
+
+        if self.entries.len() == self.entries.capacity() {
+            panic!("time: deadline queue capacity exhausted");
+        }
+
+        self.entries.push(DeadlineEntry { deadline, event });
+        let last = self.entries.len() - 1;
+        self.sift_up(last);
+    }
+
+    fn cancel(&mut self, event: TimedEvent) -> bool {
+        let Some(index) = self.find_event_index(event) else {
+            return false;
+        };
+
+        self.remove_at(index);
+        true
+    }
+
+    fn event_pending(&self, event: TimedEvent) -> bool {
+        self.find_event_index(event).is_some()
+    }
+
+    fn pop_expired(&mut self, now: u64) -> Option<TimedEvent> {
+        let entry = self.entries.first().copied()?;
+        if entry.deadline > now {
+            return None;
+        }
+
+        Some(self.remove_at(0).event)
+    }
+
+    fn next_deadline(&self) -> Option<u64> {
+        self.entries.first().map(|entry| entry.deadline)
+    }
+
+    fn find_event_index(&self, event: TimedEvent) -> Option<usize> {
+        self.entries.iter().position(|entry| entry.event == event)
+    }
+
+    fn remove_at(&mut self, index: usize) -> DeadlineEntry {
+        let last_index = self.entries.len() - 1;
+        self.entries.swap(index, last_index);
+        let removed = self
+            .entries
+            .pop()
+            .unwrap_or_else(|| panic!("time: empty deadline queue"));
+
+        if index < self.entries.len() {
+            if index > 0 && self.less(index, Self::parent(index)) {
+                self.sift_up(index);
+            } else {
+                self.sift_down(index);
+            }
+        }
+
+        removed
+    }
+
+    fn sift_up(&mut self, mut index: usize) {
+        while index > 0 {
+            let parent = Self::parent(index);
+            if !self.less(index, parent) {
+                break;
+            }
+            self.entries.swap(index, parent);
+            index = parent;
+        }
+    }
+
+    fn sift_down(&mut self, mut index: usize) {
+        loop {
+            let left = Self::left(index);
+            if left >= self.entries.len() {
+                break;
+            }
+
+            let right = left + 1;
+            let mut best = left;
+            if right < self.entries.len() && self.less(right, left) {
+                best = right;
+            }
+
+            if !self.less(best, index) {
+                break;
+            }
+
+            self.entries.swap(index, best);
+            index = best;
+        }
+    }
+
+    fn less(&self, lhs: usize, rhs: usize) -> bool {
+        let left = self.entries[lhs];
+        let right = self.entries[rhs];
+        left.deadline < right.deadline
+            || (left.deadline == right.deadline && left.event.sort_key() < right.event.sort_key())
+    }
+
+    const fn parent(index: usize) -> usize {
+        (index - 1) / 2
+    }
+
+    const fn left(index: usize) -> usize {
+        (index * 2) + 1
     }
 }
 
 struct TimeState {
-    // `kernel::time` is the sole owner of timed events:
-    // - registration/cancellation,
+    // `kernel::time` remains the sole owner of timed events:
+    // - registration/cancellation/update,
     // - nearest-deadline selection,
     // - one-shot timer reprogramming,
     // - expired-event dispatch on timer IRQ.
-    slots: [TimedSlot; MAX_TIMED_EVENTS],
+    //
+    // The deadline queue is heap-backed but fully reserved during bootstrap so
+    // timer IRQ handling never grows it at runtime.
+    queue: DeadlineQueue,
     armed_timer_deadline: Option<u64>,
     dispatching_irq: bool,
-    handlers: Option<TimeHandlers>,
+    handlers: TimeHandlers,
 }
 
 impl TimeState {
-    const fn new() -> Self {
+    fn new(handlers: TimeHandlers, deadline_capacity: usize) -> Self {
         Self {
-            slots: [TimedSlot::empty(); MAX_TIMED_EVENTS],
+            queue: DeadlineQueue::with_capacity(deadline_capacity),
             armed_timer_deadline: None,
             dispatching_irq: false,
-            handlers: None,
+            handlers,
         }
     }
 
     fn reset(&mut self) {
-        for slot in &mut self.slots {
-            *slot = TimedSlot::empty();
-        }
-
+        self.queue.reset();
         self.armed_timer_deadline = None;
         self.dispatching_irq = false;
     }
 
     fn schedule_event(&mut self, deadline: u64, event: TimedEvent) {
-        if let Some(slot) = self.slots.iter_mut().find(|slot| slot.event == Some(event)) {
-            slot.deadline = deadline;
-            return;
-        }
-
-        let slot = self
-            .slots
-            .iter_mut()
-            .find(|slot| slot.event.is_none())
-            .unwrap_or_else(|| panic!("time: no free timed event slots"));
-        slot.event = Some(event);
-        slot.deadline = deadline;
+        self.queue.schedule(deadline, event);
     }
 
     fn cancel_event(&mut self, event: TimedEvent) -> bool {
-        let Some(slot) = self.slots.iter_mut().find(|slot| slot.event == Some(event)) else {
-            return false;
-        };
-
-        *slot = TimedSlot::empty();
-        true
+        self.queue.cancel(event)
     }
 
     fn event_pending(&self, event: TimedEvent) -> bool {
-        self.slots.iter().any(|slot| slot.event == Some(event))
+        self.queue.event_pending(event)
     }
 
-    fn collect_expired(&mut self, now: u64) -> [Option<TimedEvent>; MAX_TIMED_EVENTS] {
-        let mut expired = [None; MAX_TIMED_EVENTS];
-        let mut out = 0usize;
-
-        for slot in &mut self.slots {
-            let Some(event) = slot.event else {
-                continue;
-            };
-
-            if now < slot.deadline {
-                continue;
-            }
-
-            expired[out] = Some(event);
-            out += 1;
-            *slot = TimedSlot::empty();
-        }
-
-        expired
-    }
-
-    fn next_deadline(&self) -> Option<u64> {
-        self.slots
-            .iter()
-            .filter_map(|slot| slot.event.map(|_| slot.deadline))
-            .min()
+    fn pop_expired(&mut self, now: u64) -> Option<TimedEvent> {
+        self.queue.pop_expired(now)
     }
 
     fn rearm_timer(&mut self, now: u64) {
-        let next_deadline = self.next_deadline();
+        let next_deadline = self.queue.next_deadline();
         if next_deadline != self.armed_timer_deadline {
             match next_deadline {
                 Some(deadline) => crate::trace!("time: arm next deadline={deadline} now={now}"),
@@ -147,12 +242,12 @@ impl TimeState {
     }
 }
 
-struct TimeCell(UnsafeCell<TimeState>);
+struct TimeCell(UnsafeCell<Option<TimeState>>);
 
 // SAFETY: genrt currently mutates time state only on a single core.
 unsafe impl Sync for TimeCell {}
 
-static TIME: TimeCell = TimeCell(UnsafeCell::new(TimeState::new()));
+static TIME: TimeCell = TimeCell(UnsafeCell::new(None));
 
 #[inline(always)]
 pub fn now_counter() -> u64 {
@@ -186,11 +281,20 @@ pub fn uptime_ms() -> u64 {
     now_counter() / ms_to_counts(1)
 }
 
-pub(crate) fn init(handlers: TimeHandlers) {
-    let time = time_mut();
-    time.reset();
-    time.handlers = Some(handlers);
+pub(crate) fn init(handlers: TimeHandlers, deadline_capacity: usize) {
+    let slot = time_slot_mut();
+    if slot.is_some() {
+        panic!("time: already initialized");
+    }
+
+    // Scheduler bootstrap publishes the global `Scheduler` before calling
+    // `time::init()`, so any timer callback installed here can safely resolve
+    // scheduler-owned state once timer IRQ dispatch becomes active.
+    let mut state = TimeState::new(handlers, deadline_capacity);
+    state.reset();
+    crate::debug!("time: deadline queue capacity={}", state.queue.capacity());
     program_timer_deadline(None);
+    *slot = Some(state);
 }
 
 pub(crate) fn schedule_event(deadline: u64, event: TimedEvent) {
@@ -223,21 +327,24 @@ pub fn on_timer_interrupt(active_frame_words: *mut u64) {
         return;
     }
 
+    if try_time_mut().is_none() {
+        // Keep stray early-boot timer IRQs from ever reaching scheduler
+        // callbacks before `time::init()` installs their handler table.
+        program_timer_deadline(None);
+        return;
+    }
+
     // Timer IRQ fast-path policy: do not allocate here. The heap is protected
     // against local IRQ reentrancy for ordinary task-context allocations, but
     // timed-event dispatch itself must stay on preallocated, bounded state.
-
     let now = now_counter();
-    let expired = {
+    let handlers = {
         let time = time_mut();
         time.dispatching_irq = true;
-        time.collect_expired(now)
+        time.handlers
     };
-    let handlers = time_ref()
-        .handlers
-        .unwrap_or_else(|| panic!("time: handlers are not initialized"));
 
-    for event in expired.into_iter().flatten() {
+    while let Some(event) = time_mut().pop_expired(now) {
         dispatch_expired_event(handlers, event);
     }
 
@@ -277,15 +384,28 @@ fn program_timer_deadline(deadline: Option<u64>) {
 }
 
 #[inline(always)]
-fn time_mut() -> &'static mut TimeState {
+fn time_slot_mut() -> &'static mut Option<TimeState> {
     // SAFETY: Access is single-writer in the current single-core bring-up model.
     unsafe { &mut *TIME.0.get() }
 }
 
 #[inline(always)]
+fn time_mut() -> &'static mut TimeState {
+    time_slot_mut()
+        .as_mut()
+        .unwrap_or_else(|| panic!("time: subsystem is not initialized"))
+}
+
+#[inline(always)]
+fn try_time_mut() -> Option<&'static mut TimeState> {
+    time_slot_mut().as_mut()
+}
+
+#[inline(always)]
 fn time_ref() -> &'static TimeState {
-    // SAFETY: Access is single-core; read-only borrow does not outlive this call.
-    unsafe { &*TIME.0.get() }
+    time_slot_mut()
+        .as_ref()
+        .unwrap_or_else(|| panic!("time: subsystem is not initialized"))
 }
 
 #[inline(always)]

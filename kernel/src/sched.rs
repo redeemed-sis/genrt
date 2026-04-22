@@ -1,18 +1,17 @@
+use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::{cell::UnsafeCell, mem};
 
 use crate::{
     arch_consts::TASK_FRAME_WORDS,
-    time::{TimeHandlers, TimedEvent, TimedTaskId},
+    task::TaskId,
+    time::{TimeHandlers, TimedEvent},
 };
 
-pub(crate) type TaskId = usize;
 pub(crate) type TaskEntry = fn() -> !;
 pub(crate) type Result<T> = core::result::Result<T, SchedError>;
 
-pub(crate) const MAX_TASKS: usize = 8;
 const TASK_STACK_SIZE: usize = 4096;
-const IDLE_TASK_ID: TaskId = 0;
-const IDLE_PRIORITY: u8 = 0;
+const IDLE_TASK_ID: TaskId = TaskId::new(0);
 
 unsafe extern "C" {
     fn arch_init_task_frame(
@@ -25,12 +24,12 @@ unsafe extern "C" {
     fn arch_sleep_until(deadline: u64);
 }
 
-struct SchedulerCell(UnsafeCell<Scheduler>);
+struct SchedulerCell(UnsafeCell<Option<Scheduler>>);
 
 // SAFETY: genrt currently mutates scheduler state only on a single core.
 unsafe impl Sync for SchedulerCell {}
 
-static SCHEDULER: SchedulerCell = SchedulerCell(UnsafeCell::new(Scheduler::new()));
+static SCHEDULER: SchedulerCell = SchedulerCell(UnsafeCell::new(None));
 
 #[derive(Copy, Clone)]
 pub(crate) struct StaticTask {
@@ -46,7 +45,7 @@ impl StaticTask {
 
 // Task-state semantics:
 // - Running: the sole task whose saved frame matches the scheduler's committed resume target.
-// - Ready: runnable and owns a valid saved frame, but is not the current resume target.
+// - Ready: runnable, owns a valid saved frame, and sits in the ready queue unless it is idle.
 // - Blocked: not runnable and not considered during round-robin selection.
 //   Wakeup deadlines live in `kernel::time`; the scheduler only observes the
 //   resulting `WakeTask(task_id)` timed event and restores the task to `Ready`.
@@ -58,7 +57,6 @@ enum TaskState {
 }
 
 #[repr(C, align(16))]
-#[derive(Copy, Clone)]
 struct TaskStack {
     bytes: [u8; TASK_STACK_SIZE],
 }
@@ -76,7 +74,6 @@ impl TaskStack {
 }
 
 #[repr(C, align(16))]
-#[derive(Copy, Clone)]
 struct TaskFrameStorage {
     words: [u64; TASK_FRAME_WORDS],
 }
@@ -85,12 +82,6 @@ impl TaskFrameStorage {
     const fn zeroed() -> Self {
         Self {
             words: [0; TASK_FRAME_WORDS],
-        }
-    }
-
-    fn clear(&mut self) {
-        for word in &mut self.words {
-            *word = 0;
         }
     }
 
@@ -103,28 +94,41 @@ impl TaskFrameStorage {
     }
 }
 
-#[derive(Copy, Clone)]
 struct Task {
-    id: TaskId,
-    priority: u8,
     state: TaskState,
     entry: TaskEntry,
-    stack_top: usize,
-    frame: TaskFrameStorage,
+    stack: Box<TaskStack>,
+    frame: Box<TaskFrameStorage>,
+}
+
+impl Task {
+    fn new(entry: TaskEntry, state: TaskState) -> Self {
+        Self {
+            state,
+            entry,
+            stack: Box::new(TaskStack::zeroed()),
+            frame: Box::new(TaskFrameStorage::zeroed()),
+        }
+    }
+
+    fn stack_top(&self) -> usize {
+        self.stack.top()
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SchedError {
+    AlreadyBootstrapped,
     InvalidTaskId,
-    AlreadyScheduled,
-    NoFreeTaskSlot,
 }
 
 pub(crate) struct Scheduler {
-    tasks: [Task; MAX_TASKS],
-    stacks: [TaskStack; MAX_TASKS],
-    // `current` is the scheduler's committed CPU-resume target. Once task execution starts,
-    // it must match the frame that IRQ return or `arch_enter_task_frame()` will resume.
+    // Scheduler storage is now dynamic-but-preallocated at bootstrap:
+    // - `tasks` owns boxed stacks and saved frames for stable addresses,
+    // - `ready_queue` owns round-robin order for non-idle runnable tasks,
+    // - no allocation or queue growth is allowed in IRQ fast paths.
+    tasks: Vec<Task>,
+    ready_queue: VecDeque<TaskId>,
     current: Option<TaskId>,
     rr_quantum_ms: u64,
     // Set when `kernel::time` dispatches `QuantumExpired(current_task)`.
@@ -139,8 +143,20 @@ pub(crate) fn bootstrap(
     tasks: &[StaticTask],
     rr_quantum_ms: u64,
 ) -> Result<()> {
-    let sched = scheduler_mut();
-    sched.bootstrap(idle_entry, tasks, rr_quantum_ms)
+    if scheduler_slot_mut().is_some() {
+        return Err(SchedError::AlreadyBootstrapped);
+    }
+
+    // Bootstrap ordering is intentionally split into two phases:
+    // 1. Build and publish the global scheduler so timer-owned callbacks always
+    //    have a concrete scheduler instance to reach.
+    // 2. Only then initialize `kernel::time`, which is the first point where
+    //    timer IRQ dispatch can invoke scheduler callbacks.
+    let scheduler = Scheduler::bootstrap_new(idle_entry, tasks, rr_quantum_ms)?;
+    let task_count = scheduler.tasks.len();
+    *scheduler_slot_mut() = Some(scheduler);
+    init_time_after_scheduler_publish(task_count);
+    Ok(())
 }
 
 pub fn usleep(us: u64) {
@@ -177,12 +193,24 @@ pub fn sleep_until(deadline: u64) {
     sleep_until_counter(deadline);
 }
 
-fn on_wake_task(task_id: TimedTaskId) {
+fn on_wake_task(task_id: TaskId) {
     scheduler_mut().wake_task(task_id);
 }
 
-fn on_quantum_expired(task_id: TimedTaskId) {
+fn on_quantum_expired(task_id: TaskId) {
     scheduler_mut().note_quantum_expired(task_id);
+}
+
+#[inline(always)]
+fn init_time_after_scheduler_publish(task_count: usize) {
+    crate::time::init(
+        TimeHandlers {
+            finish_timer_interrupt,
+            wake_task: on_wake_task,
+            quantum_expired: on_quantum_expired,
+        },
+        task_count.saturating_mul(2),
+    );
 }
 
 fn finish_timer_interrupt(active_frame_words: *mut u64, now: u64) {
@@ -202,65 +230,96 @@ pub(crate) fn enter_running_task() -> ! {
 }
 
 #[inline(always)]
-fn scheduler_mut() -> &'static mut Scheduler {
+fn scheduler_slot_mut() -> &'static mut Option<Scheduler> {
     // SAFETY: Access is single-writer in the current single-core bring-up model.
     unsafe { &mut *SCHEDULER.0.get() }
 }
 
+#[inline(always)]
+fn scheduler_mut() -> &'static mut Scheduler {
+    scheduler_slot_mut()
+        .as_mut()
+        .unwrap_or_else(|| panic!("sched: scheduler is not initialized"))
+}
+
 impl Scheduler {
-    pub(crate) const fn new() -> Self {
+    fn bootstrap_new(
+        idle_entry: TaskEntry,
+        tasks: &[StaticTask],
+        rr_quantum_ms: u64,
+    ) -> Result<Self> {
+        let task_count = tasks.len() + 1;
+        let mut scheduler = Self::new(task_count, rr_quantum_ms);
+        scheduler.push_idle_task(idle_entry);
+        for task in tasks {
+            scheduler.push_bootstrap_task(task.priority, task.entry);
+        }
+        scheduler.initialize_all_task_frames()?;
+
+        let first = scheduler.dequeue_next_ready().unwrap_or(IDLE_TASK_ID);
+        scheduler.mark_initial_running(first)?;
+        crate::debug!(
+            "sched: task_count={} ready_queue_capacity={} quantum={}ms",
+            scheduler.tasks.len(),
+            scheduler.ready_queue.capacity(),
+            scheduler.rr_quantum_ms
+        );
+        Ok(scheduler)
+    }
+
+    fn new(task_capacity: usize, rr_quantum_ms: u64) -> Self {
+        let mut task_table = Vec::new();
+        task_table.reserve_exact(task_capacity);
+
+        let mut ready_queue = VecDeque::new();
+        ready_queue.reserve_exact(task_capacity.saturating_sub(1));
+
         Self {
-            tasks: [
-                Task::blocked(0),
-                Task::blocked(1),
-                Task::blocked(2),
-                Task::blocked(3),
-                Task::blocked(4),
-                Task::blocked(5),
-                Task::blocked(6),
-                Task::blocked(7),
-            ],
-            stacks: [
-                TaskStack::zeroed(),
-                TaskStack::zeroed(),
-                TaskStack::zeroed(),
-                TaskStack::zeroed(),
-                TaskStack::zeroed(),
-                TaskStack::zeroed(),
-                TaskStack::zeroed(),
-                TaskStack::zeroed(),
-            ],
+            tasks: task_table,
+            ready_queue,
             current: None,
-            rr_quantum_ms: 10,
+            rr_quantum_ms: rr_quantum_ms.max(1),
             resched_requested: false,
             entered_running_task: false,
         }
     }
-}
 
-impl Scheduler {
-    fn bootstrap(
-        &mut self,
-        idle_entry: TaskEntry,
-        tasks: &[StaticTask],
-        rr_quantum_ms: u64,
-    ) -> Result<()> {
-        crate::time::init(TimeHandlers {
-            finish_timer_interrupt,
-            wake_task: on_wake_task,
-            quantum_expired: on_quantum_expired,
-        });
-        self.init(rr_quantum_ms);
-        self.set_idle_task(idle_entry);
-        self.initialize_task_frame(IDLE_TASK_ID)?;
-        for task in tasks {
-            let id = self.add_ready_task(task.priority, task.entry)?;
-            self.initialize_task_frame(id)?;
+    fn push_idle_task(&mut self, entry: TaskEntry) {
+        let id = TaskId::new(self.tasks.len());
+        debug_assert_eq!(id, IDLE_TASK_ID);
+        self.tasks.push(Task::new(entry, TaskState::Ready));
+    }
+
+    fn push_bootstrap_task(&mut self, priority: u8, entry: TaskEntry) {
+        let id = TaskId::new(self.tasks.len());
+        self.tasks.push(Task::new(entry, TaskState::Ready));
+        self.ready_push_back(id);
+        crate::debug!("sched: bootstrap task {} priority={priority}", id);
+    }
+
+    fn initialize_all_task_frames(&mut self) -> Result<()> {
+        for index in 0..self.tasks.len() {
+            self.initialize_task_frame(TaskId::new(index))?;
         }
-        let first = self
-            .pick_next_excluding(IDLE_TASK_ID, None)
-            .unwrap_or(IDLE_TASK_ID);
-        self.mark_initial_running(first)?;
+        Ok(())
+    }
+
+    fn initialize_task_frame(&mut self, id: TaskId) -> Result<()> {
+        if !self.is_valid_task(id) {
+            return Err(SchedError::InvalidTaskId);
+        }
+
+        let task = self.task_mut(id);
+        // SAFETY: scheduler owns frame storage, stack top and entry pointer are
+        // validated by bootstrap task-table setup.
+        unsafe {
+            arch_init_task_frame(
+                task.frame.as_mut_words_ptr(),
+                task.stack_top(),
+                task.entry as usize,
+                task_entry_bootstrap as usize,
+            );
+        }
         Ok(())
     }
 
@@ -272,38 +331,30 @@ impl Scheduler {
         // Scheduler IRQ-return handoff policy: this path must remain heap-free.
         // The kernel heap is IRQ-safe for task-context allocation, but the
         // timer/scheduler fast path must continue to run on preallocated state.
-
         let current = match self.running_task() {
             Some(id) => id,
             None => return,
         };
-        let must_leave_idle = current == IDLE_TASK_ID && self.has_runnable_peer(current);
-        let mut replaced_quantum_event = false;
+        let must_leave_idle = current == IDLE_TASK_ID && !self.ready_queue.is_empty();
+        let mut refreshed_quantum_event = false;
 
         if self.resched_requested || must_leave_idle {
-            let next = self.select_next();
+            let next = self.dequeue_next_ready().unwrap_or(current);
             if next != current {
-                // Switch-commit invariant:
-                // 1. persist the interrupted running task frame
-                // 2. install the selected next frame into the live IRQ-return slot
-                // 3. only then update logical task-state bookkeeping
-                //
-                // This keeps the scheduler's `Running` state aligned with the actual
-                // CPU resume target at the handoff point.
                 copy_words(
-                    self.tasks[current].frame.as_mut_words_ptr(),
+                    self.frame_words_mut_ptr(current),
                     active_frame_words as *const u64,
                 );
-                copy_words(active_frame_words, self.tasks[next].frame.as_words_ptr());
+                copy_words(active_frame_words, self.frame_words_ptr(next));
                 self.commit_switch(current, next);
                 log_switch(current, next);
             }
 
             self.replace_quantum_event(now, current);
-            replaced_quantum_event = true;
+            refreshed_quantum_event = true;
         }
 
-        if !replaced_quantum_event {
+        if !refreshed_quantum_event {
             self.ensure_quantum_event(now);
         }
 
@@ -314,15 +365,15 @@ impl Scheduler {
         let current = self
             .running_task()
             .unwrap_or_else(|| panic!("sleep requested without a running task"));
-        let next = self.select_next_excluding(current);
+        let next = self.dequeue_next_ready().unwrap_or(IDLE_TASK_ID);
 
         // Save the current task's post-SVC resume frame before making it unrunnable.
         copy_words(
-            self.tasks[current].frame.as_mut_words_ptr(),
+            self.frame_words_mut_ptr(current),
             active_frame_words as *const u64,
         );
 
-        copy_words(active_frame_words, self.tasks[next].frame.as_words_ptr());
+        copy_words(active_frame_words, self.frame_words_ptr(next));
         self.commit_block(current, next);
         let now = crate::time::now_counter();
         crate::time::schedule_event(deadline, TimedEvent::WakeTask(current));
@@ -333,114 +384,40 @@ impl Scheduler {
         }
     }
 
-    pub(crate) fn enter_running_task(&mut self) -> ! {
+    fn enter_running_task(&mut self) -> ! {
         let running = self
             .running_task()
             .unwrap_or_else(|| panic!("scheduler has no running task"));
-        let frame_words = self.tasks[running].frame.as_words_ptr();
+        let frame_words = self.frame_words_ptr(running);
         let now = crate::time::now_counter();
 
         self.entered_running_task = true;
         self.ensure_quantum_event(now);
         debug_assert_eq!(self.current, Some(running));
-        debug_assert_eq!(self.tasks[running].state, TaskState::Running);
+        debug_assert_eq!(self.task(running).state, TaskState::Running);
         // SAFETY: scheduler bootstrap prepared the running task trap frame.
         unsafe { arch_enter_task_frame(frame_words) }
     }
 }
 
 impl Scheduler {
-    fn init(&mut self, rr_quantum_ms: u64) {
-        for id in 0..MAX_TASKS {
-            let task = &mut self.tasks[id];
-            task.id = id;
-            task.priority = 0;
-            task.state = TaskState::Blocked;
-            task.entry = parked_task;
-            task.stack_top = self.stacks[id].top();
-            task.frame.clear();
-        }
-
-        self.tasks[IDLE_TASK_ID].priority = IDLE_PRIORITY;
-        self.tasks[IDLE_TASK_ID].state = TaskState::Ready;
-        self.current = None;
-        self.rr_quantum_ms = rr_quantum_ms.max(1);
-        self.resched_requested = false;
-        self.entered_running_task = false;
-    }
-
-    fn set_idle_task(&mut self, entry: TaskEntry) {
-        self.tasks[IDLE_TASK_ID].entry = entry;
-        self.tasks[IDLE_TASK_ID].priority = IDLE_PRIORITY;
-        self.make_ready(IDLE_TASK_ID);
-    }
-
-    fn add_ready_task(&mut self, priority: u8, entry: TaskEntry) -> Result<TaskId> {
-        let id = self
-            .find_free_task_slot()
-            .ok_or(SchedError::NoFreeTaskSlot)?;
-
-        self.tasks[id].id = id;
-        self.tasks[id].priority = priority;
-        self.tasks[id].entry = entry;
-        self.make_ready(id);
-        Ok(id)
-    }
-
-    fn initialize_task_frame(&mut self, id: TaskId) -> Result<()> {
-        if id >= MAX_TASKS {
-            return Err(SchedError::InvalidTaskId);
-        }
-
-        if self.is_free_slot(id) {
-            return Err(SchedError::AlreadyScheduled);
-        }
-
-        let task = &mut self.tasks[id];
-
-        // SAFETY: scheduler owns frame storage, stack top and entry pointer are validated by task table setup.
-        unsafe {
-            arch_init_task_frame(
-                task.frame.as_mut_words_ptr(),
-                task.stack_top,
-                task.entry as usize,
-                task_entry_bootstrap as usize,
-            );
-        }
-        Ok(())
-    }
-
     fn running_task(&self) -> Option<TaskId> {
         self.current
     }
 
     fn mark_initial_running(&mut self, id: TaskId) -> Result<()> {
-        if id >= MAX_TASKS {
+        if !self.is_valid_task(id) {
             return Err(SchedError::InvalidTaskId);
         }
 
-        if self.tasks[id].state == TaskState::Blocked {
-            return Err(SchedError::AlreadyScheduled);
+        if self.task(id).state == TaskState::Blocked {
+            return Err(SchedError::InvalidTaskId);
         }
 
-        self.make_ready(IDLE_TASK_ID);
         self.make_running(id);
-        debug_assert_eq!(self.tasks[id].state, TaskState::Running);
+        debug_assert_eq!(self.task(id).state, TaskState::Running);
         debug_assert_eq!(self.current, Some(id));
         Ok(())
-    }
-
-    fn select_next(&self) -> TaskId {
-        self.pick_next_excluding(self.current.unwrap_or(IDLE_TASK_ID), None)
-            .unwrap_or(IDLE_TASK_ID)
-    }
-
-    // Round-robin continuation used when the current running task is about to
-    // stop being runnable (for example, it goes to sleep). We continue the scan
-    // after the current slot, but explicitly skip selecting that task again.
-    fn select_next_excluding(&self, excluded: TaskId) -> TaskId {
-        self.pick_next_excluding(self.current.unwrap_or(IDLE_TASK_ID), Some(excluded))
-            .unwrap_or(IDLE_TASK_ID)
     }
 
     fn commit_switch(&mut self, prev: TaskId, next: TaskId) {
@@ -449,42 +426,44 @@ impl Scheduler {
         }
 
         debug_assert_eq!(self.current, Some(prev));
-        debug_assert_eq!(self.tasks[prev].state, TaskState::Running);
-        debug_assert_ne!(self.tasks[next].state, TaskState::Blocked);
+        debug_assert_eq!(self.task(prev).state, TaskState::Running);
+        debug_assert_ne!(self.task(next).state, TaskState::Blocked);
 
         self.make_ready(prev);
+        if prev != IDLE_TASK_ID {
+            self.ready_push_back(prev);
+        }
         self.make_running(next);
         debug_assert_eq!(self.current, Some(next));
-        debug_assert_eq!(self.tasks[next].state, TaskState::Running);
-        debug_assert_eq!(self.tasks[prev].state, TaskState::Ready);
+        debug_assert_eq!(self.task(next).state, TaskState::Running);
+        debug_assert_eq!(self.task(prev).state, TaskState::Ready);
     }
 
     fn commit_block(&mut self, blocked: TaskId, next: TaskId) {
         debug_assert_eq!(self.current, Some(blocked));
-        debug_assert_eq!(self.tasks[blocked].state, TaskState::Running);
-        debug_assert_ne!(self.tasks[next].state, TaskState::Blocked);
+        debug_assert_eq!(self.task(blocked).state, TaskState::Running);
+        debug_assert_ne!(self.task(next).state, TaskState::Blocked);
 
         self.make_blocked(blocked);
         self.make_running(next);
 
         debug_assert_eq!(self.current, Some(next));
-        debug_assert_eq!(self.tasks[blocked].state, TaskState::Blocked);
-        debug_assert_eq!(self.tasks[next].state, TaskState::Running);
+        debug_assert_eq!(self.task(blocked).state, TaskState::Blocked);
+        debug_assert_eq!(self.task(next).state, TaskState::Running);
     }
 }
 
 impl Scheduler {
     fn wake_task(&mut self, task_id: TaskId) {
-        if task_id >= MAX_TASKS {
+        if !self.is_valid_task(task_id) {
             return;
         }
 
-        if self.is_free_slot(task_id) {
-            return;
-        }
-
-        if self.tasks[task_id].state == TaskState::Blocked {
+        if self.task(task_id).state == TaskState::Blocked {
             self.make_ready(task_id);
+            if task_id != IDLE_TASK_ID {
+                self.ready_push_back(task_id);
+            }
             crate::trace!("sched: task {task_id} moved to Ready");
         }
     }
@@ -496,59 +475,39 @@ impl Scheduler {
         }
     }
 
-    fn pick_next_excluding(&self, start: TaskId, excluded: Option<TaskId>) -> Option<TaskId> {
-        for offset in 1..=MAX_TASKS {
-            let id = (start + offset) % MAX_TASKS;
-            if id == IDLE_TASK_ID {
-                continue;
-            }
+    fn ready_push_back(&mut self, id: TaskId) {
+        debug_assert_ne!(id, IDLE_TASK_ID);
+        debug_assert!(
+            !self.ready_queue.iter().any(|queued| *queued == id),
+            "sched: task already present in ready queue"
+        );
 
-            if Some(id) == excluded {
-                continue;
-            }
-
-            if self.tasks[id].state != TaskState::Blocked {
-                return Some(id);
-            }
+        if self.ready_queue.len() == self.ready_queue.capacity() {
+            panic!("sched: ready queue capacity exhausted");
         }
 
-        None
+        self.ready_queue.push_back(id);
     }
 
-    fn find_free_task_slot(&self) -> Option<TaskId> {
-        ((IDLE_TASK_ID + 1)..MAX_TASKS).find(|&id| self.is_free_slot(id))
+    fn dequeue_next_ready(&mut self) -> Option<TaskId> {
+        self.ready_queue.pop_front()
     }
 
     fn make_ready(&mut self, id: TaskId) {
-        self.tasks[id].state = TaskState::Ready;
+        self.task_mut(id).state = TaskState::Ready;
     }
 
     fn make_running(&mut self, id: TaskId) {
-        self.tasks[id].state = TaskState::Running;
+        self.task_mut(id).state = TaskState::Running;
         self.current = Some(id);
     }
 
     fn make_blocked(&mut self, id: TaskId) {
-        self.tasks[id].state = TaskState::Blocked;
+        self.task_mut(id).state = TaskState::Blocked;
     }
 
-    fn is_free_slot(&self, id: TaskId) -> bool {
-        let task = &self.tasks[id];
-        task.state == TaskState::Blocked && task.entry as usize == parked_task as usize
-    }
-
-    fn has_runnable_peer(&self, current: TaskId) -> bool {
-        for id in 0..MAX_TASKS {
-            if id == current || id == IDLE_TASK_ID {
-                continue;
-            }
-
-            if self.tasks[id].state != TaskState::Blocked {
-                return true;
-            }
-        }
-
-        false
+    fn has_runnable_peer(&self) -> bool {
+        !self.ready_queue.is_empty()
     }
 
     fn ensure_quantum_event(&mut self, now: u64) {
@@ -557,7 +516,7 @@ impl Scheduler {
         };
 
         let event = TimedEvent::QuantumExpired(current);
-        if !self.has_runnable_peer(current) {
+        if !self.has_runnable_peer() {
             crate::time::cancel_event(event);
             return;
         }
@@ -578,40 +537,36 @@ impl Scheduler {
         crate::time::cancel_event(TimedEvent::QuantumExpired(obsolete_task));
         self.ensure_quantum_event(now);
     }
-}
 
-impl Default for Scheduler {
-    fn default() -> Self {
-        Self::new()
+    fn is_valid_task(&self, id: TaskId) -> bool {
+        id.index() < self.tasks.len()
     }
-}
 
-impl Task {
-    const fn blocked(id: TaskId) -> Self {
-        Self {
-            id,
-            priority: 0,
-            state: TaskState::Blocked,
-            entry: parked_task,
-            stack_top: 0,
-            frame: TaskFrameStorage::zeroed(),
-        }
+    fn task(&self, id: TaskId) -> &Task {
+        &self.tasks[id.index()]
+    }
+
+    fn task_mut(&mut self, id: TaskId) -> &mut Task {
+        &mut self.tasks[id.index()]
+    }
+
+    fn frame_words_ptr(&self, id: TaskId) -> *const u64 {
+        self.task(id).frame.as_words_ptr()
+    }
+
+    fn frame_words_mut_ptr(&mut self, id: TaskId) -> *mut u64 {
+        self.task_mut(id).frame.as_mut_words_ptr()
     }
 }
 
 #[inline(always)]
 fn copy_words(dst: *mut u64, src: *const u64) {
-    // SAFETY: caller guarantees both buffers are valid and non-overlapping `TASK_FRAME_WORDS` storage.
+    // SAFETY: caller guarantees both buffers are valid and non-overlapping
+    // `TASK_FRAME_WORDS` storage.
     unsafe {
         for i in 0..TASK_FRAME_WORDS {
             *dst.add(i) = *src.add(i);
         }
-    }
-}
-
-fn parked_task() -> ! {
-    loop {
-        core::hint::spin_loop();
     }
 }
 
@@ -626,6 +581,6 @@ extern "C" fn task_entry_bootstrap(entry_addr: usize) -> ! {
     }
 }
 
-fn log_switch(prev: usize, next: usize) {
+fn log_switch(prev: TaskId, next: TaskId) {
     crate::trace!("sched: prev={prev} next={next}");
 }

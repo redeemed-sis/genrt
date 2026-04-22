@@ -10,6 +10,7 @@ pub mod log;
 pub mod memory;
 pub mod panic;
 pub mod sched;
+pub mod task;
 pub mod time;
 
 use bootinfo::BootInfo;
