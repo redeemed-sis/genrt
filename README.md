@@ -38,6 +38,8 @@ The current AArch64 path already has:
 * `kernel::time` owns a preallocated heap-backed deadline queue and one-shot timer rearming
 * sleep wakeups and scheduler quantum both delivered as typed timed events
 * round-robin quantum configured as a duration at scheduler bootstrap
+* bounded mailbox IPC for kernel tasks with heap-preallocated buffers and wait queues
+* demo producer/consumer tasks exchanging messages through a capacity-bounded mailbox
 * minimal allocation-free formatted logging with log levels
 * improved fatal exception diagnostics
 
@@ -55,7 +57,8 @@ in ordinary Rust code.
 * MMU / virtual memory
 * EL0 / user mode
 * SMP scheduling
-* bounded IPC/mailboxes
+* mailbox timeout operations
+* mailbox registry / dynamic mailbox creation
 * driver model
 * low-overhead buffered tracing
 
@@ -162,6 +165,27 @@ The scheduler and time subsystem now follow that rule explicitly:
 * all of those containers are allocated and reserved during bootstrap
 * timer IRQ and scheduler handoff only perform bounded operations on already allocated storage
 
+## IPC
+
+The first IPC primitive is a bounded mailbox for EL1 kernel tasks.
+
+Current mailbox scope:
+
+* client-defined message type (`Mailbox<T>`)
+* heap-preallocated fixed-capacity ring buffer
+* non-blocking `try_send` / `try_recv`
+* blocking `send` / `recv`
+* preallocated bounded send and recv wait queues
+* one bootstrap-created demo mailbox owned by the demo task module
+
+Mailbox state is protected by the shared IRQ-save lock abstraction. In the
+current no-SMP build that means local IRQ masking plus contention checks; the
+same abstraction is the intended upgrade point for a future SMP spinlock.
+Blocking waits enter the scheduler through a typed synchronous task-call path,
+which lets the IPC layer recheck the wait condition and join waiter insertion
+with scheduler blocking. This avoids heap allocation and lost wakeups in the
+preemption-critical path.
+
 ## Build and run
 
 ```bash
@@ -190,8 +214,8 @@ cargo xtask run-aarch64 --log-level trace
 
 The best next steps are:
 
-1. page-table allocation groundwork
-2. bounded mailbox/queue IPC with timeout integration
+1. mailbox timeout integration on top of `kernel::time`
+2. page-table allocation groundwork
 3. growable heap design on top of frame allocation
 
 ## Documentation
@@ -207,4 +231,6 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0007-dtb-memory-map-and-frame-allocator.md`
 * `ai-docs/decision-records/ADR-0008-aarch64-softfloat-kernel-target.md`
 * `ai-docs/decision-records/ADR-0009-bootstrap-kernel-heap-on-frame-allocator.md`
+* `ai-docs/decision-records/ADR-0010-irq-safe-kernel-heap-lock-and-allocation-policy.md`
 * `ai-docs/decision-records/ADR-0011-dynamic-preallocated-scheduler-and-time-structures.md`
+* `ai-docs/decision-records/ADR-0012-bounded-mailbox-ipc.md`

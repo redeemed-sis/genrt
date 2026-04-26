@@ -131,6 +131,20 @@ Keep the first IPC primitive narrow:
 - send/recv can interact correctly with block/wakeup
 - a simple ping-pong demo works under QEMU
 
+### Current implementation note
+
+The first bounded mailbox milestone is now implemented for EL1 kernel tasks:
+
+- client-defined message type through `Mailbox<T>`
+- heap-preallocated fixed-capacity ring buffer
+- preallocated bounded send and recv wait queues
+- non-blocking `try_send` / `try_recv`
+- blocking `send` / `recv` through scheduler block/wake
+- one bootstrap-created demo mailbox owned by the demo task module
+
+Timeout variants are intentionally left for the follow-up milestone and should
+be built on top of the existing time-owned deadline queue.
+
 ---
 
 ## Week 8 — tracing, regression loop, and documentation cleanup
