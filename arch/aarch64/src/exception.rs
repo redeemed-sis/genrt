@@ -3,7 +3,7 @@ use core::arch::asm;
 use crate::{esr, gic, timer, trap_frame::TrapFrame};
 
 const VECTOR_CURRENT_EL_SPX_SYNC: u64 = 4;
-const ISS_SVC_IMM_ZERO: u32 = 0;
+const ISS_SVC_TASK_CALL: u32 = 0;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn irq_entry(frame: *mut TrapFrame) {
@@ -30,16 +30,17 @@ pub extern "C" fn sync_entry(vector: u64, frame: *mut TrapFrame) {
     let iss = esr::iss(raw_esr);
 
     // `sync_entry` is the narrow Rust-side dispatcher for controlled synchronous
-    // traps that originate from kernel task code. In the first sleep/wakeup
-    // implementation we only accept `svc #0` from the current EL1 task path;
+    // traps that originate from kernel task code. We currently accept
+    // scheduler-controlled `svc` calls from the current EL1 task path;
     // any other synchronous exception remains fatal and goes through
     // `exception_entry()` for diagnostics + halt.
-    if vector == VECTOR_CURRENT_EL_SPX_SYNC && ec == esr::EC_SVC_AARCH64 && iss == ISS_SVC_IMM_ZERO
+    if vector == VECTOR_CURRENT_EL_SPX_SYNC && ec == esr::EC_SVC_AARCH64 && iss == ISS_SVC_TASK_CALL
     {
-        // SAFETY: `exceptions.s` saved a live trap frame for the current EL1 task before calling
-        // into Rust. `x0` carries the requested sleep deadline from `arch_sleep_until()`.
-        let deadline = unsafe { (*frame).x[0] };
-        kernel::sched::on_sleep_sync(frame as *mut u64, deadline);
+        // SAFETY: `exceptions.s` saved a live trap frame for the current EL1 task before
+        // calling into Rust. `x0` carries a pointer to the typed task-call request
+        // from `arch_task_call()`.
+        let request = unsafe { (*frame).x[0] as *const core::ffi::c_void };
+        kernel::task_call::on_arch_task_call(frame as *mut u64, request);
         return;
     }
 

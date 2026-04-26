@@ -104,16 +104,15 @@ pub extern "C" fn arch_timer_disarm() {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn arch_sleep_until(deadline: u64) {
-    // SAFETY: `svc #0` raises a synchronous exception at the current EL.
-    // The EL1 vector path saves the current TrapFrame, routes the request
-    // through `sync_entry()`, lets the scheduler block this task, and
-    // eventually resumes another task with `eret`. When the sleeping task is
-    // woken later, execution continues after this instruction.
+pub extern "C" fn arch_task_call(request: *const core::ffi::c_void) {
+    // SAFETY: `svc #0` raises a synchronous exception at the current EL. The
+    // EL1 vector path saves the current TrapFrame and routes the request pointer
+    // through `sync_entry()`. If the request blocks, execution resumes after this
+    // instruction when the task is later woken.
     unsafe {
         asm!(
             "svc #0",
-            in("x0") deadline,
+            in("x0") request,
             options(nostack)
         );
     }

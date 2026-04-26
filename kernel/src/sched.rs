@@ -21,7 +21,6 @@ unsafe extern "C" {
         bootstrap_pc: usize,
     );
     fn arch_enter_task_frame(frame_words: *const u64) -> !;
-    fn arch_sleep_until(deadline: u64);
 }
 
 struct SchedulerCell(UnsafeCell<Option<Scheduler>>);
@@ -47,8 +46,9 @@ impl StaticTask {
 // - Running: the sole task whose saved frame matches the scheduler's committed resume target.
 // - Ready: runnable, owns a valid saved frame, and sits in the ready queue unless it is idle.
 // - Blocked: not runnable and not considered during round-robin selection.
-//   Wakeup deadlines live in `kernel::time`; the scheduler only observes the
-//   resulting `WakeTask(task_id)` timed event and restores the task to `Ready`.
+//   Wakeup ownership lives outside the scheduler: deadlines in `kernel::time`
+//   and mailbox wait queues in `kernel::ipc`. The scheduler only restores the
+//   task to `Ready` when those owners explicitly wake it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum TaskState {
     Ready,
@@ -182,10 +182,7 @@ pub fn sleep_until_counter(deadline: u64) {
         return;
     }
 
-    // SAFETY: `arch_sleep_until()` enters a controlled synchronous exception path that
-    // saves the current task frame and hands ownership back to the scheduler.
-    // The deadline is expressed in hardware counter units.
-    unsafe { arch_sleep_until(deadline) }
+    crate::task_call::sleep_until_counter(deadline);
 }
 
 #[inline(always)]
@@ -194,7 +191,7 @@ pub fn sleep_until(deadline: u64) {
 }
 
 fn on_wake_task(task_id: TaskId) {
-    scheduler_mut().wake_task(task_id);
+    wake_task(task_id);
 }
 
 fn on_quantum_expired(task_id: TaskId) {
@@ -223,6 +220,18 @@ fn finish_timer_interrupt(active_frame_words: *mut u64, now: u64) {
 
 pub fn on_sleep_sync(active_frame_words: *mut u64, deadline: u64) {
     scheduler_mut().block_current_until(active_frame_words, deadline);
+}
+
+pub fn current_task_id() -> Option<TaskId> {
+    scheduler_mut().running_task()
+}
+
+pub fn wake_task(task_id: TaskId) {
+    scheduler_mut().wake_task(task_id);
+}
+
+pub fn block_current_on_ipc(active_frame_words: *mut u64) {
+    scheduler_mut().block_current_on_ipc(active_frame_words);
 }
 
 pub(crate) fn enter_running_task() -> ! {
@@ -362,9 +371,30 @@ impl Scheduler {
     }
 
     fn block_current_until(&mut self, active_frame_words: *mut u64, deadline: u64) {
+        let (current, next) = self.begin_block_current(active_frame_words);
+        crate::time::schedule_event(deadline, TimedEvent::WakeTask(current));
+        self.finish_block_current(current, next);
+        crate::trace!("sched: task {current} sleeping until counter {deadline}");
+    }
+
+    fn block_current_on_ipc(&mut self, active_frame_words: *mut u64) {
+        let (current, next) = self.begin_block_current(active_frame_words);
+        self.finish_block_current(current, next);
+        crate::trace!("sched: task {current} blocked on IPC");
+    }
+
+    fn begin_block_current(&mut self, active_frame_words: *mut u64) -> (TaskId, TaskId) {
+        if active_frame_words.is_null() {
+            panic!("sched: block without active frame");
+        }
+
         let current = self
             .running_task()
-            .unwrap_or_else(|| panic!("sleep requested without a running task"));
+            .unwrap_or_else(|| panic!("block requested without a running task"));
+        if current == IDLE_TASK_ID {
+            panic!("sched: idle task cannot block");
+        }
+
         let next = self.dequeue_next_ready().unwrap_or(IDLE_TASK_ID);
 
         // Save the current task's post-SVC resume frame before making it unrunnable.
@@ -375,10 +405,12 @@ impl Scheduler {
 
         copy_words(active_frame_words, self.frame_words_ptr(next));
         self.commit_block(current, next);
+        (current, next)
+    }
+
+    fn finish_block_current(&mut self, current: TaskId, next: TaskId) {
         let now = crate::time::now_counter();
-        crate::time::schedule_event(deadline, TimedEvent::WakeTask(current));
         self.replace_quantum_event(now, current);
-        crate::trace!("sched: task {current} sleeping until counter {deadline}");
         if next != current {
             log_switch(current, next);
         }
