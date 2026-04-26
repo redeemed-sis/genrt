@@ -18,15 +18,16 @@ allocation is now supported inside IRQ and scheduler fast paths.
 
 ## Decision
 
-The kernel heap now uses a minimal single-core IRQ-save lock around
+The kernel heap now uses the shared kernel IRQ-save lock abstraction around
 `linked_list_allocator::Heap`.
 
 Key points:
 
 * ordinary task-context `alloc/free` is protected against local IRQ reentrancy
 * entering the allocator saves the current local DAIF state, masks IRQs, takes
-  the raw heap lock, and restores the saved IRQ state on exit
-* the implementation is intentionally single-core only and is not an SMP lock
+  the raw lock, and restores the saved IRQ state on exit
+* the current implementation is intentionally single-core, while the shared
+  abstraction is the intended upgrade point for a future SMP spin acquisition
 * the allocator still follows the existing panic path on OOM
 
 Allocation policy for the current kernel stage:
@@ -59,6 +60,6 @@ Positive:
 Limitations:
 
 * still single-core only
-* not an SMP-safe synchronization primitive
+* the current no-SMP implementation is not yet an SMP-safe synchronization primitive
 * does not make heap allocation acceptable inside IRQ-critical paths
 * heap remains fixed-size and non-growable

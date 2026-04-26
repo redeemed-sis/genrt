@@ -4,7 +4,6 @@ use alloc::{
 };
 use core::{
     alloc::{GlobalAlloc, Layout},
-    cell::UnsafeCell,
     cmp::Reverse,
     ptr::NonNull,
     sync::atomic::{AtomicBool, Ordering},
@@ -12,10 +11,7 @@ use core::{
 
 use linked_list_allocator::Heap;
 
-unsafe extern "C" {
-    fn arch_local_irq_save_and_disable() -> u64;
-    fn arch_local_irq_restore(saved_daif: u64);
-}
+use crate::sync::IrqSpinLock;
 
 // Heap allocation policy for the current single-core kernel:
 // - allowed during bootstrap/init code,
@@ -23,9 +19,9 @@ unsafe extern "C" {
 // - protected against local IRQ reentrancy by saving/restoring the local IRQ mask,
 // - still forbidden in timer/scheduler/exception fast paths.
 //
-// The lock below is intentionally minimal and single-core scoped. It prevents a
-// task-context allocation from being interrupted by the timer IRQ and re-entering
-// the allocator, but it is not an SMP-safe synchronization primitive.
+// The allocator uses the shared IRQ-save lock abstraction. In the current
+// no-SMP build it masks local IRQs; the same call sites can later gain a real
+// SMP spin acquisition inside `kernel::sync`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum HeapInitError {
     AlreadyInitialized,
@@ -42,22 +38,12 @@ pub enum HeapSmokeError {
 }
 
 struct IrqSafeHeap {
-    heap: UnsafeCell<Heap>,
-    locked: AtomicBool,
+    heap: IrqSpinLock<Heap>,
     initialized: AtomicBool,
 }
 
-struct LocalIrqGuard {
-    saved_daif: u64,
-}
-
-struct HeapGuard<'a> {
-    owner: &'a IrqSafeHeap,
-    _irq_guard: LocalIrqGuard,
-}
-
 // SAFETY: allocator state is shared globally, but access is serialized through
-// the single-core IRQ-save lock above.
+// the shared IRQ-save lock.
 unsafe impl Sync for IrqSafeHeap {}
 
 #[global_allocator]
@@ -69,26 +55,8 @@ static KERNEL_HEAP: IrqSafeHeap = IrqSafeHeap::empty();
 impl IrqSafeHeap {
     const fn empty() -> Self {
         Self {
-            heap: UnsafeCell::new(Heap::empty()),
-            locked: AtomicBool::new(false),
+            heap: IrqSpinLock::new(Heap::empty()),
             initialized: AtomicBool::new(false),
-        }
-    }
-
-    fn lock(&self) -> HeapGuard<'_> {
-        let irq_guard = LocalIrqGuard::save_and_disable();
-        if self
-            .locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            drop(irq_guard);
-            panic!("heap: recursive or IRQ-reentrant allocator entry");
-        }
-
-        HeapGuard {
-            owner: self,
-            _irq_guard: irq_guard,
         }
     }
 
@@ -101,8 +69,8 @@ impl IrqSafeHeap {
             return Err(HeapInitError::AlreadyInitialized);
         }
 
-        let mut guard = self.lock();
-        if !guard.heap_mut().bottom().is_null() {
+        let mut guard = self.heap.lock();
+        if !guard.bottom().is_null() {
             return Err(HeapInitError::AlreadyInitialized);
         }
 
@@ -110,65 +78,27 @@ impl IrqSafeHeap {
         // is a unique, page-aligned, contiguous bootstrap heap region allocated
         // from the frame allocator before other kernel users receive heap access.
         unsafe {
-            guard.heap_mut().init(heap_start as *mut u8, heap_size);
+            guard.init(heap_start as *mut u8, heap_size);
         }
         self.initialized.store(true, Ordering::Release);
         Ok(())
     }
 }
 
-impl LocalIrqGuard {
-    #[inline(always)]
-    fn save_and_disable() -> Self {
-        // SAFETY: the architecture layer returns the current local DAIF state and masks
-        // IRQ delivery on this single core until `Drop` restores the saved state.
-        let saved_daif = unsafe { arch_local_irq_save_and_disable() };
-        Self { saved_daif }
-    }
-}
-
-impl Drop for LocalIrqGuard {
-    fn drop(&mut self) {
-        // SAFETY: `saved_daif` came from `arch_local_irq_save_and_disable()` on the
-        // same core, so restoring it here returns the caller to its prior IRQ state.
-        unsafe { arch_local_irq_restore(self.saved_daif) }
-    }
-}
-
-impl HeapGuard<'_> {
-    #[inline(always)]
-    fn heap_mut(&mut self) -> &mut Heap {
-        // SAFETY: the IRQ-save lock guarantees exclusive access to the allocator state
-        // on the current single core for the guard's lifetime.
-        unsafe { &mut *self.owner.heap.get() }
-    }
-}
-
-impl Drop for HeapGuard<'_> {
-    fn drop(&mut self) {
-        self.owner.locked.store(false, Ordering::Release);
-    }
-}
-
 unsafe impl GlobalAlloc for IrqSafeHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let mut guard = self.lock();
+        let mut guard = self.heap.lock();
         guard
-            .heap_mut()
             .allocate_first_fit(layout)
             .ok()
             .map_or(core::ptr::null_mut(), |allocation| allocation.as_ptr())
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let mut guard = self.lock();
+        let mut guard = self.heap.lock();
         // SAFETY: `GlobalAlloc` callers pass back exactly the pointer/layout pair that
         // originated from this allocator instance.
-        unsafe {
-            guard
-                .heap_mut()
-                .deallocate(NonNull::new_unchecked(ptr), layout)
-        }
+        unsafe { guard.deallocate(NonNull::new_unchecked(ptr), layout) }
     }
 }
 
