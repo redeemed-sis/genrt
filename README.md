@@ -175,6 +175,8 @@ Current mailbox scope:
 * heap-preallocated fixed-capacity ring buffer
 * non-blocking `try_send` / `try_recv`
 * blocking `send` / `recv`
+* timeout-aware `send_until_counter` / `recv_until_counter`
+* explicit duration wrappers in ticks, microseconds, and milliseconds
 * preallocated bounded send and recv wait queues
 * one bootstrap-created demo mailbox owned by the demo task module
 
@@ -185,6 +187,11 @@ Blocking waits enter the scheduler through a typed synchronous task-call path,
 which lets the IPC layer recheck the wait condition and join waiter insertion
 with scheduler blocking. This avoids heap allocation and lost wakeups in the
 preemption-critical path.
+
+IPC timeouts are represented as typed time events rather than callbacks. The
+scheduler stores an opaque IPC wait token and timeout event; normal IPC wakeup
+cancels the event, while timeout dispatch asks IPC to remove the task from the
+owning wait queue before waking it with a timeout result.
 
 ## Build and run
 
@@ -214,9 +221,9 @@ cargo xtask run-aarch64 --log-level trace
 
 The best next steps are:
 
-1. mailbox timeout integration on top of `kernel::time`
-2. page-table allocation groundwork
-3. growable heap design on top of frame allocation
+1. page-table allocation groundwork
+2. growable heap design on top of frame allocation
+3. mailbox registry / dynamic mailbox creation
 
 ## Documentation
 
@@ -234,3 +241,4 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0010-irq-safe-kernel-heap-lock-and-allocation-policy.md`
 * `ai-docs/decision-records/ADR-0011-dynamic-preallocated-scheduler-and-time-structures.md`
 * `ai-docs/decision-records/ADR-0012-bounded-mailbox-ipc.md`
+* `ai-docs/decision-records/ADR-0013-mailbox-timeout-semantics.md`

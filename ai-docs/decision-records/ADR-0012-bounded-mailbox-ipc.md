@@ -42,8 +42,9 @@ Key points:
   module instead of introducing a dynamic mailbox registry
 
 Timeouts are intentionally not part of this ADR. The wait queues and retry model
-are shaped so `send_timeout` and `recv_timeout` can later be layered on top of
-the existing time-owned deadline queue.
+were shaped so timeout-aware send/recv operations could later be layered on top
+of the existing time-owned deadline queue. That follow-up is captured in
+ADR-0013.
 
 The architecture boundary is intentionally typed rather than callback-based:
 AArch64 exposes a single synchronous `arch_task_call(request_ptr)` entry, and
@@ -71,5 +72,5 @@ Limitations:
 * single-core only
 * kernel tasks only
 * one demo mailbox, no registry yet
-* no timeout events yet
+* timeout semantics are specified separately in ADR-0013
 * no priority inheritance or SMP synchronization
