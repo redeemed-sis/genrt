@@ -4,7 +4,10 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use crate::{ipc::Mailbox, sched};
+use crate::{
+    ipc::{Mailbox, RecvTimeoutError},
+    sched,
+};
 
 const DEMO_MAILBOX_CAPACITY: usize = 1;
 type DemoMessage = usize;
@@ -50,20 +53,34 @@ pub(crate) fn init() {
 
 fn consumer_task() -> ! {
     loop {
-        crate::debug!("consumer: recv wait");
-        let msg = demo_mailbox().recv();
-        crate::info!("consumer: recv {msg}");
-        sched::msleep(2_000);
+        crate::debug!("consumer: recv_timeout success scenario wait=3000ms");
+        match demo_mailbox().recv_timeout_ms(3_000) {
+            Ok(msg) => crate::info!("consumer: recv_timeout Ok({msg}) before deadline"),
+            Err(RecvTimeoutError::Timeout) => {
+                crate::warn!("consumer: expected message before timeout")
+            }
+        }
+
+        crate::debug!("consumer: recv_timeout timeout scenario wait=300ms");
+        match demo_mailbox().recv_timeout_ms(300) {
+            Ok(msg) => crate::warn!("consumer: expected timeout but received {msg}"),
+            Err(RecvTimeoutError::Timeout) => {
+                crate::info!("consumer: recv_timeout Err(Timeout)")
+            }
+        }
+
+        sched::msleep(200);
     }
 }
 
 fn producer_task() -> ! {
     let mut msg: DemoMessage = 1;
     loop {
+        sched::msleep(500);
         demo_mailbox().send(msg);
         crate::info!("producer: send {msg}");
         msg = msg.wrapping_add(1);
-        sched::msleep(500);
+        sched::msleep(1_500);
     }
 }
 
