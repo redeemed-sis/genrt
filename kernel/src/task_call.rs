@@ -28,6 +28,8 @@ struct TaskCallSleepUntil {
 struct TaskCallMailboxWait {
     mailbox: *const core::ffi::c_void,
     wait_kind: u64,
+    timeout_enabled: u64,
+    deadline: u64,
 }
 
 impl TaskCallRequest {
@@ -40,11 +42,25 @@ impl TaskCallRequest {
         }
     }
 
-    fn mailbox_wait(mailbox: *const core::ffi::c_void, wait_kind: u64) -> Self {
+    fn mailbox_wait(
+        mailbox: *const core::ffi::c_void,
+        wait_kind: u64,
+        timeout_deadline: Option<u64>,
+    ) -> Self {
+        let (timeout_enabled, deadline) = match timeout_deadline {
+            Some(deadline) => (1, deadline),
+            None => (0, 0),
+        };
+
         Self {
             op: TASK_CALL_MAILBOX_WAIT,
             args: TaskCallArgs {
-                mailbox_wait: TaskCallMailboxWait { mailbox, wait_kind },
+                mailbox_wait: TaskCallMailboxWait {
+                    mailbox,
+                    wait_kind,
+                    timeout_enabled,
+                    deadline,
+                },
             },
         }
     }
@@ -60,9 +76,20 @@ pub(crate) fn sleep_until_counter(deadline: u64) {
 }
 
 pub(crate) fn mailbox_wait(mailbox: *const core::ffi::c_void, wait_kind: u64) {
-    let request = TaskCallRequest::mailbox_wait(mailbox, wait_kind);
+    let request = TaskCallRequest::mailbox_wait(mailbox, wait_kind, None);
     // SAFETY: same controlled synchronous exception path as sleep. The caller
     // passes an opaque pointer whose lifetime is validated by the mailbox owner.
+    unsafe { arch_task_call(&request as *const TaskCallRequest as *const core::ffi::c_void) }
+}
+
+pub(crate) fn mailbox_wait_until_counter(
+    mailbox: *const core::ffi::c_void,
+    wait_kind: u64,
+    deadline: u64,
+) {
+    let request = TaskCallRequest::mailbox_wait(mailbox, wait_kind, Some(deadline));
+    // SAFETY: same controlled synchronous exception path as sleep. The timeout
+    // deadline is an absolute architecture counter value consumed synchronously.
     unsafe { arch_task_call(&request as *const TaskCallRequest as *const core::ffi::c_void) }
 }
 
@@ -89,6 +116,11 @@ pub fn on_arch_task_call(active_frame_words: *mut u64, request: *const core::ffi
                 active_frame_words,
                 args.mailbox.cast_mut(),
                 args.wait_kind,
+                if args.timeout_enabled != 0 {
+                    Some(args.deadline)
+                } else {
+                    None
+                },
             );
         }
         op => panic!("task-call: unknown operation {op}"),

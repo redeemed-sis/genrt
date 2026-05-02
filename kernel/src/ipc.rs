@@ -1,5 +1,5 @@
 use alloc::{collections::VecDeque, vec::Vec};
-use core::cell::UnsafeCell;
+use core::{cell::UnsafeCell, fmt};
 
 use crate::{sync::IrqSpinLock, task::TaskId};
 
@@ -11,9 +11,19 @@ pub enum SendError<T> {
     Full(T),
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum SendTimeoutError<T> {
+    Timeout(T),
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum RecvError {
     Empty,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum RecvTimeoutError {
+    Timeout,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -39,11 +49,69 @@ impl MailboxWaitKind {
     }
 }
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum IpcWaitObject {
+    Mailbox(MailboxWaitKind),
+}
+
+/// Opaque scheduler token for an IPC wait.
+///
+/// The scheduler stores and returns this token but does not inspect the
+/// concrete IPC primitive behind it. That keeps mailbox-specific cleanup in
+/// `kernel::ipc` and leaves room for later semaphore/mutex/socket waiters to
+/// reuse the same timeout path without teaching the scheduler about each one.
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub(crate) struct IpcWaitToken {
+    object: *mut core::ffi::c_void,
+    wait_object: IpcWaitObject,
+}
+
+impl fmt::Debug for IpcWaitToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IpcWaitToken")
+            .field("object", &self.object)
+            .finish()
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IpcWaitRegistration {
+    token: IpcWaitToken,
+    timeout_deadline: Option<u64>,
+}
+
+impl IpcWaitRegistration {
+    fn mailbox(
+        control: *mut core::ffi::c_void,
+        wait_kind: MailboxWaitKind,
+        timeout_deadline: Option<u64>,
+    ) -> Self {
+        Self {
+            token: IpcWaitToken {
+                object: control,
+                wait_object: IpcWaitObject::Mailbox(wait_kind),
+            },
+            timeout_deadline,
+        }
+    }
+
+    pub(crate) const fn token(self) -> IpcWaitToken {
+        self.token
+    }
+
+    pub(crate) const fn timeout_deadline(self) -> Option<u64> {
+        self.timeout_deadline
+    }
+}
+
 /// Bounded mailbox for kernel-task IPC.
 ///
 /// Blocking `send`/`recv` pass a pointer to this mailbox's control block through
 /// the synchronous task-call path. The mailbox object must therefore remain
-/// alive and must not be moved while any task may be waiting on it.
+/// alive and must not be moved while any task may be waiting on it. Timeout
+/// waits use time-owned `IpcTimeout(task)` events; normal mailbox wakeups cancel
+/// those events before making the task runnable, while timeout dispatch removes
+/// the task from this mailbox's bounded wait queue before waking it.
 pub struct Mailbox<T> {
     control: IrqSpinLock<MailboxControl>,
     buffer: UnsafeCell<Vec<Option<T>>>,
@@ -106,7 +174,7 @@ impl<T> Mailbox<T> {
 
             let woken = control.pop_waiter(MailboxWaitKind::Recv);
             if let Some(task_id) = woken {
-                crate::sched::wake_task(task_id);
+                crate::sched::complete_ipc_wait(task_id);
             }
             (control.len, woken)
         };
@@ -136,7 +204,7 @@ impl<T> Mailbox<T> {
 
             let woken = control.pop_waiter(MailboxWaitKind::Send);
             if let Some(task_id) = woken {
-                crate::sched::wake_task(task_id);
+                crate::sched::complete_ipc_wait(task_id);
             }
             (msg, control.len, woken)
         };
@@ -169,11 +237,95 @@ impl<T> Mailbox<T> {
         }
     }
 
+    pub fn send_until_counter(&self, mut msg: T, deadline: u64) -> Result<(), SendTimeoutError<T>> {
+        loop {
+            match self.try_send(msg) {
+                Ok(()) => return Ok(()),
+                Err(SendError::Full(returned)) => msg = returned,
+            }
+
+            if deadline <= crate::time::now_counter() {
+                crate::trace!("ipc: send_until_counter returned Timeout before blocking");
+                return Err(SendTimeoutError::Timeout(msg));
+            }
+
+            if self.wait_until_counter(MailboxWaitKind::Send, deadline)
+                == Some(crate::sched::WaitResult::TimedOut)
+            {
+                crate::debug!("ipc: send_until_counter returned Err(Timeout)");
+                return Err(SendTimeoutError::Timeout(msg));
+            }
+        }
+    }
+
+    pub fn recv_until_counter(&self, deadline: u64) -> Result<T, RecvTimeoutError> {
+        loop {
+            if let Ok(msg) = self.try_recv() {
+                return Ok(msg);
+            }
+
+            if deadline <= crate::time::now_counter() {
+                crate::trace!("ipc: recv_until_counter returned Timeout before blocking");
+                return Err(RecvTimeoutError::Timeout);
+            }
+
+            if self.wait_until_counter(MailboxWaitKind::Recv, deadline)
+                == Some(crate::sched::WaitResult::TimedOut)
+            {
+                crate::debug!("ipc: recv_until_counter returned Err(Timeout)");
+                return Err(RecvTimeoutError::Timeout);
+            }
+        }
+    }
+
+    pub fn send_timeout_ticks(
+        &self,
+        msg: T,
+        timeout_ticks: u64,
+    ) -> Result<(), SendTimeoutError<T>> {
+        let deadline = crate::time::now_counter().wrapping_add(timeout_ticks);
+        self.send_until_counter(msg, deadline)
+    }
+
+    pub fn recv_timeout_ticks(&self, timeout_ticks: u64) -> Result<T, RecvTimeoutError> {
+        let deadline = crate::time::now_counter().wrapping_add(timeout_ticks);
+        self.recv_until_counter(deadline)
+    }
+
+    pub fn send_timeout_ms(&self, msg: T, timeout_ms: u64) -> Result<(), SendTimeoutError<T>> {
+        self.send_timeout_ticks(msg, crate::time::ms_to_counts(timeout_ms))
+    }
+
+    pub fn recv_timeout_ms(&self, timeout_ms: u64) -> Result<T, RecvTimeoutError> {
+        self.recv_timeout_ticks(crate::time::ms_to_counts(timeout_ms))
+    }
+
+    pub fn send_timeout_us(&self, msg: T, timeout_us: u64) -> Result<(), SendTimeoutError<T>> {
+        self.send_timeout_ticks(msg, crate::time::us_to_counts(timeout_us))
+    }
+
+    pub fn recv_timeout_us(&self, timeout_us: u64) -> Result<T, RecvTimeoutError> {
+        self.recv_timeout_ticks(crate::time::us_to_counts(timeout_us))
+    }
+
     fn wait(&self, wait_kind: MailboxWaitKind) {
         crate::task_call::mailbox_wait(
             &self.control as *const IrqSpinLock<MailboxControl> as *const core::ffi::c_void,
             wait_kind.raw(),
         );
+    }
+
+    fn wait_until_counter(
+        &self,
+        wait_kind: MailboxWaitKind,
+        deadline: u64,
+    ) -> Option<crate::sched::WaitResult> {
+        crate::task_call::mailbox_wait_until_counter(
+            &self.control as *const IrqSpinLock<MailboxControl> as *const core::ffi::c_void,
+            wait_kind.raw(),
+            deadline,
+        );
+        crate::sched::take_current_wait_result()
     }
 }
 
@@ -240,6 +392,16 @@ impl MailboxControl {
         self.waiters_mut(kind).pop_front()
     }
 
+    fn remove_waiter(&mut self, kind: MailboxWaitKind, task_id: TaskId) -> bool {
+        let waiters = self.waiters_mut(kind);
+        let Some(index) = waiters.iter().position(|queued| *queued == task_id) else {
+            return false;
+        };
+
+        waiters.remove(index);
+        true
+    }
+
     fn waiters_mut(&mut self, kind: MailboxWaitKind) -> &mut VecDeque<TaskId> {
         match kind {
             MailboxWaitKind::Send => &mut self.send_waiters,
@@ -252,6 +414,7 @@ pub fn on_mailbox_wait_sync(
     active_frame_words: *mut u64,
     control: *mut core::ffi::c_void,
     raw_wait_kind: u64,
+    timeout_deadline: Option<u64>,
 ) {
     if active_frame_words.is_null() {
         panic!("ipc: mailbox wait without active frame");
@@ -264,10 +427,12 @@ pub fn on_mailbox_wait_sync(
         .unwrap_or_else(|| panic!("ipc: invalid mailbox wait kind {raw_wait_kind}"));
     let task_id =
         crate::sched::current_task_id().unwrap_or_else(|| panic!("ipc: wait without task"));
+    crate::sched::clear_current_wait_result();
 
     // SAFETY: blocking mailbox operations pass a pointer to their non-generic
     // control lock. The containing mailbox must remain alive while tasks wait.
-    let control = unsafe { &*(control.cast::<IrqSpinLock<MailboxControl>>()) };
+    let control_ptr = control;
+    let control = unsafe { &*(control_ptr.cast::<IrqSpinLock<MailboxControl>>()) };
     let mut control = control.lock();
 
     if !control.should_wait(wait_kind) {
@@ -275,7 +440,59 @@ pub fn on_mailbox_wait_sync(
         return;
     }
 
+    if let Some(deadline) = timeout_deadline {
+        if deadline <= crate::time::now_counter() {
+            crate::trace!("ipc: wait deadline already expired task {task_id} kind={wait_kind:?}");
+            crate::sched::set_current_wait_result(crate::sched::WaitResult::TimedOut);
+            return;
+        }
+    }
+
     control.enqueue_waiter(wait_kind, task_id);
-    crate::trace!("ipc: task {task_id} blocked on mailbox {wait_kind:?}");
-    crate::sched::block_current_on_ipc(active_frame_words);
+    if let Some(deadline) = timeout_deadline {
+        crate::debug!(
+            "ipc: task {task_id} blocked on mailbox {wait_kind:?} timeout_deadline={deadline}"
+        );
+    } else {
+        crate::trace!("ipc: task {task_id} blocked on mailbox {wait_kind:?}");
+    }
+
+    // Keep the mailbox lock held through timeout registration and scheduler
+    // blocking. Local IRQs stay masked, so no producer/consumer or timer IRQ can
+    // observe "queued but not blocked" or "timed event without wait state".
+    crate::sched::block_current_on_ipc(
+        active_frame_words,
+        IpcWaitRegistration::mailbox(control_ptr, wait_kind, timeout_deadline),
+    );
+}
+
+pub(crate) fn remove_timed_out_waiter(token: IpcWaitToken, task_id: TaskId) -> bool {
+    match token.wait_object {
+        IpcWaitObject::Mailbox(wait_kind) => {
+            remove_timed_out_mailbox_waiter(token.object, wait_kind, task_id)
+        }
+    }
+}
+
+fn remove_timed_out_mailbox_waiter(
+    control: *mut core::ffi::c_void,
+    wait_kind: MailboxWaitKind,
+    task_id: TaskId,
+) -> bool {
+    if control.is_null() {
+        panic!("ipc: timeout cleanup with null control block");
+    }
+
+    // SAFETY: scheduler stores the same control pointer supplied by a blocking
+    // mailbox wait. The mailbox owner must keep the mailbox alive and unmoved
+    // until all waiters have completed or timed out.
+    let control = unsafe { &*(control.cast::<IrqSpinLock<MailboxControl>>()) };
+    let mut control = control.lock();
+    let removed = control.remove_waiter(wait_kind, task_id);
+    if removed {
+        crate::debug!("ipc: removed timed-out task {task_id} from {wait_kind:?} wait queue");
+    } else {
+        crate::trace!("ipc: timeout cleanup found no task {task_id} in {wait_kind:?} wait queue");
+    }
+    removed
 }

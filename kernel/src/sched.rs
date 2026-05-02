@@ -3,6 +3,7 @@ use core::{cell::UnsafeCell, mem};
 
 use crate::{
     arch_consts::TASK_FRAME_WORDS,
+    ipc::{IpcWaitRegistration, IpcWaitToken},
     task::TaskId,
     time::{TimeHandlers, TimedEvent},
 };
@@ -42,18 +43,37 @@ impl StaticTask {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WaitResult {
+    Completed,
+    TimedOut,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct IpcBlock {
+    token: IpcWaitToken,
+    timeout_event: Option<TimedEvent>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum BlockReason {
+    Sleep,
+    Ipc(IpcBlock),
+}
+
 // Task-state semantics:
 // - Running: the sole task whose saved frame matches the scheduler's committed resume target.
 // - Ready: runnable, owns a valid saved frame, and sits in the ready queue unless it is idle.
-// - Blocked: not runnable and not considered during round-robin selection.
-//   Wakeup ownership lives outside the scheduler: deadlines in `kernel::time`
-//   and mailbox wait queues in `kernel::ipc`. The scheduler only restores the
-//   task to `Ready` when those owners explicitly wake it.
+// - Blocked(reason): not runnable and not considered during round-robin
+//   selection. Wakeup ownership still lives outside the scheduler: deadlines in
+//   `kernel::time` and wait queues in `kernel::ipc`. The scheduler keeps an
+//   opaque IPC wait token so timeout dispatch can ask IPC to remove the waiter
+//   before restoring the task to `Ready`, without knowing the concrete IPC type.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum TaskState {
     Ready,
     Running,
-    Blocked,
+    Blocked(BlockReason),
 }
 
 #[repr(C, align(16))]
@@ -96,6 +116,7 @@ impl TaskFrameStorage {
 
 struct Task {
     state: TaskState,
+    last_wait_result: Option<WaitResult>,
     entry: TaskEntry,
     stack: Box<TaskStack>,
     frame: Box<TaskFrameStorage>,
@@ -105,6 +126,7 @@ impl Task {
     fn new(entry: TaskEntry, state: TaskState) -> Self {
         Self {
             state,
+            last_wait_result: None,
             entry,
             stack: Box::new(TaskStack::zeroed()),
             frame: Box::new(TaskFrameStorage::zeroed()),
@@ -113,6 +135,10 @@ impl Task {
 
     fn stack_top(&self) -> usize {
         self.stack.top()
+    }
+
+    fn is_blocked(&self) -> bool {
+        matches!(self.state, TaskState::Blocked(_))
     }
 }
 
@@ -198,6 +224,10 @@ fn on_quantum_expired(task_id: TaskId) {
     scheduler_mut().note_quantum_expired(task_id);
 }
 
+fn on_ipc_timeout(task_id: TaskId) {
+    scheduler_mut().handle_ipc_timeout(task_id);
+}
+
 #[inline(always)]
 fn init_time_after_scheduler_publish(task_count: usize) {
     crate::time::init(
@@ -205,8 +235,9 @@ fn init_time_after_scheduler_publish(task_count: usize) {
             finish_timer_interrupt,
             wake_task: on_wake_task,
             quantum_expired: on_quantum_expired,
+            ipc_timeout: on_ipc_timeout,
         },
-        task_count.saturating_mul(2),
+        task_count.saturating_mul(3),
     );
 }
 
@@ -230,8 +261,24 @@ pub fn wake_task(task_id: TaskId) {
     scheduler_mut().wake_task(task_id);
 }
 
-pub fn block_current_on_ipc(active_frame_words: *mut u64) {
-    scheduler_mut().block_current_on_ipc(active_frame_words);
+pub(crate) fn complete_ipc_wait(task_id: TaskId) {
+    scheduler_mut().complete_ipc_wait(task_id);
+}
+
+pub(crate) fn clear_current_wait_result() {
+    scheduler_mut().clear_current_wait_result();
+}
+
+pub(crate) fn set_current_wait_result(result: WaitResult) {
+    scheduler_mut().set_current_wait_result(result);
+}
+
+pub(crate) fn take_current_wait_result() -> Option<WaitResult> {
+    scheduler_mut().take_current_wait_result()
+}
+
+pub(crate) fn block_current_on_ipc(active_frame_words: *mut u64, wait: IpcWaitRegistration) {
+    scheduler_mut().block_current_on_ipc(active_frame_words, wait);
 }
 
 pub(crate) fn enter_running_task() -> ! {
@@ -371,19 +418,45 @@ impl Scheduler {
     }
 
     fn block_current_until(&mut self, active_frame_words: *mut u64, deadline: u64) {
-        let (current, next) = self.begin_block_current(active_frame_words);
+        let (current, next) = self.begin_block_current(active_frame_words, BlockReason::Sleep);
         crate::time::schedule_event(deadline, TimedEvent::WakeTask(current));
         self.finish_block_current(current, next);
         crate::trace!("sched: task {current} sleeping until counter {deadline}");
     }
 
-    fn block_current_on_ipc(&mut self, active_frame_words: *mut u64) {
-        let (current, next) = self.begin_block_current(active_frame_words);
+    fn block_current_on_ipc(&mut self, active_frame_words: *mut u64, wait: IpcWaitRegistration) {
+        let current = self.blocking_current(active_frame_words);
+        let timeout_event = wait.timeout_deadline().map(|deadline| {
+            let event = TimedEvent::IpcTimeout(current);
+            crate::time::schedule_event(deadline, event);
+            crate::debug!("sched: timeout event scheduled {event:?} deadline={deadline}");
+            event
+        });
+        let reason = BlockReason::Ipc(IpcBlock {
+            token: wait.token(),
+            timeout_event,
+        });
+
+        let next = self.block_current_with_reason(active_frame_words, current, reason);
         self.finish_block_current(current, next);
-        crate::trace!("sched: task {current} blocked on IPC");
+        crate::trace!(
+            "sched: task {current} blocked on IPC token={:?} timeout_event={:?}",
+            wait.token(),
+            timeout_event
+        );
     }
 
-    fn begin_block_current(&mut self, active_frame_words: *mut u64) -> (TaskId, TaskId) {
+    fn begin_block_current(
+        &mut self,
+        active_frame_words: *mut u64,
+        reason: BlockReason,
+    ) -> (TaskId, TaskId) {
+        let current = self.blocking_current(active_frame_words);
+        let next = self.block_current_with_reason(active_frame_words, current, reason);
+        (current, next)
+    }
+
+    fn blocking_current(&self, active_frame_words: *mut u64) -> TaskId {
         if active_frame_words.is_null() {
             panic!("sched: block without active frame");
         }
@@ -395,6 +468,15 @@ impl Scheduler {
             panic!("sched: idle task cannot block");
         }
 
+        current
+    }
+
+    fn block_current_with_reason(
+        &mut self,
+        active_frame_words: *mut u64,
+        current: TaskId,
+        reason: BlockReason,
+    ) -> TaskId {
         let next = self.dequeue_next_ready().unwrap_or(IDLE_TASK_ID);
 
         // Save the current task's post-SVC resume frame before making it unrunnable.
@@ -404,8 +486,8 @@ impl Scheduler {
         );
 
         copy_words(active_frame_words, self.frame_words_ptr(next));
-        self.commit_block(current, next);
-        (current, next)
+        self.commit_block(current, next, reason);
+        next
     }
 
     fn finish_block_current(&mut self, current: TaskId, next: TaskId) {
@@ -442,7 +524,7 @@ impl Scheduler {
             return Err(SchedError::InvalidTaskId);
         }
 
-        if self.task(id).state == TaskState::Blocked {
+        if self.task(id).is_blocked() {
             return Err(SchedError::InvalidTaskId);
         }
 
@@ -459,7 +541,7 @@ impl Scheduler {
 
         debug_assert_eq!(self.current, Some(prev));
         debug_assert_eq!(self.task(prev).state, TaskState::Running);
-        debug_assert_ne!(self.task(next).state, TaskState::Blocked);
+        debug_assert!(!self.task(next).is_blocked());
 
         self.make_ready(prev);
         if prev != IDLE_TASK_ID {
@@ -471,16 +553,16 @@ impl Scheduler {
         debug_assert_eq!(self.task(prev).state, TaskState::Ready);
     }
 
-    fn commit_block(&mut self, blocked: TaskId, next: TaskId) {
+    fn commit_block(&mut self, blocked: TaskId, next: TaskId, reason: BlockReason) {
         debug_assert_eq!(self.current, Some(blocked));
         debug_assert_eq!(self.task(blocked).state, TaskState::Running);
-        debug_assert_ne!(self.task(next).state, TaskState::Blocked);
+        debug_assert!(!self.task(next).is_blocked());
 
-        self.make_blocked(blocked);
+        self.make_blocked(blocked, reason);
         self.make_running(next);
 
         debug_assert_eq!(self.current, Some(next));
-        debug_assert_eq!(self.task(blocked).state, TaskState::Blocked);
+        debug_assert!(self.task(blocked).is_blocked());
         debug_assert_eq!(self.task(next).state, TaskState::Running);
     }
 }
@@ -491,13 +573,95 @@ impl Scheduler {
             return;
         }
 
-        if self.task(task_id).state == TaskState::Blocked {
+        if self.task(task_id).is_blocked() {
             self.make_ready(task_id);
             if task_id != IDLE_TASK_ID {
                 self.ready_push_back(task_id);
             }
             crate::trace!("sched: task {task_id} moved to Ready");
         }
+    }
+
+    fn complete_ipc_wait(&mut self, task_id: TaskId) {
+        if !self.is_valid_task(task_id) {
+            return;
+        }
+
+        let timeout_event = match self.task(task_id).state {
+            TaskState::Blocked(BlockReason::Ipc(wait)) => wait.timeout_event,
+            TaskState::Blocked(reason) => {
+                crate::trace!(
+                    "sched: ignoring IPC completion for task {task_id}; blocked on {reason:?}"
+                );
+                return;
+            }
+            state => {
+                crate::trace!("sched: ignoring IPC completion for task {task_id}; state={state:?}");
+                return;
+            }
+        };
+
+        if let Some(event) = timeout_event {
+            crate::time::cancel_event(event);
+            crate::debug!("sched: normal IPC wake canceled timeout {event:?}");
+        }
+
+        self.task_mut(task_id).last_wait_result = Some(WaitResult::Completed);
+        self.wake_task(task_id);
+    }
+
+    fn handle_ipc_timeout(&mut self, task_id: TaskId) {
+        if !self.is_valid_task(task_id) {
+            return;
+        }
+
+        let wait = match self.task(task_id).state {
+            TaskState::Blocked(BlockReason::Ipc(wait))
+                if wait.timeout_event == Some(TimedEvent::IpcTimeout(task_id)) =>
+            {
+                wait
+            }
+            TaskState::Blocked(BlockReason::Ipc(wait)) => {
+                crate::trace!("sched: stale IPC timeout for task {task_id}; current wait={wait:?}");
+                return;
+            }
+            state => {
+                crate::trace!("sched: stale IPC timeout for task {task_id}; state={state:?}");
+                return;
+            }
+        };
+
+        let removed = crate::ipc::remove_timed_out_waiter(wait.token, task_id);
+        if !removed {
+            panic!("sched: IPC timeout task {task_id} missing from IPC wait queue");
+        }
+
+        self.task_mut(task_id).last_wait_result = Some(WaitResult::TimedOut);
+        self.wake_task(task_id);
+        crate::debug!(
+            "sched: IPC timeout completed task {task_id} token={:?}",
+            wait.token
+        );
+    }
+
+    fn clear_current_wait_result(&mut self) {
+        if let Some(current) = self.current {
+            self.task_mut(current).last_wait_result = None;
+        }
+    }
+
+    fn set_current_wait_result(&mut self, result: WaitResult) {
+        let current = self
+            .running_task()
+            .unwrap_or_else(|| panic!("sched: wait result without running task"));
+        self.task_mut(current).last_wait_result = Some(result);
+    }
+
+    fn take_current_wait_result(&mut self) -> Option<WaitResult> {
+        let current = self
+            .running_task()
+            .unwrap_or_else(|| panic!("sched: wait result without running task"));
+        self.task_mut(current).last_wait_result.take()
     }
 
     fn note_quantum_expired(&mut self, task_id: TaskId) {
@@ -534,8 +698,8 @@ impl Scheduler {
         self.current = Some(id);
     }
 
-    fn make_blocked(&mut self, id: TaskId) {
-        self.task_mut(id).state = TaskState::Blocked;
+    fn make_blocked(&mut self, id: TaskId, reason: BlockReason) {
+        self.task_mut(id).state = TaskState::Blocked(reason);
     }
 
     fn has_runnable_peer(&self) -> bool {

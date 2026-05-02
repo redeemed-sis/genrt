@@ -17,6 +17,9 @@ type TimedTaskHandler = fn(TaskId);
 pub(crate) enum TimedEvent {
     WakeTask(TaskId),
     QuantumExpired(TaskId),
+    // IPC timeouts are typed task events, not callbacks. Scheduler owns the
+    // task wait state and asks IPC to remove the mailbox waiter during dispatch.
+    IpcTimeout(TaskId),
 }
 
 impl TimedEvent {
@@ -24,6 +27,7 @@ impl TimedEvent {
         match self {
             Self::WakeTask(task_id) => (0, task_id.index()),
             Self::QuantumExpired(task_id) => (1, task_id.index()),
+            Self::IpcTimeout(task_id) => (2, task_id.index()),
         }
     }
 }
@@ -35,6 +39,7 @@ pub(crate) struct TimeHandlers {
     pub finish_timer_interrupt: FinishTimerInterruptHandler,
     pub wake_task: TimedTaskHandler,
     pub quantum_expired: TimedTaskHandler,
+    pub ipc_timeout: TimedTaskHandler,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -365,6 +370,10 @@ fn dispatch_expired_event(handlers: TimeHandlers, event: TimedEvent) {
         TimedEvent::QuantumExpired(task_id) => {
             crate::trace!("time: dispatch QuantumExpired({task_id})");
             (handlers.quantum_expired)(task_id);
+        }
+        TimedEvent::IpcTimeout(task_id) => {
+            crate::debug!("time: timeout fired IpcTimeout({task_id})");
+            (handlers.ipc_timeout)(task_id);
         }
     }
 }
