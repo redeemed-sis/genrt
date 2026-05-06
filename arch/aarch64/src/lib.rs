@@ -119,10 +119,11 @@ pub extern "C" fn arch_task_call(request: *const core::ffi::c_void) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn arch_init_task_frame(
+pub extern "C" fn arch_init_thread_frame(
     frame_words: *mut u64,
     stack_top: usize,
     entry_addr: usize,
+    arg: usize,
     bootstrap_pc: usize,
 ) {
     if frame_words.is_null() {
@@ -133,6 +134,7 @@ pub extern "C" fn arch_init_task_frame(
     let frame = unsafe { &mut *(frame_words as *mut TrapFrame) };
     *frame = TrapFrame::zeroed();
     frame.x[0] = entry_addr as u64;
+    frame.x[1] = arg as u64;
     frame.sp = (stack_top as u64) & !0xF;
     frame.elr = bootstrap_pc as u64;
     frame.spsr = TrapFrame::EL1H;

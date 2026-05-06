@@ -1,5 +1,9 @@
 const TASK_CALL_SLEEP_UNTIL: u64 = 1;
 const TASK_CALL_MAILBOX_WAIT: u64 = 2;
+const TASK_CALL_THREAD_EXIT: u64 = 3;
+const TASK_CALL_THREAD_JOIN: u64 = 4;
+
+use crate::task::ThreadId;
 
 unsafe extern "C" {
     fn arch_task_call(request: *const core::ffi::c_void);
@@ -15,6 +19,8 @@ struct TaskCallRequest {
 union TaskCallArgs {
     sleep_until: TaskCallSleepUntil,
     mailbox_wait: TaskCallMailboxWait,
+    thread_exit: TaskCallThreadExit,
+    thread_join: TaskCallThreadJoin,
 }
 
 #[repr(C)]
@@ -30,6 +36,19 @@ struct TaskCallMailboxWait {
     wait_kind: u64,
     timeout_enabled: u64,
     deadline: u64,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct TaskCallThreadExit {
+    code: usize,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct TaskCallThreadJoin {
+    index: usize,
+    generation: u32,
 }
 
 impl TaskCallRequest {
@@ -64,6 +83,27 @@ impl TaskCallRequest {
             },
         }
     }
+
+    fn thread_exit(code: usize) -> Self {
+        Self {
+            op: TASK_CALL_THREAD_EXIT,
+            args: TaskCallArgs {
+                thread_exit: TaskCallThreadExit { code },
+            },
+        }
+    }
+
+    fn thread_join(id: ThreadId) -> Self {
+        Self {
+            op: TASK_CALL_THREAD_JOIN,
+            args: TaskCallArgs {
+                thread_join: TaskCallThreadJoin {
+                    index: id.index(),
+                    generation: id.generation(),
+                },
+            },
+        }
+    }
 }
 
 pub(crate) fn sleep_until_counter(deadline: u64) {
@@ -90,6 +130,22 @@ pub(crate) fn mailbox_wait_until_counter(
     let request = TaskCallRequest::mailbox_wait(mailbox, wait_kind, Some(deadline));
     // SAFETY: same controlled synchronous exception path as sleep. The timeout
     // deadline is an absolute architecture counter value consumed synchronously.
+    unsafe { arch_task_call(&request as *const TaskCallRequest as *const core::ffi::c_void) }
+}
+
+pub(crate) fn thread_exit(code: usize) -> ! {
+    let request = TaskCallRequest::thread_exit(code);
+    // SAFETY: thread exit uses the same controlled synchronous exception path as
+    // other scheduler task calls. The scheduler replaces the active frame with a
+    // different runnable thread, so this call must not return to the exiting one.
+    unsafe { arch_task_call(&request as *const TaskCallRequest as *const core::ffi::c_void) }
+    panic!("task-call: thread_exit returned to exiting thread");
+}
+
+pub(crate) fn thread_join(id: ThreadId) {
+    let request = TaskCallRequest::thread_join(id);
+    // SAFETY: the join request is consumed synchronously by the controlled SVC
+    // path before this stack frame can go away or the caller blocks.
     unsafe { arch_task_call(&request as *const TaskCallRequest as *const core::ffi::c_void) }
 }
 
@@ -121,6 +177,19 @@ pub fn on_arch_task_call(active_frame_words: *mut u64, request: *const core::ffi
                 } else {
                     None
                 },
+            );
+        }
+        TASK_CALL_THREAD_EXIT => {
+            // SAFETY: the `op` tag selects this payload variant.
+            let args = unsafe { request.args.thread_exit };
+            crate::sched::on_thread_exit_sync(active_frame_words, args.code);
+        }
+        TASK_CALL_THREAD_JOIN => {
+            // SAFETY: the `op` tag selects this payload variant.
+            let args = unsafe { request.args.thread_join };
+            crate::sched::on_thread_join_sync(
+                active_frame_words,
+                ThreadId::new(args.index, args.generation),
             );
         }
         op => panic!("task-call: unknown operation {op}"),

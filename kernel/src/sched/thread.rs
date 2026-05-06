@@ -1,0 +1,436 @@
+use core::mem;
+
+use crate::{
+    sync::LocalIrqGuard,
+    task::{TaskId, ThreadId},
+};
+
+use super::{
+    IDLE_TASK_ID, Scheduler, arch_init_thread_frame, copy_words, preempt, scheduler_mut,
+    try_scheduler_mut,
+};
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ThreadArg(usize);
+
+impl ThreadArg {
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn from_usize(value: usize) -> Self {
+        Self(value)
+    }
+
+    pub const fn as_usize(self) -> usize {
+        self.0
+    }
+
+    pub fn from_ptr<T>(ptr: *const T) -> Self {
+        Self(ptr as usize)
+    }
+
+    pub fn from_mut_ptr<T>(ptr: *mut T) -> Self {
+        Self(ptr as usize)
+    }
+
+    pub const fn as_ptr<T>(self) -> *const T {
+        self.0 as *const T
+    }
+
+    pub const fn as_mut_ptr<T>(self) -> *mut T {
+        self.0 as *mut T
+    }
+
+    /// # Safety
+    ///
+    /// The caller must guarantee that the encoded pointer is valid for `T`,
+    /// properly aligned, and remains live for the returned `'static` reference.
+    pub unsafe fn as_static_ref<T>(self) -> Option<&'static T> {
+        // SAFETY: upheld by the caller of this unsafe conversion.
+        unsafe { self.as_ptr::<T>().as_ref() }
+    }
+
+    /// # Safety
+    ///
+    /// The caller must guarantee that the encoded pointer is uniquely owned,
+    /// valid for `T`, properly aligned, and remains live for the returned
+    /// `'static` mutable reference.
+    pub unsafe fn as_static_mut<T>(self) -> Option<&'static mut T> {
+        // SAFETY: upheld by the caller of this unsafe conversion.
+        unsafe { self.as_mut_ptr::<T>().as_mut() }
+    }
+}
+
+impl From<usize> for ThreadArg {
+    fn from(value: usize) -> Self {
+        Self::from_usize(value)
+    }
+}
+
+impl<T> From<*const T> for ThreadArg {
+    fn from(value: *const T) -> Self {
+        Self::from_ptr(value)
+    }
+}
+
+impl<T> From<*mut T> for ThreadArg {
+    fn from(value: *mut T) -> Self {
+        Self::from_mut_ptr(value)
+    }
+}
+
+pub type ThreadEntry = fn(ThreadArg) -> usize;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ThreadAttrs {
+    pub joinable: bool,
+}
+
+impl ThreadAttrs {
+    pub const fn joinable() -> Self {
+        Self { joinable: true }
+    }
+
+    pub const fn detached() -> Self {
+        Self { joinable: false }
+    }
+}
+
+impl Default for ThreadAttrs {
+    fn default() -> Self {
+        Self::joinable()
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SpawnError {
+    NoThreadSlots,
+    NoStackSlots,
+    SchedulerNotInitialized,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum JoinError {
+    InvalidThread,
+    NotJoinable,
+    SelfJoin,
+    JoinInProgress,
+    SchedulerNotInitialized,
+}
+
+pub fn thread_spawn(
+    entry: ThreadEntry,
+    arg: ThreadArg,
+    attrs: ThreadAttrs,
+) -> core::result::Result<ThreadId, SpawnError> {
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    let Some(scheduler) = try_scheduler_mut() else {
+        return Err(SpawnError::SchedulerNotInitialized);
+    };
+
+    scheduler.spawn_thread(entry, arg, attrs)
+}
+
+pub fn thread_exit(code: usize) -> ! {
+    crate::task_call::thread_exit(code)
+}
+
+pub fn thread_join(id: ThreadId) -> core::result::Result<usize, JoinError> {
+    {
+        let _irq_guard = LocalIrqGuard::save_and_disable();
+        if try_scheduler_mut().is_none() {
+            return Err(JoinError::SchedulerNotInitialized);
+        }
+    }
+
+    crate::task_call::thread_join(id);
+    take_current_join_result_irqsave()
+}
+
+pub fn current_thread_id() -> Option<ThreadId> {
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    try_scheduler_mut().and_then(|scheduler| scheduler.running_thread_id())
+}
+
+pub(crate) fn on_thread_exit_sync(active_frame_words: *mut u64, code: usize) {
+    scheduler_mut().exit_current(active_frame_words, code);
+}
+
+pub(crate) fn on_thread_join_sync(active_frame_words: *mut u64, target: ThreadId) {
+    scheduler_mut().join_thread(active_frame_words, target);
+}
+
+impl Scheduler {
+    fn spawn_thread(
+        &mut self,
+        entry: ThreadEntry,
+        arg: ThreadArg,
+        attrs: ThreadAttrs,
+    ) -> core::result::Result<ThreadId, SpawnError> {
+        let Some(id) = self.find_free_slot() else {
+            return Err(SpawnError::NoThreadSlots);
+        };
+
+        let thread_id = {
+            let task = self.task_mut(id);
+            task.generation = next_generation(task.generation);
+            task.state = preempt::TaskState::Ready;
+            task.joinable = attrs.joinable;
+            task.exit_code = None;
+            task.joiner = None;
+            task.ipc.reset();
+            task.last_join_result = None;
+            task.entry = free_task_entry;
+            task.arg = ThreadArg::empty();
+            ThreadId::new(id.index(), task.generation)
+        };
+
+        self.initialize_spawned_thread_frame(id, entry, arg);
+        if id != IDLE_TASK_ID {
+            let was_empty = self.ready_queue.is_empty();
+            self.ready_push_back(id);
+            if was_empty {
+                self.note_runnable_peer_available();
+            }
+        }
+
+        crate::debug!(
+            "thread: spawned id={thread_id} joinable={} arg={}",
+            attrs.joinable,
+            arg.as_usize()
+        );
+        Ok(thread_id)
+    }
+
+    fn initialize_spawned_thread_frame(&mut self, id: TaskId, entry: ThreadEntry, arg: ThreadArg) {
+        let stack_top = self.task(id).stack_top();
+        let frame_words = self.frame_words_mut_ptr(id);
+        // SAFETY: scheduler owns stable frame and stack storage for this slot.
+        unsafe {
+            arch_init_thread_frame(
+                frame_words,
+                stack_top,
+                entry as *const () as usize,
+                arg.as_usize(),
+                thread_entry_bootstrap as *const () as usize,
+            );
+        }
+    }
+
+    fn find_free_slot(&self) -> Option<TaskId> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(index, task)| task.is_free().then_some(TaskId::new(index)))
+    }
+
+    fn exit_current(&mut self, active_frame_words: *mut u64, code: usize) {
+        if active_frame_words.is_null() {
+            panic!("thread: exit without active frame");
+        }
+
+        let current = self
+            .running_task()
+            .unwrap_or_else(|| panic!("thread: exit without running thread"));
+        if current == IDLE_TASK_ID {
+            panic!("thread: idle thread cannot exit");
+        }
+
+        let exited = self.thread_id(current);
+        self.finish_current_exit(current, exited, code);
+
+        let next = self.dequeue_next_ready().unwrap_or(IDLE_TASK_ID);
+        copy_words(active_frame_words, self.frame_words_ptr(next));
+        self.make_running(next);
+        self.finish_block_current(current, next);
+        crate::debug!("thread: exited id={exited} code={code}");
+    }
+
+    fn join_thread(&mut self, active_frame_words: *mut u64, target: ThreadId) {
+        if active_frame_words.is_null() {
+            panic!("thread: join without active frame");
+        }
+
+        let current = self
+            .running_task()
+            .unwrap_or_else(|| panic!("thread: join without running thread"));
+        let current_thread = self.thread_id(current);
+        self.task_mut(current).last_join_result = None;
+
+        if current == IDLE_TASK_ID {
+            self.finish_join_immediate(current, Err(JoinError::NotJoinable));
+            return;
+        }
+
+        let Some(target_task) = self.task_id_from_thread_id(target) else {
+            self.finish_join_immediate(current, Err(JoinError::InvalidThread));
+            crate::debug!("thread: invalid/stale join target {target}");
+            return;
+        };
+
+        if target_task == IDLE_TASK_ID {
+            self.finish_join_immediate(current, Err(JoinError::NotJoinable));
+            return;
+        }
+
+        if target_task == current {
+            self.finish_join_immediate(current, Err(JoinError::SelfJoin));
+            return;
+        }
+
+        if !self.task(target_task).joinable {
+            self.finish_join_immediate(current, Err(JoinError::NotJoinable));
+            return;
+        }
+
+        if self.task(target_task).joiner.is_some() {
+            self.finish_join_immediate(current, Err(JoinError::JoinInProgress));
+            return;
+        }
+
+        if self.task(target_task).state == preempt::TaskState::Zombie {
+            let code = self
+                .task(target_task)
+                .exit_code
+                .unwrap_or_else(|| panic!("thread: zombie without exit code"));
+            self.reclaim_thread(target_task);
+            self.finish_join_immediate(current, Ok(code));
+            crate::debug!("thread: join completed target={target} code={code}");
+            return;
+        }
+
+        self.task_mut(target_task).joiner = Some(current_thread);
+        let next = self.block_current_with_reason(
+            active_frame_words,
+            current,
+            preempt::BlockReason::Join(target),
+        );
+        self.finish_block_current(current, next);
+        crate::debug!("thread: join blocking current={current_thread} target={target}");
+    }
+
+    fn running_thread_id(&self) -> Option<ThreadId> {
+        self.current.map(|id| self.thread_id(id))
+    }
+
+    fn thread_id(&self, id: TaskId) -> ThreadId {
+        ThreadId::new(id.index(), self.task(id).generation)
+    }
+
+    fn task_id_from_thread_id(&self, id: ThreadId) -> Option<TaskId> {
+        let task_id = TaskId::new(id.index());
+        if !self.is_valid_task(task_id) {
+            return None;
+        }
+
+        let task = self.task(task_id);
+        (task.generation == id.generation() && !task.is_free()).then_some(task_id)
+    }
+
+    fn finish_current_exit(&mut self, current: TaskId, exited: ThreadId, code: usize) {
+        let joinable = self.task(current).joinable;
+        let joiner = self.task(current).joiner;
+
+        self.task_mut(current).exit_code = Some(code);
+
+        if let Some(joiner) = joiner {
+            self.task_mut(current).state = preempt::TaskState::Zombie;
+            self.complete_joiner(exited, joiner, code);
+            self.reclaim_thread(current);
+            return;
+        }
+
+        if joinable {
+            self.task_mut(current).state = preempt::TaskState::Zombie;
+        } else {
+            self.reclaim_thread(current);
+        }
+    }
+
+    fn complete_joiner(&mut self, target: ThreadId, joiner: ThreadId, code: usize) {
+        let Some(joiner_task) = self.task_id_from_thread_id(joiner) else {
+            panic!("thread: joiner {joiner} disappeared while target {target} exited");
+        };
+
+        match self.task(joiner_task).state {
+            preempt::TaskState::Blocked(preempt::BlockReason::Join(waiting_for))
+                if waiting_for == target => {}
+            state => panic!("thread: joiner {joiner} has invalid state {state:?}"),
+        }
+
+        self.task_mut(joiner_task).last_join_result = Some(Ok(code));
+        self.make_ready(joiner_task);
+        if joiner_task != IDLE_TASK_ID {
+            self.ready_push_back(joiner_task);
+        }
+        crate::debug!("thread: join wake target={target} joiner={joiner} code={code}");
+    }
+
+    fn finish_join_immediate(
+        &mut self,
+        current: TaskId,
+        result: core::result::Result<usize, JoinError>,
+    ) {
+        self.task_mut(current).last_join_result = Some(result);
+    }
+
+    fn reclaim_thread(&mut self, id: TaskId) {
+        if id == IDLE_TASK_ID {
+            panic!("thread: idle thread cannot be reclaimed");
+        }
+
+        debug_assert!(
+            !self.ready_queue.iter().any(|queued| *queued == id),
+            "thread: reclaim target still queued ready"
+        );
+
+        let generation = self.task(id).generation;
+        let task = self.task_mut(id);
+        task.state = preempt::TaskState::Free;
+        task.joinable = false;
+        task.exit_code = None;
+        task.joiner = None;
+        task.ipc.reset();
+        task.last_join_result = None;
+        task.entry = free_task_entry;
+        task.arg = ThreadArg::empty();
+        crate::debug!(
+            "thread: reclaimed slot={} generation={generation}",
+            id.index()
+        );
+    }
+
+    fn take_current_join_result(&mut self) -> Option<core::result::Result<usize, JoinError>> {
+        let current = self
+            .running_task()
+            .unwrap_or_else(|| panic!("thread: join result without running thread"));
+        self.task_mut(current).last_join_result.take()
+    }
+}
+
+fn take_current_join_result_irqsave() -> core::result::Result<usize, JoinError> {
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    scheduler_mut()
+        .take_current_join_result()
+        .unwrap_or(Err(JoinError::InvalidThread))
+}
+
+pub(super) extern "C" fn thread_entry_bootstrap(entry_addr: usize, arg: usize) -> ! {
+    // SAFETY: frame setup passes a `ThreadEntry` function pointer in x0 and a
+    // raw `ThreadArg` payload in x1.
+    let entry_fn: ThreadEntry = unsafe { mem::transmute(entry_addr) };
+    let code = entry_fn(ThreadArg::from_usize(arg));
+    thread_exit(code)
+}
+
+pub(super) fn free_task_entry(_arg: ThreadArg) -> usize {
+    panic!("thread: free thread slot entered");
+}
+
+fn next_generation(generation: u32) -> u32 {
+    let next = generation.wrapping_add(1);
+    if next == 0 { 1 } else { next }
+}

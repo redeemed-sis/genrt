@@ -21,6 +21,7 @@ use bootinfo::BootInfo;
 
 pub const TEST_PRIORITY: u8 = 10;
 pub const TEST_RR_QUANTUM_MS: u64 = 10;
+pub const TEST_THREAD_CAPACITY: usize = 8;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
@@ -41,7 +42,15 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
     log_bootstrap_stack_usage("after memory init");
     demo::init();
 
-    if sched::bootstrap(idle_task, &demo::TASKS, TEST_RR_QUANTUM_MS).is_err() {
+    if sched::bootstrap(
+        idle_task,
+        sched::ThreadArg::empty(),
+        &demo::TASKS,
+        TEST_RR_QUANTUM_MS,
+        TEST_THREAD_CAPACITY,
+    )
+    .is_err()
+    {
         panic!("sched: failed to bootstrap scheduler");
     }
 
@@ -52,7 +61,7 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
     sched::enter_running_task()
 }
 
-fn idle_task() -> ! {
+fn idle_task(_arg: sched::ThreadArg) -> usize {
     let mut last_log_ms = 0u64;
     loop {
         let now_ms = time::uptime_ms();
