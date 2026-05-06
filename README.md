@@ -193,6 +193,32 @@ scheduler stores an opaque IPC wait token and timeout event; normal IPC wakeup
 cancels the event, while timeout dispatch asks IPC to remove the task from the
 owning wait queue before waking it with a timeout result.
 
+## Kernel threads
+
+Kernel tasks now have a bounded thread lifecycle API:
+
+* `kernel::sched::thread_spawn(entry, ThreadArg, attrs)`
+* `kernel::sched::thread_exit(code)`
+* `kernel::sched::thread_join(id)`
+
+Thread handles are `ThreadId { index, generation }` values. The index names a
+preallocated scheduler slot; the generation changes before a freed slot is
+reused, so stale handles fail validation instead of naming a later thread.
+
+Thread slots, stacks, saved frames, and ready queue capacity are prepared during
+scheduler bootstrap. Runtime spawn does not grow scheduler containers; it
+initializes a free slot, prepares its trap frame, and queues it. Returning from a
+spawned thread entry goes through the same controlled SVC path as explicit
+`thread_exit`, which records the exit code, wakes a single joiner if present,
+and never resumes the exited thread. Successful join reclaims the slot for reuse.
+Bootstrap/static tasks use the same `fn(ThreadArg) -> usize` entry shape as
+runtime-spawned threads; `ThreadArg` can carry a small integer or an explicit
+raw pointer when a caller needs richer Rust-owned context.
+
+The current stack class is fixed at 8 KiB per thread slot. Detached threads are
+supported by `ThreadAttrs::detached()` and are reclaimed on exit; the demo uses
+joinable workers to exercise `spawn -> exit -> join`.
+
 ## Build and run
 
 ```bash
@@ -223,7 +249,7 @@ The best next steps are:
 
 1. page-table allocation groundwork
 2. growable heap design on top of frame allocation
-3. mailbox registry / dynamic mailbox creation
+3. userspace/process lifecycle groundwork after MMU
 
 ## Documentation
 
@@ -242,3 +268,4 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0011-dynamic-preallocated-scheduler-and-time-structures.md`
 * `ai-docs/decision-records/ADR-0012-bounded-mailbox-ipc.md`
 * `ai-docs/decision-records/ADR-0013-mailbox-timeout-semantics.md`
+* `ai-docs/decision-records/ADR-0014-bounded-kernel-thread-lifecycle.md`
