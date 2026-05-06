@@ -6,16 +6,17 @@ use core::{
 
 use crate::{
     ipc::{Mailbox, RecvTimeoutError},
-    sched,
+    sched::{self, ThreadArg, ThreadAttrs},
 };
 
 const DEMO_MAILBOX_CAPACITY: usize = 1;
 type DemoMessage = usize;
 
-pub(crate) const TASKS: [sched::StaticTask; 3] = [
-    sched::StaticTask::new(crate::TEST_PRIORITY, consumer_task),
-    sched::StaticTask::new(crate::TEST_PRIORITY, producer_task),
-    sched::StaticTask::new(crate::TEST_PRIORITY, sleeper_task),
+pub(crate) const TASKS: [sched::StaticTask; 4] = [
+    sched::StaticTask::new(crate::TEST_PRIORITY, consumer_task, ThreadArg::empty()),
+    sched::StaticTask::new(crate::TEST_PRIORITY, producer_task, ThreadArg::empty()),
+    sched::StaticTask::new(crate::TEST_PRIORITY, sleeper_task, ThreadArg::empty()),
+    sched::StaticTask::new(crate::TEST_PRIORITY, thread_parent_task, ThreadArg::empty()),
 ];
 
 struct DemoMailboxCell {
@@ -51,7 +52,7 @@ pub(crate) fn init() {
     );
 }
 
-fn consumer_task() -> ! {
+fn consumer_task(_arg: ThreadArg) -> usize {
     loop {
         crate::debug!("consumer: recv_timeout success scenario wait=3000ms");
         match demo_mailbox().recv_timeout_ms(3_000) {
@@ -73,7 +74,7 @@ fn consumer_task() -> ! {
     }
 }
 
-fn producer_task() -> ! {
+fn producer_task(_arg: ThreadArg) -> usize {
     let mut msg: DemoMessage = 1;
     loop {
         sched::msleep(500);
@@ -84,7 +85,7 @@ fn producer_task() -> ! {
     }
 }
 
-fn sleeper_task() -> ! {
+fn sleeper_task(_arg: ThreadArg) -> usize {
     let mut cycle = 0u64;
     let sleep_ms = 6_000;
     loop {
@@ -94,6 +95,38 @@ fn sleeper_task() -> ! {
         sched::msleep(sleep_ms);
         crate::debug!("sleeper: woke, cycle {cycle}");
     }
+}
+
+fn thread_parent_task(_arg: ThreadArg) -> usize {
+    let mut arg = 41usize;
+    loop {
+        match sched::thread_spawn(
+            worker_thread,
+            ThreadArg::from_usize(arg),
+            ThreadAttrs::joinable(),
+        ) {
+            Ok(id) => {
+                crate::info!("thread: spawned worker id={id} arg={arg}");
+                match sched::thread_join(id) {
+                    Ok(code) => crate::info!("parent: join returned code={code}"),
+                    Err(err) => crate::warn!("parent: join failed: {err:?}"),
+                }
+            }
+            Err(err) => crate::warn!("thread: spawn failed: {err:?}"),
+        }
+
+        arg = arg.wrapping_add(1);
+        sched::msleep(5_000);
+    }
+}
+
+fn worker_thread(arg: ThreadArg) -> usize {
+    let arg = arg.as_usize();
+    crate::info!("worker: start arg={arg}");
+    sched::msleep(250);
+    let code = arg.wrapping_add(1);
+    crate::info!("worker: exit code={code}");
+    code
 }
 
 fn demo_mailbox() -> &'static Mailbox<DemoMessage> {
