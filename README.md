@@ -8,25 +8,35 @@ Current active target:
 * **Rust target `aarch64-unknown-none-softfloat`**
 * **QEMU `virt`**
 * **single-core EL1 kernel threads**
+* **high-half kernel with AArch64 stage-1 MMU enabled**
 * **QEMU-first bring-up and debugging**
 
 ## Current status
 
 The current AArch64 path already has:
 
-* boot entry in `boot.S`
-* `VBAR_EL1` exception-vector setup
-* early PL011 UART output
+* low-linked `.boot.*` trampoline that runs before MMU enable
+* high-linked kernel sections loaded at low physical addresses
+* AArch64 stage-1 MMU bring-up with temporary TTBR0 identity mappings
+* TTBR1 high direct map using `KERNEL_HVA_OFFSET = 0xffff_0000_0000_0000`
+* post-memory-init switch from boot-owned page tables to allocator-owned runtime TTBR1 tables
+* low identity mapping removal after the high kernel is established
+* `VBAR_EL1` exception-vector setup at high VA
+* PL011 UART output through high virtual MMIO aliases
 * `BootInfo` handoff into Rust
 * DTB-seeded physical memory discovery
-* generated-and-embedded QEMU `virt` DTB fallback for ELF boot
+* QEMU `virt,gic-version=2` DTB loaded by `xtask` at `0x4000_0000`
+* low `.boot.text` DTB parser for RAM, PL011, and GICv2 initial mappings
+* QEMU `virt` emergency platform fallback for early diagnostic reachability
 * internal physical memory map with reserved-range carving
 * page-aligned usable frame ranges
 * minimal free-list physical frame allocator
+* architecture-agnostic generic frame allocator that continues to return physical frames
 * fixed-size bootstrap kernel heap on `linked_list_allocator`
+* heap initialized through a high virtual pointer over a physical frame range
 * single-core IRQ-safe heap lock for task-context allocation/free
 * working `alloc` container smoke tests (`Vec`, `VecDeque`, `BinaryHeap`, `BTreeMap`)
-* GICv2 initialization
+* GICv2 initialization through high virtual MMIO aliases
 * architected timer in one-shot nearest-deadline mode
 * monotonic hardware counter timebase
 * full trap-frame save/restore on IRQ
@@ -40,12 +50,15 @@ The current AArch64 path already has:
 * round-robin quantum configured as a duration at scheduler bootstrap
 * bounded mailbox IPC for kernel tasks with heap-preallocated buffers and wait queues
 * demo producer/consumer tasks exchanging messages through a capacity-bounded mailbox
+* timeout-aware mailbox send/receive operations
+* bounded `thread_spawn` / `thread_exit` / `thread_join`
 * minimal allocation-free formatted logging with log levels
 * improved fatal exception diagnostics
+* `xtask` post-link `.boot.text` autonomy check using `readelf` and `llvm-objdump`
 
 In one sentence:
 
-> genrt is currently an early **single-core preemptive EL1 kernel prototype** on AArch64/QEMU.
+> genrt is currently an early **single-core high-half preemptive EL1 kernel prototype** on AArch64/QEMU.
 
 The AArch64 build currently uses the Rust target `aarch64-unknown-none-softfloat`.
 This is intentional for the current kernel stage: the scheduler/trap path does not
@@ -54,26 +67,40 @@ in ordinary Rust code.
 
 ## What is not implemented yet
 
-* MMU / virtual memory
 * EL0 / user mode
 * SMP scheduling
-* mailbox timeout operations
 * mailbox registry / dynamic mailbox creation
 * driver model
 * low-overhead buffered tracing
+* demand paging / page faults / per-process address spaces
+* ASIDs and TTBR0 userspace address spaces
 
 ## Execution model
 
 High-level flow:
 
 ```text
-_start (boot.S)
-  -> early arch init
-  -> GICv2 init
-  -> one-shot timer init
-  -> BootInfo + DTB memory discovery
+_start (.boot.text, low physical/identity)
+  -> park secondary CPUs
+  -> set low boot stack
+  -> boot_build_page_tables()
+       -> parse QEMU-loaded DTB from platform boot slot
+       -> build TTBR0 identity mappings
+       -> build TTBR1 high direct-map/MMIO mappings
+  -> program MAIR_EL1 / TCR_EL1 / TTBR0_EL1 / TTBR1_EL1
+  -> enable SCTLR_EL1.M/C/I
+  -> switch SP to high boot-stack alias
+  -> branch to high rust_entry
+
+rust_entry (high VA)
+  -> zero high .bss
+  -> set high VBAR_EL1
+  -> initialize UART/GIC high MMIO aliases
+  -> BootInfo + DTB memory discovery through HVA
   -> kernel_main()
   -> physical memory init
+  -> switch to allocator-owned runtime kernel page tables
+  -> clear TTBR0 temporary identity mappings
   -> start first task from prepared trap frame
 
 Timer IRQ
@@ -99,19 +126,21 @@ Key milestone already reached:
 
 * single-core only
 * EL1 kernel threads only
-* no MMU
+* no EL0/user address spaces yet
+* no ASIDs or per-process TTBR0 yet
+* VM API currently supports only 2 MiB-aligned TTBR1 kernel mappings
 * heap is currently a fixed-size `16 MiB` bootstrap region
 * direct-to-UART logging
 * scheduler/time dynamic containers are preallocated at bootstrap and must not grow in IRQ paths
 * heap does not grow from arbitrary frames yet
-* scheduler/task management still in early-kernel form
-* platform-specific MMIO mapping still partly lives in the AArch64 layer
+* no SMP TLB shootdown
+* platform-specific boot protocol and MMIO discovery live in the AArch64 platform layer
 
 ## Repository layout
 
 ```text
 genrt/
-├── arch/aarch64/      # AArch64-specific boot, traps, timer, GIC, low-level context handling
+├── arch/aarch64/      # AArch64 boot, MMU, traps, timer, GIC, platform discovery
 ├── kernel/            # architecture-neutral kernel logic
 ├── crates/bootinfo/   # early boot handoff structures
 ├── tools/xtask/       # build/run/debug workflow
@@ -136,6 +165,49 @@ Available levels:
 
 The logger is allocation-free and intended for kernel bring-up. It is useful for diagnostics, but high-volume UART logging still perturbs timing.
 
+## AArch64 MMU And Boot Protocol
+
+The current AArch64 strategy is:
+
+```text
+low-linked trampoline + high-linked kernel loaded low
+```
+
+`.boot.*` sections have low VMA/LMA and execute before the MMU is enabled. The
+main kernel sections are linked at high virtual addresses but loaded at low
+physical addresses via linker `AT(...)`; no segment copy is performed.
+
+Address convention:
+
+```text
+KERNEL_HVA_OFFSET = 0xffff_0000_0000_0000
+HVA = PA + KERNEL_HVA_OFFSET
+PA  = HVA - KERNEL_HVA_OFFSET
+```
+
+The bootstrap page tables are intentionally small:
+
+* TTBR0 temporarily maps the low identity window needed by the trampoline and DTB access.
+* TTBR1 maps the high direct-map RAM window and high Device mappings for UART/GIC.
+* After `kernel::memory::init()`, the kernel switches to allocator-owned TTBR1 tables and clears TTBR0.
+
+`xtask` controls the QEMU bare-metal protocol. It generates a compact QEMU
+`virt,gic-version=2` DTB and loads it at `0x4000_0000` with a loader device. The
+kernel image stays at `0x4008_0000`. The low `.boot.text` parser reads that DTB
+before UART/GIC are initialized and extracts only the ranges needed for initial
+MMU mappings. If that early parse fails, the AArch64 QEMU platform layer has an
+emergency fallback for RAM/UART/GIC so early diagnostics can still reach UART.
+
+The generic frame allocator remains MMU-agnostic: it manages physical frames and
+returns `PhysAddr`. PA-to-HVA conversion happens only at explicit dereference
+boundaries such as DTB reads, free-list metadata inside frames, heap init,
+page-table writes, and MMIO access.
+
+The build command runs a post-link `.boot.text` autonomy check. It verifies that
+the pre-MMU boot code has no relocations, no runtime helper thunks such as
+`memcpy`/`memset`/panic/formatting, no high-VA instruction operands, and no
+direct branch/call out of `.boot.*`.
+
 ## Heap
 
 The kernel heap is currently initialized from one contiguous `16 MiB` region
@@ -146,8 +218,9 @@ Initialization order is:
 1. parse and normalize physical memory regions
 2. initialize the frame allocator on usable page ranges
 3. allocate one contiguous heap range via `alloc_contiguous`
-4. initialize `linked_list_allocator`
-5. run heap-backed smoke tests
+4. convert the physical heap range to HVA at the heap boundary
+5. initialize `linked_list_allocator`
+6. run heap-backed smoke tests
 
 This keeps heap ownership unambiguous: once the bootstrap heap region is
 allocated, it is no longer part of the frame allocator free list.
@@ -164,6 +237,26 @@ The scheduler and time subsystem now follow that rule explicitly:
 * the task table, saved frames, task stacks, ready queue, and deadline queue are heap-backed
 * all of those containers are allocated and reserved during bootstrap
 * timer IRQ and scheduler handoff only perform bounded operations on already allocated storage
+
+## Virtual Memory API
+
+The first VM API is deliberately narrow and kernel-only. It supports TTBR1
+kernel mappings after runtime page tables are active:
+
+* `phys_to_virt`
+* `virt_to_phys_direct`
+* `translate_kernel_va`
+* `map_kernel_region`
+* `unmap_kernel_region`
+* `protect_kernel_region`
+* `drop_boot_identity_mapping`
+* `switch_to_runtime_kernel_tables`
+
+Mutation APIs return `VmError::NotInitialized` until
+`switch_to_runtime_kernel_tables()` has replaced boot-owned tables from
+`.boot.bss` with frame-allocator-owned page tables. This prevents mappings from
+being added to tables that will be discarded and prevents reclaiming boot table
+storage through the generic frame allocator.
 
 ## IPC
 
@@ -247,9 +340,10 @@ cargo xtask run-aarch64 --log-level trace
 
 The best next steps are:
 
-1. page-table allocation groundwork
+1. refine VM permissions and page-table ownership invariants
 2. growable heap design on top of frame allocation
-3. userspace/process lifecycle groundwork after MMU
+3. minimal page-fault diagnostics
+4. userspace/process lifecycle groundwork on top of the MMU
 
 ## Documentation
 
@@ -269,3 +363,4 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0012-bounded-mailbox-ipc.md`
 * `ai-docs/decision-records/ADR-0013-mailbox-timeout-semantics.md`
 * `ai-docs/decision-records/ADR-0014-bounded-kernel-thread-lifecycle.md`
+* `ai-docs/decision-records/ADR-0015-aarch64-high-half-mmu-bring-up.md`
