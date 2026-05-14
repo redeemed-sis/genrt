@@ -1,13 +1,16 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
 const AARCH64_TARGET: &str = "aarch64-unknown-none-softfloat";
+const AARCH64_QEMU_MACHINE: &str = "virt,gic-version=2";
+const AARCH64_QEMU_CPU: &str = "cortex-a72";
+const AARCH64_DTB_LOAD_ADDR: &str = "0x40000000";
 
 #[derive(Parser)]
 #[command(name = "xtask")]
@@ -190,11 +193,14 @@ fn qemu_cmd(arch: Arch) -> Result<()> {
     match arch {
         Arch::Aarch64 => {
             println!("qemu-system-aarch64 \\");
-            println!("  -machine virt \\");
-            println!("  -cpu cortex-a72 \\");
+            println!("  -machine {AARCH64_QEMU_MACHINE} \\");
+            println!("  -cpu {AARCH64_QEMU_CPU} \\");
             println!("  -nographic \\");
             println!("  -serial mon:stdio \\");
             println!("  -kernel target/{AARCH64_TARGET}/debug/genrt-aarch64.elf \\");
+            println!(
+                "  -device loader,file=target/{AARCH64_TARGET}/debug/qemu-virt.dtb,addr={AARCH64_DTB_LOAD_ADDR} \\"
+            );
             println!("  -S -s");
         }
         Arch::X8664 => {
@@ -271,6 +277,7 @@ fn build_aarch64(log_level: Option<LogLevel>) -> Result<()> {
         bail!("ld.lld failed to produce final AArch64 ELF")
     }
 
+    verify_aarch64_boot_text_autonomy(&final_elf)?;
     println!("built {}", final_elf.display());
     Ok(())
 }
@@ -282,17 +289,20 @@ fn run_aarch64(wait_for_gdb: bool, log_level: Option<LogLevel>) -> Result<()> {
     let mut cmd = Command::new("qemu-system-aarch64");
     cmd.args([
         "-machine",
-        "virt",
+        AARCH64_QEMU_MACHINE,
         "-cpu",
-        "cortex-a72",
+        AARCH64_QEMU_CPU,
         "-nographic",
         "-serial",
         "mon:stdio",
         "-kernel",
     ])
     .arg(final_elf_path())
-    .arg("-dtb")
-    .arg(dtb_path)
+    .arg("-device")
+    .arg(format!(
+        "loader,file={},addr={AARCH64_DTB_LOAD_ADDR}",
+        dtb_path.display()
+    ))
     .stdout(Stdio::inherit())
     .stderr(Stdio::inherit());
 
@@ -328,17 +338,19 @@ fn generate_qemu_virt_dtb() -> Result<PathBuf> {
 
     let status = Command::new("qemu-system-aarch64")
         .arg("-machine")
-        .arg(format!("virt,dumpdtb={}", dtb_path.display()))
+        .arg(format!(
+            "{AARCH64_QEMU_MACHINE},dumpdtb={}",
+            dtb_path.display()
+        ))
         .args([
             "-cpu",
-            "cortex-a72",
+            AARCH64_QEMU_CPU,
             "-display",
             "none",
             "-serial",
-            "none",
+            "null",
             "-monitor",
             "none",
-            "-nodefaults",
         ])
         .status()
         .context("failed to invoke qemu-system-aarch64 for DTB generation")?;
@@ -347,7 +359,52 @@ fn generate_qemu_virt_dtb() -> Result<PathBuf> {
         bail!("qemu-system-aarch64 failed to generate virt DTB")
     }
 
+    compact_dtb(&dtb_path)?;
+    trim_dtb_to_fdt_totalsize(&dtb_path)?;
     Ok(dtb_path)
+}
+
+fn compact_dtb(path: &Path) -> Result<()> {
+    let compact_path = path.with_extension("compact.dtb");
+    let status = Command::new("dtc")
+        .args(["-I", "dtb", "-O", "dtb", "-o"])
+        .arg(&compact_path)
+        .arg(path)
+        .status()
+        .context("failed to invoke dtc to compact generated DTB")?;
+    if !status.success() {
+        bail!("dtc failed to compact generated DTB")
+    }
+
+    fs::rename(&compact_path, path).with_context(|| {
+        format!(
+            "failed to replace {} with compacted DTB {}",
+            path.display(),
+            compact_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn trim_dtb_to_fdt_totalsize(path: &Path) -> Result<()> {
+    let header = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if header.len() < 8 {
+        bail!("generated DTB is too small: {}", path.display());
+    }
+
+    let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    if magic != 0xd00d_feed {
+        bail!("generated DTB has invalid FDT magic: {}", path.display());
+    }
+
+    let total_size = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as u64;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to open {} for trimming", path.display()))?
+        .set_len(total_size)
+        .with_context(|| format!("failed to trim {}", path.display()))?;
+    Ok(())
 }
 
 fn locate_staticlib() -> Result<PathBuf> {
@@ -378,6 +435,228 @@ fn locate_staticlib() -> Result<PathBuf> {
     }
 
     bail!("unable to locate libgenrt_arch_aarch64.a after cargo build")
+}
+
+fn verify_aarch64_boot_text_autonomy(elf: &Path) -> Result<()> {
+    let sections = read_elf_sections(elf)?;
+    let allowed_ranges = [".boot.text", ".boot.rodata", ".boot.bss", ".boot_stack"]
+        .into_iter()
+        .filter_map(|name| sections.iter().find(|section| section.name == name))
+        .map(|section| (section.addr, section.end()))
+        .collect::<Vec<_>>();
+
+    if allowed_ranges.is_empty() {
+        bail!("AArch64 boot autonomy check failed: no .boot.* sections found")
+    }
+
+    ensure_no_boot_text_relocations(elf)?;
+    let disassembly = command_stdout(
+        Command::new("llvm-objdump")
+            .args(["-dr", "--section=.boot.text"])
+            .arg(elf),
+        "failed to disassemble .boot.text with llvm-objdump",
+    )?;
+
+    let mut violations = Vec::new();
+    let forbidden = [
+        "__AArch64AbsLongThunk",
+        "memcpy",
+        "memset",
+        "memmove",
+        "compiler_builtins",
+        "panic",
+        "panicking",
+        "core::fmt",
+        "fmt::",
+        "log::",
+    ];
+
+    for line in disassembly.lines() {
+        if !is_objdump_code_or_symbol_line(line) {
+            continue;
+        }
+
+        if forbidden.iter().any(|needle| line.contains(needle)) {
+            violations.push(format!(
+                "forbidden runtime/helper symbol in .boot.text: {line}"
+            ));
+        }
+
+        if objdump_instruction(line).is_some_and(|instruction| instruction.contains("0xffff0000")) {
+            violations.push(format!(
+                ".boot.text instruction references high VA before MMU is enabled: {line}"
+            ));
+        }
+
+        let Some(target) = direct_branch_target(line) else {
+            continue;
+        };
+        if !addr_in_ranges(target, &allowed_ranges) {
+            violations.push(format!(
+                ".boot.text direct branch/call leaves boot sections: target=0x{target:x}; {line}"
+            ));
+        }
+    }
+
+    if !violations.is_empty() {
+        for violation in &violations {
+            eprintln!("[boot-text] {violation}");
+        }
+        bail!(
+            "AArch64 boot autonomy check failed: .boot.text references code/data outside .boot.*"
+        );
+    }
+
+    println!(
+        "verified .boot.text autonomy: no relocations, no runtime thunks, no high-VA instruction operands, direct branches stay in .boot.*"
+    );
+    Ok(())
+}
+
+fn ensure_no_boot_text_relocations(elf: &Path) -> Result<()> {
+    let relocations = command_stdout(
+        Command::new("readelf").args(["-rW"]).arg(elf),
+        "failed to inspect ELF relocations with readelf",
+    )?;
+    let mut in_boot_rela = false;
+    let mut violations = Vec::new();
+
+    for line in relocations.lines() {
+        if line.starts_with("Relocation section ") {
+            in_boot_rela = line.contains(".rela.boot.text") || line.contains(".rel.boot.text");
+            continue;
+        }
+        if in_boot_rela && !line.trim().is_empty() && !line.contains("Offset") {
+            violations.push(line.to_string());
+        }
+    }
+
+    if !violations.is_empty() {
+        for violation in &violations {
+            eprintln!("[boot-text] relocation remains in .boot.text: {violation}");
+        }
+        bail!("AArch64 boot autonomy check failed: .boot.text has relocations");
+    }
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ElfSection {
+    name: String,
+    addr: u64,
+    size: u64,
+}
+
+impl ElfSection {
+    fn end(&self) -> u64 {
+        self.addr.saturating_add(self.size)
+    }
+}
+
+fn read_elf_sections(elf: &Path) -> Result<Vec<ElfSection>> {
+    let output = command_stdout(
+        Command::new("readelf").args(["-SW"]).arg(elf),
+        "failed to inspect ELF sections with readelf",
+    )?;
+    let mut sections = Vec::new();
+
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('[') {
+            continue;
+        }
+
+        let fields = trimmed.split_whitespace().collect::<Vec<_>>();
+        if fields.first() == Some(&"[Nr]") {
+            continue;
+        }
+        let base = if fields.first() == Some(&"[") { 1 } else { 0 };
+        if fields.len() < base + 6 {
+            continue;
+        }
+
+        let name = fields[base + 1].to_string();
+        let addr = u64::from_str_radix(fields[base + 3], 16)
+            .with_context(|| format!("failed to parse section address from line: {line}"))?;
+        let size = u64::from_str_radix(fields[base + 5], 16)
+            .with_context(|| format!("failed to parse section size from line: {line}"))?;
+        sections.push(ElfSection { name, addr, size });
+    }
+
+    Ok(sections)
+}
+
+fn is_objdump_code_or_symbol_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.ends_with(">:") {
+        return trimmed
+            .split_once(' ')
+            .is_some_and(|(addr, _)| u64::from_str_radix(addr, 16).is_ok());
+    }
+
+    trimmed
+        .split_once(':')
+        .is_some_and(|(addr, _)| u64::from_str_radix(addr.trim(), 16).is_ok())
+}
+
+fn direct_branch_target(line: &str) -> Option<u64> {
+    let instruction = objdump_instruction(line)?;
+    let mnemonic = instruction.split_whitespace().next()?;
+    let is_direct_branch = mnemonic == "b"
+        || mnemonic == "bl"
+        || mnemonic.starts_with("b.")
+        || mnemonic == "cbz"
+        || mnemonic == "cbnz"
+        || mnemonic == "tbz"
+        || mnemonic == "tbnz";
+    if !is_direct_branch {
+        return None;
+    }
+
+    for token in instruction.split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '<') {
+        let Some(hex) = token.strip_prefix("0x") else {
+            continue;
+        };
+        let hex = hex.trim_end_matches(|ch: char| !ch.is_ascii_hexdigit());
+        if let Ok(value) = u64::from_str_radix(hex, 16) {
+            return Some(value);
+        }
+    }
+
+    None
+}
+
+fn objdump_instruction(line: &str) -> Option<&str> {
+    let after_addr = line.split_once(':')?.1.trim_start();
+    let (encoding, instruction) = after_addr.split_once(char::is_whitespace)?;
+    if encoding.len() == 8 && encoding.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        Some(instruction.trim_start())
+    } else {
+        None
+    }
+}
+
+fn addr_in_ranges(addr: u64, ranges: &[(u64, u64)]) -> bool {
+    ranges
+        .iter()
+        .any(|(start, end)| addr >= *start && addr < *end)
+}
+
+fn command_stdout(command: &mut Command, context: &str) -> Result<String> {
+    let Output {
+        status,
+        stdout,
+        stderr,
+    } = command.output().with_context(|| context.to_string())?;
+    if !status.success() {
+        bail!("{context}: {}", String::from_utf8_lossy(&stderr));
+    }
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
 fn ensure_exists(path: &str) -> Result<()> {

@@ -30,18 +30,18 @@ pub(crate) struct ParsedDtbInfo {
 }
 
 pub(crate) unsafe fn parse_memory_regions(
-    dtb_pa: usize,
+    dtb_va: usize,
     out: &mut [MemoryRegion; MAX_BOOT_MEMORY_REGIONS],
 ) -> Result<ParsedDtbInfo, DtbError> {
     clear_regions(out);
-    if dtb_pa == 0 {
+    if dtb_va == 0 {
         return Ok(ParsedDtbInfo {
             dtb_size: 0,
             region_count: 0,
         });
     }
 
-    let dtb = unsafe { dtb_slice_from_pa(dtb_pa as *const u8)? };
+    let dtb = unsafe { dtb_slice_from_va(dtb_va)? };
     let fdt = Fdt::from_bytes(dtb).map_err(DtbError::Parse)?;
     let mut count = 0usize;
 
@@ -101,7 +101,8 @@ pub(crate) unsafe fn parse_memory_regions(
     })
 }
 
-unsafe fn dtb_slice_from_pa(base: *const u8) -> Result<&'static [u8], DtbError> {
+unsafe fn dtb_slice_from_va(base_va: usize) -> Result<&'static [u8], DtbError> {
+    let base = base_va as *const u8;
     if base.is_null() {
         return Err(DtbError::BadPointer);
     }

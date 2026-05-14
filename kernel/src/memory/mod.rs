@@ -6,6 +6,7 @@ mod frame_alloc;
 pub mod heap;
 mod map;
 mod types;
+pub mod vm;
 
 use frame_alloc::{FrameAllocator, FreeListStorage};
 use map::{
@@ -24,10 +25,11 @@ const MAX_PHYS_REGIONS: usize = 64;
 const MAX_USABLE_RANGES: usize = 32;
 
 unsafe extern "C" {
-    static __kernel_image_start: u8;
-    static __kernel_image_end: u8;
-    static __boot_stack_bottom: u8;
-    static __boot_stack_top: u8;
+    static __kernel_image_phys_start_value: usize;
+    static __kernel_image_phys_end_value: usize;
+    static __boot_stack_bottom_value: usize;
+    static __boot_stack_top_value: usize;
+    fn arch_phys_to_virt(pa: usize) -> usize;
 }
 
 pub(crate) type Result<T> = core::result::Result<T, MemoryError>;
@@ -52,17 +54,17 @@ impl FreeListStorage<PhysAddr> for PhysFrameStorage {
 
     #[inline(always)]
     unsafe fn read_next_free_frame(frame: PhysAddr) -> PhysAddr {
-        // SAFETY: free-list metadata is stored in the free page itself. In the
-        // current identity-mapped/no-MMU bring-up configuration, physical frame
-        // addresses are directly dereferenceable by the kernel.
-        unsafe { (frame as *const PhysAddr).read() }
+        // SAFETY: free-list metadata is stored in the free physical page. The
+        // concrete physical storage policy is the only allocator layer that
+        // converts that physical frame address into a high kernel pointer.
+        unsafe { phys_to_kernel_ptr::<PhysAddr>(frame).read() }
     }
 
     #[inline(always)]
     unsafe fn write_next_free_frame(frame: PhysAddr, next: PhysAddr) {
-        // SAFETY: same invariant as `read_next_free_frame()`: allocator metadata
-        // lives in free pages that are directly addressable in early bring-up.
-        unsafe { (frame as *mut PhysAddr).write(next) }
+        // SAFETY: same invariant as `read_next_free_frame()`: metadata lives in
+        // the free page and is reached through the high direct-map alias.
+        unsafe { phys_to_kernel_ptr::<PhysAddr>(frame).write(next) }
     }
 }
 
@@ -210,8 +212,9 @@ pub(crate) fn init(boot: &'static BootInfo) -> Result<()> {
     state.heap_range = Some(bootstrap_heap_range);
 
     crate::debug!("memory: initializing linked_list_allocator heap");
+    let bootstrap_heap_va = phys_to_kernel_va(bootstrap_heap_range.start);
     heap::init_heap(
-        bootstrap_heap_range.start,
+        bootstrap_heap_va,
         bootstrap_heap_range.end - bootstrap_heap_range.start,
     )
     .map_err(MemoryError::HeapInit)?;
@@ -221,11 +224,15 @@ pub(crate) fn init(boot: &'static BootInfo) -> Result<()> {
     state.initialized = true;
 
     crate::info!(
-        "memory: initialized usable_ranges={} free_frames={} heap_kib={} heap_range={:?}",
+        "memory: initialized usable_ranges={} free_frames={} heap_kib={} heap_phys_range={:?} heap_virt_range={:?}",
         state.usable_range_count,
         state.allocator.free_frames(),
         KERNEL_HEAP_BOOTSTRAP_SIZE / 1024,
-        bootstrap_heap_range
+        bootstrap_heap_range,
+        VirtRange {
+            start: bootstrap_heap_va,
+            end: bootstrap_heap_va + (bootstrap_heap_range.end - bootstrap_heap_range.start),
+        }
     );
     run_allocator_self_check(state)?;
     Ok(())
@@ -331,20 +338,30 @@ fn is_valid_usable_frame_range(usable_ranges: &[FrameRange], range: FrameRange) 
 
 fn kernel_image_range() -> PhysRange {
     PhysRange {
-        start: core::ptr::addr_of!(__kernel_image_start) as usize,
-        end: core::ptr::addr_of!(__kernel_image_end) as usize,
+        start: unsafe { core::ptr::addr_of!(__kernel_image_phys_start_value).read_volatile() },
+        end: unsafe { core::ptr::addr_of!(__kernel_image_phys_end_value).read_volatile() },
     }
 }
 
 fn boot_stack_range() -> PhysRange {
     PhysRange {
-        start: core::ptr::addr_of!(__boot_stack_bottom) as usize,
-        end: core::ptr::addr_of!(__boot_stack_top) as usize,
+        start: unsafe { core::ptr::addr_of!(__boot_stack_bottom_value).read_volatile() },
+        end: unsafe { core::ptr::addr_of!(__boot_stack_top_value).read_volatile() },
     }
 }
 
 fn dtb_range(boot: &BootInfo) -> Result<Option<PhysRange>> {
     phys_range_from_u64(boot.dtb_pa, boot.dtb_size)
+}
+
+#[inline(always)]
+fn phys_to_kernel_va(pa: PhysAddr) -> VirtAddr {
+    unsafe { arch_phys_to_virt(pa) }
+}
+
+#[inline(always)]
+fn phys_to_kernel_ptr<T>(pa: PhysAddr) -> *mut T {
+    phys_to_kernel_va(pa) as *mut T
 }
 
 #[inline(always)]

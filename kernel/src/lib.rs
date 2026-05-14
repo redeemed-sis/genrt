@@ -40,6 +40,15 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
     }
 
     log_bootstrap_stack_usage("after memory init");
+    if let Err(err) = unsafe { memory::vm::switch_to_runtime_kernel_tables() } {
+        crate::error!(
+            "memory: failed to switch to runtime kernel page tables: {:?}",
+            err
+        );
+        panic!("memory: failed to switch to runtime kernel page tables");
+    }
+    crate::info!("memory: switched to runtime kernel page tables; TTBR0 cleared");
+
     demo::init();
 
     if sched::bootstrap(

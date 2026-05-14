@@ -9,6 +9,8 @@ mod esr;
 mod exception;
 mod gic;
 mod mmio;
+mod mmu;
+mod platform;
 mod timer;
 mod trap_frame;
 
@@ -17,34 +19,39 @@ use trap_frame::TrapFrame;
 global_asm!(include_str!("boot.s"));
 global_asm!(include_str!("exceptions.s"));
 
-#[repr(align(8))]
-struct AlignedBytes<const N: usize>([u8; N]);
-
-// Keep the fallback DTB itself aligned in the kernel image so early boot code
-// does not depend on byte-addressed parsing alone.
-static EMBEDDED_DTB: AlignedBytes<{ include_bytes!(env!("GENRT_AARCH64_EMBEDDED_DTB")).len() }> =
-    AlignedBytes(*include_bytes!(env!("GENRT_AARCH64_EMBEDDED_DTB")));
-
 #[unsafe(no_mangle)]
 pub static mut BOOT_CURRENT_EL: u64 = 0;
 
+unsafe extern "C" {
+    static __bss_start: u8;
+    static __bss_end: u8;
+    static __vectors: u8;
+}
+
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_entry(dtb_pa: usize) -> ! {
+pub extern "C" fn rust_entry(boot_mmu_params_pa: usize) -> ! {
+    unsafe {
+        zero_bss();
+        mmu::init_from_boot_params(boot_mmu_params_pa);
+        install_vectors();
+        BOOT_CURRENT_EL = current_el();
+    }
+    let boot_platform_params = mmu::platform_params_from_boot_params(boot_mmu_params_pa);
+    let (dtb_pa, _) = platform::dtb_from_boot_params(boot_platform_params);
+    let dtb_va = mmu::phys_to_hva(dtb_pa);
+    let platform_info = platform::info_from_boot_params(boot_platform_params);
+    let platform = unsafe {
+        platform::init(platform_info)
+            .unwrap_or_else(|err| panic!("arch: invalid AArch64 platform info: {err:?}"))
+    };
+    console::configure_from_platform(platform);
+    gic::configure_from_platform(platform);
+    let bootinfo: &'static BootInfo = unsafe { kernel::boot::init_bootinfo(dtb_pa, dtb_va) };
     unsafe {
         gic::init_controller_minimal();
         gic::enable_irq(timer::TIMER_IRQ_ID_PHYS, 0x40);
         timer::early_init();
     }
-    let dtb_pa = if dtb_pa != 0 {
-        dtb_pa
-    } else {
-        let fallback = effective_dtb_pa(0);
-        if fallback != 0 {
-            kernel::debug!("arch: using embedded qemu DTB fallback");
-        }
-        fallback
-    };
-    let bootinfo: &'static BootInfo = unsafe { kernel::boot::init_bootinfo(dtb_pa) };
     kernel::kernel_main(bootinfo)
 }
 
@@ -159,15 +166,36 @@ pub extern "C" fn arch_hard_fault() -> ! {
     }
 }
 
-#[inline(always)]
-fn effective_dtb_pa(dtb_pa: usize) -> usize {
-    if dtb_pa != 0 {
-        return dtb_pa;
-    }
+unsafe fn zero_bss() {
+    let start = core::ptr::addr_of!(__bss_start) as usize;
+    let end = core::ptr::addr_of!(__bss_end) as usize;
+    let len = end.saturating_sub(start);
+    // SAFETY: `rust_entry` runs once after the MMU high mapping is live and
+    // before Rust globals are observed by normal kernel code.
+    unsafe { core::ptr::write_bytes(start as *mut u8, 0, len) };
+}
 
-    if EMBEDDED_DTB.0.is_empty() {
-        return 0;
+unsafe fn install_vectors() {
+    let vectors = core::ptr::addr_of!(__vectors) as usize;
+    // SAFETY: `__vectors` is high-linked and mapped through TTBR1 before entry.
+    unsafe {
+        asm!(
+            "msr VBAR_EL1, {vectors}",
+            "isb",
+            vectors = in(reg) vectors,
+            options(nostack, preserves_flags)
+        );
     }
+}
 
-    EMBEDDED_DTB.0.as_ptr() as usize
+fn current_el() -> u64 {
+    let value: u64;
+    unsafe {
+        asm!(
+            "mrs {value}, CurrentEL",
+            value = out(reg) value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    value
 }
