@@ -6,10 +6,15 @@
 //
 // TrapFrame ABI (must match `trap_frame.rs`):
 // - x0..x30: offsets 0..240
-// - sp:      248
+// - sp:      248  resume SP; EL1 SP for kernel frames, user SP_EL0 for EL0 frames
 // - elr:     256
 // - spsr:    264
-// - size:    272 bytes
+// - kernel_sp:
+//            272  valid EL1 stack for this thread
+// - size:    280 bytes in Rust storage
+//
+// Exception stack allocation uses 288 bytes to keep SP 16-byte aligned before
+// calling Rust. The extra 8 bytes are padding below the saved TrapFrame.
 //
 // Fatal exception contract:
 // - before saving a fatal TrapFrame we switch to a dedicated emergency stack;
@@ -50,7 +55,12 @@
 .set TF_SP,  248
 .set TF_ELR, 256
 .set TF_SPSR,264
-.set TF_SIZE,272
+.set TF_KERNEL_SP,272
+.set TF_SIZE,280
+.set TF_STACK_SIZE,288
+
+.set SPSR_MODE_MASK, 0xf
+.set SPSR_MODE_EL0T, 0x0
 
 .set VECTOR_CURRENT_EL_SPX_SYNC, 4
 
@@ -59,8 +69,8 @@
     .space 0x80 - 4
 .endm
 
-.macro SAVE_TRAPFRAME
-    sub sp, sp, #TF_SIZE
+.macro SAVE_CURRENT_EL_TRAPFRAME
+    sub sp, sp, #TF_STACK_SIZE
     stp x0,  x1,  [sp, #TF_X0]
     stp x2,  x3,  [sp, #TF_X2]
     stp x4,  x5,  [sp, #TF_X4]
@@ -78,8 +88,39 @@
     stp x28, x29, [sp, #TF_X28]
     str x30,      [sp, #TF_X30]
 
-    add x9, sp, #TF_SIZE
+    add x9, sp, #TF_STACK_SIZE
     str x9, [sp, #TF_SP]
+    str x9, [sp, #TF_KERNEL_SP]
+    mrs x9, ELR_EL1
+    str x9, [sp, #TF_ELR]
+    mrs x9, SPSR_EL1
+    str x9, [sp, #TF_SPSR]
+.endm
+
+.macro SAVE_LOWER_EL_TRAPFRAME
+    sub sp, sp, #TF_STACK_SIZE
+    stp x0,  x1,  [sp, #TF_X0]
+    stp x2,  x3,  [sp, #TF_X2]
+    stp x4,  x5,  [sp, #TF_X4]
+    stp x6,  x7,  [sp, #TF_X6]
+    stp x8,  x9,  [sp, #TF_X8]
+    stp x10, x11, [sp, #TF_X10]
+    stp x12, x13, [sp, #TF_X12]
+    stp x14, x15, [sp, #TF_X14]
+    stp x16, x17, [sp, #TF_X16]
+    stp x18, x19, [sp, #TF_X18]
+    stp x20, x21, [sp, #TF_X20]
+    stp x22, x23, [sp, #TF_X22]
+    stp x24, x25, [sp, #TF_X24]
+    stp x26, x27, [sp, #TF_X26]
+    stp x28, x29, [sp, #TF_X28]
+    str x30,      [sp, #TF_X30]
+
+    // All user GPRs are saved now; x9 is safe as a temporary.
+    mrs x9, SP_EL0
+    str x9, [sp, #TF_SP]
+    add x9, sp, #TF_STACK_SIZE
+    str x9, [sp, #TF_KERNEL_SP]
     mrs x9, ELR_EL1
     str x9, [sp, #TF_ELR]
     mrs x9, SPSR_EL1
@@ -87,7 +128,7 @@
 .endm
 
 .macro SAVE_FATAL_TRAPFRAME
-    sub sp, sp, #TF_SIZE
+    sub sp, sp, #TF_STACK_SIZE
     mrs x0, TPIDR_EL1
     mrs x1, TPIDRRO_EL0
     stp x0,  x1,  [sp, #TF_X0]
@@ -109,6 +150,8 @@
 
     mrs x9, TPIDR_EL0
     str x9, [sp, #TF_SP]
+    add x9, sp, #TF_STACK_SIZE
+    str x9, [sp, #TF_KERNEL_SP]
     mrs x9, ELR_EL1
     str x9, [sp, #TF_ELR]
     mrs x9, SPSR_EL1
@@ -135,11 +178,46 @@
     b 1b
 .endm
 
+.macro FATAL_LOWER_VECTOR vec_id
+    msr daifset, #0xf
+    msr TPIDR_EL1, x0
+    msr TPIDRRO_EL0, x1
+    mrs x0, SP_EL0
+    msr TPIDR_EL0, x0
+
+    adrp x0, __fatal_exception_stack_top
+    add  x0, x0, :lo12:__fatal_exception_stack_top
+    mov sp, x0
+
+    SAVE_FATAL_TRAPFRAME
+    mov x0, #\vec_id
+    mov x1, sp
+    bl exception_entry
+1:
+    wfe
+    b 1b
+.endm
+
 .macro KERNEL_SYNC_VECTOR vec_id
-    SAVE_TRAPFRAME
+    SAVE_CURRENT_EL_TRAPFRAME
     mov x0, #\vec_id
     mov x1, sp
     bl sync_entry
+    b trap_restore_and_eret
+.endm
+
+.macro LOWER_SYNC_VECTOR vec_id
+    SAVE_LOWER_EL_TRAPFRAME
+    mov x0, #\vec_id
+    mov x1, sp
+    bl lower_el_sync_entry
+    b trap_restore_and_eret
+.endm
+
+.macro LOWER_IRQ_VECTOR
+    SAVE_LOWER_EL_TRAPFRAME
+    mov x0, sp
+    bl lower_el_irq_entry
     b trap_restore_and_eret
 .endm
 
@@ -176,7 +254,7 @@ trap_current_sp0_sync:
     FATAL_VECTOR 0
 
 trap_current_sp0_irq:
-    SAVE_TRAPFRAME
+    SAVE_CURRENT_EL_TRAPFRAME
     mov x0, sp
     bl irq_entry
     b trap_restore_and_eret
@@ -191,7 +269,7 @@ trap_current_spx_sync:
     KERNEL_SYNC_VECTOR VECTOR_CURRENT_EL_SPX_SYNC
 
 trap_current_spx_irq:
-    SAVE_TRAPFRAME
+    SAVE_CURRENT_EL_TRAPFRAME
     mov x0, sp
     bl irq_entry
     b trap_restore_and_eret
@@ -203,34 +281,41 @@ trap_current_spx_serror:
     FATAL_VECTOR 7
 
 trap_lower_el_aarch64_sync:
-    FATAL_VECTOR 8
+    LOWER_SYNC_VECTOR 8
 
 trap_lower_el_aarch64_irq:
-    FATAL_VECTOR 9
+    LOWER_IRQ_VECTOR
 
 trap_lower_el_aarch64_fiq:
-    FATAL_VECTOR 10
+    FATAL_LOWER_VECTOR 10
 
 trap_lower_el_aarch64_serror:
-    FATAL_VECTOR 11
+    FATAL_LOWER_VECTOR 11
 
 trap_lower_el_aarch32_sync:
-    FATAL_VECTOR 12
+    FATAL_LOWER_VECTOR 12
 
 trap_lower_el_aarch32_irq:
-    FATAL_VECTOR 13
+    FATAL_LOWER_VECTOR 13
 
 trap_lower_el_aarch32_fiq:
-    FATAL_VECTOR 14
+    FATAL_LOWER_VECTOR 14
 
 trap_lower_el_aarch32_serror:
-    FATAL_VECTOR 15
+    FATAL_LOWER_VECTOR 15
 
 .global arch_enter_task_frame
 .type arch_enter_task_frame, %function
 arch_enter_task_frame:
     mov sp, x0
 
+// Restore contract:
+// - EL1 frame:
+//     TF_SP is restored into current EL1 SP.
+// - EL0 frame:
+//     TF_SP is restored into SP_EL0.
+//     TF_KERNEL_SP is restored into current EL1 SP.
+// TF_SP/TF_KERNEL_SP must contain post-trapframe stack positions where applicable.
 .global trap_restore_and_eret
 trap_restore_and_eret:
     // Use x9 as frame base pointer and x10/x11 as temporaries while ELR/SPSR are restored.
@@ -241,7 +326,18 @@ trap_restore_and_eret:
     msr ELR_EL1, x11
     ldr x11, [x9, #TF_SPSR]
     msr SPSR_EL1, x11
+    and x11, x11, #SPSR_MODE_MASK
+    cmp x11, #SPSR_MODE_EL0T
+    b.eq trap_restore_el0
 
+trap_restore_el1:
+    b trap_restore_gprs_and_eret
+
+trap_restore_el0:
+    msr SP_EL0, x10
+    ldr x10, [x9, #TF_KERNEL_SP]
+
+trap_restore_gprs_and_eret:
     ldp x0,  x1,  [x9, #TF_X0]
     ldp x2,  x3,  [x9, #TF_X2]
     ldp x4,  x5,  [x9, #TF_X4]

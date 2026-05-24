@@ -24,6 +24,14 @@ pub extern "C" fn irq_entry(frame: *mut TrapFrame) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn lower_el_irq_entry(frame: *mut TrapFrame) {
+    // Lower-EL IRQ frames have the same GPR/ELR/SPSR shape as current-EL
+    // frames, but `TrapFrame.sp` contains the saved user `SP_EL0` and
+    // `TrapFrame.kernel_sp` contains the EL1 stack to reinstall on return.
+    irq_entry(frame);
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn sync_entry(vector: u64, frame: *mut TrapFrame) {
     let raw_esr = read_esr_el1();
     let ec = esr::ec(raw_esr);
@@ -42,6 +50,27 @@ pub extern "C" fn sync_entry(vector: u64, frame: *mut TrapFrame) {
         let request = unsafe { (*frame).x[0] as *const core::ffi::c_void };
         kernel::task_call::on_arch_task_call(frame as *mut u64, request);
         return;
+    }
+
+    exception_entry(vector, frame as *const TrapFrame)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lower_el_sync_entry(vector: u64, frame: *mut TrapFrame) {
+    let raw_esr = read_esr_el1();
+    let ec = esr::ec(raw_esr);
+    let iss = esr::iss(raw_esr);
+
+    // This is the future userspace syscall/fault boundary. It is deliberately
+    // separate from `sync_entry()`, whose SVC #0 ABI is reserved for controlled
+    // EL1 task calls such as sleep, mailbox wait, exit, and join.
+    if ec == esr::EC_SVC_AARCH64 {
+        kernel::error!("exception: lower EL syscall path not implemented yet ISS=0x{iss:08x}");
+    } else {
+        kernel::error!(
+            "exception: lower EL sync path not implemented yet EC=0x{ec:02x} ({}) ISS=0x{iss:08x}",
+            esr::ec_name(ec)
+        );
     }
 
     exception_entry(vector, frame as *const TrapFrame)
@@ -100,14 +129,27 @@ pub extern "C" fn exception_entry(vector: u64, frame: *const TrapFrame) -> ! {
             tf.x[30]
         );
         kernel::kprintln!(
-            "exception: tf.sp=0x{:016x} tf.elr=0x{:016x} tf.spsr=0x{:016x}",
+            "exception: tf.mode={:?} tf.sp=0x{:016x} tf.kernel_sp=0x{:016x}",
+            tf.frame_mode(),
             tf.sp,
+            tf.kernel_sp
+        );
+        kernel::kprintln!(
+            "exception: tf.elr=0x{:016x} tf.spsr=0x{:016x}",
             tf.elr,
             tf.spsr
         );
+        if is_lower_el_vector(vector) {
+            kernel::kprintln!("exception: saved SP_EL0=0x{:016x}", tf.sp);
+        }
     }
 
     crate::arch_hard_fault()
+}
+
+#[inline(always)]
+fn is_lower_el_vector(vector: u64) -> bool {
+    (8..=15).contains(&vector)
 }
 
 #[inline(always)]

@@ -139,12 +139,24 @@ pub extern "C" fn arch_init_thread_frame(
 
     // SAFETY: kernel passes valid task-owned frame storage matching TrapFrame ABI.
     let frame = unsafe { &mut *(frame_words as *mut TrapFrame) };
-    *frame = TrapFrame::zeroed();
-    frame.x[0] = entry_addr as u64;
-    frame.x[1] = arg as u64;
-    frame.sp = (stack_top as u64) & !0xF;
-    frame.elr = bootstrap_pc as u64;
-    frame.spsr = TrapFrame::EL1H;
+    frame.init_kernel_el1(bootstrap_pc, stack_top, entry_addr, arg);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_init_user_trap_frame(
+    frame_words: *mut u64,
+    user_entry: usize,
+    user_sp: usize,
+    kernel_sp: usize,
+    arg0: usize,
+) {
+    if frame_words.is_null() {
+        return;
+    }
+
+    // SAFETY: caller passes task-owned frame storage matching TrapFrame ABI.
+    let frame = unsafe { &mut *(frame_words as *mut TrapFrame) };
+    frame.init_user_el0(user_entry, user_sp, kernel_sp, arg0);
 }
 
 #[unsafe(no_mangle)]
