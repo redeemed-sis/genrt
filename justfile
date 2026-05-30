@@ -12,8 +12,8 @@ doctor:
 phase0-check:
     cargo xtask phase0-check
 
-qemu-cmd-aarch64:
-    cargo xtask qemu-cmd --arch aarch64
+qemu-cmd-aarch64 user_bin="":
+    cargo xtask qemu-cmd --arch aarch64 {{ if user_bin != "" { "--user-bin " + user_bin } else { "" } }}
 
 gdb-cmd-aarch64:
     cargo xtask gdb-cmd --arch aarch64
@@ -21,11 +21,11 @@ gdb-cmd-aarch64:
 build-aarch64 log="":
     cargo xtask build-aarch64 {{ if log != "" { "--log-level " + log } else { "" } }}
 
-run-aarch64 log="":
-    cargo xtask run-aarch64 {{ if log != "" { "--log-level " + log } else { "" } }}
+run-aarch64 log="" user_bin="":
+    cargo xtask run-aarch64 {{ if log != "" { "--log-level " + log } else { "" } }} {{ if user_bin != "" { "--user-bin " + user_bin } else { "" } }}
 
-debug-aarch64 log="debug":
-    cargo xtask debug-aarch64 --log-level {{ log }}
+debug-aarch64 log="debug" user_bin="":
+    cargo xtask debug-aarch64 --log-level {{ log }} {{ if user_bin != "" { "--user-bin " + user_bin } else { "" } }}
 
 gdb-aarch64:
     aarch64-linux-gnu-gdb target/aarch64-unknown-none-softfloat/debug/genrt-aarch64.elf \

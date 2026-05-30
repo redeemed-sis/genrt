@@ -11,6 +11,8 @@ const AARCH64_TARGET: &str = "aarch64-unknown-none-softfloat";
 const AARCH64_QEMU_MACHINE: &str = "virt,gic-version=2";
 const AARCH64_QEMU_CPU: &str = "cortex-a72";
 const AARCH64_DTB_LOAD_ADDR: &str = "0x40000000";
+const AARCH64_USER_IMAGE_LOAD_ADDR: &str = "0x47000000";
+const AARCH64_USER_IMAGE_MAX_SIZE: u64 = 4096;
 
 #[derive(Parser)]
 #[command(name = "xtask")]
@@ -28,6 +30,8 @@ enum Commands {
     QemuCmd {
         #[arg(long, value_enum)]
         arch: Arch,
+        #[arg(long)]
+        user_bin: Option<PathBuf>,
     },
     GdbCmd {
         #[arg(long, value_enum)]
@@ -40,10 +44,14 @@ enum Commands {
     RunAarch64 {
         #[arg(long, value_enum)]
         log_level: Option<LogLevel>,
+        #[arg(long)]
+        user_bin: Option<PathBuf>,
     },
     DebugAarch64 {
         #[arg(long, value_enum)]
         log_level: Option<LogLevel>,
+        #[arg(long)]
+        user_bin: Option<PathBuf>,
     },
 }
 
@@ -82,13 +90,17 @@ fn main() -> Result<()> {
         Commands::Doctor => doctor(),
         Commands::Phase0Check => phase0_check(),
         Commands::RepoTree => repo_tree(),
-        Commands::QemuCmd { arch } => qemu_cmd(arch),
+        Commands::QemuCmd { arch, user_bin } => qemu_cmd(arch, user_bin),
         Commands::GdbCmd { arch } => gdb_cmd(arch),
         Commands::BuildAarch64 { log_level } => build_aarch64(log_level),
-        Commands::RunAarch64 { log_level } => run_aarch64(false, log_level),
-        Commands::DebugAarch64 { log_level } => {
-            run_aarch64(true, Some(log_level.unwrap_or(LogLevel::Debug)))
-        }
+        Commands::RunAarch64 {
+            log_level,
+            user_bin,
+        } => run_aarch64(false, log_level, user_bin),
+        Commands::DebugAarch64 {
+            log_level,
+            user_bin,
+        } => run_aarch64(true, Some(log_level.unwrap_or(LogLevel::Debug)), user_bin),
     }
 }
 
@@ -189,9 +201,10 @@ fn repo_tree() -> Result<()> {
     Ok(())
 }
 
-fn qemu_cmd(arch: Arch) -> Result<()> {
+fn qemu_cmd(arch: Arch, user_bin: Option<PathBuf>) -> Result<()> {
     match arch {
         Arch::Aarch64 => {
+            let user_bin = user_bin.unwrap_or_else(default_user_bin_path);
             println!("qemu-system-aarch64 \\");
             println!("  -machine {AARCH64_QEMU_MACHINE} \\");
             println!("  -cpu {AARCH64_QEMU_CPU} \\");
@@ -200,6 +213,10 @@ fn qemu_cmd(arch: Arch) -> Result<()> {
             println!("  -kernel target/{AARCH64_TARGET}/debug/genrt-aarch64.elf \\");
             println!(
                 "  -device loader,file=target/{AARCH64_TARGET}/debug/qemu-virt.dtb,addr={AARCH64_DTB_LOAD_ADDR} \\"
+            );
+            println!(
+                "  -device loader,file={},addr={AARCH64_USER_IMAGE_LOAD_ADDR},force-raw=on \\",
+                user_bin.display()
             );
             println!("  -S -s");
         }
@@ -237,6 +254,7 @@ fn gdb_cmd(arch: Arch) -> Result<()> {
 
 fn build_aarch64(log_level: Option<LogLevel>) -> Result<()> {
     let dtb_path = generate_qemu_virt_dtb()?;
+    build_aarch64_user_hello()?;
 
     let mut build = Command::new("cargo");
     build.args([
@@ -282,9 +300,14 @@ fn build_aarch64(log_level: Option<LogLevel>) -> Result<()> {
     Ok(())
 }
 
-fn run_aarch64(wait_for_gdb: bool, log_level: Option<LogLevel>) -> Result<()> {
+fn run_aarch64(
+    wait_for_gdb: bool,
+    log_level: Option<LogLevel>,
+    user_bin: Option<PathBuf>,
+) -> Result<()> {
     build_aarch64(log_level)?;
     let dtb_path = qemu_virt_dtb_path()?;
+    let user_bin = user_bin.unwrap_or_else(default_user_bin_path);
 
     let mut cmd = Command::new("qemu-system-aarch64");
     cmd.args([
@@ -302,6 +325,11 @@ fn run_aarch64(wait_for_gdb: bool, log_level: Option<LogLevel>) -> Result<()> {
     .arg(format!(
         "loader,file={},addr={AARCH64_DTB_LOAD_ADDR}",
         dtb_path.display()
+    ))
+    .arg("-device")
+    .arg(format!(
+        "loader,file={},addr={AARCH64_USER_IMAGE_LOAD_ADDR},force-raw=on",
+        user_bin.display()
     ))
     .stdout(Stdio::inherit())
     .stderr(Stdio::inherit());
@@ -322,6 +350,54 @@ fn run_aarch64(wait_for_gdb: bool, log_level: Option<LogLevel>) -> Result<()> {
 
 fn final_elf_path() -> PathBuf {
     PathBuf::from(format!("target/{AARCH64_TARGET}/debug/genrt-aarch64.elf"))
+}
+
+fn default_user_bin_path() -> PathBuf {
+    PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/hello.bin"))
+}
+
+fn build_aarch64_user_hello() -> Result<PathBuf> {
+    let source = Path::new("user/aarch64/hello.S");
+    ensure_exists(source.to_str().unwrap_or("user/aarch64/hello.S"))?;
+
+    let bin = default_user_bin_path();
+    let obj = bin.with_extension("o");
+    if let Some(parent) = bin.parent() {
+        fs::create_dir_all(parent).context("failed to create user binary output directory")?;
+    }
+
+    let status = Command::new("llvm-mc")
+        .args(["-triple=aarch64-none-elf", "-filetype=obj"])
+        .arg(source)
+        .arg("-o")
+        .arg(&obj)
+        .status()
+        .context("failed to invoke llvm-mc for AArch64 user program")?;
+    if !status.success() {
+        bail!("llvm-mc failed to assemble AArch64 user program")
+    }
+
+    let status = Command::new("llvm-objcopy")
+        .args(["-O", "binary"])
+        .arg(&obj)
+        .arg(&bin)
+        .status()
+        .context("failed to invoke llvm-objcopy for AArch64 user program")?;
+    if !status.success() {
+        bail!("llvm-objcopy failed to produce AArch64 user binary")
+    }
+
+    let size = fs::metadata(&bin)
+        .with_context(|| format!("failed to stat {}", bin.display()))?
+        .len();
+    if size == 0 || size > AARCH64_USER_IMAGE_MAX_SIZE {
+        bail!(
+            "AArch64 user binary size {size} exceeds bring-up mapping limit {AARCH64_USER_IMAGE_MAX_SIZE}"
+        );
+    }
+
+    println!("built {} ({} bytes)", bin.display(), size);
+    Ok(bin)
 }
 
 fn qemu_virt_dtb_path() -> Result<PathBuf> {
