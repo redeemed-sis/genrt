@@ -7,7 +7,7 @@ Current active target:
 * **AArch64**
 * **Rust target `aarch64-unknown-none-softfloat`**
 * **QEMU `virt`**
-* **single-core EL1 kernel threads**
+* **single-core EL1 kernel threads + first EL0 userspace bring-up**
 * **high-half kernel with AArch64 stage-1 MMU enabled**
 * **QEMU-first bring-up and debugging**
 
@@ -52,13 +52,18 @@ The current AArch64 path already has:
 * demo producer/consumer tasks exchanging messages through a capacity-bounded mailbox
 * timeout-aware mailbox send/receive operations
 * bounded `thread_spawn` / `thread_exit` / `thread_join`
+* first EL0 flat userspace program loaded by QEMU generic loader
+* minimal TTBR0 user address space with 4 KiB user page mappings
+* scheduler TTBR0 activation for user threads and TTBR0 clear for kernel threads
+* lower-EL `svc #0` syscall dispatch separated from EL1 task-call `svc #0`
+* bring-up `sys_write` / `sys_exit` path for the first user process
 * minimal allocation-free formatted logging with log levels
 * improved fatal exception diagnostics
 * `xtask` post-link `.boot.text` autonomy check using `readelf` and `llvm-objdump`
 
 In one sentence:
 
-> genrt is currently an early **single-core high-half preemptive EL1 kernel prototype** on AArch64/QEMU.
+> genrt is currently an early **single-core high-half preemptive kernel prototype with a first EL0 userspace smoke path** on AArch64/QEMU.
 
 The AArch64 build currently uses the Rust target `aarch64-unknown-none-softfloat`.
 This is intentional for the current kernel stage: the scheduler/trap path does not
@@ -67,13 +72,12 @@ in ordinary Rust code.
 
 ## What is not implemented yet
 
-* EL0 / user mode
 * SMP scheduling
 * mailbox registry / dynamic mailbox creation
 * driver model
 * low-overhead buffered tracing
-* demand paging / page faults / per-process address spaces
-* ASIDs and TTBR0 userspace address spaces
+* demand paging / recoverable user page faults / full process model
+* ASIDs and multiple TTBR0 userspace address spaces
 
 ## Execution model
 
@@ -101,7 +105,15 @@ rust_entry (high VA)
   -> physical memory init
   -> switch to allocator-owned runtime kernel page tables
   -> clear TTBR0 temporary identity mappings
-  -> start first task from prepared trap frame
+  -> bootstrap scheduler
+  -> start first kernel task from prepared trap frame
+
+kernel init thread
+  -> create first TTBR0 user address space
+  -> map QEMU-loaded flat user image
+  -> map user stack
+  -> spawn EL0 user thread
+  -> join user thread and log exit code
 
 Timer IRQ
   -> save full TrapFrame
@@ -125,10 +137,12 @@ Key milestone already reached:
 ## Current limitations
 
 * single-core only
-* EL1 kernel threads only
-* no EL0/user address spaces yet
-* no ASIDs or per-process TTBR0 yet
+* only one demo userspace process is created
+* no general EL0 process subsystem yet
+* no ASIDs or multiple per-process TTBR0 roots yet
 * VM API currently supports only 2 MiB-aligned TTBR1 kernel mappings
+* user VM bring-up supports only explicit 4 KiB mappings created by the first process path
+* userspace image size is a fixed bring-up constant, not discovered from an ELF header
 * heap is currently a fixed-size `16 MiB` bootstrap region
 * direct-to-UART logging
 * scheduler/time dynamic containers are preallocated at bootstrap and must not grow in IRQ paths
@@ -193,10 +207,13 @@ The bootstrap page tables are intentionally small:
 
 `xtask` controls the QEMU bare-metal protocol. It generates a compact QEMU
 `virt,gic-version=2` DTB and loads it at `0x4000_0000` with a loader device. The
-kernel image stays at `0x4008_0000`. The low `.boot.text` parser reads that DTB
-before UART/GIC are initialized and extracts only the ranges needed for initial
-MMU mappings. If that early parse fails, the AArch64 QEMU platform layer has an
-emergency fallback for RAM/UART/GIC so early diagnostics can still reach UART.
+kernel image stays at `0x4008_0000`. It also assembles a tiny raw AArch64 user
+program and loads it at the reserved bring-up physical address `0x4700_0000`
+with `-device loader,...,force-raw=on`; the loader does not change the CPU PC.
+The low `.boot.text` parser reads the DTB before UART/GIC are initialized and
+extracts only the ranges needed for initial MMU mappings. If that early parse
+fails, the AArch64 QEMU platform layer has an emergency fallback for RAM/UART/GIC
+so early diagnostics can still reach UART.
 
 The generic frame allocator remains MMU-agnostic: it manages physical frames and
 returns `PhysAddr`. PA-to-HVA conversion happens only at explicit dereference
@@ -257,6 +274,17 @@ Mutation APIs return `VmError::NotInitialized` until
 `.boot.bss` with frame-allocator-owned page tables. This prevents mappings from
 being added to tables that will be discarded and prevents reclaiming boot table
 storage through the generic frame allocator.
+
+The first userspace path adds a separate narrow TTBR0 API:
+
+* create/destroy one user address space root from physical frames
+* map 4 KiB EL0 pages for user text and stack
+* translate user VA for bring-up `copy_from_user` validation
+* activate a user TTBR0 root or clear TTBR0 during scheduler handoff
+
+The initial user syscall ABI is AArch64-style: `x8` is the syscall number,
+`x0..x5` are arguments, and `x0` is the return value. Only `write(fd=1, ptr,
+len)` and `exit(code)` exist today.
 
 ## IPC
 
@@ -341,9 +369,9 @@ cargo xtask run-aarch64 --log-level trace
 The best next steps are:
 
 1. refine VM permissions and page-table ownership invariants
-2. growable heap design on top of frame allocation
-3. minimal page-fault diagnostics
-4. userspace/process lifecycle groundwork on top of the MMU
+2. replace bring-up user image constants with ELF/initramfs metadata
+3. fault-aware `copy_from_user` and user fault termination
+4. growable heap design on top of frame allocation
 
 ## Documentation
 
@@ -364,3 +392,4 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0013-mailbox-timeout-semantics.md`
 * `ai-docs/decision-records/ADR-0014-bounded-kernel-thread-lifecycle.md`
 * `ai-docs/decision-records/ADR-0015-aarch64-high-half-mmu-bring-up.md`
+* `ai-docs/decision-records/ADR-0016-first-aarch64-el0-process.md`
