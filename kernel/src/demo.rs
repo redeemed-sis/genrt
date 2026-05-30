@@ -12,7 +12,12 @@ use crate::{
 const DEMO_MAILBOX_CAPACITY: usize = 1;
 type DemoMessage = usize;
 
-pub(crate) const TASKS: [sched::StaticTask; 4] = [
+pub(crate) const TASKS: [sched::StaticTask; 5] = [
+    sched::StaticTask::new(
+        crate::TEST_PRIORITY,
+        crate::init::kernel_init_thread,
+        ThreadArg::empty(),
+    ),
     sched::StaticTask::new(crate::TEST_PRIORITY, consumer_task, ThreadArg::empty()),
     sched::StaticTask::new(crate::TEST_PRIORITY, producer_task, ThreadArg::empty()),
     sched::StaticTask::new(crate::TEST_PRIORITY, sleeper_task, ThreadArg::empty()),

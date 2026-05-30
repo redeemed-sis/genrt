@@ -1,13 +1,14 @@
 use core::mem;
 
 use crate::{
+    memory::vm::UserAddressSpace,
     sync::LocalIrqGuard,
     task::{TaskId, ThreadId},
 };
 
 use super::{
-    IDLE_TASK_ID, Scheduler, arch_init_thread_frame, copy_words, preempt, scheduler_mut,
-    try_scheduler_mut,
+    IDLE_TASK_ID, Scheduler, arch_init_thread_frame, arch_init_user_trap_frame, copy_words,
+    preempt, scheduler_mut, try_scheduler_mut,
 };
 
 #[repr(transparent)]
@@ -154,6 +155,26 @@ pub fn current_thread_id() -> Option<ThreadId> {
     try_scheduler_mut().and_then(|scheduler| scheduler.running_thread_id())
 }
 
+pub(crate) fn current_user_address_space() -> Option<UserAddressSpace> {
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    try_scheduler_mut().and_then(|scheduler| scheduler.running_user_address_space())
+}
+
+pub(crate) fn thread_spawn_user(
+    address_space: UserAddressSpace,
+    user_entry: usize,
+    user_sp: usize,
+    arg0: usize,
+    attrs: ThreadAttrs,
+) -> core::result::Result<ThreadId, SpawnError> {
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    let Some(scheduler) = try_scheduler_mut() else {
+        return Err(SpawnError::SchedulerNotInitialized);
+    };
+
+    scheduler.spawn_user_thread(address_space, user_entry, user_sp, arg0, attrs)
+}
+
 pub(crate) fn on_thread_exit_sync(active_frame_words: *mut u64, code: usize) {
     scheduler_mut().exit_current(active_frame_words, code);
 }
@@ -184,6 +205,7 @@ impl Scheduler {
             task.last_join_result = None;
             task.entry = free_task_entry;
             task.arg = ThreadArg::empty();
+            task.kind = preempt::ThreadKind::Kernel;
             ThreadId::new(id.index(), task.generation)
         };
 
@@ -204,6 +226,49 @@ impl Scheduler {
         Ok(thread_id)
     }
 
+    fn spawn_user_thread(
+        &mut self,
+        address_space: UserAddressSpace,
+        user_entry: usize,
+        user_sp: usize,
+        arg0: usize,
+        attrs: ThreadAttrs,
+    ) -> core::result::Result<ThreadId, SpawnError> {
+        let Some(id) = self.find_free_slot() else {
+            return Err(SpawnError::NoThreadSlots);
+        };
+
+        let thread_id = {
+            let task = self.task_mut(id);
+            task.generation = next_generation(task.generation);
+            task.state = preempt::TaskState::Ready;
+            task.joinable = attrs.joinable;
+            task.exit_code = None;
+            task.joiner = None;
+            task.ipc.reset();
+            task.last_join_result = None;
+            task.entry = free_task_entry;
+            task.arg = ThreadArg::empty();
+            task.kind = preempt::ThreadKind::User { address_space };
+            ThreadId::new(id.index(), task.generation)
+        };
+
+        self.initialize_spawned_user_thread_frame(id, user_entry, user_sp, arg0);
+        if id != IDLE_TASK_ID {
+            let was_empty = self.ready_queue.is_empty();
+            self.ready_push_back(id);
+            if was_empty {
+                self.note_runnable_peer_available();
+            }
+        }
+
+        crate::debug!(
+            "thread: spawned user id={thread_id} entry=0x{user_entry:x} sp=0x{user_sp:x} ttbr0=0x{:x}",
+            address_space.root_pa()
+        );
+        Ok(thread_id)
+    }
+
     fn initialize_spawned_thread_frame(&mut self, id: TaskId, entry: ThreadEntry, arg: ThreadArg) {
         let stack_top = self.task(id).stack_top();
         let frame_words = self.frame_words_mut_ptr(id);
@@ -216,6 +281,22 @@ impl Scheduler {
                 arg.as_usize(),
                 thread_entry_bootstrap as *const () as usize,
             );
+        }
+    }
+
+    fn initialize_spawned_user_thread_frame(
+        &mut self,
+        id: TaskId,
+        user_entry: usize,
+        user_sp: usize,
+        arg0: usize,
+    ) {
+        let kernel_sp = self.task(id).stack_top();
+        let frame_words = self.frame_words_mut_ptr(id);
+        // SAFETY: scheduler owns stable frame and kernel stack storage. The
+        // process layer already mapped `user_entry` and `user_sp` in TTBR0.
+        unsafe {
+            arch_init_user_trap_frame(frame_words, user_entry, user_sp, kernel_sp, arg0);
         }
     }
 
@@ -397,6 +478,7 @@ impl Scheduler {
         task.last_join_result = None;
         task.entry = free_task_entry;
         task.arg = ThreadArg::empty();
+        task.kind = preempt::ThreadKind::Kernel;
         crate::debug!(
             "thread: reclaimed slot={} generation={generation}",
             id.index()
@@ -408,6 +490,14 @@ impl Scheduler {
             .running_task()
             .unwrap_or_else(|| panic!("thread: join result without running thread"));
         self.task_mut(current).last_join_result.take()
+    }
+
+    fn running_user_address_space(&self) -> Option<UserAddressSpace> {
+        let current = self.running_task()?;
+        match self.task(current).kind {
+            preempt::ThreadKind::User { address_space } => Some(address_space),
+            preempt::ThreadKind::Kernel => None,
+        }
     }
 }
 

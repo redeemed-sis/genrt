@@ -2,6 +2,7 @@ use alloc::boxed::Box;
 
 use crate::{
     arch_consts::TASK_FRAME_WORDS,
+    memory::vm::UserAddressSpace,
     task::{TaskId, ThreadId},
     time::TimedEvent,
 };
@@ -40,6 +41,12 @@ pub(super) enum TaskState {
     Running,
     Blocked(BlockReason),
     Zombie,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum ThreadKind {
+    Kernel,
+    User { address_space: UserAddressSpace },
 }
 
 #[repr(C, align(16))]
@@ -90,6 +97,7 @@ pub(super) struct Task {
     pub(super) last_join_result: Option<core::result::Result<usize, thread::JoinError>>,
     pub(super) entry: thread::ThreadEntry,
     pub(super) arg: thread::ThreadArg,
+    pub(super) kind: ThreadKind,
     stack: Box<TaskStack>,
     frame: Box<TaskFrameStorage>,
 }
@@ -111,6 +119,7 @@ impl Task {
             last_join_result: None,
             entry,
             arg,
+            kind: ThreadKind::Kernel,
             stack: Box::new(TaskStack::zeroed()),
             frame: Box::new(TaskFrameStorage::zeroed()),
         }
@@ -127,6 +136,7 @@ impl Task {
             last_join_result: None,
             entry: thread::free_task_entry,
             arg: thread::ThreadArg::empty(),
+            kind: ThreadKind::Kernel,
             stack: Box::new(TaskStack::zeroed()),
             frame: Box::new(TaskFrameStorage::zeroed()),
         }
@@ -382,12 +392,26 @@ impl Scheduler {
     }
 
     pub(super) fn make_running(&mut self, id: TaskId) {
+        self.activate_task_address_space(id);
         self.task_mut(id).state = TaskState::Running;
         self.current = Some(id);
     }
 
     fn make_blocked(&mut self, id: TaskId, reason: BlockReason) {
         self.task_mut(id).state = TaskState::Blocked(reason);
+    }
+
+    fn activate_task_address_space(&self, id: TaskId) {
+        let result = match self.task(id).kind {
+            ThreadKind::Kernel => unsafe { crate::memory::vm::clear_user_address_space() },
+            ThreadKind::User { address_space } => unsafe {
+                crate::memory::vm::activate_user_address_space(address_space)
+            },
+        };
+
+        if let Err(err) = result {
+            panic!("sched: failed to activate address space for task {id}: {err:?}");
+        }
     }
 
     fn has_runnable_peer(&self) -> bool {

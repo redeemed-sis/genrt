@@ -7,12 +7,15 @@ pub mod boot;
 pub mod console;
 mod demo;
 mod dtb;
+mod init;
 pub mod ipc;
 pub mod log;
 pub mod memory;
 pub mod panic;
+pub(crate) mod process;
 pub mod sched;
 pub(crate) mod sync;
+pub mod syscall;
 pub mod task;
 pub mod task_call;
 pub mod time;
@@ -21,7 +24,7 @@ use bootinfo::BootInfo;
 
 pub const TEST_PRIORITY: u8 = 10;
 pub const TEST_RR_QUANTUM_MS: u64 = 10;
-pub const TEST_THREAD_CAPACITY: usize = 8;
+pub const TEST_THREAD_CAPACITY: usize = 12;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {

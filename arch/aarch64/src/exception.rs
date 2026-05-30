@@ -61,18 +61,18 @@ pub extern "C" fn lower_el_sync_entry(vector: u64, frame: *mut TrapFrame) {
     let ec = esr::ec(raw_esr);
     let iss = esr::iss(raw_esr);
 
-    // This is the future userspace syscall/fault boundary. It is deliberately
-    // separate from `sync_entry()`, whose SVC #0 ABI is reserved for controlled
-    // EL1 task calls such as sleep, mailbox wait, exit, and join.
+    // This is the userspace syscall/fault boundary. It is deliberately separate
+    // from `sync_entry()`, whose SVC #0 ABI is reserved for controlled EL1 task
+    // calls such as sleep, mailbox wait, exit, and join.
     if ec == esr::EC_SVC_AARCH64 {
-        kernel::error!("exception: lower EL syscall path not implemented yet ISS=0x{iss:08x}");
-    } else {
-        kernel::error!(
-            "exception: lower EL sync path not implemented yet EC=0x{ec:02x} ({}) ISS=0x{iss:08x}",
-            esr::ec_name(ec)
-        );
+        kernel::syscall::dispatch(frame as *mut u64);
+        return;
     }
 
+    kernel::error!(
+        "exception: lower EL sync fault EC=0x{ec:02x} ({}) ISS=0x{iss:08x}",
+        esr::ec_name(ec)
+    );
     exception_entry(vector, frame as *const TrapFrame)
 }
 

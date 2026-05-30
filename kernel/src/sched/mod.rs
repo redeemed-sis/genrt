@@ -17,7 +17,9 @@ pub(crate) use self::{
     },
     preempt::enter_running_task,
     sleep::on_sleep_sync,
-    thread::{on_thread_exit_sync, on_thread_join_sync},
+    thread::{
+        current_user_address_space, on_thread_exit_sync, on_thread_join_sync, thread_spawn_user,
+    },
 };
 pub use self::{
     preempt::{current_task_id, wake_task},
@@ -41,6 +43,13 @@ unsafe extern "C" {
         entry_addr: usize,
         arg: usize,
         bootstrap_pc: usize,
+    );
+    fn arch_init_user_trap_frame(
+        frame_words: *mut u64,
+        user_entry: usize,
+        user_sp: usize,
+        kernel_sp: usize,
+        arg0: usize,
     );
     fn arch_enter_task_frame(frame_words: *const u64) -> !;
 }

@@ -160,6 +160,21 @@ pub extern "C" fn arch_init_user_trap_frame(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn arch_user_image_load_pa() -> usize {
+    platform::qemu::USER_IMAGE_LOAD_PA
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_user_image_reserved_size() -> usize {
+    platform::qemu::USER_IMAGE_RESERVED_SIZE
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_user_image_bringup_size() -> usize {
+    platform::qemu::USER_IMAGE_BRINGUP_SIZE
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn arch_hard_fault() -> ! {
     // SAFETY: this path is terminal by contract; IRQ/FIQ/SError are masked first.
     unsafe {
