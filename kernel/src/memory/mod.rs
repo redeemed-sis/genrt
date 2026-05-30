@@ -148,6 +148,12 @@ pub(crate) fn init(boot: &'static BootInfo) -> Result<()> {
     if let Some(dtb_range) = dtb_range(boot)? {
         add_reserved_range(&mut reserved_ranges, &mut reserved_count, dtb_range, "dtb")?;
     }
+    add_reserved_range(
+        &mut reserved_ranges,
+        &mut reserved_count,
+        vm::user_image_load_range(),
+        "user image loader region",
+    )?;
 
     crate::debug!(
         "memory: raw ranges ram={} reserved={}",

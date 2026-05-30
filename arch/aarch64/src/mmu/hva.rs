@@ -7,7 +7,7 @@
 
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 
-use kernel::memory::{PhysAddr, VirtAddr};
+use kernel::memory::{PAGE_SIZE, PhysAddr, VirtAddr};
 
 pub const KERNEL_HVA_OFFSET: usize = 0xffff_0000_0000_0000;
 
@@ -15,6 +15,7 @@ pub const KERNEL_HVA_OFFSET: usize = 0xffff_0000_0000_0000;
 // L0 -> L1 table -> L2 table -> 2 MiB blocks.
 pub(super) const BLOCK_SIZE_2M: usize = 2 * 1024 * 1024;
 pub(super) const TABLE_ENTRIES: usize = 512;
+const LOWER_VA_LIMIT: usize = 1usize << 48;
 
 // Биты AArch64 stage-1 descriptors. В PTE всегда хранится PA, не HVA.
 pub(super) const DESC_VALID: u64 = 1 << 0;
@@ -207,6 +208,23 @@ impl VmFlags {
     pub const EXECUTE: Self = Self(1 << 2);
     pub const USER: Self = Self(1 << 3);
     pub const GLOBAL: Self = Self(1 << 4);
+
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    pub const fn contains(self, rhs: Self) -> bool {
+        (self.0 & rhs.0) == rhs.0
+    }
+}
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct UserMapFlags(u64);
+
+impl UserMapFlags {
+    pub const WRITE: Self = Self(1 << 1);
+    pub const EXECUTE: Self = Self(1 << 2);
 
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
@@ -496,6 +514,136 @@ pub(super) unsafe fn switch_to_runtime_kernel_tables() -> Result<(), VmError> {
     Ok(())
 }
 
+pub(super) fn create_user_address_space() -> Result<PhysAddr, VmError> {
+    require_runtime_tables()?;
+
+    let mut root = OwnedTableFrame::alloc()?;
+    root.table().clear();
+    Ok(root.release())
+}
+
+pub(super) unsafe fn destroy_user_address_space(root_pa: PhysAddr) -> Result<(), VmError> {
+    require_runtime_tables()?;
+    if root_pa == 0 {
+        return Err(VmError::InvalidRange);
+    }
+
+    if ttbr0_l0_pa() == root_pa {
+        unsafe { clear_user_address_space()? };
+    }
+
+    let l0 = MappedPageTable::from_pa(root_pa);
+    let mut l0i = 0usize;
+    while l0i < TABLE_ENTRIES {
+        let l0e = l0.read(l0i);
+        if is_table_desc(l0e) {
+            let l1_pa = desc_pa(l0e);
+            let l1 = MappedPageTable::from_pa(l1_pa);
+            let mut l1i = 0usize;
+            while l1i < TABLE_ENTRIES {
+                let l1e = l1.read(l1i);
+                if is_table_desc(l1e) {
+                    let l2_pa = desc_pa(l1e);
+                    let l2 = MappedPageTable::from_pa(l2_pa);
+                    let mut l2i = 0usize;
+                    while l2i < TABLE_ENTRIES {
+                        let l2e = l2.read(l2i);
+                        if is_table_desc(l2e) {
+                            kernel::memory::free_frame(desc_pa(l2e));
+                        }
+                        l2i += 1;
+                    }
+                    kernel::memory::free_frame(l2_pa);
+                }
+                l1i += 1;
+            }
+            kernel::memory::free_frame(l1_pa);
+        }
+        l0i += 1;
+    }
+
+    kernel::memory::free_frame(root_pa);
+    Ok(())
+}
+
+pub(super) unsafe fn map_user_page(
+    root_pa: PhysAddr,
+    va: VirtAddr,
+    pa: PhysAddr,
+    flags: UserMapFlags,
+) -> Result<(), VmError> {
+    require_runtime_tables()?;
+    validate_user_page(va, pa)?;
+
+    let l3 = ensure_user_l3_table(root_pa, va)?;
+    let index = l3_index(va);
+    if l3.read(index) & DESC_VALID != 0 {
+        return Err(VmError::AlreadyMapped);
+    }
+
+    l3.write(index, user_page_desc(pa, flags));
+    unsafe { flush_tlb_all() };
+    Ok(())
+}
+
+pub(super) fn translate_user_va(root_pa: PhysAddr, va: VirtAddr) -> Option<PhysAddr> {
+    if root_pa == 0 || !is_user_va(va) {
+        return None;
+    }
+
+    let l0 = MappedPageTable::from_pa(root_pa);
+    let l0e = l0.read(l0_index(va));
+    if !is_table_desc(l0e) {
+        return None;
+    }
+
+    let l1 = MappedPageTable::from_pa(desc_pa(l0e));
+    let l1e = l1.read(l1_index(va));
+    if !is_table_desc(l1e) {
+        return None;
+    }
+
+    let l2 = MappedPageTable::from_pa(desc_pa(l1e));
+    let l2e = l2.read(l2_index(va));
+    if !is_table_desc(l2e) {
+        return None;
+    }
+
+    let l3 = MappedPageTable::from_pa(desc_pa(l2e));
+    let l3e = l3.read(l3_index(va));
+    if l3e & DESC_VALID == 0 {
+        return None;
+    }
+
+    Some(desc_pa(l3e) + (va & (PAGE_SIZE - 1)))
+}
+
+pub(super) unsafe fn activate_user_address_space(root_pa: PhysAddr) -> Result<(), VmError> {
+    require_runtime_tables()?;
+    if root_pa == 0 {
+        return Err(VmError::InvalidRange);
+    }
+
+    unsafe {
+        dsb_sy();
+        set_ttbr0(root_pa);
+        flush_tlb_all();
+        set_current_ttbr_roots(root_pa, ttbr1_l0_pa());
+    }
+    Ok(())
+}
+
+pub(super) unsafe fn clear_user_address_space() -> Result<(), VmError> {
+    require_runtime_tables()?;
+    unsafe {
+        dsb_sy();
+        clear_ttbr0();
+        flush_tlb_all();
+        set_current_ttbr_roots(0, ttbr1_l0_pa());
+    }
+    Ok(())
+}
+
 #[derive(Copy, Clone)]
 struct RuntimePlatformMap {
     ram: AlignedMapRange,
@@ -590,6 +738,32 @@ const fn block_desc(pa: usize, attr_index: u64, flags: VmFlags) -> u64 {
     desc
 }
 
+/// High-side L3 page descriptor for TTBR0 user mappings.
+///
+/// User text is EL0 executable but PXN, so EL1 cannot accidentally execute it.
+/// User data/stack is UXN|PXN. All user pages are non-global.
+#[inline(always)]
+const fn user_page_desc(pa: usize, flags: UserMapFlags) -> u64 {
+    let mut desc = (pa as u64 & DESC_ADDR_MASK)
+        | DESC_VALID
+        | DESC_TABLE
+        | DESC_AF
+        | DESC_SH_INNER
+        | DESC_AP_USER
+        | DESC_NG
+        | (ATTR_NORMAL_WB << 2);
+
+    if !flags.contains(UserMapFlags::WRITE) {
+        desc |= DESC_AP_RO;
+    }
+    if flags.contains(UserMapFlags::EXECUTE) {
+        desc |= DESC_PXN;
+    } else {
+        desc |= DESC_PXN | DESC_UXN;
+    }
+    desc
+}
+
 /// L0 index for 4 KiB granule, 48-bit VA: bits [47:39].
 #[inline(always)]
 pub(super) const fn l0_index(va: usize) -> usize {
@@ -606,6 +780,12 @@ pub(super) const fn l1_index(va: usize) -> usize {
 #[inline(always)]
 pub(super) const fn l2_index(va: usize) -> usize {
     (va >> 21) & 0x1ff
+}
+
+/// L3 index for 4 KiB page mappings: bits [20:12].
+#[inline(always)]
+const fn l3_index(va: usize) -> usize {
+    (va >> 12) & 0x1ff
 }
 
 fn validate_kernel_region(va: VirtAddr, pa: PhysAddr, size: usize) -> Result<(), VmError> {
@@ -632,6 +812,16 @@ fn validate_kernel_va_size(va: VirtAddr, size: usize) -> Result<(), VmError> {
     Ok(())
 }
 
+fn validate_user_page(va: VirtAddr, pa: PhysAddr) -> Result<(), VmError> {
+    if !is_user_va(va) {
+        return Err(VmError::InvalidRange);
+    }
+    if va & (PAGE_SIZE - 1) != 0 || pa & (PAGE_SIZE - 1) != 0 {
+        return Err(VmError::NotAligned);
+    }
+    Ok(())
+}
+
 const fn align_down_2m(addr: usize) -> usize {
     addr & !(BLOCK_SIZE_2M - 1)
 }
@@ -649,6 +839,11 @@ fn align_up_2m(addr: usize) -> Result<usize, VmError> {
 #[inline(always)]
 fn is_kernel_va(va: VirtAddr) -> bool {
     va >= KERNEL_HVA_OFFSET
+}
+
+#[inline(always)]
+fn is_user_va(va: VirtAddr) -> bool {
+    va < LOWER_VA_LIMIT
 }
 
 /// Найти или создать L2 table для TTBR1 VA.
@@ -694,6 +889,54 @@ fn ensure_l2_table(va: VirtAddr) -> Result<MappedPageTable, VmError> {
         return Err(VmError::Unsupported);
     };
     Ok(l2)
+}
+
+fn ensure_user_l3_table(root_pa: PhysAddr, va: VirtAddr) -> Result<MappedPageTable, VmError> {
+    if root_pa == 0 {
+        return Err(VmError::NotInitialized);
+    }
+
+    let l0 = MappedPageTable::from_pa(root_pa);
+    let l0e = l0.read(l0_index(va));
+    let l1 = if is_table_desc(l0e) {
+        MappedPageTable::from_pa(desc_pa(l0e))
+    } else if l0e & DESC_VALID == 0 {
+        let pa = alloc_table_frame()?;
+        let table = MappedPageTable::from_pa(pa);
+        table.clear();
+        l0.install_table(l0_index(va), pa);
+        table
+    } else {
+        return Err(VmError::Unsupported);
+    };
+
+    let l1e = l1.read(l1_index(va));
+    let l2 = if is_table_desc(l1e) {
+        MappedPageTable::from_pa(desc_pa(l1e))
+    } else if l1e & DESC_VALID == 0 {
+        let pa = alloc_table_frame()?;
+        let table = MappedPageTable::from_pa(pa);
+        table.clear();
+        l1.install_table(l1_index(va), pa);
+        table
+    } else {
+        return Err(VmError::Unsupported);
+    };
+
+    let l2e = l2.read(l2_index(va));
+    let l3 = if is_table_desc(l2e) {
+        MappedPageTable::from_pa(desc_pa(l2e))
+    } else if l2e & DESC_VALID == 0 {
+        let pa = alloc_table_frame()?;
+        let table = MappedPageTable::from_pa(pa);
+        table.clear();
+        l2.install_table(l2_index(va), pa);
+        table
+    } else {
+        return Err(VmError::Unsupported);
+    };
+
+    Ok(l3)
 }
 
 /// Reclaim empty allocator-owned intermediate tables for one VA path.

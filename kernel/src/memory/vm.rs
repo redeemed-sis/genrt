@@ -1,14 +1,23 @@
-use super::{PhysAddr, VirtAddr};
+use super::{PhysAddr, PhysRange, VirtAddr};
 
 unsafe extern "C" {
     fn arch_phys_to_virt(pa: usize) -> usize;
     fn arch_virt_to_phys(va: usize) -> usize;
+    fn arch_user_image_load_pa() -> usize;
+    fn arch_user_image_reserved_size() -> usize;
+    fn arch_user_image_bringup_size() -> usize;
     fn arch_translate_kernel_va(va: usize, out_pa: *mut usize) -> u64;
     fn arch_map_kernel_region(va: usize, pa: usize, size: usize, attr: u32, flags: u64) -> u64;
     fn arch_unmap_kernel_region(va: usize, size: usize) -> u64;
     fn arch_protect_kernel_region(va: usize, size: usize, flags: u64) -> u64;
     fn arch_drop_boot_identity_mapping() -> u64;
     fn arch_switch_to_runtime_kernel_tables() -> u64;
+    fn arch_create_user_address_space(out_root_pa: *mut usize) -> u64;
+    fn arch_destroy_user_address_space(root_pa: usize) -> u64;
+    fn arch_map_user_page(root_pa: usize, va: usize, pa: usize, flags: u64) -> u64;
+    fn arch_translate_user_va(root_pa: usize, va: usize, out_pa: *mut usize) -> u64;
+    fn arch_activate_user_address_space(root_pa: usize) -> u64;
+    fn arch_clear_user_address_space() -> u64;
 }
 
 #[repr(u32)]
@@ -40,6 +49,43 @@ impl VmFlags {
 
     pub const fn union(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
+    }
+}
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct UserMapFlags(u64);
+
+impl UserMapFlags {
+    pub const WRITE: Self = Self(1 << 1);
+    pub const EXECUTE: Self = Self(1 << 2);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub const fn union(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct UserAddressSpace {
+    root_pa: PhysAddr,
+}
+
+impl UserAddressSpace {
+    pub const fn root_pa(self) -> PhysAddr {
+        self.root_pa
+    }
+
+    const fn from_root_pa(root_pa: PhysAddr) -> Self {
+        Self { root_pa }
     }
 }
 
@@ -104,16 +150,74 @@ pub unsafe fn switch_to_runtime_kernel_tables() -> Result<(), VmError> {
     vm_result(unsafe { arch_switch_to_runtime_kernel_tables() })
 }
 
+pub fn user_image_load_range() -> PhysRange {
+    let start = unsafe { arch_user_image_load_pa() };
+    let size = unsafe { arch_user_image_reserved_size() };
+    PhysRange {
+        start,
+        end: start.saturating_add(size),
+    }
+}
+
+pub fn user_image_bringup_size() -> usize {
+    unsafe { arch_user_image_bringup_size() }
+}
+
+pub fn create_user_address_space() -> Result<UserAddressSpace, VmError> {
+    let mut root_pa = 0usize;
+    match unsafe { arch_create_user_address_space(&mut root_pa as *mut usize) } {
+        0 => Ok(UserAddressSpace::from_root_pa(root_pa)),
+        code => Err(vm_error_from_code(code)),
+    }
+}
+
+pub unsafe fn destroy_user_address_space(aspace: UserAddressSpace) -> Result<(), VmError> {
+    vm_result(unsafe { arch_destroy_user_address_space(aspace.root_pa()) })
+}
+
+pub unsafe fn map_user_page(
+    aspace: UserAddressSpace,
+    va: VirtAddr,
+    pa: PhysAddr,
+    flags: UserMapFlags,
+) -> Result<(), VmError> {
+    vm_result(unsafe { arch_map_user_page(aspace.root_pa(), va, pa, flags.bits()) })
+}
+
+pub fn translate_user_va(aspace: UserAddressSpace, va: VirtAddr) -> Option<PhysAddr> {
+    let mut pa = 0usize;
+    match unsafe { arch_translate_user_va(aspace.root_pa(), va, &mut pa as *mut usize) } {
+        0 => Some(pa),
+        _ => None,
+    }
+}
+
+pub unsafe fn activate_user_address_space(aspace: UserAddressSpace) -> Result<(), VmError> {
+    vm_result(unsafe { arch_activate_user_address_space(aspace.root_pa()) })
+}
+
+pub unsafe fn clear_user_address_space() -> Result<(), VmError> {
+    vm_result(unsafe { arch_clear_user_address_space() })
+}
+
 fn vm_result(code: u64) -> Result<(), VmError> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(vm_error_from_code(code))
+    }
+}
+
+fn vm_error_from_code(code: u64) -> VmError {
     match code {
-        0 => Ok(()),
-        1 => Err(VmError::NotInitialized),
-        2 => Err(VmError::InvalidRange),
-        3 => Err(VmError::NotAligned),
-        4 => Err(VmError::NotKernelVa),
-        5 => Err(VmError::AlreadyMapped),
-        6 => Err(VmError::MissingMapping),
-        7 => Err(VmError::OutOfFrames),
-        _ => Err(VmError::Unsupported),
+        0 => VmError::Unsupported,
+        1 => VmError::NotInitialized,
+        2 => VmError::InvalidRange,
+        3 => VmError::NotAligned,
+        4 => VmError::NotKernelVa,
+        5 => VmError::AlreadyMapped,
+        6 => VmError::MissingMapping,
+        7 => VmError::OutOfFrames,
+        _ => VmError::Unsupported,
     }
 }

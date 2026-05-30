@@ -7,9 +7,11 @@
 use core::ptr::write_volatile;
 
 use super::hva::{
-    VmError, VmFlags, drop_boot_identity_mapping, hva_to_phys, map_kernel_region, phys_to_hva,
-    protect_kernel_region, switch_to_runtime_kernel_tables, translate_kernel_va,
-    unmap_kernel_region, vm_attr_from_code, vm_error_code,
+    UserMapFlags, VmError, VmFlags, activate_user_address_space, clear_user_address_space,
+    create_user_address_space, destroy_user_address_space, drop_boot_identity_mapping, hva_to_phys,
+    map_kernel_region, map_user_page, phys_to_hva, protect_kernel_region,
+    switch_to_runtime_kernel_tables, translate_kernel_va, translate_user_va, unmap_kernel_region,
+    vm_attr_from_code, vm_error_code,
 };
 
 #[unsafe(no_mangle)]
@@ -91,6 +93,77 @@ pub unsafe extern "C" fn arch_unmap_kernel_region(va: usize, size: usize) -> u64
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arch_protect_kernel_region(va: usize, size: usize, flags: u64) -> u64 {
     match unsafe { protect_kernel_region(va, size, VmFlags::from_bits(flags)) } {
+        Ok(()) => 0,
+        Err(err) => vm_error_code(err),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arch_create_user_address_space(out_root_pa: *mut usize) -> u64 {
+    if out_root_pa.is_null() {
+        return vm_error_code(VmError::InvalidRange);
+    }
+
+    match create_user_address_space() {
+        Ok(root_pa) => {
+            unsafe { write_volatile(out_root_pa, root_pa) };
+            0
+        }
+        Err(err) => vm_error_code(err),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arch_destroy_user_address_space(root_pa: usize) -> u64 {
+    match unsafe { destroy_user_address_space(root_pa) } {
+        Ok(()) => 0,
+        Err(err) => vm_error_code(err),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arch_map_user_page(
+    root_pa: usize,
+    va: usize,
+    pa: usize,
+    flags: u64,
+) -> u64 {
+    match unsafe { map_user_page(root_pa, va, pa, UserMapFlags::from_bits(flags)) } {
+        Ok(()) => 0,
+        Err(err) => vm_error_code(err),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arch_translate_user_va(
+    root_pa: usize,
+    va: usize,
+    out_pa: *mut usize,
+) -> u64 {
+    if out_pa.is_null() {
+        return vm_error_code(VmError::InvalidRange);
+    }
+
+    match translate_user_va(root_pa, va) {
+        Some(pa) => {
+            unsafe { write_volatile(out_pa, pa) };
+            0
+        }
+        None => vm_error_code(VmError::MissingMapping),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arch_activate_user_address_space(root_pa: usize) -> u64 {
+    match unsafe { activate_user_address_space(root_pa) } {
+        Ok(()) => 0,
+        Err(err) => vm_error_code(err),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arch_clear_user_address_space() -> u64 {
+    match unsafe { clear_user_address_space() } {
         Ok(()) => 0,
         Err(err) => vm_error_code(err),
     }
