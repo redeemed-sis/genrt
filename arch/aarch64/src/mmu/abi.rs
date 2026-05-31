@@ -9,7 +9,7 @@ use core::ptr::write_volatile;
 use super::hva::{
     UserMapFlags, VmError, VmFlags, activate_user_address_space, clear_user_address_space,
     create_user_address_space, destroy_user_address_space, drop_boot_identity_mapping, hva_to_phys,
-    map_kernel_region, map_user_page, phys_to_hva, protect_kernel_region,
+    map_kernel_region, map_user_page, phys_to_hva, protect_kernel_region, query_user_mapping,
     switch_to_runtime_kernel_tables, translate_kernel_va, translate_user_va, unmap_kernel_region,
     vm_attr_from_code, vm_error_code,
 };
@@ -147,6 +147,36 @@ pub unsafe extern "C" fn arch_translate_user_va(
     match translate_user_va(root_pa, va) {
         Some(pa) => {
             unsafe { write_volatile(out_pa, pa) };
+            0
+        }
+        None => vm_error_code(VmError::MissingMapping),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arch_query_user_mapping(
+    root_pa: usize,
+    va: usize,
+    out_info: *mut kernel::memory::vm::UserMappingInfo,
+) -> u64 {
+    if out_info.is_null() {
+        return vm_error_code(VmError::InvalidRange);
+    }
+
+    match query_user_mapping(root_pa, va) {
+        Some(info) => {
+            unsafe {
+                write_volatile(
+                    out_info,
+                    kernel::memory::vm::UserMappingInfo {
+                        pa: info.pa,
+                        user: info.user,
+                        readable: info.readable,
+                        writable: info.writable,
+                        executable: info.executable,
+                    },
+                )
+            };
             0
         }
         None => vm_error_code(VmError::MissingMapping),

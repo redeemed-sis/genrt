@@ -235,6 +235,16 @@ impl UserMapFlags {
     }
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct UserMappingInfo {
+    pub pa: PhysAddr,
+    pub user: bool,
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum VmError {
     NotInitialized,
@@ -587,35 +597,12 @@ pub(super) unsafe fn map_user_page(
 }
 
 pub(super) fn translate_user_va(root_pa: PhysAddr, va: VirtAddr) -> Option<PhysAddr> {
-    if root_pa == 0 || !is_user_va(va) {
-        return None;
-    }
+    query_user_mapping(root_pa, va).map(|info| info.pa)
+}
 
-    let l0 = MappedPageTable::from_pa(root_pa);
-    let l0e = l0.read(l0_index(va));
-    if !is_table_desc(l0e) {
-        return None;
-    }
-
-    let l1 = MappedPageTable::from_pa(desc_pa(l0e));
-    let l1e = l1.read(l1_index(va));
-    if !is_table_desc(l1e) {
-        return None;
-    }
-
-    let l2 = MappedPageTable::from_pa(desc_pa(l1e));
-    let l2e = l2.read(l2_index(va));
-    if !is_table_desc(l2e) {
-        return None;
-    }
-
-    let l3 = MappedPageTable::from_pa(desc_pa(l2e));
-    let l3e = l3.read(l3_index(va));
-    if l3e & DESC_VALID == 0 {
-        return None;
-    }
-
-    Some(desc_pa(l3e) + (va & (PAGE_SIZE - 1)))
+pub(super) fn query_user_mapping(root_pa: PhysAddr, va: VirtAddr) -> Option<UserMappingInfo> {
+    let desc = lookup_user_page_desc(root_pa, va)?;
+    Some(user_mapping_info_from_desc(desc, va))
 }
 
 pub(super) unsafe fn activate_user_address_space(root_pa: PhysAddr) -> Result<(), VmError> {
@@ -939,6 +926,47 @@ fn ensure_user_l3_table(root_pa: PhysAddr, va: VirtAddr) -> Result<MappedPageTab
     Ok(l3)
 }
 
+fn lookup_user_page_desc(root_pa: PhysAddr, va: VirtAddr) -> Option<u64> {
+    if root_pa == 0 || !is_user_va(va) {
+        return None;
+    }
+
+    let l0 = MappedPageTable::from_pa(root_pa);
+    let l0e = l0.read(l0_index(va));
+    if !is_table_desc(l0e) {
+        return None;
+    }
+
+    let l1 = MappedPageTable::from_pa(desc_pa(l0e));
+    let l1e = l1.read(l1_index(va));
+    if !is_table_desc(l1e) {
+        return None;
+    }
+
+    let l2 = MappedPageTable::from_pa(desc_pa(l1e));
+    let l2e = l2.read(l2_index(va));
+    if !is_table_desc(l2e) {
+        return None;
+    }
+
+    let l3 = MappedPageTable::from_pa(desc_pa(l2e));
+    let l3e = l3.read(l3_index(va));
+    is_page_desc(l3e).then_some(l3e)
+}
+
+fn user_mapping_info_from_desc(desc: u64, va: VirtAddr) -> UserMappingInfo {
+    let user = desc & DESC_AP_USER != 0;
+    let access_flag = desc & DESC_AF != 0;
+    let writable = user && access_flag && desc & DESC_AP_RO == 0;
+    UserMappingInfo {
+        pa: desc_pa(desc) + (va & (PAGE_SIZE - 1)),
+        user,
+        readable: user && access_flag,
+        writable,
+        executable: user && desc & DESC_UXN == 0,
+    }
+}
+
 /// Reclaim empty allocator-owned intermediate tables for one VA path.
 ///
 /// This relies on the post-memory-init invariant that TTBR1 has already been
@@ -1043,6 +1071,11 @@ fn is_table_desc(desc: u64) -> bool {
 #[inline(always)]
 fn is_block_desc(desc: u64) -> bool {
     (desc & DESC_VALID) != 0 && (desc & DESC_TABLE) == 0
+}
+
+#[inline(always)]
+fn is_page_desc(desc: u64) -> bool {
+    (desc & (DESC_VALID | DESC_TABLE)) == (DESC_VALID | DESC_TABLE)
 }
 
 #[inline(always)]

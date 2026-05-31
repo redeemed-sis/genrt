@@ -16,6 +16,7 @@ unsafe extern "C" {
     fn arch_destroy_user_address_space(root_pa: usize) -> u64;
     fn arch_map_user_page(root_pa: usize, va: usize, pa: usize, flags: u64) -> u64;
     fn arch_translate_user_va(root_pa: usize, va: usize, out_pa: *mut usize) -> u64;
+    fn arch_query_user_mapping(root_pa: usize, va: usize, out_info: *mut UserMappingInfo) -> u64;
     fn arch_activate_user_address_space(root_pa: usize) -> u64;
     fn arch_clear_user_address_space() -> u64;
 }
@@ -87,6 +88,16 @@ impl UserAddressSpace {
     const fn from_root_pa(root_pa: PhysAddr) -> Self {
         Self { root_pa }
     }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct UserMappingInfo {
+    pub pa: PhysAddr,
+    pub user: bool,
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -188,6 +199,20 @@ pub fn translate_user_va(aspace: UserAddressSpace, va: VirtAddr) -> Option<PhysA
     let mut pa = 0usize;
     match unsafe { arch_translate_user_va(aspace.root_pa(), va, &mut pa as *mut usize) } {
         0 => Some(pa),
+        _ => None,
+    }
+}
+
+pub fn query_user_mapping(aspace: UserAddressSpace, va: VirtAddr) -> Option<UserMappingInfo> {
+    let mut info = UserMappingInfo {
+        pa: 0,
+        user: false,
+        readable: false,
+        writable: false,
+        executable: false,
+    };
+    match unsafe { arch_query_user_mapping(aspace.root_pa(), va, &mut info as *mut _) } {
+        0 => Some(info),
         _ => None,
     }
 }
