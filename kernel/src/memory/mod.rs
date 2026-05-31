@@ -6,6 +6,7 @@ mod frame_alloc;
 pub mod heap;
 mod map;
 mod types;
+pub mod user;
 pub mod vm;
 
 use frame_alloc::{FrameAllocator, FreeListStorage};

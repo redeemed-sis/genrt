@@ -1,15 +1,13 @@
 use crate::{
     memory::{
         self, FrameRange, PAGE_SIZE, PhysAddr, VirtAddr,
+        user::{USER_STACK_TOP, USER_TEXT_BASE},
         vm::{self, UserAddressSpace, UserMapFlags, VmError},
     },
     sched::{self, ThreadAttrs},
 };
 
-pub(crate) const USER_TEXT_BASE: VirtAddr = 0x0000_0040_0000_0000;
-pub(crate) const USER_STACK_TOP: VirtAddr = 0x0000_0080_0000_0000;
 pub(crate) const USER_STACK_SIZE: usize = 64 * 1024;
-pub(crate) const MAX_USER_WRITE: usize = 256;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProcessId(usize);
@@ -79,32 +77,6 @@ pub(crate) fn join(process: Process) -> Result<usize, ProcessError> {
     );
     reclaim(process);
     Ok(code)
-}
-
-pub(crate) fn validate_user_buffer(ptr: VirtAddr, len: usize) -> bool {
-    if len == 0 || len > MAX_USER_WRITE {
-        return false;
-    }
-
-    let Some(end) = ptr.checked_add(len) else {
-        return false;
-    };
-    if ptr < USER_TEXT_BASE || end > USER_STACK_TOP {
-        return false;
-    }
-
-    let Some(address_space) = sched::current_user_address_space() else {
-        return false;
-    };
-
-    let mut cursor = align_down(ptr, PAGE_SIZE);
-    while cursor < end {
-        if vm::translate_user_va(address_space, cursor).is_none() {
-            return false;
-        }
-        cursor = cursor.saturating_add(PAGE_SIZE);
-    }
-    true
 }
 
 fn map_user_image(address_space: UserAddressSpace) -> Result<(), ProcessError> {
@@ -181,8 +153,4 @@ fn zero_phys_range(range: FrameRange) {
     // SAFETY: `range` was freshly allocated from the physical frame allocator,
     // and the kernel direct map covers RAM before process creation.
     unsafe { core::ptr::write_bytes(va as *mut u8, 0, len) };
-}
-
-const fn align_down(value: usize, align: usize) -> usize {
-    (value / align) * align
 }

@@ -1,4 +1,4 @@
-use crate::{console, process};
+use crate::{console, memory::user};
 
 pub const SYS_WRITE: usize = 1;
 pub const SYS_EXIT: usize = 2;
@@ -31,23 +31,26 @@ fn sys_write(frame_words: *mut u64) {
     let ptr = frame_word(frame_words, X1) as usize;
     let len = frame_word(frame_words, X2) as usize;
 
-    if fd != STDOUT || !process::validate_user_buffer(ptr, len) {
+    if fd != STDOUT || len > user::MAX_USER_COPY {
+        set_return(frame_words, -1);
+        return;
+    }
+    if len == 0 {
+        set_return(frame_words, 0);
+        return;
+    }
+
+    let mut buffer = [0u8; user::MAX_USER_COPY];
+    if user::copy_from_user(&mut buffer[..len], ptr).is_err() {
         set_return(frame_words, -1);
         return;
     }
 
-    let mut written = 0usize;
-    while written < len {
-        // SAFETY: `validate_user_buffer()` verified the range belongs to the
-        // current TTBR0 user address space. This bring-up copy intentionally
-        // relies on the active user mapping; a later milestone should replace
-        // it with fault-aware `copy_from_user`.
-        let byte = unsafe { (ptr as *const u8).add(written).read_volatile() };
-        console::putc(byte);
-        written += 1;
+    for byte in &buffer[..len] {
+        console::putc(*byte);
     }
 
-    set_return(frame_words, written as isize);
+    set_return(frame_words, len as isize);
 }
 
 fn sys_exit(frame_words: *mut u64) {
