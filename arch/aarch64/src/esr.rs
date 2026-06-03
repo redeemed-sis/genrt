@@ -1,4 +1,6 @@
 pub const EC_SVC_AARCH64: u8 = 0b010101;
+pub const EC_INST_ABORT_LOWER: u8 = 0b100000;
+pub const EC_DATA_ABORT_LOWER: u8 = 0b100100;
 
 #[inline(always)]
 pub fn ec(raw_esr: u64) -> u8 {

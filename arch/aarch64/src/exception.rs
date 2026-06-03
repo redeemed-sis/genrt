@@ -64,16 +64,59 @@ pub extern "C" fn lower_el_sync_entry(vector: u64, frame: *mut TrapFrame) {
     // This is the userspace syscall/fault boundary. It is deliberately separate
     // from `sync_entry()`, whose SVC #0 ABI is reserved for controlled EL1 task
     // calls such as sleep, mailbox wait, exit, and join.
+    let far = read_far_el1();
+    let tf = unsafe { &*frame };
+
     if ec == esr::EC_SVC_AARCH64 {
-        kernel::syscall::dispatch(frame as *mut u64);
+        match kernel::syscall::dispatch(frame as *mut u64) {
+            Ok(()) => return,
+            Err(kernel::syscall::DispatchError::UnknownSyscall(nr)) => {
+                let fault = kernel::process::UserFault::unknown_syscall(nr);
+                log_lower_el_user_fault("unknown syscall", &fault, raw_esr, far, tf);
+                if kernel::process::kill_current_process_on_user_fault(frame as *mut u64, fault)
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+        }
+        kernel::error!(
+            "exception: lower EL syscall fault without current process nr={}",
+            tf.x[8]
+        );
+        exception_entry(vector, frame as *const TrapFrame)
+    }
+
+    let fault = kernel::process::UserFault::sync_exception(user_fault_kind(raw_esr));
+    log_lower_el_user_fault("sync fault", &fault, raw_esr, far, tf);
+    if kernel::process::kill_current_process_on_user_fault(frame as *mut u64, fault).is_ok() {
         return;
     }
 
     kernel::error!(
-        "exception: lower EL sync fault EC=0x{ec:02x} ({}) ISS=0x{iss:08x}",
+        "exception: lower EL sync fault without current process EC=0x{ec:02x} ({}) ISS=0x{iss:08x}",
         esr::ec_name(ec)
     );
     exception_entry(vector, frame as *const TrapFrame)
+}
+
+fn log_lower_el_user_fault(
+    label: &str,
+    fault: &kernel::process::UserFault,
+    raw_esr: u64,
+    far: u64,
+    frame: &TrapFrame,
+) {
+    kernel::warn!(
+        "exception: lower EL {label} kind={:?} esr=0x{:x} far=0x{:x} elr=0x{:x} spsr=0x{:x} sp_el0=0x{:x} x8=0x{:x}",
+        fault.kind,
+        raw_esr,
+        far,
+        frame.elr,
+        frame.spsr,
+        frame.sp,
+        frame.x[8]
+    );
 }
 
 #[unsafe(no_mangle)]
@@ -173,6 +216,36 @@ fn vector_source_kind(vector: u64) -> (&'static str, &'static str) {
         15 => ("lower_el_aarch32", "serror"),
         _ => ("unknown", "unknown"),
     }
+}
+
+fn user_fault_kind(raw_esr: u64) -> kernel::process::UserFaultKind {
+    let ec = esr::ec(raw_esr);
+    let iss = esr::iss(raw_esr);
+    let fault_status = iss & 0x3f;
+
+    match ec {
+        esr::EC_INST_ABORT_LOWER | esr::EC_DATA_ABORT_LOWER
+            if is_translation_fault(fault_status) =>
+        {
+            kernel::process::UserFaultKind::TranslationFault
+        }
+        esr::EC_INST_ABORT_LOWER | esr::EC_DATA_ABORT_LOWER
+            if is_permission_fault(fault_status) =>
+        {
+            kernel::process::UserFaultKind::PermissionFault
+        }
+        esr::EC_INST_ABORT_LOWER => kernel::process::UserFaultKind::InstructionAbort,
+        esr::EC_DATA_ABORT_LOWER => kernel::process::UserFaultKind::DataAbort,
+        _ => kernel::process::UserFaultKind::OtherSync,
+    }
+}
+
+fn is_translation_fault(fault_status: u32) -> bool {
+    matches!(fault_status, 0b000100..=0b000111)
+}
+
+fn is_permission_fault(fault_status: u32) -> bool {
+    matches!(fault_status, 0b001100..=0b001111)
 }
 
 #[inline(always)]

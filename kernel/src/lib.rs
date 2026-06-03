@@ -12,7 +12,7 @@ pub mod ipc;
 pub mod log;
 pub mod memory;
 pub mod panic;
-pub(crate) mod process;
+pub mod process;
 pub mod sched;
 pub(crate) mod sync;
 pub mod syscall;

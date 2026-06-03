@@ -2,8 +2,9 @@ const TASK_CALL_SLEEP_UNTIL: u64 = 1;
 const TASK_CALL_MAILBOX_WAIT: u64 = 2;
 const TASK_CALL_THREAD_EXIT: u64 = 3;
 const TASK_CALL_THREAD_JOIN: u64 = 4;
+const TASK_CALL_PROCESS_JOIN: u64 = 5;
 
-use crate::task::ThreadId;
+use crate::{process::ProcessId, task::ThreadId};
 
 unsafe extern "C" {
     fn arch_task_call(request: *const core::ffi::c_void);
@@ -21,6 +22,7 @@ union TaskCallArgs {
     mailbox_wait: TaskCallMailboxWait,
     thread_exit: TaskCallThreadExit,
     thread_join: TaskCallThreadJoin,
+    process_join: TaskCallProcessJoin,
 }
 
 #[repr(C)]
@@ -47,6 +49,13 @@ struct TaskCallThreadExit {
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct TaskCallThreadJoin {
+    index: usize,
+    generation: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct TaskCallProcessJoin {
     index: usize,
     generation: u32,
 }
@@ -104,6 +113,18 @@ impl TaskCallRequest {
             },
         }
     }
+
+    fn process_join(id: ProcessId) -> Self {
+        Self {
+            op: TASK_CALL_PROCESS_JOIN,
+            args: TaskCallArgs {
+                process_join: TaskCallProcessJoin {
+                    index: id.index(),
+                    generation: id.generation(),
+                },
+            },
+        }
+    }
 }
 
 pub(crate) fn sleep_until_counter(deadline: u64) {
@@ -149,6 +170,14 @@ pub(crate) fn thread_join(id: ThreadId) {
     unsafe { arch_task_call(&request as *const TaskCallRequest as *const core::ffi::c_void) }
 }
 
+pub(crate) fn process_join(id: ProcessId) {
+    let request = TaskCallRequest::process_join(id);
+    // SAFETY: process join is consumed synchronously by the controlled SVC path.
+    // If the process is still running, the current kernel thread may block and
+    // resume after the process stores a terminal exit status.
+    unsafe { arch_task_call(&request as *const TaskCallRequest as *const core::ffi::c_void) }
+}
+
 pub fn on_arch_task_call(active_frame_words: *mut u64, request: *const core::ffi::c_void) {
     if request.is_null() {
         panic!("task-call: null request");
@@ -190,6 +219,14 @@ pub fn on_arch_task_call(active_frame_words: *mut u64, request: *const core::ffi
             crate::sched::on_thread_join_sync(
                 active_frame_words,
                 ThreadId::new(args.index, args.generation),
+            );
+        }
+        TASK_CALL_PROCESS_JOIN => {
+            // SAFETY: the `op` tag selects this payload variant.
+            let args = unsafe { request.args.process_join };
+            crate::process::on_process_join_sync(
+                active_frame_words,
+                ProcessId::new(args.index, args.generation),
             );
         }
         op => panic!("task-call: unknown operation {op}"),

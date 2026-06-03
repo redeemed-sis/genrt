@@ -3,6 +3,7 @@ use alloc::boxed::Box;
 use crate::{
     arch_consts::TASK_FRAME_WORDS,
     memory::vm::UserAddressSpace,
+    process::ProcessId,
     task::{TaskId, ThreadId},
     time::TimedEvent,
 };
@@ -17,6 +18,7 @@ pub(super) enum BlockReason {
     Sleep,
     Ipc(sched_ipc::IpcBlock),
     Join(ThreadId),
+    ProcessJoin(ProcessId),
 }
 
 // Task-state semantics:
@@ -46,7 +48,10 @@ pub(super) enum TaskState {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum ThreadKind {
     Kernel,
-    User { address_space: UserAddressSpace },
+    User {
+        process_id: ProcessId,
+        address_space: UserAddressSpace,
+    },
 }
 
 #[repr(C, align(16))]
@@ -404,7 +409,7 @@ impl Scheduler {
     fn activate_task_address_space(&self, id: TaskId) {
         let result = match self.task(id).kind {
             ThreadKind::Kernel => unsafe { crate::memory::vm::clear_user_address_space() },
-            ThreadKind::User { address_space } => unsafe {
+            ThreadKind::User { address_space, .. } => unsafe {
                 crate::memory::vm::activate_user_address_space(address_space)
             },
         };

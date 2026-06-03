@@ -18,7 +18,8 @@ pub(crate) use self::{
     preempt::enter_running_task,
     sleep::on_sleep_sync,
     thread::{
-        current_user_address_space, on_thread_exit_sync, on_thread_join_sync, thread_spawn_user,
+        block_current_on_process_join, complete_process_join, current_user_address_space,
+        current_user_process_id, on_thread_exit_sync, on_thread_join_sync, thread_spawn_user,
     },
 };
 pub use self::{

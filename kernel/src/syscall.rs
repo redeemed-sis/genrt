@@ -1,4 +1,4 @@
-use crate::{console, memory::user};
+use crate::{console, memory::user, process};
 
 pub const SYS_WRITE: usize = 1;
 pub const SYS_EXIT: usize = 2;
@@ -9,20 +9,27 @@ const X2: usize = 2;
 const X8: usize = 8;
 const STDOUT: usize = 1;
 
-pub fn dispatch(frame_words: *mut u64) {
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum DispatchError {
+    UnknownSyscall(usize),
+}
+
+pub fn dispatch(frame_words: *mut u64) -> Result<(), DispatchError> {
     if frame_words.is_null() {
         panic!("syscall: null trap frame");
     }
 
     let nr = frame_word(frame_words, X8) as usize;
     match nr {
-        SYS_WRITE => sys_write(frame_words),
-        SYS_EXIT => sys_exit(frame_words),
-        _ => {
-            let elr = frame_word(frame_words, 32);
-            crate::error!("syscall: unknown nr={nr} elr=0x{elr:x}; terminating current user task");
-            crate::sched::on_thread_exit_sync(frame_words, usize::MAX);
+        SYS_WRITE => {
+            sys_write(frame_words);
+            Ok(())
         }
+        SYS_EXIT => {
+            sys_exit(frame_words);
+            Ok(())
+        }
+        _ => Err(DispatchError::UnknownSyscall(nr)),
     }
 }
 
@@ -56,7 +63,7 @@ fn sys_write(frame_words: *mut u64) {
 fn sys_exit(frame_words: *mut u64) {
     let code = frame_word(frame_words, X0) as usize;
     crate::debug!("syscall: exit code={code}");
-    crate::sched::on_thread_exit_sync(frame_words, code);
+    process::process_exit_current(frame_words, code);
 }
 
 fn frame_word(frame_words: *mut u64, index: usize) -> u64 {

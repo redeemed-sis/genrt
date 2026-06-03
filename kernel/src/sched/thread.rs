@@ -2,6 +2,7 @@ use core::mem;
 
 use crate::{
     memory::vm::UserAddressSpace,
+    process::ProcessId,
     sync::LocalIrqGuard,
     task::{TaskId, ThreadId},
 };
@@ -160,7 +161,13 @@ pub(crate) fn current_user_address_space() -> Option<UserAddressSpace> {
     try_scheduler_mut().and_then(|scheduler| scheduler.running_user_address_space())
 }
 
+pub(crate) fn current_user_process_id() -> Option<ProcessId> {
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    try_scheduler_mut().and_then(|scheduler| scheduler.running_user_process_id())
+}
+
 pub(crate) fn thread_spawn_user(
+    process_id: ProcessId,
     address_space: UserAddressSpace,
     user_entry: usize,
     user_sp: usize,
@@ -172,7 +179,7 @@ pub(crate) fn thread_spawn_user(
         return Err(SpawnError::SchedulerNotInitialized);
     };
 
-    scheduler.spawn_user_thread(address_space, user_entry, user_sp, arg0, attrs)
+    scheduler.spawn_user_thread(process_id, address_space, user_entry, user_sp, arg0, attrs)
 }
 
 pub(crate) fn on_thread_exit_sync(active_frame_words: *mut u64, code: usize) {
@@ -181,6 +188,14 @@ pub(crate) fn on_thread_exit_sync(active_frame_words: *mut u64, code: usize) {
 
 pub(crate) fn on_thread_join_sync(active_frame_words: *mut u64, target: ThreadId) {
     scheduler_mut().join_thread(active_frame_words, target);
+}
+
+pub(crate) fn block_current_on_process_join(active_frame_words: *mut u64, pid: ProcessId) {
+    scheduler_mut().block_current_on_process_join(active_frame_words, pid);
+}
+
+pub(crate) fn complete_process_join(joiner: ThreadId, pid: ProcessId) {
+    scheduler_mut().complete_process_join(joiner, pid);
 }
 
 impl Scheduler {
@@ -228,6 +243,7 @@ impl Scheduler {
 
     fn spawn_user_thread(
         &mut self,
+        process_id: ProcessId,
         address_space: UserAddressSpace,
         user_entry: usize,
         user_sp: usize,
@@ -249,7 +265,10 @@ impl Scheduler {
             task.last_join_result = None;
             task.entry = free_task_entry;
             task.arg = ThreadArg::empty();
-            task.kind = preempt::ThreadKind::User { address_space };
+            task.kind = preempt::ThreadKind::User {
+                process_id,
+                address_space,
+            };
             ThreadId::new(id.index(), task.generation)
         };
 
@@ -263,7 +282,7 @@ impl Scheduler {
         }
 
         crate::debug!(
-            "thread: spawned user id={thread_id} entry=0x{user_entry:x} sp=0x{user_sp:x} ttbr0=0x{:x}",
+            "thread: spawned user id={thread_id} pid={process_id} entry=0x{user_entry:x} sp=0x{user_sp:x} ttbr0=0x{:x}",
             address_space.root_pa()
         );
         Ok(thread_id)
@@ -495,9 +514,45 @@ impl Scheduler {
     fn running_user_address_space(&self) -> Option<UserAddressSpace> {
         let current = self.running_task()?;
         match self.task(current).kind {
-            preempt::ThreadKind::User { address_space } => Some(address_space),
+            preempt::ThreadKind::User { address_space, .. } => Some(address_space),
             preempt::ThreadKind::Kernel => None,
         }
+    }
+
+    fn running_user_process_id(&self) -> Option<ProcessId> {
+        let current = self.running_task()?;
+        match self.task(current).kind {
+            preempt::ThreadKind::User { process_id, .. } => Some(process_id),
+            preempt::ThreadKind::Kernel => None,
+        }
+    }
+
+    fn block_current_on_process_join(&mut self, active_frame_words: *mut u64, pid: ProcessId) {
+        let current = self.blocking_current(active_frame_words);
+        let next = self.block_current_with_reason(
+            active_frame_words,
+            current,
+            preempt::BlockReason::ProcessJoin(pid),
+        );
+        self.finish_block_current(current, next);
+    }
+
+    fn complete_process_join(&mut self, joiner: ThreadId, pid: ProcessId) {
+        let Some(joiner_task) = self.task_id_from_thread_id(joiner) else {
+            panic!("process: joiner {joiner} disappeared while pid {pid} exited");
+        };
+
+        match self.task(joiner_task).state {
+            preempt::TaskState::Blocked(preempt::BlockReason::ProcessJoin(waiting_for))
+                if waiting_for == pid => {}
+            state => panic!("process: joiner {joiner} has invalid state {state:?}"),
+        }
+
+        self.make_ready(joiner_task);
+        if joiner_task != IDLE_TASK_ID {
+            self.ready_push_back(joiner_task);
+        }
+        crate::debug!("process: join wake pid={pid} joiner={joiner}");
     }
 }
 
