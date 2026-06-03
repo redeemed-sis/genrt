@@ -57,6 +57,9 @@ The current AArch64 path already has:
 * scheduler TTBR0 activation for user threads and TTBR0 clear for kernel threads
 * lower-EL `svc #0` syscall dispatch separated from EL1 task-call `svc #0`
 * bring-up `sys_write` / `sys_exit` path for the first user process
+* bounded process table with generation-checked `ProcessId`
+* process exit/fault status and kernel-side `process_join`
+* lower-EL user fault policy that terminates the current process instead of panicking the kernel
 * minimal allocation-free formatted logging with log levels
 * improved fatal exception diagnostics
 * `xtask` post-link `.boot.text` autonomy check using `readelf` and `llvm-objdump`
@@ -138,7 +141,7 @@ Key milestone already reached:
 
 * single-core only
 * only one demo userspace process is created
-* no general EL0 process subsystem yet
+* no general multi-process subsystem yet
 * no ASIDs or multiple per-process TTBR0 roots yet
 * VM API currently supports only 2 MiB-aligned TTBR1 kernel mappings
 * user VM bring-up supports only explicit 4 KiB mappings created by the first process path
@@ -370,7 +373,7 @@ The best next steps are:
 
 1. refine VM permissions and page-table ownership invariants
 2. replace bring-up user image constants with ELF/initramfs metadata
-3. fault-aware `copy_from_user` and user fault termination
+3. fault-aware `copy_from_user` recovery for faults during actual loads/stores
 4. growable heap design on top of frame allocation
 
 ## Documentation
@@ -393,3 +396,4 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0014-bounded-kernel-thread-lifecycle.md`
 * `ai-docs/decision-records/ADR-0015-aarch64-high-half-mmu-bring-up.md`
 * `ai-docs/decision-records/ADR-0016-first-aarch64-el0-process.md`
+* `ai-docs/decision-records/ADR-0017-process-table-and-user-fault-policy.md`
