@@ -32,6 +32,8 @@ enum Commands {
         arch: Arch,
         #[arg(long)]
         user_bin: Option<PathBuf>,
+        #[arg(long)]
+        check_fault: bool,
     },
     GdbCmd {
         #[arg(long, value_enum)]
@@ -46,12 +48,16 @@ enum Commands {
         log_level: Option<LogLevel>,
         #[arg(long)]
         user_bin: Option<PathBuf>,
+        #[arg(long)]
+        check_fault: bool,
     },
     DebugAarch64 {
         #[arg(long, value_enum)]
         log_level: Option<LogLevel>,
         #[arg(long)]
         user_bin: Option<PathBuf>,
+        #[arg(long)]
+        check_fault: bool,
     },
 }
 
@@ -90,17 +96,28 @@ fn main() -> Result<()> {
         Commands::Doctor => doctor(),
         Commands::Phase0Check => phase0_check(),
         Commands::RepoTree => repo_tree(),
-        Commands::QemuCmd { arch, user_bin } => qemu_cmd(arch, user_bin),
+        Commands::QemuCmd {
+            arch,
+            user_bin,
+            check_fault,
+        } => qemu_cmd(arch, user_bin, check_fault),
         Commands::GdbCmd { arch } => gdb_cmd(arch),
         Commands::BuildAarch64 { log_level } => build_aarch64(log_level),
         Commands::RunAarch64 {
             log_level,
             user_bin,
-        } => run_aarch64(false, log_level, user_bin),
+            check_fault,
+        } => run_aarch64(false, log_level, user_bin, check_fault),
         Commands::DebugAarch64 {
             log_level,
             user_bin,
-        } => run_aarch64(true, Some(log_level.unwrap_or(LogLevel::Debug)), user_bin),
+            check_fault,
+        } => run_aarch64(
+            true,
+            Some(log_level.unwrap_or(LogLevel::Debug)),
+            user_bin,
+            check_fault,
+        ),
     }
 }
 
@@ -201,10 +218,10 @@ fn repo_tree() -> Result<()> {
     Ok(())
 }
 
-fn qemu_cmd(arch: Arch, user_bin: Option<PathBuf>) -> Result<()> {
+fn qemu_cmd(arch: Arch, user_bin: Option<PathBuf>, check_fault: bool) -> Result<()> {
     match arch {
         Arch::Aarch64 => {
-            let user_bin = user_bin.unwrap_or_else(default_user_bin_path);
+            let user_bin = selected_user_bin_path(user_bin, check_fault)?;
             println!("qemu-system-aarch64 \\");
             println!("  -machine {AARCH64_QEMU_MACHINE} \\");
             println!("  -cpu {AARCH64_QEMU_CPU} \\");
@@ -254,7 +271,7 @@ fn gdb_cmd(arch: Arch) -> Result<()> {
 
 fn build_aarch64(log_level: Option<LogLevel>) -> Result<()> {
     let dtb_path = generate_qemu_virt_dtb()?;
-    build_aarch64_user_hello()?;
+    build_aarch64_user_bins()?;
 
     let mut build = Command::new("cargo");
     build.args([
@@ -304,10 +321,11 @@ fn run_aarch64(
     wait_for_gdb: bool,
     log_level: Option<LogLevel>,
     user_bin: Option<PathBuf>,
+    check_fault: bool,
 ) -> Result<()> {
     build_aarch64(log_level)?;
     let dtb_path = qemu_virt_dtb_path()?;
-    let user_bin = user_bin.unwrap_or_else(default_user_bin_path);
+    let user_bin = selected_user_bin_path(user_bin, check_fault)?;
 
     let mut cmd = Command::new("qemu-system-aarch64");
     cmd.args([
@@ -356,11 +374,37 @@ fn default_user_bin_path() -> PathBuf {
     PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/hello.bin"))
 }
 
-fn build_aarch64_user_hello() -> Result<PathBuf> {
-    let source = Path::new("user/aarch64/hello.S");
-    ensure_exists(source.to_str().unwrap_or("user/aarch64/hello.S"))?;
+fn fault_user_bin_path() -> PathBuf {
+    PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/fault_null.bin"))
+}
 
-    let bin = default_user_bin_path();
+fn selected_user_bin_path(user_bin: Option<PathBuf>, check_fault: bool) -> Result<PathBuf> {
+    if check_fault && user_bin.is_some() {
+        bail!("--check-fault and --user-bin are mutually exclusive")
+    }
+
+    Ok(match (check_fault, user_bin) {
+        (true, None) => fault_user_bin_path(),
+        (false, Some(path)) => path,
+        (false, None) => default_user_bin_path(),
+        (true, Some(_)) => unreachable!(),
+    })
+}
+
+fn build_aarch64_user_bins() -> Result<()> {
+    build_aarch64_user_bin("hello", "user/aarch64/hello.S", default_user_bin_path())?;
+    build_aarch64_user_bin(
+        "fault_null",
+        "user/aarch64/fault_null.S",
+        fault_user_bin_path(),
+    )?;
+    Ok(())
+}
+
+fn build_aarch64_user_bin(name: &str, source: &str, bin: PathBuf) -> Result<PathBuf> {
+    let source = Path::new(source);
+    ensure_exists(source.to_str().unwrap_or("<invalid user source path>"))?;
+
     let obj = bin.with_extension("o");
     if let Some(parent) = bin.parent() {
         fs::create_dir_all(parent).context("failed to create user binary output directory")?;
@@ -372,9 +416,9 @@ fn build_aarch64_user_hello() -> Result<PathBuf> {
         .arg("-o")
         .arg(&obj)
         .status()
-        .context("failed to invoke llvm-mc for AArch64 user program")?;
+        .with_context(|| format!("failed to invoke llvm-mc for AArch64 user program {name}"))?;
     if !status.success() {
-        bail!("llvm-mc failed to assemble AArch64 user program")
+        bail!("llvm-mc failed to assemble AArch64 user program {name}")
     }
 
     let status = Command::new("llvm-objcopy")
@@ -382,9 +426,11 @@ fn build_aarch64_user_hello() -> Result<PathBuf> {
         .arg(&obj)
         .arg(&bin)
         .status()
-        .context("failed to invoke llvm-objcopy for AArch64 user program")?;
+        .with_context(|| {
+            format!("failed to invoke llvm-objcopy for AArch64 user program {name}")
+        })?;
     if !status.success() {
-        bail!("llvm-objcopy failed to produce AArch64 user binary")
+        bail!("llvm-objcopy failed to produce AArch64 user binary {name}")
     }
 
     let size = fs::metadata(&bin)
