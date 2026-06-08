@@ -52,7 +52,8 @@ The current AArch64 path already has:
 * demo producer/consumer tasks exchanging messages through a capacity-bounded mailbox
 * timeout-aware mailbox send/receive operations
 * bounded `thread_spawn` / `thread_exit` / `thread_join`
-* first EL0 flat userspace program loaded by QEMU generic loader
+* first EL0 userspace examples loaded as ELF64 AArch64 executables
+* minimal kernel ELF loader for static freestanding `ET_EXEC` images
 * minimal TTBR0 user address space with 4 KiB user page mappings
 * scheduler TTBR0 activation for user threads and TTBR0 clear for kernel threads
 * lower-EL `svc #0` syscall dispatch separated from EL1 task-call `svc #0`
@@ -113,10 +114,11 @@ rust_entry (high VA)
 
 kernel init thread
   -> create first TTBR0 user address space
-  -> map QEMU-loaded flat user image
+  -> parse QEMU-loaded user ELF image
+  -> map ELF PT_LOAD segments
   -> map user stack
   -> spawn EL0 user thread
-  -> join user thread and log exit code
+  -> join user process and log exit/fault status
 
 Timer IRQ
   -> save full TrapFrame
@@ -145,7 +147,7 @@ Key milestone already reached:
 * no ASIDs or multiple per-process TTBR0 roots yet
 * VM API currently supports only 2 MiB-aligned TTBR1 kernel mappings
 * user VM bring-up supports only explicit 4 KiB mappings created by the first process path
-* userspace image size is a fixed bring-up constant, not discovered from an ELF header
+* userspace ELF file size is bounded by a fixed bring-up loader reservation
 * heap is currently a fixed-size `16 MiB` bootstrap region
 * direct-to-UART logging
 * scheduler/time dynamic containers are preallocated at bootstrap and must not grow in IRQ paths
@@ -210,9 +212,11 @@ The bootstrap page tables are intentionally small:
 
 `xtask` controls the QEMU bare-metal protocol. It generates a compact QEMU
 `virt,gic-version=2` DTB and loads it at `0x4000_0000` with a loader device. The
-kernel image stays at `0x4008_0000`. It also assembles a tiny raw AArch64 user
-program and loads it at the reserved bring-up physical address `0x4700_0000`
-with `-device loader,...,force-raw=on`; the loader does not change the CPU PC.
+kernel image stays at `0x4008_0000`. It also builds freestanding AArch64 user
+ELF examples and loads the selected ELF file as raw bytes at the reserved
+bring-up physical address `0x4700_0000` with
+`-device loader,...,force-raw=on`; the loader does not change the CPU PC. The
+kernel parses the ELF image itself and maps `PT_LOAD` segments into TTBR0.
 The low `.boot.text` parser reads the DTB before UART/GIC are initialized and
 extracts only the ranges needed for initial MMU mappings. If that early parse
 fails, the AArch64 QEMU platform layer has an emergency fallback for RAM/UART/GIC
@@ -281,9 +285,15 @@ storage through the generic frame allocator.
 The first userspace path adds a separate narrow TTBR0 API:
 
 * create/destroy one user address space root from physical frames
-* map 4 KiB EL0 pages for user text and stack
+* map 4 KiB EL0 pages for ELF segments and user stack
 * translate user VA for bring-up `copy_from_user` validation
 * activate a user TTBR0 root or clear TTBR0 during scheduler handoff
+
+The current userspace loader accepts only ELF64 little-endian AArch64
+`ET_EXEC` files with static `PT_LOAD` segments. It rejects dynamic linking,
+interpreters, TLS, non-AArch64 images, and RWX segments. User examples are built
+from `user/c/` with a tiny freestanding C runtime and linker script; there is no
+legacy raw `.bin` userspace payload path.
 
 The initial user syscall ABI is AArch64-style: `x8` is the syscall number,
 `x0..x5` are arguments, and `x0` is the return value. Only `write(fd=1, ptr,
@@ -348,8 +358,12 @@ joinable workers to exercise `spawn -> exit -> join`.
 ```bash
 just doctor
 just build-aarch64
+just build-user-hello
+just build-user-fault
 just run-aarch64
+just run-aarch64-fault
 just debug-aarch64
+just debug-aarch64-fault
 just gdb-aarch64
 ```
 
@@ -372,7 +386,7 @@ cargo xtask run-aarch64 --log-level trace
 The best next steps are:
 
 1. refine VM permissions and page-table ownership invariants
-2. replace bring-up user image constants with ELF/initramfs metadata
+2. replace fixed user ELF loader reservation with generated/initramfs metadata
 3. fault-aware `copy_from_user` recovery for faults during actual loads/stores
 4. growable heap design on top of frame allocation
 
@@ -396,4 +410,5 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0014-bounded-kernel-thread-lifecycle.md`
 * `ai-docs/decision-records/ADR-0015-aarch64-high-half-mmu-bring-up.md`
 * `ai-docs/decision-records/ADR-0016-first-aarch64-el0-process.md`
+* `ai-docs/decision-records/ADR-0018-userspace-elf-loader.md`
 * `ai-docs/decision-records/ADR-0017-process-table-and-user-fault-policy.md`
