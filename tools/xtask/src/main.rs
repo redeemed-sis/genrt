@@ -12,7 +12,9 @@ const AARCH64_QEMU_MACHINE: &str = "virt,gic-version=2";
 const AARCH64_QEMU_CPU: &str = "cortex-a72";
 const AARCH64_DTB_LOAD_ADDR: &str = "0x40000000";
 const AARCH64_USER_IMAGE_LOAD_ADDR: &str = "0x47000000";
-const AARCH64_USER_IMAGE_MAX_SIZE: u64 = 4096;
+const AARCH64_USER_IMAGE_MAX_SIZE: u64 = 64 * 1024;
+const AARCH64_USER_CRT0: &str = "user/c/aarch64/crt0.S";
+const AARCH64_USER_INCLUDE_DIR: &str = "user/c/aarch64/include";
 
 #[derive(Parser)]
 #[command(name = "xtask")]
@@ -31,7 +33,7 @@ enum Commands {
         #[arg(long, value_enum)]
         arch: Arch,
         #[arg(long)]
-        user_bin: Option<PathBuf>,
+        user_elf: Option<PathBuf>,
         #[arg(long)]
         check_fault: bool,
     },
@@ -43,11 +45,13 @@ enum Commands {
         #[arg(long, value_enum)]
         log_level: Option<LogLevel>,
     },
+    BuildUserHello,
+    BuildUserFault,
     RunAarch64 {
         #[arg(long, value_enum)]
         log_level: Option<LogLevel>,
         #[arg(long)]
-        user_bin: Option<PathBuf>,
+        user_elf: Option<PathBuf>,
         #[arg(long)]
         check_fault: bool,
     },
@@ -55,7 +59,7 @@ enum Commands {
         #[arg(long, value_enum)]
         log_level: Option<LogLevel>,
         #[arg(long)]
-        user_bin: Option<PathBuf>,
+        user_elf: Option<PathBuf>,
         #[arg(long)]
         check_fault: bool,
     },
@@ -98,24 +102,31 @@ fn main() -> Result<()> {
         Commands::RepoTree => repo_tree(),
         Commands::QemuCmd {
             arch,
-            user_bin,
+            user_elf,
             check_fault,
-        } => qemu_cmd(arch, user_bin, check_fault),
+        } => qemu_cmd(arch, user_elf, check_fault),
         Commands::GdbCmd { arch } => gdb_cmd(arch),
         Commands::BuildAarch64 { log_level } => build_aarch64(log_level),
+        Commands::BuildUserHello => {
+            build_aarch64_user_elf("hello", "user/c/hello.c", default_user_elf_path()).map(|_| ())
+        }
+        Commands::BuildUserFault => {
+            build_aarch64_user_elf("fault_null", "user/c/fault_null.c", fault_user_elf_path())
+                .map(|_| ())
+        }
         Commands::RunAarch64 {
             log_level,
-            user_bin,
+            user_elf,
             check_fault,
-        } => run_aarch64(false, log_level, user_bin, check_fault),
+        } => run_aarch64(false, log_level, user_elf, check_fault),
         Commands::DebugAarch64 {
             log_level,
-            user_bin,
+            user_elf,
             check_fault,
         } => run_aarch64(
             true,
             Some(log_level.unwrap_or(LogLevel::Debug)),
-            user_bin,
+            user_elf,
             check_fault,
         ),
     }
@@ -129,6 +140,7 @@ fn doctor() -> Result<()> {
         "qemu-system-aarch64",
         "gdb",
         "aarch64-linux-gnu-gdb",
+        "clang",
         "ld.lld",
     ];
 
@@ -218,10 +230,10 @@ fn repo_tree() -> Result<()> {
     Ok(())
 }
 
-fn qemu_cmd(arch: Arch, user_bin: Option<PathBuf>, check_fault: bool) -> Result<()> {
+fn qemu_cmd(arch: Arch, user_elf: Option<PathBuf>, check_fault: bool) -> Result<()> {
     match arch {
         Arch::Aarch64 => {
-            let user_bin = selected_user_bin_path(user_bin, check_fault)?;
+            let user_elf = selected_user_elf_path(user_elf, check_fault)?;
             println!("qemu-system-aarch64 \\");
             println!("  -machine {AARCH64_QEMU_MACHINE} \\");
             println!("  -cpu {AARCH64_QEMU_CPU} \\");
@@ -233,7 +245,7 @@ fn qemu_cmd(arch: Arch, user_bin: Option<PathBuf>, check_fault: bool) -> Result<
             );
             println!(
                 "  -device loader,file={},addr={AARCH64_USER_IMAGE_LOAD_ADDR},force-raw=on \\",
-                user_bin.display()
+                user_elf.display()
             );
             println!("  -S -s");
         }
@@ -271,7 +283,7 @@ fn gdb_cmd(arch: Arch) -> Result<()> {
 
 fn build_aarch64(log_level: Option<LogLevel>) -> Result<()> {
     let dtb_path = generate_qemu_virt_dtb()?;
-    build_aarch64_user_bins()?;
+    build_aarch64_user_elfs()?;
 
     let mut build = Command::new("cargo");
     build.args([
@@ -320,12 +332,12 @@ fn build_aarch64(log_level: Option<LogLevel>) -> Result<()> {
 fn run_aarch64(
     wait_for_gdb: bool,
     log_level: Option<LogLevel>,
-    user_bin: Option<PathBuf>,
+    user_elf: Option<PathBuf>,
     check_fault: bool,
 ) -> Result<()> {
     build_aarch64(log_level)?;
     let dtb_path = qemu_virt_dtb_path()?;
-    let user_bin = selected_user_bin_path(user_bin, check_fault)?;
+    let user_elf = selected_user_elf_path(user_elf, check_fault)?;
 
     let mut cmd = Command::new("qemu-system-aarch64");
     cmd.args([
@@ -347,7 +359,7 @@ fn run_aarch64(
     .arg("-device")
     .arg(format!(
         "loader,file={},addr={AARCH64_USER_IMAGE_LOAD_ADDR},force-raw=on",
-        user_bin.display()
+        user_elf.display()
     ))
     .stdout(Stdio::inherit())
     .stderr(Stdio::inherit());
@@ -370,80 +382,133 @@ fn final_elf_path() -> PathBuf {
     PathBuf::from(format!("target/{AARCH64_TARGET}/debug/genrt-aarch64.elf"))
 }
 
-fn default_user_bin_path() -> PathBuf {
-    PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/hello.bin"))
+fn default_user_elf_path() -> PathBuf {
+    PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/hello.elf"))
 }
 
-fn fault_user_bin_path() -> PathBuf {
-    PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/fault_null.bin"))
+fn fault_user_elf_path() -> PathBuf {
+    PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/fault_null.elf"))
 }
 
-fn selected_user_bin_path(user_bin: Option<PathBuf>, check_fault: bool) -> Result<PathBuf> {
-    if check_fault && user_bin.is_some() {
-        bail!("--check-fault and --user-bin are mutually exclusive")
+fn selected_user_elf_path(user_elf: Option<PathBuf>, check_fault: bool) -> Result<PathBuf> {
+    if check_fault && user_elf.is_some() {
+        bail!("--check-fault and --user-elf are mutually exclusive")
     }
 
-    Ok(match (check_fault, user_bin) {
-        (true, None) => fault_user_bin_path(),
+    let path = match (check_fault, user_elf) {
+        (true, None) => fault_user_elf_path(),
         (false, Some(path)) => path,
-        (false, None) => default_user_bin_path(),
+        (false, None) => default_user_elf_path(),
         (true, Some(_)) => unreachable!(),
-    })
+    };
+    validate_user_elf_payload(&path)?;
+    Ok(path)
 }
 
-fn build_aarch64_user_bins() -> Result<()> {
-    build_aarch64_user_bin("hello", "user/aarch64/hello.S", default_user_bin_path())?;
-    build_aarch64_user_bin(
-        "fault_null",
-        "user/aarch64/fault_null.S",
-        fault_user_bin_path(),
-    )?;
+fn build_aarch64_user_elfs() -> Result<()> {
+    build_aarch64_user_elf("hello", "user/c/hello.c", default_user_elf_path())?;
+    build_aarch64_user_elf("fault_null", "user/c/fault_null.c", fault_user_elf_path())?;
     Ok(())
 }
 
-fn build_aarch64_user_bin(name: &str, source: &str, bin: PathBuf) -> Result<PathBuf> {
+fn build_aarch64_user_elf(name: &str, source: &str, elf: PathBuf) -> Result<PathBuf> {
     let source = Path::new(source);
     ensure_exists(source.to_str().unwrap_or("<invalid user source path>"))?;
+    ensure_exists(AARCH64_USER_CRT0)?;
+    ensure_exists(AARCH64_USER_INCLUDE_DIR)?;
+    ensure_exists("user/c/linker.ld")?;
 
-    let obj = bin.with_extension("o");
-    if let Some(parent) = bin.parent() {
-        fs::create_dir_all(parent).context("failed to create user binary output directory")?;
+    let parent = elf
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("user ELF path has no parent: {}", elf.display()))?;
+    fs::create_dir_all(parent).context("failed to create user ELF output directory")?;
+
+    let crt_obj = parent.join(format!("{name}.crt0.o"));
+    let obj = parent.join(format!("{name}.o"));
+
+    let status = Command::new("clang")
+        .args(aarch64_user_compile_args())
+        .arg("-c")
+        .arg(AARCH64_USER_CRT0)
+        .arg("-o")
+        .arg(&crt_obj)
+        .status()
+        .with_context(|| format!("failed to invoke clang for AArch64 user crt0 {name}"))?;
+    if !status.success() {
+        bail!("clang failed to assemble AArch64 user crt0 for {name}")
     }
 
-    let status = Command::new("llvm-mc")
-        .args(["-triple=aarch64-none-elf", "-filetype=obj"])
+    let status = Command::new("clang")
+        .args(aarch64_user_compile_args())
+        .arg("-c")
         .arg(source)
         .arg("-o")
         .arg(&obj)
         .status()
-        .with_context(|| format!("failed to invoke llvm-mc for AArch64 user program {name}"))?;
+        .with_context(|| format!("failed to invoke clang for AArch64 user program {name}"))?;
     if !status.success() {
-        bail!("llvm-mc failed to assemble AArch64 user program {name}")
+        bail!("clang failed to compile AArch64 user program {name}")
     }
 
-    let status = Command::new("llvm-objcopy")
-        .args(["-O", "binary"])
+    let status = Command::new("ld.lld")
+        .args([
+            "-T",
+            "user/c/linker.ld",
+            "--build-id=none",
+            "-z",
+            "max-page-size=0x1000",
+            "-z",
+            "common-page-size=0x1000",
+            "-o",
+        ])
+        .arg(&elf)
+        .arg(&crt_obj)
         .arg(&obj)
-        .arg(&bin)
         .status()
-        .with_context(|| {
-            format!("failed to invoke llvm-objcopy for AArch64 user program {name}")
-        })?;
+        .with_context(|| format!("failed to invoke ld.lld for AArch64 user program {name}"))?;
     if !status.success() {
-        bail!("llvm-objcopy failed to produce AArch64 user binary {name}")
+        bail!("ld.lld failed to link AArch64 user ELF {name}")
     }
 
-    let size = fs::metadata(&bin)
-        .with_context(|| format!("failed to stat {}", bin.display()))?
+    let size = validate_user_elf_payload(&elf)?;
+
+    println!("built {} ({} bytes)", elf.display(), size);
+    Ok(elf)
+}
+
+fn validate_user_elf_payload(path: &Path) -> Result<u64> {
+    let size = fs::metadata(path)
+        .with_context(|| format!("failed to stat user ELF {}", path.display()))?
         .len();
-    if size == 0 || size > AARCH64_USER_IMAGE_MAX_SIZE {
+    if size == 0 {
+        bail!("user ELF {} is empty", path.display());
+    }
+    if size > AARCH64_USER_IMAGE_MAX_SIZE {
         bail!(
-            "AArch64 user binary size {size} exceeds bring-up mapping limit {AARCH64_USER_IMAGE_MAX_SIZE}"
+            "user ELF {} size {} exceeds loader reservation {} bytes",
+            path.display(),
+            size,
+            AARCH64_USER_IMAGE_MAX_SIZE
         );
     }
+    Ok(size)
+}
 
-    println!("built {} ({} bytes)", bin.display(), size);
-    Ok(bin)
+fn aarch64_user_compile_args() -> [&'static str; 12] {
+    [
+        "--target=aarch64-none-elf",
+        "-ffreestanding",
+        "-fno-builtin",
+        "-fno-stack-protector",
+        "-fno-pic",
+        "-fno-unwind-tables",
+        "-fno-asynchronous-unwind-tables",
+        "-nostdlib",
+        "-I",
+        AARCH64_USER_INCLUDE_DIR,
+        "-Wall",
+        "-Wextra",
+    ]
 }
 
 fn qemu_virt_dtb_path() -> Result<PathBuf> {
