@@ -1,11 +1,10 @@
-use super::{PhysAddr, PhysRange, VirtAddr};
+use super::{PAGE_SIZE, PhysAddr, PhysRange, VirtAddr};
 
 unsafe extern "C" {
     fn arch_phys_to_virt(pa: usize) -> usize;
     fn arch_virt_to_phys(va: usize) -> usize;
     fn arch_user_image_load_pa() -> usize;
     fn arch_user_image_reserved_size() -> usize;
-    fn arch_user_image_bringup_size() -> usize;
     fn arch_translate_kernel_va(va: usize, out_pa: *mut usize) -> u64;
     fn arch_map_kernel_region(va: usize, pa: usize, size: usize, attr: u32, flags: u64) -> u64;
     fn arch_unmap_kernel_region(va: usize, size: usize) -> u64;
@@ -170,10 +169,6 @@ pub fn user_image_load_range() -> PhysRange {
     }
 }
 
-pub fn user_image_bringup_size() -> usize {
-    unsafe { arch_user_image_bringup_size() }
-}
-
 pub fn create_user_address_space() -> Result<UserAddressSpace, VmError> {
     let mut root_pa = 0usize;
     match unsafe { arch_create_user_address_space(&mut root_pa as *mut usize) } {
@@ -193,6 +188,35 @@ pub unsafe fn map_user_page(
     flags: UserMapFlags,
 ) -> Result<(), VmError> {
     vm_result(unsafe { arch_map_user_page(aspace.root_pa(), va, pa, flags.bits()) })
+}
+
+pub fn map_user_page_range(
+    aspace: UserAddressSpace,
+    va: VirtAddr,
+    pa: PhysAddr,
+    size: usize,
+    flags: UserMapFlags,
+) -> Result<(), VmError> {
+    if size == 0 {
+        return Ok(());
+    }
+    if va & (PAGE_SIZE - 1) != 0 || pa & (PAGE_SIZE - 1) != 0 || size & (PAGE_SIZE - 1) != 0 {
+        return Err(VmError::NotAligned);
+    }
+    if va.checked_add(size).is_none() || pa.checked_add(size).is_none() {
+        return Err(VmError::InvalidRange);
+    }
+
+    let mut offset = 0usize;
+    while offset < size {
+        // SAFETY: this wrapper validates page alignment and bounded arithmetic.
+        // The caller owns the target TTBR0 root for the lifetime of the mapping.
+        unsafe {
+            map_user_page(aspace, va + offset, pa + offset, flags)?;
+        }
+        offset += PAGE_SIZE;
+    }
+    Ok(())
 }
 
 pub fn translate_user_va(aspace: UserAddressSpace, va: VirtAddr) -> Option<PhysAddr> {

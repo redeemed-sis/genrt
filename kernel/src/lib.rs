@@ -9,6 +9,7 @@ mod demo;
 mod dtb;
 mod init;
 pub mod ipc;
+pub mod loader;
 pub mod log;
 pub mod memory;
 pub mod panic;

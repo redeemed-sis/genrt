@@ -287,6 +287,18 @@ pub fn free_contiguous_frames(range: FrameRange) {
     state.allocator.free_contiguous(range, PAGE_SIZE);
 }
 
+pub fn zero_phys_range(range: FrameRange) {
+    if range.start >= range.end {
+        return;
+    }
+
+    let len = range.end - range.start;
+    // SAFETY: callers pass physical RAM ranges that are accessible through the
+    // kernel direct map. This helper centralizes the PA -> HVA dereference
+    // boundary while the generic frame allocator remains address-agnostic.
+    unsafe { core::ptr::write_bytes(phys_to_kernel_va(range.start) as *mut u8, 0, len) };
+}
+
 pub fn usable_ranges() -> &'static [FrameRange] {
     let state = memory_ref();
     // SAFETY: usable ranges are immutable after memory initialization.

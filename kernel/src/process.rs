@@ -1,9 +1,10 @@
 use core::{cell::UnsafeCell, fmt};
 
 use crate::{
+    loader::elf::{self, ElfLoadError, UserElfImage},
     memory::{
-        self, FrameRange, PAGE_SIZE, PhysAddr, VirtAddr,
-        user::{USER_STACK_TOP, USER_TEXT_BASE},
+        self, FrameRange, PAGE_SIZE,
+        user::USER_STACK_TOP,
         vm::{self, UserAddressSpace, UserMapFlags, VmError},
     },
     sched::{self, ThreadAttrs},
@@ -100,6 +101,7 @@ pub(crate) enum ProcessError {
     Vm(VmError),
     OutOfFrames,
     Spawn(sched::SpawnError),
+    Elf(ElfLoadError),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -116,11 +118,11 @@ pub enum ProcessFaultError {
     InvalidProcess,
 }
 
-#[derive(Copy, Clone)]
 struct ProcessSlot {
     generation: u32,
     state: ProcessState,
     address_space: Option<UserAddressSpace>,
+    user_image: Option<UserElfImage>,
     main_thread: Option<ThreadId>,
     stack: FrameRange,
     exit_status: Option<ProcessExitStatus>,
@@ -133,6 +135,7 @@ impl ProcessSlot {
             generation: 0,
             state: ProcessState::Free,
             address_space: None,
+            user_image: None,
             main_thread: None,
             stack: FrameRange::empty(),
             exit_status: None,
@@ -140,7 +143,7 @@ impl ProcessSlot {
         }
     }
 
-    fn is_free(self) -> bool {
+    fn is_free(&self) -> bool {
         self.state == ProcessState::Free
     }
 }
@@ -152,6 +155,13 @@ struct ProcessTable {
 struct ReclaimedProcess {
     status: ProcessExitStatus,
     address_space: Option<UserAddressSpace>,
+    user_image: Option<UserElfImage>,
+    stack: FrameRange,
+}
+
+struct ProcessResources {
+    address_space: Option<UserAddressSpace>,
+    user_image: Option<UserElfImage>,
     stack: FrameRange,
 }
 
@@ -163,7 +173,7 @@ enum ConsumeProcessError {
 impl ProcessTable {
     const fn new() -> Self {
         Self {
-            slots: [ProcessSlot::free(); MAX_PROCESSES],
+            slots: [const { ProcessSlot::free() }; MAX_PROCESSES],
         }
     }
 }
@@ -184,22 +194,30 @@ pub(crate) fn spawn_first_user_process() -> Result<ProcessId, ProcessError> {
         ProcessError::Vm(err)
     })?;
     let mut stack = FrameRange::empty();
+    let mut user_image = None;
 
     let result = (|| {
-        map_user_image(address_space)?;
+        let loaded = load_user_image(address_space)?;
+        let entry = loaded.entry;
+        user_image = Some(loaded);
 
         stack = memory::alloc_contiguous_frames(USER_STACK_SIZE / PAGE_SIZE)
             .ok_or(ProcessError::OutOfFrames)?;
-        zero_phys_range(stack);
+        memory::zero_phys_range(stack);
         map_user_stack(address_space, stack)?;
-        attach_process_resources(pid, address_space, stack)?;
+        attach_process_resources(
+            pid,
+            address_space,
+            user_image.take().ok_or(ProcessError::InvalidProcess)?,
+            stack,
+        )?;
 
         {
             let _irq_guard = LocalIrqGuard::save_and_disable();
             let main_thread = sched::thread_spawn_user(
                 pid,
                 address_space,
-                USER_TEXT_BASE,
+                entry,
                 USER_STACK_TOP,
                 0,
                 ThreadAttrs::detached(),
@@ -211,9 +229,18 @@ pub(crate) fn spawn_first_user_process() -> Result<ProcessId, ProcessError> {
     })();
 
     if result.is_err() {
-        if stack.start != 0 {
+        let attached = take_process_resources(pid);
+        if let Some(image) = user_image {
+            elf::free_loaded_segments(&image);
+        } else if let Some(image) = attached.user_image {
+            elf::free_loaded_segments(&image);
+        }
+        if attached.stack.start != 0 {
+            memory::free_contiguous_frames(attached.stack);
+        } else if stack.start != 0 {
             memory::free_contiguous_frames(stack);
         }
+        let address_space = attached.address_space.unwrap_or(address_space);
         // SAFETY: a failed spawn path never leaves a runnable user thread that
         // can still reference this address space.
         let _ = unsafe { vm::destroy_user_address_space(address_space) };
@@ -333,6 +360,7 @@ fn allocate_process_slot() -> Result<ProcessId, ProcessError> {
         generation,
         state: ProcessState::Running,
         address_space: None,
+        user_image: None,
         main_thread: None,
         stack: FrameRange::empty(),
         exit_status: None,
@@ -347,12 +375,14 @@ fn allocate_process_slot() -> Result<ProcessId, ProcessError> {
 fn attach_process_resources(
     pid: ProcessId,
     address_space: UserAddressSpace,
+    user_image: UserElfImage,
     stack: FrameRange,
 ) -> Result<(), ProcessError> {
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let table = table_mut();
     let slot = table.slot_mut(pid).ok_or(ProcessError::InvalidProcess)?;
     slot.address_space = Some(address_space);
+    slot.user_image = Some(user_image);
     slot.stack = stack;
     slot.state = ProcessState::Running;
     crate::debug!(
@@ -417,6 +447,7 @@ fn consume_process_for_join(
     let reclaimed = ReclaimedProcess {
         status,
         address_space: slot.address_space.take(),
+        user_image: slot.user_image.take(),
         stack: slot.stack,
     };
     let next_generation = next_generation(slot.generation);
@@ -433,15 +464,17 @@ fn cleanup_reclaimed_process(
     reclaimed: ReclaimedProcess,
 ) -> Result<ProcessExitStatus, ProcessJoinError> {
     let status = reclaimed.status;
+    if let Some(image) = reclaimed.user_image {
+        elf::free_loaded_segments(&image);
+    }
     if reclaimed.stack.start != 0 {
         memory::free_contiguous_frames(reclaimed.stack);
     }
     if let Some(address_space) = reclaimed.address_space {
         // SAFETY: process join has observed terminal status, and the detached
         // main user thread has already exited, so no scheduler state references
-        // this TTBR0 root anymore. Leaf user image frames belong to the QEMU
-        // loader reservation and are not freed here; the stack frames are freed
-        // separately above.
+        // this TTBR0 root anymore. User segment and stack frames have already
+        // been returned to the frame allocator above.
         if let Err(err) = unsafe { vm::destroy_user_address_space(address_space) } {
             crate::warn!("process: failed to destroy address space pid={pid}: {err:?}");
         }
@@ -461,22 +494,40 @@ fn free_process_slot(pid: ProcessId) {
     }
 }
 
-fn map_user_image(address_space: UserAddressSpace) -> Result<(), ProcessError> {
-    let image = vm::user_image_load_range();
-    let size = vm::user_image_bringup_size();
+fn take_process_resources(pid: ProcessId) -> ProcessResources {
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    let table = table_mut();
+    let Some(slot) = table.slot_mut(pid) else {
+        return ProcessResources {
+            address_space: None,
+            user_image: None,
+            stack: FrameRange::empty(),
+        };
+    };
+
+    let resources = ProcessResources {
+        address_space: slot.address_space.take(),
+        user_image: slot.user_image.take(),
+        stack: slot.stack,
+    };
+    slot.stack = FrameRange::empty();
+    resources
+}
+
+fn load_user_image(address_space: UserAddressSpace) -> Result<UserElfImage, ProcessError> {
+    let range = vm::user_image_load_range();
+    let size = range.end - range.start;
     crate::debug!(
-        "process: map user image pa=0x{:x} size={} va=0x{:x}",
-        image.start,
+        "process: load user ELF image pa=0x{:x} size={}",
+        range.start,
         size,
-        USER_TEXT_BASE
     );
-    map_page_range(
-        address_space,
-        USER_TEXT_BASE,
-        image.start,
-        size,
-        UserMapFlags::EXECUTE,
-    )
+    let image_va = vm::phys_to_virt(range.start);
+    // SAFETY: the platform reserves `user_image_load_range()` for the QEMU
+    // loader payload, and kernel direct-map covers RAM after MMU bring-up.
+    let image = unsafe { core::slice::from_raw_parts(image_va as *const u8, size) };
+    let mut address_space = address_space;
+    elf::load_user_elf(image, &mut address_space).map_err(ProcessError::Elf)
 }
 
 fn map_user_stack(address_space: UserAddressSpace, stack: FrameRange) -> Result<(), ProcessError> {
@@ -487,41 +538,14 @@ fn map_user_stack(address_space: UserAddressSpace, stack: FrameRange) -> Result<
         stack_base,
         USER_STACK_TOP
     );
-    map_page_range(
+    vm::map_user_page_range(
         address_space,
         stack_base,
         stack.start,
         USER_STACK_SIZE,
         UserMapFlags::WRITE,
     )
-}
-
-fn map_page_range(
-    address_space: UserAddressSpace,
-    va: VirtAddr,
-    pa: PhysAddr,
-    size: usize,
-    flags: UserMapFlags,
-) -> Result<(), ProcessError> {
-    let mut offset = 0usize;
-    while offset < size {
-        // SAFETY: caller provides page-aligned process layout ranges and the
-        // TTBR0 root is owned by this process until `process_join()` reclaims it.
-        unsafe {
-            vm::map_user_page(address_space, va + offset, pa + offset, flags)
-                .map_err(ProcessError::Vm)?;
-        }
-        offset += PAGE_SIZE;
-    }
-    Ok(())
-}
-
-fn zero_phys_range(range: FrameRange) {
-    let va = vm::phys_to_virt(range.start);
-    let len = range.end - range.start;
-    // SAFETY: `range` was freshly allocated from the physical frame allocator,
-    // and the kernel direct map covers RAM before process creation.
-    unsafe { core::ptr::write_bytes(va as *mut u8, 0, len) };
+    .map_err(ProcessError::Vm)
 }
 
 impl ProcessTable {

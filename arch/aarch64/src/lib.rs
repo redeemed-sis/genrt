@@ -170,11 +170,6 @@ pub extern "C" fn arch_user_image_reserved_size() -> usize {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn arch_user_image_bringup_size() -> usize {
-    platform::qemu::USER_IMAGE_BRINGUP_SIZE
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn arch_hard_fault() -> ! {
     // SAFETY: this path is terminal by contract; IRQ/FIQ/SError are masked first.
     unsafe {
