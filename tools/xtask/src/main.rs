@@ -47,6 +47,7 @@ enum Commands {
     },
     BuildUserHello,
     BuildUserFault,
+    BuildUserReadFile,
     RunAarch64 {
         #[arg(long, value_enum)]
         log_level: Option<LogLevel>,
@@ -108,10 +109,14 @@ fn main() -> Result<()> {
         Commands::GdbCmd { arch } => gdb_cmd(arch),
         Commands::BuildAarch64 { log_level } => build_aarch64(log_level),
         Commands::BuildUserHello => {
-            build_aarch64_user_elf("hello", "user/c/hello.c", default_user_elf_path()).map(|_| ())
+            build_aarch64_user_elf("hello", "user/c/hello.c", hello_user_elf_path()).map(|_| ())
         }
         Commands::BuildUserFault => {
             build_aarch64_user_elf("fault_null", "user/c/fault_null.c", fault_user_elf_path())
+                .map(|_| ())
+        }
+        Commands::BuildUserReadFile => {
+            build_aarch64_user_elf("read_file", "user/c/read_file.c", default_user_elf_path())
                 .map(|_| ())
         }
         Commands::RunAarch64 {
@@ -383,6 +388,10 @@ fn final_elf_path() -> PathBuf {
 }
 
 fn default_user_elf_path() -> PathBuf {
+    PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/read_file.elf"))
+}
+
+fn hello_user_elf_path() -> PathBuf {
     PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/hello.elf"))
 }
 
@@ -406,8 +415,9 @@ fn selected_user_elf_path(user_elf: Option<PathBuf>, check_fault: bool) -> Resul
 }
 
 fn build_aarch64_user_elfs() -> Result<()> {
-    build_aarch64_user_elf("hello", "user/c/hello.c", default_user_elf_path())?;
+    build_aarch64_user_elf("hello", "user/c/hello.c", hello_user_elf_path())?;
     build_aarch64_user_elf("fault_null", "user/c/fault_null.c", fault_user_elf_path())?;
+    build_aarch64_user_elf("read_file", "user/c/read_file.c", default_user_elf_path())?;
     Ok(())
 }
 

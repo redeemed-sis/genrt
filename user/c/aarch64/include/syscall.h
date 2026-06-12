@@ -1,7 +1,25 @@
 #pragma once
 
+#ifndef NULL
+#define NULL ((void *)0)
+#endif
+
+#define SYS_READ 0
 #define SYS_WRITE 1
 #define SYS_EXIT 2
+#define SYS_OPEN 3
+#define SYS_CLOSE 4
+
+typedef long ssize_t;
+typedef unsigned long size_t;
+typedef unsigned int mode_t;
+
+#define O_RDONLY 0
+#define O_WRONLY 1
+#define O_RDWR 2
+#define O_CREAT 0100
+#define O_TRUNC 01000
+#define O_APPEND 02000
 
 static inline long genrt_syscall3(long nr, long a0, long a1, long a2) {
     register long x0 __asm__("x0") = a0;
@@ -16,11 +34,25 @@ static inline long genrt_syscall3(long nr, long a0, long a1, long a2) {
     return x0;
 }
 
-static inline long write(int fd, const void *buf, unsigned long len) {
+static inline int genrt_open3(const char *pathname, int flags, mode_t mode) {
+    return (int)genrt_syscall3(SYS_OPEN, (long)pathname, flags, (long)mode);
+}
+
+#define open(pathname, flags, ...) genrt_open3((pathname), (flags), 0)
+
+static inline ssize_t read(int fd, void *buf, size_t count) {
+    return genrt_syscall3(SYS_READ, fd, (long)buf, (long)count);
+}
+
+static inline ssize_t write(int fd, const void *buf, size_t len) {
     return genrt_syscall3(SYS_WRITE, fd, (long)buf, (long)len);
 }
 
-__attribute__((noreturn)) static inline void exit(int code) {
+static inline int close(int fd) {
+    return (int)genrt_syscall3(SYS_CLOSE, fd, 0, 0);
+}
+
+__attribute__((noreturn)) static inline void _exit(int code) {
     register long x0 __asm__("x0") = code;
     register long x8 __asm__("x8") = SYS_EXIT;
 
@@ -28,4 +60,8 @@ __attribute__((noreturn)) static inline void exit(int code) {
     for (;;) {
         __asm__ volatile("wfe" : : : "memory");
     }
+}
+
+__attribute__((noreturn)) static inline void exit(int code) {
+    _exit(code);
 }
