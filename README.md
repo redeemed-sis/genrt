@@ -57,7 +57,8 @@ The current AArch64 path already has:
 * minimal TTBR0 user address space with 4 KiB user page mappings
 * scheduler TTBR0 activation for user threads and TTBR0 clear for kernel threads
 * lower-EL `svc #0` syscall dispatch separated from EL1 task-call `svc #0`
-* bring-up `sys_write` / `sys_exit` path for the first user process
+* POSIX-like `open` / `read` / `write` / `close` syscall path for the first user process
+* readonly static ramfs and per-process bounded FD table
 * bounded process table with generation-checked `ProcessId`
 * process exit/fault status and kernel-side `process_join`
 * lower-EL user fault policy that terminates the current process instead of panicking the kernel
@@ -296,8 +297,14 @@ from `user/c/` with a tiny freestanding C runtime and linker script; there is no
 legacy raw `.bin` userspace payload path.
 
 The initial user syscall ABI is AArch64-style: `x8` is the syscall number,
-`x0..x5` are arguments, and `x0` is the return value. Only `write(fd=1, ptr,
-len)` and `exit(code)` exist today.
+`x0..x5` are arguments, and `x0` is the return value. The current POSIX-like
+subset includes `open`, `read`, `write`, `close`, and `exit`; errors are
+reported as negative errno values.
+
+The first readonly filesystem is a static ramfs with exact path lookup. The
+default user demo opens `/hello.txt`, reads it through fd-backed `read()`, writes
+the bytes to stdout, closes the descriptor, and exits. Pathname scanning is
+bounded by `GENRT_PATH_MAX = 4096` bytes.
 
 ## IPC
 
@@ -360,7 +367,9 @@ just doctor
 just build-aarch64
 just build-user-hello
 just build-user-fault
+just build-user-read-file
 just run-aarch64
+just run-aarch64-read-file
 just run-aarch64-fault
 just debug-aarch64
 just debug-aarch64-fault
@@ -410,5 +419,6 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0014-bounded-kernel-thread-lifecycle.md`
 * `ai-docs/decision-records/ADR-0015-aarch64-high-half-mmu-bring-up.md`
 * `ai-docs/decision-records/ADR-0016-first-aarch64-el0-process.md`
-* `ai-docs/decision-records/ADR-0018-userspace-elf-loader.md`
 * `ai-docs/decision-records/ADR-0017-process-table-and-user-fault-policy.md`
+* `ai-docs/decision-records/ADR-0018-userspace-elf-loader.md`
+* `ai-docs/decision-records/ADR-0019-readonly-ramfs-and-fd-table.md`
