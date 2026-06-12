@@ -1,6 +1,7 @@
 use core::{cell::UnsafeCell, fmt};
 
 use crate::{
+    fs::fd::{FdError, FdTable},
     loader::elf::{self, ElfLoadError, UserElfImage},
     memory::{
         self, FrameRange, PAGE_SIZE,
@@ -123,6 +124,7 @@ struct ProcessSlot {
     state: ProcessState,
     address_space: Option<UserAddressSpace>,
     user_image: Option<UserElfImage>,
+    fds: FdTable,
     main_thread: Option<ThreadId>,
     stack: FrameRange,
     exit_status: Option<ProcessExitStatus>,
@@ -136,6 +138,7 @@ impl ProcessSlot {
             state: ProcessState::Free,
             address_space: None,
             user_image: None,
+            fds: FdTable::new(),
             main_thread: None,
             stack: FrameRange::empty(),
             exit_status: None,
@@ -361,6 +364,7 @@ fn allocate_process_slot() -> Result<ProcessId, ProcessError> {
         state: ProcessState::Running,
         address_space: None,
         user_image: None,
+        fds: FdTable::new(),
         main_thread: None,
         stack: FrameRange::empty(),
         exit_status: None,
@@ -408,6 +412,7 @@ fn finish_process(pid: ProcessId, status: ProcessExitStatus) -> Option<Option<Th
         return Some(None);
     }
 
+    slot.fds.close_all();
     slot.state = match status {
         ProcessExitStatus::Exited(_) => ProcessState::Exited,
         ProcessExitStatus::Faulted(_) => ProcessState::Faulted,
@@ -492,6 +497,48 @@ fn free_process_slot(pid: ProcessId) {
             ..ProcessSlot::free()
         };
     }
+}
+
+pub(crate) fn open_current_ram_file(file_index: usize) -> Result<usize, FdError> {
+    with_current_fd_table_mut(|fds| fds.open_ram_file(file_index))
+}
+
+pub(crate) fn current_fd_read_slice(fd: usize, max_len: usize) -> Result<&'static [u8], FdError> {
+    with_current_fd_table(|fds| fds.read_slice(fd, max_len))
+}
+
+pub(crate) fn advance_current_fd_read(fd: usize, amount: usize) -> Result<(), FdError> {
+    with_current_fd_table_mut(|fds| fds.advance_read(fd, amount))
+}
+
+pub(crate) fn close_current_fd(fd: usize) -> Result<(), FdError> {
+    with_current_fd_table_mut(|fds| fds.close(fd))
+}
+
+pub(crate) fn current_fd_is_open(fd: usize) -> Result<bool, FdError> {
+    with_current_fd_table(|fds| Ok(fds.is_open(fd)))
+}
+
+fn with_current_fd_table<T>(f: impl FnOnce(&FdTable) -> Result<T, FdError>) -> Result<T, FdError> {
+    let pid = sched::current_user_process_id().ok_or(FdError::BadFd)?;
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    let table = table_mut();
+    let slot = table.slot_mut(pid).ok_or(FdError::BadFd)?;
+    f(&slot.fds)
+}
+
+fn with_current_fd_table_mut<T>(
+    f: impl FnOnce(&mut FdTable) -> Result<T, FdError>,
+) -> Result<T, FdError> {
+    // FD table sharing across multiple user threads in one process is not
+    // implemented yet. These short IRQ-disabled sections are sufficient for the
+    // current single-threaded user process milestone; user memory copies happen
+    // outside them in the syscall layer.
+    let pid = sched::current_user_process_id().ok_or(FdError::BadFd)?;
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    let table = table_mut();
+    let slot = table.slot_mut(pid).ok_or(FdError::BadFd)?;
+    f(&mut slot.fds)
 }
 
 fn take_process_resources(pid: ProcessId) -> ProcessResources {

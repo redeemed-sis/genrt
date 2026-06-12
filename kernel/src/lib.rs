@@ -7,6 +7,8 @@ pub mod boot;
 pub mod console;
 mod demo;
 mod dtb;
+pub mod errno;
+pub mod fs;
 mod init;
 pub mod ipc;
 pub mod loader;

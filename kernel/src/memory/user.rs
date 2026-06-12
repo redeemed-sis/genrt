@@ -9,6 +9,8 @@
 //! there is not yet an exception/fixup table for fault recovery if the actual
 //! load/store faults.
 
+use alloc::vec::Vec;
+
 use super::{
     PAGE_SIZE, VirtAddr,
     vm::{self, UserMappingInfo},
@@ -23,16 +25,25 @@ pub const USER_STACK_TOP: VirtAddr = 0x0000_0080_0000_0000;
 /// kernel has fault-recovering copy loops and a richer process memory model.
 pub const MAX_USER_COPY: usize = 1024;
 
+/// POSIX-like pathname bound, excluding the terminating NUL byte.
+///
+/// `open()` receives NUL-terminated userspace pathnames, but the kernel must
+/// bound userspace scanning for RT predictability and memory safety. Paths
+/// longer than `GENRT_PATH_MAX` fail with `UserCopyError::NameTooLong`.
+pub const GENRT_PATH_MAX: usize = 4096;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum UserCopyError {
     Empty,
     TooLarge,
+    NameTooLong,
     AddressOverflow,
     NotUserRange,
     NotMapped,
     NotReadable,
     NotWritable,
     NoCurrentAddressSpace,
+    OutOfMemory,
 }
 
 pub fn copy_from_user(dst: &mut [u8], user_src: VirtAddr) -> Result<(), UserCopyError> {
@@ -83,6 +94,48 @@ pub fn validate_user_write_range(ptr: VirtAddr, len: usize) -> Result<(), UserCo
     validate_user_range(ptr, len, AccessKind::Write)
 }
 
+pub fn copy_path_cstr_from_user(path_ptr: VirtAddr) -> Result<Vec<u8>, UserCopyError> {
+    let mut path = Vec::new();
+    path.try_reserve_exact(GENRT_PATH_MAX)
+        .map_err(|_| UserCopyError::OutOfMemory)?;
+
+    let mut cursor = path_ptr;
+    let mut scanned = 0usize;
+    while scanned <= GENRT_PATH_MAX {
+        let page_end = align_down(cursor, PAGE_SIZE)
+            .checked_add(PAGE_SIZE)
+            .ok_or(UserCopyError::AddressOverflow)?;
+        let remaining_scan = (GENRT_PATH_MAX + 1) - scanned;
+        let chunk_len = page_end.saturating_sub(cursor).min(remaining_scan);
+        validate_user_read_range_unbounded(cursor, chunk_len)?;
+
+        let mut offset = 0usize;
+        while offset < chunk_len {
+            // SAFETY: the current chunk is validated as user-readable. This is
+            // still bring-up-only and does not recover from a faulting load.
+            let byte = unsafe { (cursor as *const u8).add(offset).read_volatile() };
+            if byte == 0 {
+                if path.is_empty() {
+                    return Err(UserCopyError::Empty);
+                }
+                return Ok(path);
+            }
+            if path.len() == GENRT_PATH_MAX {
+                return Err(UserCopyError::NameTooLong);
+            }
+            path.push(byte);
+            offset += 1;
+        }
+
+        cursor = cursor
+            .checked_add(chunk_len)
+            .ok_or(UserCopyError::AddressOverflow)?;
+        scanned += chunk_len;
+    }
+
+    Err(UserCopyError::NameTooLong)
+}
+
 #[derive(Copy, Clone)]
 enum AccessKind {
     Read,
@@ -96,7 +149,21 @@ fn validate_user_range(ptr: VirtAddr, len: usize, access: AccessKind) -> Result<
     if len > MAX_USER_COPY {
         return Err(UserCopyError::TooLarge);
     }
+    validate_user_range_unbounded(ptr, len, access)
+}
 
+fn validate_user_read_range_unbounded(ptr: VirtAddr, len: usize) -> Result<(), UserCopyError> {
+    validate_user_range_unbounded(ptr, len, AccessKind::Read)
+}
+
+fn validate_user_range_unbounded(
+    ptr: VirtAddr,
+    len: usize,
+    access: AccessKind,
+) -> Result<(), UserCopyError> {
+    if len == 0 {
+        return Err(UserCopyError::Empty);
+    }
     let end = ptr.checked_add(len).ok_or(UserCopyError::AddressOverflow)?;
     if ptr < USER_TEXT_BASE || end > USER_STACK_TOP || ptr >= end {
         return Err(UserCopyError::NotUserRange);
