@@ -61,7 +61,7 @@ fn consumer_task(_arg: ThreadArg) -> usize {
     loop {
         crate::debug!("consumer: recv_timeout success scenario wait=3000ms");
         match demo_mailbox().recv_timeout_ms(3_000) {
-            Ok(msg) => crate::info!("consumer: recv_timeout Ok({msg}) before deadline"),
+            Ok(msg) => crate::debug!("consumer: recv_timeout Ok({msg}) before deadline"),
             Err(RecvTimeoutError::Timeout) => {
                 crate::warn!("consumer: expected message before timeout")
             }
@@ -71,7 +71,7 @@ fn consumer_task(_arg: ThreadArg) -> usize {
         match demo_mailbox().recv_timeout_ms(300) {
             Ok(msg) => crate::warn!("consumer: expected timeout but received {msg}"),
             Err(RecvTimeoutError::Timeout) => {
-                crate::info!("consumer: recv_timeout Err(Timeout)")
+                crate::debug!("consumer: recv_timeout Err(Timeout)")
             }
         }
 
@@ -84,7 +84,7 @@ fn producer_task(_arg: ThreadArg) -> usize {
     loop {
         sched::msleep(500);
         demo_mailbox().send(msg);
-        crate::info!("producer: send {msg}");
+        crate::debug!("producer: send {msg}");
         msg = msg.wrapping_add(1);
         sched::msleep(1_500);
     }
@@ -111,9 +111,9 @@ fn thread_parent_task(_arg: ThreadArg) -> usize {
             ThreadAttrs::joinable(),
         ) {
             Ok(id) => {
-                crate::info!("thread: spawned worker id={id} arg={arg}");
+                crate::debug!("thread: spawned worker id={id} arg={arg}");
                 match sched::thread_join(id) {
-                    Ok(code) => crate::info!("parent: join returned code={code}"),
+                    Ok(code) => crate::debug!("parent: join returned code={code}"),
                     Err(err) => crate::warn!("parent: join failed: {err:?}"),
                 }
             }
@@ -127,10 +127,10 @@ fn thread_parent_task(_arg: ThreadArg) -> usize {
 
 fn worker_thread(arg: ThreadArg) -> usize {
     let arg = arg.as_usize();
-    crate::info!("worker: start arg={arg}");
+    crate::debug!("worker: start arg={arg}");
     sched::msleep(250);
     let code = arg.wrapping_add(1);
-    crate::info!("worker: exit code={code}");
+    crate::debug!("worker: exit code={code}");
     code
 }
 
