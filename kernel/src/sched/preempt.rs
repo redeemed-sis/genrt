@@ -355,14 +355,7 @@ impl Scheduler {
         }
 
         if self.task(task_id).is_blocked() {
-            self.make_ready(task_id);
-            if task_id != IDLE_TASK_ID {
-                let was_empty = self.ready_queue.is_empty();
-                self.ready_push_back(task_id);
-                if was_empty {
-                    self.note_runnable_peer_available();
-                }
-            }
+            self.make_ready_and_queue(task_id);
             crate::trace!("sched: task {task_id} moved to Ready");
         }
     }
@@ -394,6 +387,17 @@ impl Scheduler {
 
     pub(super) fn make_ready(&mut self, id: TaskId) {
         self.task_mut(id).state = TaskState::Ready;
+    }
+
+    pub(super) fn make_ready_and_queue(&mut self, id: TaskId) {
+        self.make_ready(id);
+        if id != IDLE_TASK_ID {
+            let was_empty = self.ready_queue.is_empty();
+            self.ready_push_back(id);
+            if was_empty {
+                self.note_runnable_peer_available();
+            }
+        }
     }
 
     pub(super) fn make_running(&mut self, id: TaskId) {

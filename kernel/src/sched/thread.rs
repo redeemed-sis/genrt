@@ -462,10 +462,7 @@ impl Scheduler {
         }
 
         self.task_mut(joiner_task).last_join_result = Some(Ok(code));
-        self.make_ready(joiner_task);
-        if joiner_task != IDLE_TASK_ID {
-            self.ready_push_back(joiner_task);
-        }
+        self.make_ready_and_queue(joiner_task);
         crate::debug!("thread: join wake target={target} joiner={joiner} code={code}");
     }
 
@@ -548,10 +545,7 @@ impl Scheduler {
             state => panic!("process: joiner {joiner} has invalid state {state:?}"),
         }
 
-        self.make_ready(joiner_task);
-        if joiner_task != IDLE_TASK_ID {
-            self.ready_push_back(joiner_task);
-        }
+        self.make_ready_and_queue(joiner_task);
         crate::debug!("process: join wake pid={pid} joiner={joiner}");
     }
 }
