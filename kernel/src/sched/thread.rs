@@ -198,6 +198,14 @@ pub(crate) fn complete_process_join(joiner: ThreadId, pid: ProcessId) {
     scheduler_mut().complete_process_join(joiner, pid);
 }
 
+pub(crate) fn block_current_on_stdin_read(active_frame_words: *mut u64) {
+    scheduler_mut().block_current_on_stdin_read(active_frame_words);
+}
+
+pub(crate) fn complete_stdin_read(waiter: ThreadId) {
+    scheduler_mut().complete_stdin_read(waiter);
+}
+
 impl Scheduler {
     fn spawn_thread(
         &mut self,
@@ -534,6 +542,16 @@ impl Scheduler {
         self.finish_block_current(current, next);
     }
 
+    fn block_current_on_stdin_read(&mut self, active_frame_words: *mut u64) {
+        let current = self.blocking_current(active_frame_words);
+        let next = self.block_current_with_reason(
+            active_frame_words,
+            current,
+            preempt::BlockReason::StdinRead,
+        );
+        self.finish_block_current(current, next);
+    }
+
     fn complete_process_join(&mut self, joiner: ThreadId, pid: ProcessId) {
         let Some(joiner_task) = self.task_id_from_thread_id(joiner) else {
             panic!("process: joiner {joiner} disappeared while pid {pid} exited");
@@ -547,6 +565,24 @@ impl Scheduler {
 
         self.make_ready_and_queue(joiner_task);
         crate::debug!("process: join wake pid={pid} joiner={joiner}");
+    }
+
+    fn complete_stdin_read(&mut self, waiter: ThreadId) {
+        let Some(task_id) = self.task_id_from_thread_id(waiter) else {
+            crate::trace!("stdin: waiter {waiter} disappeared before UART wake");
+            return;
+        };
+
+        match self.task(task_id).state {
+            preempt::TaskState::Blocked(preempt::BlockReason::StdinRead) => {}
+            state => {
+                crate::trace!("stdin: ignoring wake for waiter {waiter}; state={state:?}");
+                return;
+            }
+        }
+
+        self.make_ready_and_queue(task_id);
+        crate::trace!("stdin: wake waiter={waiter}");
     }
 }
 

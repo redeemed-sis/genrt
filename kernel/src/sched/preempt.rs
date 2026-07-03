@@ -19,6 +19,7 @@ pub(super) enum BlockReason {
     Ipc(sched_ipc::IpcBlock),
     Join(ThreadId),
     ProcessJoin(ProcessId),
+    StdinRead,
 }
 
 // Task-state semantics:

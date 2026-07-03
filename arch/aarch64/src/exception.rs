@@ -1,6 +1,6 @@
 use core::arch::asm;
 
-use crate::{esr, gic, timer, trap_frame::TrapFrame};
+use crate::{console, esr, gic, platform, timer, trap_frame::TrapFrame};
 
 const VECTOR_CURRENT_EL_SPX_SYNC: u64 = 4;
 const ISS_SVC_TASK_CALL: u32 = 0;
@@ -16,6 +16,8 @@ pub extern "C" fn irq_entry(frame: *mut TrapFrame) {
     if !gic::is_spurious(irq_id) {
         if irq_id == timer::TIMER_IRQ_ID_PHYS {
             timer::on_timer_irq(frame_words);
+        } else if irq_id == platform::qemu::UART0_IRQ_ID {
+            console::on_uart_irq();
         } else {
             kernel::warn!("irq: unexpected id=0x{irq_id:08x}");
         }

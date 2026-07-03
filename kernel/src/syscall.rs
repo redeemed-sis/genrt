@@ -70,23 +70,76 @@ fn sys_read(frame_words: *mut u64) {
     let ptr = frame_word(frame_words, X1) as usize;
     let count = frame_word(frame_words, X2) as usize;
 
-    let result = (|| {
-        if count == 0 {
-            return Ok(0);
+    if fd == fd::STDIN {
+        match sys_read_stdin(frame_words, ptr, count) {
+            ReadAction::Return(result) => set_return(frame_words, errno::syscall_ret(result)),
+            ReadAction::Blocked => {}
         }
+        return;
+    }
 
-        let max_len = count.min(user::MAX_USER_COPY);
-        let chunk = process::current_fd_read_slice(fd, max_len).map_err(fd_errno)?;
-        if chunk.is_empty() {
-            return Ok(0);
-        }
-
-        user::copy_to_user(ptr, chunk).map_err(user_copy_errno)?;
-        process::advance_current_fd_read(fd, chunk.len()).map_err(fd_errno)?;
-        Ok(chunk.len())
-    })();
-
+    let result = sys_read_file(fd, ptr, count);
     set_return(frame_words, errno::syscall_ret(result));
+}
+
+enum ReadAction {
+    Return(Result<usize, errno::Errno>),
+    Blocked,
+}
+
+fn sys_read_stdin(frame_words: *mut u64, ptr: usize, count: usize) -> ReadAction {
+    if count == 0 {
+        return ReadAction::Return(Ok(0));
+    }
+
+    let max_len = count.min(user::MAX_USER_COPY);
+    if let Err(err) = user::validate_user_write_range(ptr, max_len).map_err(user_copy_errno) {
+        return ReadAction::Return(Err(err));
+    }
+
+    let mut buffer = [0u8; user::MAX_USER_COPY];
+    let len = console::read_stdin(&mut buffer[..max_len]);
+    if len != 0 {
+        let result = user::copy_to_user(ptr, &buffer[..len])
+            .map(|()| len)
+            .map_err(user_copy_errno);
+        return ReadAction::Return(result);
+    }
+
+    match console::block_current_stdin_read_if_empty(frame_words) {
+        Ok(true) => ReadAction::Blocked,
+        Ok(false) => {
+            let len = console::read_stdin(&mut buffer[..max_len]);
+            if len != 0 {
+                let result = user::copy_to_user(ptr, &buffer[..len])
+                    .map(|()| len)
+                    .map_err(user_copy_errno);
+                ReadAction::Return(result)
+            } else {
+                ReadAction::Return(Err(errno::EFAULT))
+            }
+        }
+        Err(()) => ReadAction::Return(Err(errno::ENOTSUP)),
+    }
+}
+
+fn sys_read_file(fd: usize, ptr: usize, count: usize) -> Result<usize, errno::Errno> {
+    if count == 0 {
+        return Ok(0);
+    }
+    if fd == fd::STDOUT || fd == fd::STDERR {
+        return Err(errno::EBADF);
+    }
+
+    let max_len = count.min(user::MAX_USER_COPY);
+    let chunk = process::current_fd_read_slice(fd, max_len).map_err(fd_errno)?;
+    if chunk.is_empty() {
+        return Ok(0);
+    }
+
+    user::copy_to_user(ptr, chunk).map_err(user_copy_errno)?;
+    process::advance_current_fd_read(fd, chunk.len()).map_err(fd_errno)?;
+    Ok(chunk.len())
 }
 
 fn sys_write(frame_words: *mut u64) {

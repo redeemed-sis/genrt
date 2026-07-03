@@ -57,6 +57,13 @@ pub fn enable_irq(irq_id: u32, priority: u8) {
 
     // SAFETY: GIC base addresses came from the parsed DTB GIC `reg` property.
     unsafe {
+        // Route SPIs to CPU0 in the current single-core QEMU virt milestone.
+        // SGIs/PPIs use banked targeting and do not have writable ITARGETSR
+        // entries in the same way.
+        if irq_id >= 32 {
+            mmio_write8(gicd + 0x800 + irq_id as usize, 0x01);
+        }
+
         // Set interrupt priority (lower numeric value = higher priority in GIC).
         mmio_write8(gicd + 0x400 + irq_id as usize, priority);
 

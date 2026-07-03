@@ -50,6 +50,8 @@ pub extern "C" fn rust_entry(boot_mmu_params_pa: usize) -> ! {
     unsafe {
         gic::init_controller_minimal();
         gic::enable_irq(timer::TIMER_IRQ_ID_PHYS, 0x40);
+        console::enable_rx_interrupts();
+        gic::enable_irq(platform::qemu::UART0_IRQ_ID, 0x60);
         timer::early_init();
     }
     kernel::kernel_main(bootinfo)
@@ -123,6 +125,22 @@ pub extern "C" fn arch_task_call(request: *const core::ffi::c_void) {
             options(nostack)
         );
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_restart_current_syscall(frame_words: *mut u64) {
+    if frame_words.is_null() {
+        return;
+    }
+
+    // SAFETY: lower-EL syscall dispatch passes a live TrapFrame pointer. AArch64
+    // `svc #imm` is a fixed 4-byte instruction, so subtracting 4 from ELR_EL1
+    // restarts the same userspace syscall after the blocked thread wakes.
+    let frame = unsafe { &mut *(frame_words as *mut TrapFrame) };
+    frame.elr = frame
+        .elr
+        .checked_sub(4)
+        .unwrap_or_else(|| panic!("arch: cannot restart syscall at ELR=0"));
 }
 
 #[unsafe(no_mangle)]
