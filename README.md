@@ -37,6 +37,7 @@ The current AArch64 path already has:
 * single-core IRQ-safe heap lock for task-context allocation/free
 * working `alloc` container smoke tests (`Vec`, `VecDeque`, `BinaryHeap`, `BTreeMap`)
 * GICv2 initialization through high virtual MMIO aliases
+* PL011 RX interrupts routed through GICv2 for UART-backed stdin
 * architected timer in one-shot nearest-deadline mode
 * monotonic hardware counter timebase
 * full trap-frame save/restore on IRQ
@@ -58,7 +59,9 @@ The current AArch64 path already has:
 * scheduler TTBR0 activation for user threads and TTBR0 clear for kernel threads
 * lower-EL `svc #0` syscall dispatch separated from EL1 task-call `svc #0`
 * POSIX-like `open` / `read` / `write` / `close` syscall path for the first user process
+* blocking `read(0)` over UART stdin using a bounded kernel RX ring and scheduler wakeup
 * readonly static ramfs and per-process bounded FD table
+* interactive userspace shell demo that opens and prints files from ramfs
 * bounded process table with generation-checked `ProcessId`
 * process exit/fault status and kernel-side `process_join`
 * lower-EL user fault policy that terminates the current process instead of panicking the kernel
@@ -134,6 +137,19 @@ Timer IRQ
     -> active frame may be replaced
   -> restore selected TrapFrame
   -> eret into selected task
+
+UART RX IRQ
+  -> acknowledge GIC interrupt
+  -> drain PL011 RX FIFO into bounded kernel stdin ring
+  -> wake one stdin-blocked thread if present
+  -> return through normal IRQ path
+
+EL0 read(0)
+  -> if stdin ring has bytes, copy bytes to userspace with copy_to_user()
+  -> if stdin ring is empty, register the current thread as stdin waiter
+  -> rewind ELR_EL1 by one AArch64 SVC instruction
+  -> block on BlockReason::StdinRead and run another task or idle
+  -> after UART wake, restart the same read(0) syscall and return bytes
 ```
 
 Key milestone already reached:
@@ -306,6 +322,11 @@ default user demo opens `/hello.txt`, reads it through fd-backed `read()`, write
 the bytes to stdout, closes the descriptor, and exits. Pathname scanning is
 bounded by `GENRT_PATH_MAX = 4096` bytes.
 
+`read(0)` is backed by PL011 RX interrupts rather than polling. The kernel keeps
+only raw bytes in a bounded stdin ring and does not implement terminal line
+discipline. The `shell.elf` demo owns echo, backspace, Enter handling, and turns
+each entered line into a pathname for `open()`.
+
 ## IPC
 
 The first IPC primitive is a bounded mailbox for EL1 kernel tasks.
@@ -368,10 +389,13 @@ just build-aarch64
 just build-user-hello
 just build-user-fault
 just build-user-read-file
+just build-user-shell
 just run-aarch64
 just run-aarch64-read-file
+just run-aarch64-shell
 just run-aarch64-fault
 just debug-aarch64
+just debug-aarch64-shell
 just debug-aarch64-fault
 just gdb-aarch64
 ```
@@ -390,6 +414,22 @@ cargo xtask run-aarch64 --log-level debug
 cargo xtask run-aarch64 --log-level trace
 ```
 
+Interactive shell:
+
+```bash
+just run-aarch64-shell
+```
+
+The shell accepts paths such as `/hello.txt`, `/etc/banner`, and `/readme.txt`;
+`exit` terminates the userspace process. The shell recipes default to `info`
+logs so UART input remains readable.
+
+QEMU is run with `-serial mon:stdio`, so stdin goes to the emulated UART while
+QEMU monitor escape commands are still available:
+
+* `Ctrl-a x` exits QEMU.
+* `Ctrl-a c` switches between serial and monitor.
+
 ## Immediate priorities
 
 The best next steps are:
@@ -397,7 +437,8 @@ The best next steps are:
 1. refine VM permissions and page-table ownership invariants
 2. replace fixed user ELF loader reservation with generated/initramfs metadata
 3. fault-aware `copy_from_user` recovery for faults during actual loads/stores
-4. growable heap design on top of frame allocation
+4. evolve UART stdin into a real TTY/console subsystem without changing the fd ABI
+5. growable heap design on top of frame allocation
 
 ## Documentation
 
@@ -422,3 +463,4 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0017-process-table-and-user-fault-policy.md`
 * `ai-docs/decision-records/ADR-0018-userspace-elf-loader.md`
 * `ai-docs/decision-records/ADR-0019-readonly-ramfs-and-fd-table.md`
+* `ai-docs/decision-records/ADR-0020-uart-stdin-and-shell.md`
