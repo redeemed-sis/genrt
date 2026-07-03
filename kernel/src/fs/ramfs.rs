@@ -12,6 +12,10 @@ static RAMFS_FILES: &[RamFile] = &[
         path: b"/etc/banner",
         data: b"genrt ramfs\n",
     },
+    RamFile {
+        path: b"/readme.txt",
+        data: b"genrt userspace shell demo\n",
+    },
 ];
 
 pub fn lookup(path: &[u8]) -> Option<usize> {

@@ -48,6 +48,7 @@ enum Commands {
     BuildUserHello,
     BuildUserFault,
     BuildUserReadFile,
+    BuildUserShell,
     RunAarch64 {
         #[arg(long, value_enum)]
         log_level: Option<LogLevel>,
@@ -118,6 +119,9 @@ fn main() -> Result<()> {
         Commands::BuildUserReadFile => {
             build_aarch64_user_elf("read_file", "user/c/read_file.c", default_user_elf_path())
                 .map(|_| ())
+        }
+        Commands::BuildUserShell => {
+            build_aarch64_user_elf("shell", "user/c/shell.c", shell_user_elf_path()).map(|_| ())
         }
         Commands::RunAarch64 {
             log_level,
@@ -399,6 +403,10 @@ fn fault_user_elf_path() -> PathBuf {
     PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/fault_null.elf"))
 }
 
+fn shell_user_elf_path() -> PathBuf {
+    PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/shell.elf"))
+}
+
 fn selected_user_elf_path(user_elf: Option<PathBuf>, check_fault: bool) -> Result<PathBuf> {
     if check_fault && user_elf.is_some() {
         bail!("--check-fault and --user-elf are mutually exclusive")
@@ -418,6 +426,7 @@ fn build_aarch64_user_elfs() -> Result<()> {
     build_aarch64_user_elf("hello", "user/c/hello.c", hello_user_elf_path())?;
     build_aarch64_user_elf("fault_null", "user/c/fault_null.c", fault_user_elf_path())?;
     build_aarch64_user_elf("read_file", "user/c/read_file.c", default_user_elf_path())?;
+    build_aarch64_user_elf("shell", "user/c/shell.c", shell_user_elf_path())?;
     Ok(())
 }
 
