@@ -12,11 +12,12 @@ doctor:
 phase0-check:
     cargo xtask phase0-check
 
-qemu-cmd-aarch64 user_elf="":
-    cargo xtask qemu-cmd --arch aarch64 {{ if user_elf != "" { "--user-elf " + user_elf } else { "" } }}
+qemu-cmd-aarch64 initramfs="":
+    cargo xtask qemu-cmd --arch aarch64 {{ if initramfs != "" { "--initramfs " + initramfs } else { "" } }}
 
-qemu-cmd-aarch64-fault:
-    cargo xtask qemu-cmd --arch aarch64 --check-fault
+qemu-cmd-aarch64-fault: build-user-fault
+    cargo xtask build-initramfs --init target/aarch64-unknown-none-softfloat/debug/user/fault_null.elf
+    cargo xtask qemu-cmd --arch aarch64 --initramfs target/aarch64-unknown-none-softfloat/debug/initramfs.cpio
 
 gdb-cmd-aarch64:
     cargo xtask gdb-cmd --arch aarch64
@@ -36,26 +37,29 @@ build-user-read-file:
 build-user-shell:
     cargo xtask build-user-shell
 
-run-aarch64 log="" user_elf="":
-    cargo xtask run-aarch64 {{ if log != "" { "--log-level " + log } else { "" } }} {{ if user_elf != "" { "--user-elf " + user_elf } else { "" } }}
+build-initramfs:
+    cargo xtask build-initramfs
 
-run-aarch64-read-file log="":
-    cargo xtask run-aarch64 {{ if log != "" { "--log-level " + log } else { "" } }} --user-elf target/aarch64-unknown-none-softfloat/debug/user/read_file.elf
+run-aarch64-read-file log="": build-user-read-file
+    cargo xtask run-aarch64 {{ if log != "" { "--log-level " + log } else { "" } }} --init target/aarch64-unknown-none-softfloat/debug/user/read_file.elf
+
+run-aarch64 log="info":
+    cargo xtask run-aarch64 --log-level {{ log }}
 
 run-aarch64-shell log="info":
-    cargo xtask run-aarch64 --log-level {{ log }} --user-elf target/aarch64-unknown-none-softfloat/debug/user/shell.elf
+    cargo xtask run-aarch64 --log-level {{ log }}
 
-run-aarch64-fault:
-    cargo xtask run-aarch64 --check-fault
+run-aarch64-fault: build-user-fault
+    cargo xtask run-aarch64 --init target/aarch64-unknown-none-softfloat/debug/user/fault_null.elf
 
-debug-aarch64 log="debug" user_elf="":
-    cargo xtask debug-aarch64 --log-level {{ log }} {{ if user_elf != "" { "--user-elf " + user_elf } else { "" } }}
+debug-aarch64 log="debug":
+    cargo xtask debug-aarch64 --log-level {{ log }}
 
 debug-aarch64-shell log="info":
-    cargo xtask debug-aarch64 --log-level {{ log }} --user-elf target/aarch64-unknown-none-softfloat/debug/user/shell.elf
+    cargo xtask debug-aarch64 --log-level {{ log }}
 
-debug-aarch64-fault:
-    cargo xtask debug-aarch64 --log-level debug --check-fault
+debug-aarch64-fault: build-user-fault
+    cargo xtask debug-aarch64 --log-level debug --init target/aarch64-unknown-none-softfloat/debug/user/fault_null.elf
 
 gdb-aarch64:
     aarch64-linux-gnu-gdb target/aarch64-unknown-none-softfloat/debug/genrt-aarch64.elf \

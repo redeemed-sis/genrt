@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+cpio = "0.4.1"

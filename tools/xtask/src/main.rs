@@ -1,5 +1,6 @@
 use std::{
     env, fs,
+    io::Cursor,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
@@ -11,10 +12,11 @@ const AARCH64_TARGET: &str = "aarch64-unknown-none-softfloat";
 const AARCH64_QEMU_MACHINE: &str = "virt,gic-version=2";
 const AARCH64_QEMU_CPU: &str = "cortex-a72";
 const AARCH64_DTB_LOAD_ADDR: &str = "0x40000000";
-const AARCH64_USER_IMAGE_LOAD_ADDR: &str = "0x47000000";
-const AARCH64_USER_IMAGE_MAX_SIZE: u64 = 64 * 1024;
+const AARCH64_INITRAMFS_LOAD_ADDR: &str = "0x47000000";
+const AARCH64_INITRAMFS_IMAGE_MAX_SIZE: u64 = 4 * 1024 * 1024;
 const AARCH64_USER_CRT0: &str = "user/c/aarch64/crt0.S";
 const AARCH64_USER_INCLUDE_DIR: &str = "user/c/aarch64/include";
+const DEFAULT_INITRAMFS_ROOT: &str = "user/initramfs";
 
 #[derive(Parser)]
 #[command(name = "xtask")]
@@ -33,9 +35,7 @@ enum Commands {
         #[arg(long, value_enum)]
         arch: Arch,
         #[arg(long)]
-        user_elf: Option<PathBuf>,
-        #[arg(long)]
-        check_fault: bool,
+        initramfs: Option<PathBuf>,
     },
     GdbCmd {
         #[arg(long, value_enum)]
@@ -49,21 +49,33 @@ enum Commands {
     BuildUserFault,
     BuildUserReadFile,
     BuildUserShell,
+    BuildInitramfs {
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        init: Option<PathBuf>,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     RunAarch64 {
         #[arg(long, value_enum)]
         log_level: Option<LogLevel>,
         #[arg(long)]
-        user_elf: Option<PathBuf>,
+        initramfs: Option<PathBuf>,
         #[arg(long)]
-        check_fault: bool,
+        initramfs_root: Option<PathBuf>,
+        #[arg(long)]
+        init: Option<PathBuf>,
     },
     DebugAarch64 {
         #[arg(long, value_enum)]
         log_level: Option<LogLevel>,
         #[arg(long)]
-        user_elf: Option<PathBuf>,
+        initramfs: Option<PathBuf>,
         #[arg(long)]
-        check_fault: bool,
+        initramfs_root: Option<PathBuf>,
+        #[arg(long)]
+        init: Option<PathBuf>,
     },
 }
 
@@ -102,11 +114,7 @@ fn main() -> Result<()> {
         Commands::Doctor => doctor(),
         Commands::Phase0Check => phase0_check(),
         Commands::RepoTree => repo_tree(),
-        Commands::QemuCmd {
-            arch,
-            user_elf,
-            check_fault,
-        } => qemu_cmd(arch, user_elf, check_fault),
+        Commands::QemuCmd { arch, initramfs } => qemu_cmd(arch, initramfs),
         Commands::GdbCmd { arch } => gdb_cmd(arch),
         Commands::BuildAarch64 { log_level } => build_aarch64(log_level),
         Commands::BuildUserHello => {
@@ -123,20 +131,26 @@ fn main() -> Result<()> {
         Commands::BuildUserShell => {
             build_aarch64_user_elf("shell", "user/c/shell.c", shell_user_elf_path()).map(|_| ())
         }
+        Commands::BuildInitramfs { root, init, output } => {
+            build_initramfs(root, init, output).map(|_| ())
+        }
         Commands::RunAarch64 {
             log_level,
-            user_elf,
-            check_fault,
-        } => run_aarch64(false, log_level, user_elf, check_fault),
+            initramfs,
+            initramfs_root,
+            init,
+        } => run_aarch64(false, log_level, initramfs, initramfs_root, init),
         Commands::DebugAarch64 {
             log_level,
-            user_elf,
-            check_fault,
+            initramfs,
+            initramfs_root,
+            init,
         } => run_aarch64(
             true,
             Some(log_level.unwrap_or(LogLevel::Debug)),
-            user_elf,
-            check_fault,
+            initramfs,
+            initramfs_root,
+            init,
         ),
     }
 }
@@ -239,10 +253,16 @@ fn repo_tree() -> Result<()> {
     Ok(())
 }
 
-fn qemu_cmd(arch: Arch, user_elf: Option<PathBuf>, check_fault: bool) -> Result<()> {
+fn qemu_cmd(arch: Arch, initramfs: Option<PathBuf>) -> Result<()> {
     match arch {
         Arch::Aarch64 => {
-            let user_elf = selected_user_elf_path(user_elf, check_fault)?;
+            let initramfs = match initramfs {
+                Some(path) => {
+                    validate_initramfs_payload(&path)?;
+                    path
+                }
+                None => default_initramfs_path(),
+            };
             println!("qemu-system-aarch64 \\");
             println!("  -machine {AARCH64_QEMU_MACHINE} \\");
             println!("  -cpu {AARCH64_QEMU_CPU} \\");
@@ -253,8 +273,8 @@ fn qemu_cmd(arch: Arch, user_elf: Option<PathBuf>, check_fault: bool) -> Result<
                 "  -device loader,file=target/{AARCH64_TARGET}/debug/qemu-virt.dtb,addr={AARCH64_DTB_LOAD_ADDR} \\"
             );
             println!(
-                "  -device loader,file={},addr={AARCH64_USER_IMAGE_LOAD_ADDR},force-raw=on \\",
-                user_elf.display()
+                "  -device loader,file={},addr={AARCH64_INITRAMFS_LOAD_ADDR},force-raw=on \\",
+                initramfs.display()
             );
             println!("  -S -s");
         }
@@ -292,7 +312,6 @@ fn gdb_cmd(arch: Arch) -> Result<()> {
 
 fn build_aarch64(log_level: Option<LogLevel>) -> Result<()> {
     let dtb_path = generate_qemu_virt_dtb()?;
-    build_aarch64_user_elfs()?;
 
     let mut build = Command::new("cargo");
     build.args([
@@ -341,12 +360,13 @@ fn build_aarch64(log_level: Option<LogLevel>) -> Result<()> {
 fn run_aarch64(
     wait_for_gdb: bool,
     log_level: Option<LogLevel>,
-    user_elf: Option<PathBuf>,
-    check_fault: bool,
+    initramfs: Option<PathBuf>,
+    initramfs_root: Option<PathBuf>,
+    init: Option<PathBuf>,
 ) -> Result<()> {
     build_aarch64(log_level)?;
     let dtb_path = qemu_virt_dtb_path()?;
-    let user_elf = selected_user_elf_path(user_elf, check_fault)?;
+    let initramfs = selected_or_build_initramfs_path(initramfs, initramfs_root, init)?;
 
     let mut cmd = Command::new("qemu-system-aarch64");
     cmd.args([
@@ -367,8 +387,8 @@ fn run_aarch64(
     ))
     .arg("-device")
     .arg(format!(
-        "loader,file={},addr={AARCH64_USER_IMAGE_LOAD_ADDR},force-raw=on",
-        user_elf.display()
+        "loader,file={},addr={AARCH64_INITRAMFS_LOAD_ADDR},force-raw=on",
+        initramfs.display()
     ))
     .stdout(Stdio::inherit())
     .stderr(Stdio::inherit());
@@ -407,27 +427,243 @@ fn shell_user_elf_path() -> PathBuf {
     PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/shell.elf"))
 }
 
-fn selected_user_elf_path(user_elf: Option<PathBuf>, check_fault: bool) -> Result<PathBuf> {
-    if check_fault && user_elf.is_some() {
-        bail!("--check-fault and --user-elf are mutually exclusive")
-    }
-
-    let path = match (check_fault, user_elf) {
-        (true, None) => fault_user_elf_path(),
-        (false, Some(path)) => path,
-        (false, None) => default_user_elf_path(),
-        (true, Some(_)) => unreachable!(),
-    };
-    validate_user_elf_payload(&path)?;
-    Ok(path)
+fn default_initramfs_path() -> PathBuf {
+    PathBuf::from(format!("target/{AARCH64_TARGET}/debug/initramfs.cpio"))
 }
 
-fn build_aarch64_user_elfs() -> Result<()> {
-    build_aarch64_user_elf("hello", "user/c/hello.c", hello_user_elf_path())?;
-    build_aarch64_user_elf("fault_null", "user/c/fault_null.c", fault_user_elf_path())?;
-    build_aarch64_user_elf("read_file", "user/c/read_file.c", default_user_elf_path())?;
-    build_aarch64_user_elf("shell", "user/c/shell.c", shell_user_elf_path())?;
+fn initramfs_staging_root() -> PathBuf {
+    PathBuf::from(format!("target/{AARCH64_TARGET}/debug/initramfs-root"))
+}
+
+fn selected_or_build_initramfs_path(
+    initramfs: Option<PathBuf>,
+    root: Option<PathBuf>,
+    init: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(path) = initramfs {
+        if root.is_some() || init.is_some() {
+            bail!("--initramfs is mutually exclusive with --initramfs-root and --init");
+        }
+        validate_initramfs_payload(&path)?;
+        return Ok(path);
+    }
+
+    build_initramfs(root, init, None)
+}
+
+fn build_initramfs(
+    root: Option<PathBuf>,
+    init: Option<PathBuf>,
+    output: Option<PathBuf>,
+) -> Result<PathBuf> {
+    let root = root.unwrap_or_else(|| PathBuf::from(DEFAULT_INITRAMFS_ROOT));
+    ensure_dir(&root)?;
+
+    let init = match init {
+        Some(path) => {
+            validate_user_elf_payload(&path)?;
+            path
+        }
+        None => build_aarch64_user_elf("shell", "user/c/shell.c", shell_user_elf_path())?,
+    };
+
+    let output = output.unwrap_or_else(default_initramfs_path);
+    let staging = initramfs_staging_root();
+    if staging.exists() {
+        fs::remove_dir_all(&staging)
+            .with_context(|| format!("failed to clear {}", staging.display()))?;
+    }
+    fs::create_dir_all(&staging)
+        .with_context(|| format!("failed to create {}", staging.display()))?;
+
+    copy_initramfs_root(&root, &staging)?;
+    let staged_init = staging.join("init");
+    if staged_init.exists() {
+        bail!(
+            "initramfs root {} already contains init; pass a root without init",
+            root.display()
+        );
+    }
+    fs::copy(&init, &staged_init).with_context(|| {
+        format!(
+            "failed to stage init ELF {} as {}",
+            init.display(),
+            staged_init.display()
+        )
+    })?;
+
+    write_initramfs_cpio(&staging, &output)?;
+    let size = validate_initramfs_payload(&output)?;
+    println!("built {} ({} bytes)", output.display(), size);
+    Ok(output)
+}
+
+#[derive(Debug)]
+struct ArchiveEntry {
+    rel: String,
+    path: PathBuf,
+    kind: ArchiveEntryKind,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ArchiveEntryKind {
+    Directory,
+    File,
+}
+
+fn copy_initramfs_root(src: &Path, dst: &Path) -> Result<()> {
+    for entry in fs::read_dir(src).with_context(|| format!("failed to read {}", src.display()))? {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", src.display()))?;
+        let source = entry.path();
+        let target = dst.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source)
+            .with_context(|| format!("failed to stat {}", source.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!("initramfs rejects symlink {}", source.display());
+        }
+        if metadata.is_dir() {
+            fs::create_dir_all(&target)
+                .with_context(|| format!("failed to create {}", target.display()))?;
+            copy_initramfs_root(&source, &target)?;
+        } else if metadata.is_file() {
+            fs::copy(&source, &target).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    source.display(),
+                    target.display()
+                )
+            })?;
+        } else {
+            bail!(
+                "initramfs rejects unsupported file type {}",
+                source.display()
+            );
+        }
+    }
     Ok(())
+}
+
+fn write_initramfs_cpio(root: &Path, output: &Path) -> Result<()> {
+    let mut entries = Vec::new();
+    collect_archive_entries(root, root, &mut entries)?;
+    entries.sort_by(|lhs, rhs| lhs.rel.cmp(&rhs.rel));
+    ensure_archive_contains_init(&entries)?;
+
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let mut cpio_entries = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.into_iter().enumerate() {
+        let perms = entry_mode_permissions(&entry);
+        let file_type = entry_mode_file_type(entry.kind);
+        let data = match entry.kind {
+            ArchiveEntryKind::Directory => Vec::new(),
+            ArchiveEntryKind::File => fs::read(&entry.path)
+                .with_context(|| format!("failed to read {}", entry.path.display()))?,
+        };
+        if data.len() > u32::MAX as usize {
+            bail!("initramfs entry {} is too large", entry.rel);
+        }
+        let builder = cpio::NewcBuilder::new(&entry.rel)
+            .ino(index as u32)
+            .uid(0)
+            .gid(0)
+            .mode(perms)
+            .set_mode_file_type(file_type)
+            .mtime(0)
+            .nlink(1);
+        cpio_entries.push((builder, Cursor::new(data)));
+    }
+
+    let out = fs::File::create(output)
+        .with_context(|| format!("failed to create {}", output.display()))?;
+    cpio::write_cpio(cpio_entries.into_iter(), out)
+        .with_context(|| format!("failed to write {}", output.display()))?;
+    Ok(())
+}
+
+fn entry_mode_permissions(entry: &ArchiveEntry) -> u32 {
+    match entry.kind {
+        ArchiveEntryKind::Directory => 0o755,
+        ArchiveEntryKind::File if entry.rel == "init" => 0o755,
+        ArchiveEntryKind::File => 0o644,
+    }
+}
+
+fn entry_mode_file_type(kind: ArchiveEntryKind) -> cpio::newc::ModeFileType {
+    match kind {
+        ArchiveEntryKind::Directory => cpio::newc::ModeFileType::Directory,
+        ArchiveEntryKind::File => cpio::newc::ModeFileType::Regular,
+    }
+}
+
+fn collect_archive_entries(root: &Path, dir: &Path, entries: &mut Vec<ArchiveEntry>) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", dir.display()))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!("initramfs rejects symlink {}", path.display());
+        }
+        let rel = archive_relative_path(root, &path)?;
+        let kind = if metadata.is_dir() {
+            ArchiveEntryKind::Directory
+        } else if metadata.is_file() {
+            ArchiveEntryKind::File
+        } else {
+            bail!("initramfs rejects unsupported file type {}", path.display());
+        };
+        entries.push(ArchiveEntry {
+            rel: rel.clone(),
+            path: path.clone(),
+            kind,
+        });
+        if kind == ArchiveEntryKind::Directory {
+            collect_archive_entries(root, &path, entries)?;
+        }
+    }
+    Ok(())
+}
+
+fn archive_relative_path(root: &Path, path: &Path) -> Result<String> {
+    let rel = path
+        .strip_prefix(root)
+        .with_context(|| format!("{} is outside {}", path.display(), root.display()))?;
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        let std::path::Component::Normal(part) = component else {
+            bail!("initramfs rejects non-normal path {}", path.display());
+        };
+        let part = part
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("initramfs path is not UTF-8: {}", path.display()))?;
+        if part.is_empty() || part == "." || part == ".." || part.contains('/') {
+            bail!(
+                "initramfs rejects invalid path component in {}",
+                path.display()
+            );
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        bail!("initramfs rejects empty archive path {}", path.display());
+    }
+    Ok(parts.join("/"))
+}
+
+fn ensure_archive_contains_init(entries: &[ArchiveEntry]) -> Result<()> {
+    let init_count = entries
+        .iter()
+        .filter(|entry| entry.rel == "init" && entry.kind == ArchiveEntryKind::File)
+        .count();
+    match init_count {
+        1 => Ok(()),
+        0 => bail!("initramfs archive must contain regular file init"),
+        _ => bail!("initramfs archive contains duplicate init entries"),
+    }
 }
 
 fn build_aarch64_user_elf(name: &str, source: &str, elf: PathBuf) -> Result<PathBuf> {
@@ -502,12 +738,22 @@ fn validate_user_elf_payload(path: &Path) -> Result<u64> {
     if size == 0 {
         bail!("user ELF {} is empty", path.display());
     }
-    if size > AARCH64_USER_IMAGE_MAX_SIZE {
+    Ok(size)
+}
+
+fn validate_initramfs_payload(path: &Path) -> Result<u64> {
+    let size = fs::metadata(path)
+        .with_context(|| format!("failed to stat initramfs {}", path.display()))?
+        .len();
+    if size == 0 {
+        bail!("initramfs {} is empty", path.display());
+    }
+    if size > AARCH64_INITRAMFS_IMAGE_MAX_SIZE {
         bail!(
-            "user ELF {} size {} exceeds loader reservation {} bytes",
+            "initramfs {} size {} exceeds loader reservation {} bytes",
             path.display(),
             size,
-            AARCH64_USER_IMAGE_MAX_SIZE
+            AARCH64_INITRAMFS_IMAGE_MAX_SIZE
         );
     }
     Ok(size)
@@ -870,6 +1116,14 @@ fn ensure_exists(path: &str) -> Result<()> {
         Ok(())
     } else {
         bail!("missing required path: {path}")
+    }
+}
+
+fn ensure_dir(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        Ok(())
+    } else {
+        bail!("missing required directory: {}", path.display())
     }
 }
 
