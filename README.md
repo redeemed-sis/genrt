@@ -53,15 +53,15 @@ The current AArch64 path already has:
 * demo producer/consumer tasks exchanging messages through a capacity-bounded mailbox
 * timeout-aware mailbox send/receive operations
 * bounded `thread_spawn` / `thread_exit` / `thread_join`
-* first EL0 userspace examples loaded as ELF64 AArch64 executables
+* first EL0 userspace `/init` loaded from QEMU-provided initramfs as an ELF64 AArch64 executable
 * minimal kernel ELF loader for static freestanding `ET_EXEC` images
 * minimal TTBR0 user address space with 4 KiB user page mappings
 * scheduler TTBR0 activation for user threads and TTBR0 clear for kernel threads
 * lower-EL `svc #0` syscall dispatch separated from EL1 task-call `svc #0`
 * POSIX-like `open` / `read` / `write` / `close` syscall path for the first user process
 * blocking `read(0)` over UART stdin using a bounded kernel RX ring and scheduler wakeup
-* readonly static ramfs and per-process bounded FD table
-* interactive userspace shell demo that opens and prints files from ramfs
+* readonly initramfs-backed ramfs and per-process bounded FD table
+* interactive userspace shell demo that opens and prints files from initramfs
 * bounded process table with generation-checked `ProcessId`
 * process exit/fault status and kernel-side `process_join`
 * lower-EL user fault policy that terminates the current process instead of panicking the kernel
@@ -118,7 +118,8 @@ rust_entry (high VA)
 
 kernel init thread
   -> create first TTBR0 user address space
-  -> parse QEMU-loaded user ELF image
+  -> find /init in mounted initramfs
+  -> parse /init as user ELF image
   -> map ELF PT_LOAD segments
   -> map user stack
   -> spawn EL0 user thread
@@ -309,18 +310,20 @@ The first userspace path adds a separate narrow TTBR0 API:
 The current userspace loader accepts only ELF64 little-endian AArch64
 `ET_EXEC` files with static `PT_LOAD` segments. It rejects dynamic linking,
 interpreters, TLS, non-AArch64 images, and RWX segments. User examples are built
-from `user/c/` with a tiny freestanding C runtime and linker script; there is no
-legacy raw `.bin` userspace payload path.
+from `user/c/` with a tiny freestanding C runtime and linker script. QEMU loads
+`initramfs.cpio`, not a direct user ELF payload; the kernel mounts that archive
+and loads `/init` through the ELF loader.
 
 The initial user syscall ABI is AArch64-style: `x8` is the syscall number,
 `x0..x5` are arguments, and `x0` is the return value. The current POSIX-like
 subset includes `open`, `read`, `write`, `close`, and `exit`; errors are
 reported as negative errno values.
 
-The first readonly filesystem is a static ramfs with exact path lookup. The
-default user demo opens `/hello.txt`, reads it through fd-backed `read()`, writes
-the bytes to stdout, closes the descriptor, and exits. Pathname scanning is
-bounded by `GENRT_PATH_MAX = 4096` bytes.
+The first readonly filesystem is an initramfs-backed ramfs with exact path
+lookup. `xtask` builds a deterministic uncompressed `newc` cpio archive from
+`user/initramfs/` plus `/init`, currently `shell.elf`. The shell can open
+`/hello.txt`, `/etc/banner`, and `/readme.txt`; pathname scanning is bounded by
+`GENRT_PATH_MAX = 4096` bytes.
 
 `read(0)` is backed by PL011 RX interrupts rather than polling. The kernel keeps
 only raw bytes in a bounded stdin ring and does not implement terminal line
@@ -390,6 +393,7 @@ just build-user-hello
 just build-user-fault
 just build-user-read-file
 just build-user-shell
+just build-initramfs
 just run-aarch64
 just run-aarch64-read-file
 just run-aarch64-shell
@@ -412,6 +416,7 @@ Or via `xtask`:
 ```bash
 cargo xtask run-aarch64 --log-level debug
 cargo xtask run-aarch64 --log-level trace
+cargo xtask build-initramfs --root user/initramfs --output target/aarch64-unknown-none-softfloat/debug/initramfs.cpio
 ```
 
 Interactive shell:
@@ -422,7 +427,9 @@ just run-aarch64-shell
 
 The shell accepts paths such as `/hello.txt`, `/etc/banner`, and `/readme.txt`;
 `exit` terminates the userspace process. The shell recipes default to `info`
-logs so UART input remains readable.
+logs so UART input remains readable. Default QEMU runs load
+`target/aarch64-unknown-none-softfloat/debug/initramfs.cpio` at the reserved
+initramfs physical window.
 
 QEMU is run with `-serial mon:stdio`, so stdin goes to the emulated UART while
 QEMU monitor escape commands are still available:
@@ -435,7 +442,7 @@ QEMU monitor escape commands are still available:
 The best next steps are:
 
 1. refine VM permissions and page-table ownership invariants
-2. replace fixed user ELF loader reservation with generated/initramfs metadata
+2. add richer initramfs/VFS lookup semantics such as readdir/stat
 3. fault-aware `copy_from_user` recovery for faults during actual loads/stores
 4. evolve UART stdin into a real TTY/console subsystem without changing the fd ABI
 5. growable heap design on top of frame allocation
@@ -464,3 +471,4 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0018-userspace-elf-loader.md`
 * `ai-docs/decision-records/ADR-0019-readonly-ramfs-and-fd-table.md`
 * `ai-docs/decision-records/ADR-0020-uart-stdin-and-shell.md`
+* `ai-docs/decision-records/ADR-0021-initramfs-cpio-root.md`
