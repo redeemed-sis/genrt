@@ -2,6 +2,7 @@ use core::{cell::UnsafeCell, fmt};
 
 use crate::{
     fs::fd::{FdError, FdTable},
+    fs::initramfs::{self, InitramfsError},
     loader::elf::{self, ElfLoadError, UserElfImage},
     memory::{
         self, FrameRange, PAGE_SIZE,
@@ -103,6 +104,7 @@ pub(crate) enum ProcessError {
     OutOfFrames,
     Spawn(sched::SpawnError),
     Elf(ElfLoadError),
+    Initramfs(InitramfsError),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -200,7 +202,7 @@ pub(crate) fn spawn_first_user_process() -> Result<ProcessId, ProcessError> {
     let mut user_image = None;
 
     let result = (|| {
-        let loaded = load_user_image(address_space)?;
+        let loaded = load_init_image(address_space)?;
         let entry = loaded.entry;
         user_image = Some(loaded);
 
@@ -561,18 +563,10 @@ fn take_process_resources(pid: ProcessId) -> ProcessResources {
     resources
 }
 
-fn load_user_image(address_space: UserAddressSpace) -> Result<UserElfImage, ProcessError> {
-    let range = vm::user_image_load_range();
-    let size = range.end - range.start;
-    crate::debug!(
-        "process: load user ELF image pa=0x{:x} size={}",
-        range.start,
-        size,
-    );
-    let image_va = vm::phys_to_virt(range.start);
-    // SAFETY: the platform reserves `user_image_load_range()` for the QEMU
-    // loader payload, and kernel direct-map covers RAM after MMU bring-up.
-    let image = unsafe { core::slice::from_raw_parts(image_va as *const u8, size) };
+fn load_init_image(address_space: UserAddressSpace) -> Result<UserElfImage, ProcessError> {
+    let image = initramfs::init_file().map_err(ProcessError::Initramfs)?;
+    crate::info!("init: loading /init from initramfs");
+    crate::info!("init: /init size={}", image.len());
     let mut address_space = address_space;
     elf::load_user_elf(image, &mut address_space).map_err(ProcessError::Elf)
 }

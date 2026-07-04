@@ -10,8 +10,8 @@ use super::{BootDeviceRange, BootPlatformInfo};
 /// Physical address where the QEMU `virt` DTB is loaded by the current xtask
 /// bare-metal ELF flow.
 pub(crate) const BOOT_DTB_PA: usize = 0x4000_0000;
-pub(crate) const USER_IMAGE_LOAD_PA: usize = 0x4700_0000;
-pub(crate) const USER_IMAGE_RESERVED_SIZE: usize = 64 * 1024;
+pub(crate) const INITRAMFS_LOAD_PA: usize = 0x4700_0000;
+pub(crate) const INITRAMFS_RESERVED_SIZE: usize = 4 * 1024 * 1024;
 pub(crate) const UART0_IRQ_ID: u32 = 33;
 
 const RAM_START: usize = 0x4000_0000;

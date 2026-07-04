@@ -178,13 +178,13 @@ pub extern "C" fn arch_init_user_trap_frame(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn arch_user_image_load_pa() -> usize {
-    platform::qemu::USER_IMAGE_LOAD_PA
+pub extern "C" fn arch_initramfs_load_pa() -> usize {
+    platform::qemu::INITRAMFS_LOAD_PA
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn arch_user_image_reserved_size() -> usize {
-    platform::qemu::USER_IMAGE_RESERVED_SIZE
+pub extern "C" fn arch_initramfs_reserved_size() -> usize {
+    platform::qemu::INITRAMFS_RESERVED_SIZE
 }
 
 #[unsafe(no_mangle)]

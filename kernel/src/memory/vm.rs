@@ -3,8 +3,8 @@ use super::{PAGE_SIZE, PhysAddr, PhysRange, VirtAddr};
 unsafe extern "C" {
     fn arch_phys_to_virt(pa: usize) -> usize;
     fn arch_virt_to_phys(va: usize) -> usize;
-    fn arch_user_image_load_pa() -> usize;
-    fn arch_user_image_reserved_size() -> usize;
+    fn arch_initramfs_load_pa() -> usize;
+    fn arch_initramfs_reserved_size() -> usize;
     fn arch_translate_kernel_va(va: usize, out_pa: *mut usize) -> u64;
     fn arch_map_kernel_region(va: usize, pa: usize, size: usize, attr: u32, flags: u64) -> u64;
     fn arch_unmap_kernel_region(va: usize, size: usize) -> u64;
@@ -160,9 +160,9 @@ pub unsafe fn switch_to_runtime_kernel_tables() -> Result<(), VmError> {
     vm_result(unsafe { arch_switch_to_runtime_kernel_tables() })
 }
 
-pub fn user_image_load_range() -> PhysRange {
-    let start = unsafe { arch_user_image_load_pa() };
-    let size = unsafe { arch_user_image_reserved_size() };
+pub fn initramfs_load_range() -> PhysRange {
+    let start = unsafe { arch_initramfs_load_pa() };
+    let size = unsafe { arch_initramfs_reserved_size() };
     PhysRange {
         start,
         end: start.saturating_add(size),

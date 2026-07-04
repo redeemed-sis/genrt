@@ -152,8 +152,8 @@ pub(crate) fn init(boot: &'static BootInfo) -> Result<()> {
     add_reserved_range(
         &mut reserved_ranges,
         &mut reserved_count,
-        vm::user_image_load_range(),
-        "user image loader region",
+        vm::initramfs_load_range(),
+        "initramfs loader region",
     )?;
 
     crate::debug!(

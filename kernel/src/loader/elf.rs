@@ -82,7 +82,7 @@ pub fn load_user_elf(
     validate_user_range(entry, 1)?;
 
     crate::debug!(
-        "elf: parsing user image size={} entry=0x{:x}",
+        "elf: parsing image size={} entry=0x{:x}",
         image.len(),
         entry
     );

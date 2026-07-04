@@ -55,6 +55,11 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
     }
     crate::info!("memory: switched to runtime kernel page tables; TTBR0 cleared");
 
+    if let Err(err) = fs::initramfs::mount_from_loader_region() {
+        crate::error!("initramfs: mount failed: {:?}", err);
+        panic!("initramfs: failed to mount loader image");
+    }
+
     demo::init();
 
     if sched::bootstrap(

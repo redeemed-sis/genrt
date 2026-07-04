@@ -181,6 +181,9 @@ fn sys_open(frame_words: *mut u64) {
         validate_open_flags(flags)?;
         let path = user::copy_path_cstr_from_user(path_ptr).map_err(path_copy_errno)?;
         let path = path::root_relative(&path).map_err(path_errno)?;
+        if ramfs::is_dir(&path) {
+            return Err(errno::EINVAL);
+        }
         let file_index = ramfs::lookup(&path).ok_or(errno::ENOENT)?;
         process::open_current_ram_file(file_index).map_err(fd_errno)
     })();
