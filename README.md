@@ -59,9 +59,10 @@ The current AArch64 path already has:
 * scheduler TTBR0 activation for user threads and TTBR0 clear for kernel threads
 * lower-EL `svc #0` syscall dispatch separated from EL1 task-call `svc #0`
 * POSIX-like `open` / `read` / `write` / `close` syscall path for the first user process
+* POSIX-like `fork` / `execve` / `waitpid` process-control path for child processes
 * blocking `read(0)` over UART stdin using a bounded kernel RX ring and scheduler wakeup
 * readonly initramfs-backed ramfs and per-process bounded FD table
-* interactive userspace shell demo that opens and prints files from initramfs
+* interactive userspace shell demo that opens files and runs `/bin/echo` from initramfs
 * bounded process table with generation-checked `ProcessId`
 * process exit/fault status and kernel-side `process_join`
 * lower-EL user fault policy that terminates the current process instead of panicking the kernel
@@ -151,6 +152,13 @@ EL0 read(0)
   -> rewind ELR_EL1 by one AArch64 SVC instruction
   -> block on BlockReason::StdinRead and run another task or idle
   -> after UART wake, restart the same read(0) syscall and return bytes
+
+EL0 shell external command
+  -> fork()
+     parent: waitpid(child, &status, 0)
+     child:  execve("/bin/<command>", argv, NULL)
+  -> execve loads the ELF from initramfs, replaces the child's TTBR0 image,
+     builds argc/argv on the new user stack, and returns through eret to _start
 ```
 
 Key milestone already reached:
@@ -160,8 +168,11 @@ Key milestone already reached:
 ## Current limitations
 
 * single-core only
-* only one demo userspace process is created
-* no general multi-process subsystem yet
+* process control is intentionally minimal: one main user thread per process
+* `fork` uses eager address-space copying; no copy-on-write yet
+* `waitpid` supports a specific child pid with options `0`; no `waitpid(-1)` yet
+* `execve` supports `argv` but rejects non-null `envp`
+* shell command lookup is limited to `/bin/<command>` for names without `/`
 * no ASIDs or multiple per-process TTBR0 roots yet
 * VM API currently supports only 2 MiB-aligned TTBR1 kernel mappings
 * user VM bring-up supports only explicit 4 KiB mappings created by the first process path
