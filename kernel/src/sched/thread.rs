@@ -8,8 +8,8 @@ use crate::{
 };
 
 use super::{
-    IDLE_TASK_ID, Scheduler, arch_init_thread_frame, arch_init_user_trap_frame, copy_words,
-    preempt, scheduler_mut, try_scheduler_mut,
+    IDLE_TASK_ID, Scheduler, arch_clone_user_trap_frame_for_fork, arch_init_thread_frame,
+    arch_init_user_trap_frame, copy_words, preempt, scheduler_mut, try_scheduler_mut,
 };
 
 #[repr(transparent)]
@@ -182,6 +182,31 @@ pub(crate) fn thread_spawn_user(
     scheduler.spawn_user_thread(process_id, address_space, user_entry, user_sp, arg0, attrs)
 }
 
+pub(crate) fn thread_spawn_user_from_frame(
+    process_id: ProcessId,
+    address_space: UserAddressSpace,
+    frame_words: *const u64,
+    attrs: ThreadAttrs,
+) -> core::result::Result<ThreadId, SpawnError> {
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    let Some(scheduler) = try_scheduler_mut() else {
+        return Err(SpawnError::SchedulerNotInitialized);
+    };
+
+    scheduler.spawn_user_thread_from_frame(process_id, address_space, frame_words, attrs)
+}
+
+pub(crate) fn replace_current_user_address_space(
+    address_space: UserAddressSpace,
+) -> core::result::Result<(), ()> {
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    let Some(scheduler) = try_scheduler_mut() else {
+        return Err(());
+    };
+
+    scheduler.replace_current_user_address_space(address_space)
+}
+
 pub(crate) fn on_thread_exit_sync(active_frame_words: *mut u64, code: usize) {
     scheduler_mut().exit_current(active_frame_words, code);
 }
@@ -190,12 +215,12 @@ pub(crate) fn on_thread_join_sync(active_frame_words: *mut u64, target: ThreadId
     scheduler_mut().join_thread(active_frame_words, target);
 }
 
-pub(crate) fn block_current_on_process_join(active_frame_words: *mut u64, pid: ProcessId) {
-    scheduler_mut().block_current_on_process_join(active_frame_words, pid);
+pub(crate) fn block_current_on_process_wait(active_frame_words: *mut u64, pid: ProcessId) {
+    scheduler_mut().block_current_on_process_wait(active_frame_words, pid);
 }
 
-pub(crate) fn complete_process_join(joiner: ThreadId, pid: ProcessId) {
-    scheduler_mut().complete_process_join(joiner, pid);
+pub(crate) fn complete_process_wait(waiter: ThreadId, pid: ProcessId) {
+    scheduler_mut().complete_process_wait(waiter, pid);
 }
 
 pub(crate) fn block_current_on_stdin_read(active_frame_words: *mut u64) {
@@ -204,6 +229,11 @@ pub(crate) fn block_current_on_stdin_read(active_frame_words: *mut u64) {
 
 pub(crate) fn complete_stdin_read(waiter: ThreadId) {
     scheduler_mut().complete_stdin_read(waiter);
+}
+
+enum BlockedWaiterState {
+    Missing,
+    WrongState(preempt::TaskState),
 }
 
 impl Scheduler {
@@ -325,6 +355,67 @@ impl Scheduler {
         unsafe {
             arch_init_user_trap_frame(frame_words, user_entry, user_sp, kernel_sp, arg0);
         }
+    }
+
+    fn spawn_user_thread_from_frame(
+        &mut self,
+        process_id: ProcessId,
+        address_space: UserAddressSpace,
+        source_frame_words: *const u64,
+        attrs: ThreadAttrs,
+    ) -> core::result::Result<ThreadId, SpawnError> {
+        if source_frame_words.is_null() {
+            return Err(SpawnError::NoThreadSlots);
+        }
+
+        let Some(id) = self.find_free_slot() else {
+            return Err(SpawnError::NoThreadSlots);
+        };
+
+        let thread_id = {
+            let task = self.task_mut(id);
+            task.generation = next_generation(task.generation);
+            task.state = preempt::TaskState::Ready;
+            task.joinable = attrs.joinable;
+            task.exit_code = None;
+            task.joiner = None;
+            task.ipc.reset();
+            task.last_join_result = None;
+            task.entry = free_task_entry;
+            task.arg = ThreadArg::empty();
+            task.kind = preempt::ThreadKind::User {
+                process_id,
+                address_space,
+            };
+            ThreadId::new(id.index(), task.generation)
+        };
+
+        let kernel_sp = self.task(id).stack_top();
+        // SAFETY: scheduler owns the destination frame and child kernel stack.
+        // The source frame is the live lower-EL syscall frame supplied by the
+        // caller. The arch helper copies the userspace resume state and fixes
+        // the child-only return value/kernel stack.
+        unsafe {
+            arch_clone_user_trap_frame_for_fork(
+                self.frame_words_mut_ptr(id),
+                source_frame_words,
+                kernel_sp,
+            );
+        }
+
+        if id != IDLE_TASK_ID {
+            let was_empty = self.ready_queue.is_empty();
+            self.ready_push_back(id);
+            if was_empty {
+                self.note_runnable_peer_available();
+            }
+        }
+
+        crate::debug!(
+            "thread: forked user id={thread_id} pid={process_id} ttbr0=0x{:x}",
+            address_space.root_pa()
+        );
+        Ok(thread_id)
     }
 
     fn find_free_slot(&self) -> Option<TaskId> {
@@ -459,16 +550,15 @@ impl Scheduler {
     }
 
     fn complete_joiner(&mut self, target: ThreadId, joiner: ThreadId, code: usize) {
-        let Some(joiner_task) = self.task_id_from_thread_id(joiner) else {
-            panic!("thread: joiner {joiner} disappeared while target {target} exited");
+        let joiner_task = match self.blocked_waiter(joiner, preempt::BlockReason::Join(target)) {
+            Ok(task_id) => task_id,
+            Err(BlockedWaiterState::Missing) => {
+                panic!("thread: joiner {joiner} disappeared while target {target} exited")
+            }
+            Err(BlockedWaiterState::WrongState(state)) => {
+                panic!("thread: joiner {joiner} has invalid state {state:?}")
+            }
         };
-
-        match self.task(joiner_task).state {
-            preempt::TaskState::Blocked(preempt::BlockReason::Join(waiting_for))
-                if waiting_for == target => {}
-            state => panic!("thread: joiner {joiner} has invalid state {state:?}"),
-        }
-
         self.task_mut(joiner_task).last_join_result = Some(Ok(code));
         self.make_ready_and_queue(joiner_task);
         crate::debug!("thread: join wake target={target} joiner={joiner} code={code}");
@@ -532,12 +622,32 @@ impl Scheduler {
         }
     }
 
-    fn block_current_on_process_join(&mut self, active_frame_words: *mut u64, pid: ProcessId) {
+    fn replace_current_user_address_space(
+        &mut self,
+        address_space: UserAddressSpace,
+    ) -> core::result::Result<(), ()> {
+        let current = self.running_task().ok_or(())?;
+        let process_id = match self.task(current).kind {
+            preempt::ThreadKind::User { process_id, .. } => process_id,
+            preempt::ThreadKind::Kernel => return Err(()),
+        };
+
+        // SAFETY: execve commits a fully built TTBR0 root for the current user
+        // process before replacing the trap frame that will resume to EL0.
+        unsafe { crate::memory::vm::activate_user_address_space(address_space).map_err(|_| ())? };
+        self.task_mut(current).kind = preempt::ThreadKind::User {
+            process_id,
+            address_space,
+        };
+        Ok(())
+    }
+
+    fn block_current_on_process_wait(&mut self, active_frame_words: *mut u64, pid: ProcessId) {
         let current = self.blocking_current(active_frame_words);
         let next = self.block_current_with_reason(
             active_frame_words,
             current,
-            preempt::BlockReason::ProcessJoin(pid),
+            preempt::BlockReason::Process(pid),
         );
         self.finish_block_current(current, next);
     }
@@ -552,37 +662,49 @@ impl Scheduler {
         self.finish_block_current(current, next);
     }
 
-    fn complete_process_join(&mut self, joiner: ThreadId, pid: ProcessId) {
-        let Some(joiner_task) = self.task_id_from_thread_id(joiner) else {
-            panic!("process: joiner {joiner} disappeared while pid {pid} exited");
-        };
-
-        match self.task(joiner_task).state {
-            preempt::TaskState::Blocked(preempt::BlockReason::ProcessJoin(waiting_for))
-                if waiting_for == pid => {}
-            state => panic!("process: joiner {joiner} has invalid state {state:?}"),
+    fn complete_process_wait(&mut self, waiter: ThreadId, pid: ProcessId) {
+        match self.blocked_waiter(waiter, preempt::BlockReason::Process(pid)) {
+            Ok(task_id) => {
+                self.make_ready_and_queue(task_id);
+                crate::debug!("process: wake pid={pid} waiter={waiter}");
+            }
+            Err(BlockedWaiterState::Missing) => {
+                crate::trace!("process: waiter {waiter} disappeared while pid {pid} exited");
+            }
+            Err(BlockedWaiterState::WrongState(state)) => {
+                crate::trace!("process: ignoring wake for waiter {waiter}; state={state:?}");
+            }
         }
-
-        self.make_ready_and_queue(joiner_task);
-        crate::debug!("process: join wake pid={pid} joiner={joiner}");
     }
 
     fn complete_stdin_read(&mut self, waiter: ThreadId) {
+        match self.blocked_waiter(waiter, preempt::BlockReason::StdinRead) {
+            Ok(task_id) => {
+                self.make_ready_and_queue(task_id);
+                crate::trace!("stdin: wake waiter={waiter}");
+            }
+            Err(BlockedWaiterState::Missing) => {
+                crate::trace!("stdin: waiter {waiter} disappeared before UART wake");
+            }
+            Err(BlockedWaiterState::WrongState(state)) => {
+                crate::trace!("stdin: ignoring wake for waiter {waiter}; state={state:?}");
+            }
+        }
+    }
+
+    fn blocked_waiter(
+        &self,
+        waiter: ThreadId,
+        expected: preempt::BlockReason,
+    ) -> core::result::Result<TaskId, BlockedWaiterState> {
         let Some(task_id) = self.task_id_from_thread_id(waiter) else {
-            crate::trace!("stdin: waiter {waiter} disappeared before UART wake");
-            return;
+            return Err(BlockedWaiterState::Missing);
         };
 
         match self.task(task_id).state {
-            preempt::TaskState::Blocked(preempt::BlockReason::StdinRead) => {}
-            state => {
-                crate::trace!("stdin: ignoring wake for waiter {waiter}; state={state:?}");
-                return;
-            }
+            preempt::TaskState::Blocked(reason) if reason == expected => Ok(task_id),
+            state => Err(BlockedWaiterState::WrongState(state)),
         }
-
-        self.make_ready_and_queue(task_id);
-        crate::trace!("stdin: wake waiter={waiter}");
     }
 }
 

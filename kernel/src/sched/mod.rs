@@ -18,9 +18,10 @@ pub(crate) use self::{
     preempt::enter_running_task,
     sleep::on_sleep_sync,
     thread::{
-        block_current_on_process_join, block_current_on_stdin_read, complete_process_join,
+        block_current_on_process_wait, block_current_on_stdin_read, complete_process_wait,
         complete_stdin_read, current_user_address_space, current_user_process_id,
-        on_thread_exit_sync, on_thread_join_sync, thread_spawn_user,
+        on_thread_exit_sync, on_thread_join_sync, replace_current_user_address_space,
+        thread_spawn_user, thread_spawn_user_from_frame,
     },
 };
 pub use self::{
@@ -34,7 +35,7 @@ pub use self::{
 
 pub(crate) type Result<T> = core::result::Result<T, SchedError>;
 
-const THREAD_STACK_SIZE: usize = 8192;
+const THREAD_STACK_SIZE: usize = 32768;
 const IDLE_TASK_ID: TaskId = TaskId::new(0);
 const INITIAL_THREAD_GENERATION: u32 = 1;
 
@@ -52,6 +53,11 @@ unsafe extern "C" {
         user_sp: usize,
         kernel_sp: usize,
         arg0: usize,
+    );
+    fn arch_clone_user_trap_frame_for_fork(
+        dst_frame_words: *mut u64,
+        src_frame_words: *const u64,
+        child_kernel_sp: usize,
     );
     fn arch_enter_task_frame(frame_words: *const u64) -> !;
 }

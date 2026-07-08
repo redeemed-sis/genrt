@@ -14,6 +14,9 @@ pub const SYS_WRITE: usize = 1;
 pub const SYS_EXIT: usize = 2;
 pub const SYS_OPEN: usize = 3;
 pub const SYS_CLOSE: usize = 4;
+pub const SYS_FORK: usize = 5;
+pub const SYS_EXECVE: usize = 6;
+pub const SYS_WAITPID: usize = 7;
 
 const X0: usize = 0;
 const X1: usize = 1;
@@ -59,6 +62,18 @@ pub fn dispatch(frame_words: *mut u64) -> Result<(), DispatchError> {
         }
         SYS_CLOSE => {
             sys_close(frame_words);
+            Ok(())
+        }
+        SYS_FORK => {
+            sys_fork(frame_words);
+            Ok(())
+        }
+        SYS_EXECVE => {
+            sys_execve(frame_words);
+            Ok(())
+        }
+        SYS_WAITPID => {
+            sys_waitpid(frame_words);
             Ok(())
         }
         _ => Err(DispatchError::UnknownSyscall(nr)),
@@ -201,6 +216,45 @@ fn sys_exit(frame_words: *mut u64) {
     let code = frame_word(frame_words, X0) as usize;
     crate::debug!("syscall: exit code={code}");
     process::process_exit_current(frame_words, code);
+}
+
+fn sys_fork(frame_words: *mut u64) {
+    let result = process::fork_current(frame_words);
+    set_return(frame_words, errno::syscall_ret(result));
+}
+
+fn sys_execve(frame_words: *mut u64) {
+    let path_ptr = frame_word(frame_words, X0) as usize;
+    let argv_ptr = frame_word(frame_words, X1) as usize;
+    let envp_ptr = frame_word(frame_words, X2) as usize;
+
+    let result = (|| {
+        let path = user::copy_path_cstr_from_user(path_ptr).map_err(path_copy_errno)?;
+        let args = process::copy_exec_args_from_user(&path, argv_ptr, envp_ptr)?;
+        process::execve_current(frame_words, path, args)
+    })();
+
+    if let Err(errno) = result {
+        set_return(frame_words, -errno);
+    }
+}
+
+fn sys_waitpid(frame_words: *mut u64) {
+    let pid = frame_word(frame_words, X0) as isize;
+    let status_ptr = frame_word(frame_words, X1) as usize;
+    let options = frame_word(frame_words, X2) as usize;
+
+    if options != 0 {
+        set_return(frame_words, -errno::ENOTSUP);
+        return;
+    }
+
+    match process::waitpid_current(frame_words, pid, status_ptr) {
+        process::WaitPidAction::Return(result) => {
+            set_return(frame_words, errno::syscall_ret(result));
+        }
+        process::WaitPidAction::Blocked => {}
+    }
 }
 
 fn validate_open_flags(flags: usize) -> Result<(), errno::Errno> {

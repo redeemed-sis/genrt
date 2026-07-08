@@ -1,12 +1,15 @@
-use core::{cell::UnsafeCell, fmt};
+use alloc::vec::Vec;
+use core::{cell::UnsafeCell, fmt, mem};
 
 use crate::{
+    errno,
     fs::fd::{FdError, FdTable},
     fs::initramfs::{self, InitramfsError},
-    loader::elf::{self, ElfLoadError, UserElfImage},
+    fs::{path, ramfs},
+    loader::elf::{self, ElfLoadError, UserElfImage, UserElfSegment},
     memory::{
         self, FrameRange, PAGE_SIZE,
-        user::USER_STACK_TOP,
+        user::{self, USER_STACK_TOP},
         vm::{self, UserAddressSpace, UserMapFlags, VmError},
     },
     sched::{self, ThreadAttrs},
@@ -18,6 +21,26 @@ pub(crate) const USER_STACK_SIZE: usize = 64 * 1024;
 
 const MAX_PROCESSES: usize = 4;
 const INITIAL_PROCESS_GENERATION: u32 = 1;
+const PROCESS_ID_INDEX_BITS: usize = process_id_index_bits(MAX_PROCESSES);
+const PROCESS_ID_INDEX_MASK: usize = (1 << PROCESS_ID_INDEX_BITS) - 1;
+
+// AArch64 userspace starts with a compact SysV-like stack:
+//   sp + 0:                 argc
+//   sp + 8:                 argv[0]
+//   ...
+//                           argv[argc - 1]
+//                           NULL
+//                           envp[0]
+//   ...
+//                           NULL
+//
+// The argv/envp copy bound is therefore the fixed user stack itself: strings
+// plus this pointer table must fit into `USER_STACK_SIZE`. There is no separate
+// arbitrary argc/ARG_MAX limit in the process layer.
+const EXEC_STACK_WORD_BYTES: usize = mem::size_of::<u64>();
+const EXEC_STACK_ARGC_WORDS: usize = 1;
+const EXEC_STACK_ARGV_NULL_WORDS: usize = 1;
+const EXEC_STACK_ENVP_NULL_WORDS: usize = 1;
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct ProcessId {
@@ -36,6 +59,22 @@ impl ProcessId {
 
     pub(crate) const fn generation(self) -> u32 {
         self.generation
+    }
+
+    pub(crate) const fn as_raw(self) -> usize {
+        ((self.generation as usize) << PROCESS_ID_INDEX_BITS) | self.index
+    }
+
+    pub(crate) const fn from_raw(raw: usize) -> Option<Self> {
+        if raw == 0 {
+            return None;
+        }
+        let index = raw & PROCESS_ID_INDEX_MASK;
+        let generation = (raw >> PROCESS_ID_INDEX_BITS) as u32;
+        if index >= MAX_PROCESSES || generation == 0 {
+            return None;
+        }
+        Some(Self { index, generation })
     }
 }
 
@@ -58,8 +97,6 @@ impl fmt::Debug for ProcessId {
 pub(crate) enum ProcessState {
     Free,
     Running,
-    Exited,
-    Faulted,
     Zombie,
 }
 
@@ -127,10 +164,12 @@ struct ProcessSlot {
     address_space: Option<UserAddressSpace>,
     user_image: Option<UserElfImage>,
     fds: FdTable,
+    parent: Option<ProcessId>,
     main_thread: Option<ThreadId>,
     stack: FrameRange,
     exit_status: Option<ProcessExitStatus>,
     joiner: Option<ThreadId>,
+    waiter: Option<ThreadId>,
 }
 
 impl ProcessSlot {
@@ -141,10 +180,12 @@ impl ProcessSlot {
             address_space: None,
             user_image: None,
             fds: FdTable::new(),
+            parent: None,
             main_thread: None,
             stack: FrameRange::empty(),
             exit_status: None,
             joiner: None,
+            waiter: None,
         }
     }
 
@@ -170,6 +211,87 @@ struct ProcessResources {
     stack: FrameRange,
 }
 
+struct StagedProcessImage {
+    address_space: UserAddressSpace,
+    user_image: UserElfImage,
+    stack: FrameRange,
+    entry: usize,
+    initial_sp: usize,
+}
+
+pub(crate) struct ExecArgs {
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+    string_bytes: usize,
+}
+
+#[derive(Copy, Clone)]
+enum ExecStringVector {
+    Argv,
+    Envp,
+}
+
+impl ExecArgs {
+    fn empty() -> Self {
+        Self {
+            argv: Vec::new(),
+            envp: Vec::new(),
+            string_bytes: 0,
+        }
+    }
+
+    fn push(&mut self, vector: ExecStringVector, value: Vec<u8>) -> Result<(), errno::Errno> {
+        let bytes_with_nul = value.len().checked_add(1).ok_or(errno::E2BIG)?;
+        let next_argv =
+            self.argv.len() + exec_vector_slot_increment(vector, ExecStringVector::Argv);
+        let next_envp =
+            self.envp.len() + exec_vector_slot_increment(vector, ExecStringVector::Envp);
+        let budget = exec_arg_string_budget(next_argv, next_envp).ok_or(errno::E2BIG)?;
+        let next_bytes = self
+            .string_bytes
+            .checked_add(bytes_with_nul)
+            .ok_or(errno::E2BIG)?;
+        if next_bytes > budget {
+            return Err(errno::E2BIG);
+        }
+
+        match vector {
+            ExecStringVector::Argv => {
+                self.argv.try_reserve_exact(1).map_err(|_| errno::ENOMEM)?;
+                self.argv.push(value);
+            }
+            ExecStringVector::Envp => {
+                self.envp.try_reserve_exact(1).map_err(|_| errno::ENOMEM)?;
+                self.envp.push(value);
+            }
+        }
+        self.string_bytes = next_bytes;
+        Ok(())
+    }
+
+    fn remaining_for_next(&self, vector: ExecStringVector) -> Result<usize, errno::Errno> {
+        let next_argv =
+            self.argv.len() + exec_vector_slot_increment(vector, ExecStringVector::Argv);
+        let next_envp =
+            self.envp.len() + exec_vector_slot_increment(vector, ExecStringVector::Envp);
+        let budget = exec_arg_string_budget(next_argv, next_envp).ok_or(errno::E2BIG)?;
+        budget.checked_sub(self.string_bytes).ok_or(errno::E2BIG)
+    }
+}
+
+struct WaitedProcess {
+    pid: ProcessId,
+    status: ProcessExitStatus,
+    address_space: Option<UserAddressSpace>,
+    user_image: Option<UserElfImage>,
+    stack: FrameRange,
+}
+
+pub(crate) enum WaitPidAction {
+    Return(Result<usize, errno::Errno>),
+    Blocked,
+}
+
 enum ConsumeProcessError {
     WouldBlock,
     Join(ProcessJoinError),
@@ -192,8 +314,13 @@ unsafe impl Sync for ProcessTableCell {}
 
 static PROCESS_TABLE: ProcessTableCell = ProcessTableCell(UnsafeCell::new(ProcessTable::new()));
 
+unsafe extern "C" {
+    fn arch_init_user_exec_frame(frame_words: *mut u64, user_entry: usize, user_sp: usize);
+    fn arch_restart_current_syscall(frame_words: *mut u64);
+}
+
 pub(crate) fn spawn_first_user_process() -> Result<ProcessId, ProcessError> {
-    let pid = allocate_process_slot()?;
+    let pid = allocate_process_slot(None, FdTable::new())?;
     let address_space = vm::create_user_address_space().map_err(|err| {
         free_process_slot(pid);
         ProcessError::Vm(err)
@@ -210,6 +337,12 @@ pub(crate) fn spawn_first_user_process() -> Result<ProcessId, ProcessError> {
             .ok_or(ProcessError::OutOfFrames)?;
         memory::zero_phys_range(stack);
         map_user_stack(address_space, stack)?;
+        let mut exec_args = ExecArgs::empty();
+        exec_args
+            .push(ExecStringVector::Argv, b"/init".to_vec())
+            .map_err(|_| ProcessError::OutOfFrames)?;
+        let initial_sp =
+            build_initial_user_stack(stack, &exec_args).ok_or(ProcessError::OutOfFrames)?;
         attach_process_resources(
             pid,
             address_space,
@@ -223,7 +356,7 @@ pub(crate) fn spawn_first_user_process() -> Result<ProcessId, ProcessError> {
                 pid,
                 address_space,
                 entry,
-                USER_STACK_TOP,
+                initial_sp,
                 0,
                 ThreadAttrs::detached(),
             )
@@ -300,7 +433,7 @@ pub(crate) fn on_process_join_sync(active_frame_words: *mut u64, pid: ProcessId)
         slot.joiner = Some(joiner);
     }
 
-    sched::block_current_on_process_join(active_frame_words, pid);
+    sched::block_current_on_process_wait(active_frame_words, pid);
     crate::debug!("process: join blocking current={joiner} pid={pid}");
 }
 
@@ -320,6 +453,177 @@ pub fn kill_current_process_on_user_fault(
     )
 }
 
+pub(crate) fn fork_current(active_frame_words: *mut u64) -> Result<usize, errno::Errno> {
+    if active_frame_words.is_null() {
+        return Err(errno::EINVAL);
+    }
+
+    let snapshot = fork_snapshot_current()?;
+    let child_pid =
+        allocate_process_slot(Some(snapshot.parent_pid), snapshot.fds).map_err(fork_errno)?;
+    let mut address_space = None;
+    let mut user_image = None;
+    let mut stack = FrameRange::empty();
+
+    let result = (|| {
+        let child_aspace = vm::create_user_address_space().map_err(fork_vm_errno)?;
+        address_space = Some(child_aspace);
+
+        let child_image = clone_user_image(snapshot.user_image(), child_aspace)?;
+        user_image = Some(child_image);
+
+        stack = clone_user_stack(snapshot.stack, child_aspace)?;
+        attach_process_resources(
+            child_pid,
+            child_aspace,
+            user_image.take().ok_or(errno::ENOMEM)?,
+            stack,
+        )
+        .map_err(fork_errno)?;
+
+        {
+            let _irq_guard = LocalIrqGuard::save_and_disable();
+            let child_thread = sched::thread_spawn_user_from_frame(
+                child_pid,
+                child_aspace,
+                active_frame_words as *const u64,
+                ThreadAttrs::detached(),
+            )
+            .map_err(spawn_errno)?;
+            attach_process_main_thread(child_pid, child_thread).unwrap_or_else(|err| {
+                panic!("process: child thread published without process slot: {err:?}")
+            });
+        }
+
+        Ok(child_pid.as_raw())
+    })();
+
+    if result.is_err() {
+        let attached = take_process_resources(child_pid);
+        if let Some(image) = user_image {
+            elf::free_loaded_segments(&image);
+        } else if let Some(image) = attached.user_image {
+            elf::free_loaded_segments(&image);
+        }
+        if attached.stack.start != 0 {
+            memory::free_contiguous_frames(attached.stack);
+        } else if stack.start != 0 {
+            memory::free_contiguous_frames(stack);
+        }
+        let attached_aspace = attached.address_space;
+        if let Some(aspace) = attached_aspace.or(address_space) {
+            // SAFETY: failed fork did not publish a runnable child using this
+            // address space, or the child slot is reclaimed immediately below.
+            let _ = unsafe { vm::destroy_user_address_space(aspace) };
+        }
+        free_process_slot(child_pid);
+    }
+
+    result
+}
+
+pub(crate) fn execve_current(
+    active_frame_words: *mut u64,
+    path: Vec<u8>,
+    args: ExecArgs,
+) -> Result<(), errno::Errno> {
+    if active_frame_words.is_null() {
+        return Err(errno::EINVAL);
+    }
+
+    let pid = sched::current_user_process_id().ok_or(errno::EINVAL)?;
+    let staged = stage_exec_image(&path, &args)?;
+    let old = commit_exec_image(pid, staged, active_frame_words)?;
+    cleanup_process_resources(pid, old);
+    Ok(())
+}
+
+pub(crate) fn copy_exec_args_from_user(
+    path: &[u8],
+    argv_ptr: usize,
+    envp_ptr: usize,
+) -> Result<ExecArgs, errno::Errno> {
+    let mut args = ExecArgs::empty();
+
+    if argv_ptr == 0 {
+        args.push(ExecStringVector::Argv, path.to_vec())?;
+    } else {
+        copy_exec_string_vector_from_user(argv_ptr, ExecStringVector::Argv, &mut args)?;
+    }
+
+    if envp_ptr != 0 {
+        copy_exec_string_vector_from_user(envp_ptr, ExecStringVector::Envp, &mut args)?;
+    }
+
+    Ok(args)
+}
+
+pub(crate) fn waitpid_current(
+    active_frame_words: *mut u64,
+    raw_pid: isize,
+    status_ptr: usize,
+) -> WaitPidAction {
+    // This bring-up ABI supports the shell's explicit child wait:
+    // `waitpid(child_pid, status, 0)`. `waitpid(-1)` needs a parent-level
+    // "any child" wait list so a different child cannot exit between child
+    // selection and blocking.
+    if raw_pid <= 0 {
+        return WaitPidAction::Return(Err(errno::ECHILD));
+    }
+    let Some(child_pid) = ProcessId::from_raw(raw_pid as usize) else {
+        return WaitPidAction::Return(Err(errno::ECHILD));
+    };
+
+    if status_ptr != 0
+        && user::validate_user_write_range(status_ptr, mem::size_of::<u32>())
+            .map_err(wait_user_copy_errno)
+            .is_err()
+    {
+        return WaitPidAction::Return(Err(errno::EFAULT));
+    }
+
+    let parent_pid = match sched::current_user_process_id() {
+        Some(pid) => pid,
+        None => return WaitPidAction::Return(Err(errno::EINVAL)),
+    };
+    let caller = match sched::current_thread_id() {
+        Some(thread) => thread,
+        None => return WaitPidAction::Return(Err(errno::EINVAL)),
+    };
+
+    let prepare = {
+        let _irq_guard = LocalIrqGuard::save_and_disable();
+        let prepare = prepare_wait_child_locked(parent_pid, child_pid, caller);
+        if matches!(prepare, WaitChildPrepare::WouldBlock) {
+            // SAFETY: waitpid blocks before producing side effects visible to
+            // userspace. Restarting the fixed-width AArch64 SVC lets the woken
+            // thread re-run validation and consume the zombie child.
+            unsafe { arch_restart_current_syscall(active_frame_words) };
+            sched::block_current_on_process_wait(active_frame_words, child_pid);
+        }
+        prepare
+    };
+
+    match prepare {
+        WaitChildPrepare::Consumed(waited) => {
+            let encoded = encode_wait_status(waited.status);
+            cleanup_waited_process(waited);
+            if status_ptr != 0 {
+                let bytes = encoded.to_le_bytes();
+                if user::copy_to_user(status_ptr, &bytes)
+                    .map_err(wait_user_copy_errno)
+                    .is_err()
+                {
+                    return WaitPidAction::Return(Err(errno::EFAULT));
+                }
+            }
+            WaitPidAction::Return(Ok(child_pid.as_raw()))
+        }
+        WaitChildPrepare::WouldBlock => WaitPidAction::Blocked,
+        WaitChildPrepare::Err(errno) => WaitPidAction::Return(Err(errno)),
+    }
+}
+
 fn finish_current_process(
     active_frame_words: *mut u64,
     status: ProcessExitStatus,
@@ -327,7 +631,7 @@ fn finish_current_process(
 ) -> Result<(), ProcessFaultError> {
     let pid = sched::current_user_process_id().ok_or(ProcessFaultError::NoCurrentProcess)?;
     let thread = sched::current_thread_id();
-    let joiner = finish_process(pid, status).ok_or(ProcessFaultError::InvalidProcess)?;
+    let wake = finish_process(pid, status).ok_or(ProcessFaultError::InvalidProcess)?;
 
     match status {
         ProcessExitStatus::Exited(code) => {
@@ -341,14 +645,20 @@ fn finish_current_process(
         }
     }
 
-    if let Some(joiner) = joiner {
-        sched::complete_process_join(joiner, pid);
+    if let Some(joiner) = wake.joiner {
+        sched::complete_process_wait(joiner, pid);
+    }
+    if let Some(waiter) = wake.waiter {
+        sched::complete_process_wait(waiter, pid);
     }
     sched::on_thread_exit_sync(active_frame_words, thread_code);
     Ok(())
 }
 
-fn allocate_process_slot() -> Result<ProcessId, ProcessError> {
+fn allocate_process_slot(
+    parent: Option<ProcessId>,
+    fds: FdTable,
+) -> Result<ProcessId, ProcessError> {
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let table = table_mut();
     let Some(index) = table
@@ -366,11 +676,13 @@ fn allocate_process_slot() -> Result<ProcessId, ProcessError> {
         state: ProcessState::Running,
         address_space: None,
         user_image: None,
-        fds: FdTable::new(),
+        fds,
+        parent,
         main_thread: None,
         stack: FrameRange::empty(),
         exit_status: None,
         joiner: None,
+        waiter: None,
     };
 
     let pid = ProcessId::new(index, generation);
@@ -407,24 +719,532 @@ fn attach_process_main_thread(pid: ProcessId, main_thread: ThreadId) -> Result<(
     Ok(())
 }
 
-fn finish_process(pid: ProcessId, status: ProcessExitStatus) -> Option<Option<ThreadId>> {
+#[derive(Copy, Clone)]
+struct ProcessWake {
+    joiner: Option<ThreadId>,
+    waiter: Option<ThreadId>,
+}
+
+fn finish_process(pid: ProcessId, status: ProcessExitStatus) -> Option<ProcessWake> {
     let table = table_mut();
     let slot = table.slot_mut(pid)?;
     if slot.exit_status.is_some() {
-        return Some(None);
+        return Some(ProcessWake {
+            joiner: None,
+            waiter: None,
+        });
     }
 
     slot.fds.close_all();
-    slot.state = match status {
-        ProcessExitStatus::Exited(_) => ProcessState::Exited,
-        ProcessExitStatus::Faulted(_) => ProcessState::Faulted,
-    };
+    slot.state = ProcessState::Zombie;
     slot.exit_status = Some(status);
     let joiner = slot.joiner;
-    if joiner.is_some() {
-        slot.state = ProcessState::Zombie;
+    let waiter = slot.waiter;
+    Some(ProcessWake { joiner, waiter })
+}
+
+struct ForkSnapshot {
+    parent_pid: ProcessId,
+    user_image: *const UserElfImage,
+    stack: FrameRange,
+    fds: FdTable,
+}
+
+impl ForkSnapshot {
+    fn user_image(&self) -> &UserElfImage {
+        // SAFETY: the pointer targets the current process slot. genrt currently
+        // has one user thread per process, so the current process cannot mutate
+        // or reclaim its own image while fork clones resources in task context.
+        unsafe { &*self.user_image }
     }
-    Some(joiner)
+}
+
+enum WaitChildPrepare {
+    Consumed(WaitedProcess),
+    WouldBlock,
+    Err(errno::Errno),
+}
+
+fn fork_snapshot_current() -> Result<ForkSnapshot, errno::Errno> {
+    let parent_pid = sched::current_user_process_id().ok_or(errno::EINVAL)?;
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    let table = table_mut();
+    let slot = table.slot_mut(parent_pid).ok_or(errno::EINVAL)?;
+    let user_image = slot.user_image.as_ref().ok_or(errno::EINVAL)? as *const UserElfImage;
+
+    Ok(ForkSnapshot {
+        parent_pid,
+        user_image,
+        stack: slot.stack,
+        fds: slot.fds,
+    })
+}
+
+fn clone_user_image(
+    src: &UserElfImage,
+    dst_aspace: UserAddressSpace,
+) -> Result<UserElfImage, errno::Errno> {
+    let mut segments = Vec::new();
+    segments
+        .try_reserve_exact(src.segments().len())
+        .map_err(|_| errno::ENOMEM)?;
+
+    for segment in src.segments() {
+        let cloned = clone_user_segment(*segment, dst_aspace);
+        match cloned {
+            Ok(segment) => segments.push(segment),
+            Err(errno) => {
+                free_user_segments(&segments);
+                return Err(errno);
+            }
+        }
+    }
+
+    Ok(UserElfImage::from_segments(src.entry, segments))
+}
+
+fn clone_user_segment(
+    segment: UserElfSegment,
+    dst_aspace: UserAddressSpace,
+) -> Result<UserElfSegment, errno::Errno> {
+    let frames = memory::clone_frame_range(segment.frames).map_err(clone_frame_errno)?;
+    if let Err(err) = vm::map_user_page_range(
+        dst_aspace,
+        segment.va,
+        frames.start,
+        segment.size,
+        segment.flags,
+    ) {
+        memory::free_contiguous_frames(frames);
+        return Err(fork_vm_errno(err));
+    }
+
+    Ok(UserElfSegment { frames, ..segment })
+}
+
+fn clone_user_stack(
+    src_stack: FrameRange,
+    dst_aspace: UserAddressSpace,
+) -> Result<FrameRange, errno::Errno> {
+    let stack = memory::clone_frame_range(src_stack).map_err(clone_frame_errno)?;
+    if let Err(err) = map_user_stack(dst_aspace, stack) {
+        memory::free_contiguous_frames(stack);
+        return Err(fork_errno(err));
+    }
+    Ok(stack)
+}
+
+fn stage_exec_image(
+    path_bytes: &[u8],
+    args: &ExecArgs,
+) -> Result<StagedProcessImage, errno::Errno> {
+    let path = path::root_relative(path_bytes).map_err(path_errno)?;
+    if ramfs::is_dir(&path) {
+        return Err(errno::EACCES);
+    }
+    let image = ramfs::data_by_path(&path).ok_or(errno::ENOENT)?;
+
+    let address_space = vm::create_user_address_space().map_err(exec_vm_errno)?;
+    let mut stack = FrameRange::empty();
+    let mut user_image = None;
+
+    let result = (|| {
+        let mut aspace = address_space;
+        let loaded = elf::load_user_elf(image, &mut aspace).map_err(exec_elf_errno)?;
+        let entry = loaded.entry;
+        user_image = Some(loaded);
+
+        stack =
+            memory::alloc_contiguous_frames(USER_STACK_SIZE / PAGE_SIZE).ok_or(errno::ENOMEM)?;
+        memory::zero_phys_range(stack);
+        map_user_stack(address_space, stack).map_err(fork_errno)?;
+        let initial_sp = build_initial_user_stack(stack, args).ok_or(errno::E2BIG)?;
+
+        Ok(StagedProcessImage {
+            address_space,
+            user_image: user_image.take().ok_or(errno::ENOMEM)?,
+            stack,
+            entry,
+            initial_sp,
+        })
+    })();
+
+    if result.is_err() {
+        if let Some(image) = user_image {
+            elf::free_loaded_segments(&image);
+        }
+        if stack.start != 0 {
+            memory::free_contiguous_frames(stack);
+        }
+        // SAFETY: staged exec has not been published to the scheduler/process
+        // table yet, so no running task can reference this root.
+        let _ = unsafe { vm::destroy_user_address_space(address_space) };
+    }
+
+    result
+}
+
+fn commit_exec_image(
+    pid: ProcessId,
+    staged: StagedProcessImage,
+    active_frame_words: *mut u64,
+) -> Result<ProcessResources, errno::Errno> {
+    let entry = staged.entry;
+    let initial_sp = staged.initial_sp;
+    sched::replace_current_user_address_space(staged.address_space).map_err(|_| errno::EINVAL)?;
+
+    let old = replace_process_resources(pid, staged.address_space, staged.user_image, staged.stack)
+        .ok_or(errno::EINVAL)?;
+
+    // SAFETY: the current thread now points at the new TTBR0 root and the stack
+    // was populated through HVA before commit. The arch helper preserves the
+    // EL1 kernel stack and replaces all EL0-visible state.
+    unsafe { arch_init_user_exec_frame(active_frame_words, entry, initial_sp) };
+
+    Ok(old)
+}
+
+fn replace_process_resources(
+    pid: ProcessId,
+    address_space: UserAddressSpace,
+    user_image: UserElfImage,
+    stack: FrameRange,
+) -> Option<ProcessResources> {
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    let table = table_mut();
+    let slot = table.slot_mut(pid)?;
+    let old = ProcessResources {
+        address_space: slot.address_space.replace(address_space),
+        user_image: slot.user_image.replace(user_image),
+        stack: mem::replace(&mut slot.stack, stack),
+    };
+    slot.state = ProcessState::Running;
+    slot.exit_status = None;
+    Some(old)
+}
+
+fn cleanup_process_resources(pid: ProcessId, resources: ProcessResources) {
+    if let Some(image) = resources.user_image {
+        elf::free_loaded_segments(&image);
+    }
+    if resources.stack.start != 0 {
+        memory::free_contiguous_frames(resources.stack);
+    }
+    if let Some(address_space) = resources.address_space {
+        // SAFETY: resources were atomically removed from the process slot and
+        // scheduler before cleanup, so no runnable thread references this root.
+        if let Err(err) = unsafe { vm::destroy_user_address_space(address_space) } {
+            crate::warn!("process: failed to destroy old address space pid={pid}: {err:?}");
+        }
+    }
+}
+
+fn build_initial_user_stack(stack: FrameRange, args: &ExecArgs) -> Option<usize> {
+    let stack_base = USER_STACK_TOP.checked_sub(USER_STACK_SIZE)?;
+    let argc = args.argv.len();
+    let envc = args.envp.len();
+    let mut sp = USER_STACK_TOP;
+    let mut arg_ptrs = Vec::new();
+    let mut env_ptrs = Vec::new();
+    arg_ptrs.try_reserve_exact(argc).ok()?;
+    env_ptrs.try_reserve_exact(envc).ok()?;
+
+    for env in args.envp.iter().rev() {
+        let ptr = push_stack_cstr(stack, stack_base, &mut sp, env)?;
+        env_ptrs.push(ptr as u64);
+    }
+    env_ptrs.reverse();
+
+    for arg in args.argv.iter().rev() {
+        let ptr = push_stack_cstr(stack, stack_base, &mut sp, arg)?;
+        arg_ptrs.push(ptr as u64);
+    }
+    arg_ptrs.reverse();
+
+    sp &= !0xf;
+    let table_words = exec_stack_table_words(argc, envc)?;
+    let table_size = table_words.checked_mul(EXEC_STACK_WORD_BYTES)?;
+    sp = sp.checked_sub(table_size)? & !0xf;
+    if sp < stack_base {
+        return None;
+    }
+
+    write_stack_u64(stack, stack_base, sp, argc as u64)?;
+    let mut word = 1usize;
+    for ptr in arg_ptrs {
+        write_stack_u64(stack, stack_base, stack_word_addr(sp, word)?, ptr)?;
+        word += 1;
+    }
+    write_stack_u64(stack, stack_base, stack_word_addr(sp, word)?, 0)?;
+    word += 1;
+    for ptr in env_ptrs {
+        write_stack_u64(stack, stack_base, stack_word_addr(sp, word)?, ptr)?;
+        word += 1;
+    }
+    write_stack_u64(stack, stack_base, stack_word_addr(sp, word)?, 0)?;
+
+    Some(sp)
+}
+
+fn push_stack_cstr(
+    stack: FrameRange,
+    stack_base: usize,
+    sp: &mut usize,
+    bytes: &[u8],
+) -> Option<usize> {
+    *sp = (*sp).checked_sub(bytes.len().checked_add(1)?)?;
+    if *sp < stack_base {
+        return None;
+    }
+    write_stack_bytes(stack, stack_base, *sp, bytes)?;
+    write_stack_byte(stack, stack_base, *sp + bytes.len(), 0)?;
+    Some(*sp)
+}
+
+fn write_stack_bytes(
+    stack: FrameRange,
+    stack_base: usize,
+    user_va: usize,
+    bytes: &[u8],
+) -> Option<()> {
+    if bytes.is_empty() {
+        return Some(());
+    }
+    let offset = user_va.checked_sub(stack_base)?;
+    if offset.checked_add(bytes.len())? > USER_STACK_SIZE {
+        return None;
+    }
+    memory::copy_bytes_to_phys(stack.start + offset, bytes);
+    Some(())
+}
+
+fn write_stack_byte(stack: FrameRange, stack_base: usize, user_va: usize, byte: u8) -> Option<()> {
+    let offset = user_va.checked_sub(stack_base)?;
+    if offset >= USER_STACK_SIZE {
+        return None;
+    }
+    memory::copy_bytes_to_phys(stack.start + offset, &[byte]);
+    Some(())
+}
+
+fn write_stack_u64(stack: FrameRange, stack_base: usize, user_va: usize, value: u64) -> Option<()> {
+    write_stack_bytes(stack, stack_base, user_va, &value.to_le_bytes())
+}
+
+fn prepare_wait_child_locked(
+    parent_pid: ProcessId,
+    child_pid: ProcessId,
+    caller: ThreadId,
+) -> WaitChildPrepare {
+    let table = table_mut();
+    let Some(slot) = table.slot_mut(child_pid) else {
+        return WaitChildPrepare::Err(errno::ECHILD);
+    };
+    if slot.parent != Some(parent_pid) {
+        return WaitChildPrepare::Err(errno::ECHILD);
+    }
+    if let Some(waiter) = slot.waiter {
+        if waiter != caller {
+            return WaitChildPrepare::Err(errno::ECHILD);
+        }
+    }
+
+    let Some(status) = slot.exit_status.take() else {
+        slot.waiter = Some(caller);
+        return WaitChildPrepare::WouldBlock;
+    };
+
+    let waited = WaitedProcess {
+        pid: child_pid,
+        status,
+        address_space: slot.address_space.take(),
+        user_image: slot.user_image.take(),
+        stack: slot.stack,
+    };
+    let next_generation = next_generation(slot.generation);
+    *slot = ProcessSlot {
+        generation: next_generation,
+        ..ProcessSlot::free()
+    };
+    WaitChildPrepare::Consumed(waited)
+}
+
+fn cleanup_waited_process(waited: WaitedProcess) {
+    cleanup_process_resources(
+        waited.pid,
+        ProcessResources {
+            address_space: waited.address_space,
+            user_image: waited.user_image,
+            stack: waited.stack,
+        },
+    );
+    crate::debug!(
+        "waitpid: reclaimed child pid={} status={:?}",
+        waited.pid,
+        waited.status
+    );
+}
+
+fn encode_wait_status(status: ProcessExitStatus) -> u32 {
+    match status {
+        ProcessExitStatus::Exited(code) => ((code as u32) & 0xff) << 8,
+        ProcessExitStatus::Faulted(_) => 0x7f,
+    }
+}
+
+const fn process_id_index_bits(slots: usize) -> usize {
+    let mut bits = 0usize;
+    let mut capacity = 1usize;
+    while capacity < slots {
+        bits += 1;
+        capacity <<= 1;
+    }
+    bits
+}
+
+fn exec_stack_table_words(argc: usize, envc: usize) -> Option<usize> {
+    EXEC_STACK_ARGC_WORDS
+        .checked_add(argc)?
+        .checked_add(EXEC_STACK_ARGV_NULL_WORDS)?
+        .checked_add(envc)?
+        .checked_add(EXEC_STACK_ENVP_NULL_WORDS)
+}
+
+fn exec_arg_string_budget(argc: usize, envc: usize) -> Option<usize> {
+    let table_bytes = exec_stack_table_words(argc, envc)?.checked_mul(EXEC_STACK_WORD_BYTES)?;
+    USER_STACK_SIZE.checked_sub(table_bytes)
+}
+
+fn exec_vector_slot_increment(vector: ExecStringVector, target: ExecStringVector) -> usize {
+    if matches!(
+        (vector, target),
+        (ExecStringVector::Argv, ExecStringVector::Argv)
+            | (ExecStringVector::Envp, ExecStringVector::Envp)
+    ) {
+        1
+    } else {
+        0
+    }
+}
+
+fn stack_word_addr(sp: usize, word: usize) -> Option<usize> {
+    sp.checked_add(word.checked_mul(EXEC_STACK_WORD_BYTES)?)
+}
+
+fn read_user_usize(ptr: usize) -> Result<usize, errno::Errno> {
+    let mut bytes = [0u8; mem::size_of::<usize>()];
+    user::copy_from_user(&mut bytes, ptr).map_err(exec_user_copy_errno)?;
+    Ok(usize::from_le_bytes(bytes))
+}
+
+fn copy_exec_string_vector_from_user(
+    vector_ptr: usize,
+    vector: ExecStringVector,
+    args: &mut ExecArgs,
+) -> Result<(), errno::Errno> {
+    let mut index = 0usize;
+    loop {
+        let ptr = read_user_usize(
+            vector_ptr
+                .checked_add(
+                    index
+                        .checked_mul(mem::size_of::<usize>())
+                        .ok_or(errno::EFAULT)?,
+                )
+                .ok_or(errno::EFAULT)?,
+        )?;
+        if ptr == 0 {
+            return Ok(());
+        }
+
+        let remaining = args.remaining_for_next(vector)?;
+        let max_string_len = remaining.checked_sub(1).ok_or(errno::E2BIG)?;
+        let value = user::copy_cstr_from_user(ptr, max_string_len).map_err(exec_arg_copy_errno)?;
+        args.push(vector, value)?;
+        index = index.checked_add(1).ok_or(errno::E2BIG)?;
+    }
+}
+
+fn free_user_segments(segments: &[UserElfSegment]) {
+    for segment in segments {
+        if segment.frames.start != 0 {
+            memory::free_contiguous_frames(segment.frames);
+        }
+    }
+}
+
+fn fork_errno(err: ProcessError) -> errno::Errno {
+    match err {
+        ProcessError::NoProcessSlots => errno::EAGAIN,
+        ProcessError::OutOfFrames => errno::ENOMEM,
+        ProcessError::Vm(err) => fork_vm_errno(err),
+        ProcessError::Spawn(_) => errno::EAGAIN,
+        ProcessError::InvalidProcess => errno::EINVAL,
+        ProcessError::Elf(_) | ProcessError::Initramfs(_) => errno::ENOEXEC,
+    }
+}
+
+fn fork_vm_errno(err: VmError) -> errno::Errno {
+    match err {
+        VmError::OutOfFrames => errno::ENOMEM,
+        _ => errno::EINVAL,
+    }
+}
+
+fn clone_frame_errno(err: memory::FrameRangeCloneError) -> errno::Errno {
+    match err {
+        memory::FrameRangeCloneError::InvalidRange => errno::EINVAL,
+        memory::FrameRangeCloneError::OutOfFrames => errno::ENOMEM,
+    }
+}
+
+fn spawn_errno(err: sched::SpawnError) -> errno::Errno {
+    match err {
+        sched::SpawnError::NoThreadSlots | sched::SpawnError::NoStackSlots => errno::EAGAIN,
+        sched::SpawnError::SchedulerNotInitialized => errno::EINVAL,
+    }
+}
+
+fn exec_vm_errno(err: VmError) -> errno::Errno {
+    match err {
+        VmError::OutOfFrames => errno::ENOMEM,
+        _ => errno::EINVAL,
+    }
+}
+
+fn exec_elf_errno(err: ElfLoadError) -> errno::Errno {
+    match err {
+        ElfLoadError::FrameAllocationFailed => errno::ENOMEM,
+        _ => errno::ENOEXEC,
+    }
+}
+
+fn exec_user_copy_errno(err: user::UserCopyError) -> errno::Errno {
+    match err {
+        user::UserCopyError::NameTooLong => errno::ENAMETOOLONG,
+        user::UserCopyError::TooLarge => errno::E2BIG,
+        user::UserCopyError::OutOfMemory => errno::ENOMEM,
+        _ => errno::EFAULT,
+    }
+}
+
+fn exec_arg_copy_errno(err: user::UserCopyError) -> errno::Errno {
+    match err {
+        user::UserCopyError::NameTooLong | user::UserCopyError::TooLarge => errno::E2BIG,
+        user::UserCopyError::OutOfMemory => errno::ENOMEM,
+        _ => errno::EFAULT,
+    }
+}
+
+fn wait_user_copy_errno(_err: user::UserCopyError) -> errno::Errno {
+    errno::EFAULT
+}
+
+fn path_errno(err: path::PathError) -> errno::Errno {
+    match err {
+        path::PathError::Empty => errno::EINVAL,
+        path::PathError::NoMemory => errno::ENOMEM,
+    }
 }
 
 // Process terminal status is single-consumer. A terminal process may be

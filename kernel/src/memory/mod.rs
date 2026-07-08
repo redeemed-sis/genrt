@@ -45,6 +45,12 @@ pub(crate) enum MemoryError {
     HeapSmokeTest(heap::HeapSmokeError),
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FrameRangeCloneError {
+    InvalidRange,
+    OutOfFrames,
+}
+
 struct PhysFrameStorage;
 
 impl FreeListStorage<PhysAddr> for PhysFrameStorage {
@@ -297,6 +303,55 @@ pub fn zero_phys_range(range: FrameRange) {
     // kernel direct map. This helper centralizes the PA -> HVA dereference
     // boundary while the generic frame allocator remains address-agnostic.
     unsafe { core::ptr::write_bytes(phys_to_kernel_va(range.start) as *mut u8, 0, len) };
+}
+
+pub(crate) fn copy_bytes_to_phys(dst_pa: PhysAddr, src: &[u8]) {
+    if src.is_empty() {
+        return;
+    }
+
+    // SAFETY: callers pass physical RAM ranges that are owned by the caller and
+    // reachable through the kernel direct map. Keeping the dereference here
+    // preserves the frame allocator's physical-address-only contract.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            src.as_ptr(),
+            phys_to_kernel_va(dst_pa) as *mut u8,
+            src.len(),
+        )
+    };
+}
+
+pub(crate) fn clone_frame_range(
+    src: FrameRange,
+) -> core::result::Result<FrameRange, FrameRangeCloneError> {
+    let size = src
+        .end
+        .checked_sub(src.start)
+        .ok_or(FrameRangeCloneError::InvalidRange)?;
+    if size == 0 || src.start & (PAGE_SIZE - 1) != 0 || src.end & (PAGE_SIZE - 1) != 0 {
+        return Err(FrameRangeCloneError::InvalidRange);
+    }
+
+    let dst = alloc_contiguous_frames(size / PAGE_SIZE).ok_or(FrameRangeCloneError::OutOfFrames)?;
+    copy_phys_range(src.start, dst.start, size);
+    Ok(dst)
+}
+
+fn copy_phys_range(src_pa: PhysAddr, dst_pa: PhysAddr, size: usize) {
+    if size == 0 {
+        return;
+    }
+
+    // SAFETY: callers pass valid physical RAM ranges. This module is the memory
+    // boundary that converts PA to a direct-map HVA for the actual copy.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            phys_to_kernel_va(src_pa) as *const u8,
+            phys_to_kernel_va(dst_pa) as *mut u8,
+            size,
+        );
+    }
 }
 
 pub fn usable_ranges() -> &'static [FrameRange] {

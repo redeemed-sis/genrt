@@ -18,7 +18,7 @@ use elf::{
 use crate::{
     loader::elf_arch,
     memory::{
-        self, FrameRange, PAGE_SIZE, PhysAddr, VirtAddr,
+        self, FrameRange, PAGE_SIZE, VirtAddr,
         user::{USER_STACK_TOP, USER_TEXT_BASE},
         vm::{self, UserAddressSpace, UserMapFlags, VmError},
     },
@@ -27,7 +27,15 @@ use crate::{
 #[derive(Debug, Eq, PartialEq)]
 pub struct UserElfImage {
     pub entry: VirtAddr,
-    segments: Vec<FrameRange>,
+    segments: Vec<UserElfSegment>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct UserElfSegment {
+    pub va: VirtAddr,
+    pub size: usize,
+    pub frames: FrameRange,
+    pub flags: UserMapFlags,
 }
 
 impl UserElfImage {
@@ -38,7 +46,11 @@ impl UserElfImage {
         }
     }
 
-    pub fn segments(&self) -> &[FrameRange] {
+    pub fn from_segments(entry: VirtAddr, segments: Vec<UserElfSegment>) -> Self {
+        Self { entry, segments }
+    }
+
+    pub fn segments(&self) -> &[UserElfSegment] {
         &self.segments
     }
 
@@ -48,8 +60,8 @@ impl UserElfImage {
             .map_err(|_| ElfLoadError::FrameAllocationFailed)
     }
 
-    fn push_segment(&mut self, range: FrameRange) {
-        self.segments.push(range);
+    fn push_segment(&mut self, segment: UserElfSegment) {
+        self.segments.push(segment);
     }
 }
 
@@ -96,9 +108,9 @@ pub fn load_user_elf(
 }
 
 pub fn free_loaded_segments(image: &UserElfImage) {
-    for range in image.segments() {
-        if range.start != 0 {
-            memory::free_contiguous_frames(*range);
+    for segment in image.segments() {
+        if segment.frames.start != 0 {
+            memory::free_contiguous_frames(segment.frames);
         }
     }
 }
@@ -175,10 +187,9 @@ fn load_segment(
         memory::alloc_contiguous_frames(frames).ok_or(ElfLoadError::FrameAllocationFailed)?;
 
     memory::zero_phys_range(frame_range);
-    copy_file_bytes_to_segment(
+    memory::copy_bytes_to_phys(
+        frame_range.start + (vaddr - map_start),
         &image[offset..file_end],
-        frame_range.start,
-        vaddr - map_start,
     );
     let flags = map_flags_from_program_flags(ph.p_flags);
     if let Err(err) =
@@ -187,7 +198,12 @@ fn load_segment(
         memory::free_contiguous_frames(frame_range);
         return Err(map_vm_error(err));
     }
-    loaded.push_segment(frame_range);
+    loaded.push_segment(UserElfSegment {
+        va: map_start,
+        size: map_size,
+        frames: frame_range,
+        flags,
+    });
 
     crate::debug!(
         "elf: PT_LOAD vaddr=0x{:x} filesz={} memsz={} flags=0x{:x} mapped_pa={:?}",
@@ -270,13 +286,6 @@ fn map_flags_from_program_flags(flags: u32) -> UserMapFlags {
         out = out.union(UserMapFlags::EXECUTE);
     }
     out
-}
-
-fn copy_file_bytes_to_segment(src: &[u8], segment_pa: PhysAddr, page_offset: usize) {
-    let dst = vm::phys_to_virt(segment_pa + page_offset) as *mut u8;
-    // SAFETY: destination range lies inside freshly allocated, zeroed segment
-    // frames. Source is a validated subslice of the QEMU-loaded ELF image.
-    unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
 }
 
 fn u64_to_usize(value: u64) -> Result<usize, ElfLoadError> {

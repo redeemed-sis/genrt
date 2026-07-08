@@ -18,7 +18,7 @@ pub(super) enum BlockReason {
     Sleep,
     Ipc(sched_ipc::IpcBlock),
     Join(ThreadId),
-    ProcessJoin(ProcessId),
+    Process(ProcessId),
     StdinRead,
 }
 
@@ -61,12 +61,6 @@ struct TaskStack {
 }
 
 impl TaskStack {
-    const fn zeroed() -> Self {
-        Self {
-            bytes: [0; THREAD_STACK_SIZE],
-        }
-    }
-
     fn top(&self) -> usize {
         self.bytes.as_ptr() as usize + THREAD_STACK_SIZE
     }
@@ -78,12 +72,6 @@ struct TaskFrameStorage {
 }
 
 impl TaskFrameStorage {
-    const fn zeroed() -> Self {
-        Self {
-            words: [0; TASK_FRAME_WORDS],
-        }
-    }
-
     fn as_words_ptr(&self) -> *const u64 {
         self.words.as_ptr()
     }
@@ -126,8 +114,8 @@ impl Task {
             entry,
             arg,
             kind: ThreadKind::Kernel,
-            stack: Box::new(TaskStack::zeroed()),
-            frame: Box::new(TaskFrameStorage::zeroed()),
+            stack: boxed_zeroed(),
+            frame: boxed_zeroed(),
         }
     }
 
@@ -143,8 +131,8 @@ impl Task {
             entry: thread::free_task_entry,
             arg: thread::ThreadArg::empty(),
             kind: ThreadKind::Kernel,
-            stack: Box::new(TaskStack::zeroed()),
-            frame: Box::new(TaskFrameStorage::zeroed()),
+            stack: boxed_zeroed(),
+            frame: boxed_zeroed(),
         }
     }
 
@@ -162,6 +150,21 @@ impl Task {
 
     pub(super) fn is_runnable(&self) -> bool {
         matches!(self.state, TaskState::Ready | TaskState::Running)
+    }
+}
+
+fn boxed_zeroed<T>() -> Box<T> {
+    let mut boxed = Box::<T>::new_uninit();
+    // SAFETY: the allocation is valid for `T`; writing zero bytes initializes
+    // these scheduler storage types to their intended all-zero state without
+    // materializing large temporaries on the current boot/kernel stack.
+    unsafe {
+        core::ptr::write_bytes(
+            boxed.as_mut_ptr().cast::<u8>(),
+            0,
+            core::mem::size_of::<T>(),
+        );
+        boxed.assume_init()
     }
 }
 

@@ -2,8 +2,13 @@ pub type Errno = isize;
 
 pub const EPERM: Errno = 1;
 pub const ENOENT: Errno = 2;
+pub const E2BIG: Errno = 7;
+pub const ENOEXEC: Errno = 8;
 pub const EBADF: Errno = 9;
+pub const ECHILD: Errno = 10;
+pub const EAGAIN: Errno = 11;
 pub const ENOMEM: Errno = 12;
+pub const EACCES: Errno = 13;
 pub const EFAULT: Errno = 14;
 pub const EINVAL: Errno = 22;
 pub const EMFILE: Errno = 24;

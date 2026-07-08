@@ -95,17 +95,25 @@ pub fn validate_user_write_range(ptr: VirtAddr, len: usize) -> Result<(), UserCo
 }
 
 pub fn copy_path_cstr_from_user(path_ptr: VirtAddr) -> Result<Vec<u8>, UserCopyError> {
+    let path = copy_cstr_from_user(path_ptr, GENRT_PATH_MAX)?;
+    if path.is_empty() {
+        return Err(UserCopyError::Empty);
+    }
+    Ok(path)
+}
+
+pub fn copy_cstr_from_user(ptr: VirtAddr, max_len: usize) -> Result<Vec<u8>, UserCopyError> {
     let mut path = Vec::new();
-    path.try_reserve_exact(GENRT_PATH_MAX)
+    path.try_reserve_exact(max_len)
         .map_err(|_| UserCopyError::OutOfMemory)?;
 
-    let mut cursor = path_ptr;
+    let mut cursor = ptr;
     let mut scanned = 0usize;
-    while scanned <= GENRT_PATH_MAX {
+    while scanned <= max_len {
         let page_end = align_down(cursor, PAGE_SIZE)
             .checked_add(PAGE_SIZE)
             .ok_or(UserCopyError::AddressOverflow)?;
-        let remaining_scan = (GENRT_PATH_MAX + 1) - scanned;
+        let remaining_scan = (max_len + 1) - scanned;
         let chunk_len = page_end.saturating_sub(cursor).min(remaining_scan);
         validate_user_read_range_unbounded(cursor, chunk_len)?;
 
@@ -115,12 +123,9 @@ pub fn copy_path_cstr_from_user(path_ptr: VirtAddr) -> Result<Vec<u8>, UserCopyE
             // still bring-up-only and does not recover from a faulting load.
             let byte = unsafe { (cursor as *const u8).add(offset).read_volatile() };
             if byte == 0 {
-                if path.is_empty() {
-                    return Err(UserCopyError::Empty);
-                }
                 return Ok(path);
             }
-            if path.len() == GENRT_PATH_MAX {
+            if path.len() == max_len {
                 return Err(UserCopyError::NameTooLong);
             }
             path.push(byte);
