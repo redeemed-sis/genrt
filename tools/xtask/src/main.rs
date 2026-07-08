@@ -49,6 +49,7 @@ enum Commands {
     BuildUserFault,
     BuildUserReadFile,
     BuildUserShell,
+    BuildUserEcho,
     BuildInitramfs {
         #[arg(long)]
         root: Option<PathBuf>,
@@ -130,6 +131,9 @@ fn main() -> Result<()> {
         }
         Commands::BuildUserShell => {
             build_aarch64_user_elf("shell", "user/c/shell.c", shell_user_elf_path()).map(|_| ())
+        }
+        Commands::BuildUserEcho => {
+            build_aarch64_user_elf("echo", "user/c/echo.c", echo_user_elf_path()).map(|_| ())
         }
         Commands::BuildInitramfs { root, init, output } => {
             build_initramfs(root, init, output).map(|_| ())
@@ -427,6 +431,10 @@ fn shell_user_elf_path() -> PathBuf {
     PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/shell.elf"))
 }
 
+fn echo_user_elf_path() -> PathBuf {
+    PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/echo.elf"))
+}
+
 fn default_initramfs_path() -> PathBuf {
     PathBuf::from(format!("target/{AARCH64_TARGET}/debug/initramfs.cpio"))
 }
@@ -466,6 +474,7 @@ fn build_initramfs(
         }
         None => build_aarch64_user_elf("shell", "user/c/shell.c", shell_user_elf_path())?,
     };
+    let echo = build_aarch64_user_elf("echo", "user/c/echo.c", echo_user_elf_path())?;
 
     let output = output.unwrap_or_else(default_initramfs_path);
     let staging = initramfs_staging_root();
@@ -489,6 +498,23 @@ fn build_initramfs(
             "failed to stage init ELF {} as {}",
             init.display(),
             staged_init.display()
+        )
+    })?;
+    let staged_bin = staging.join("bin");
+    fs::create_dir_all(&staged_bin)
+        .with_context(|| format!("failed to create {}", staged_bin.display()))?;
+    let staged_echo = staged_bin.join("echo");
+    if staged_echo.exists() {
+        bail!(
+            "initramfs root {} already contains bin/echo; remove it or build a custom archive",
+            root.display()
+        );
+    }
+    fs::copy(&echo, &staged_echo).with_context(|| {
+        format!(
+            "failed to stage echo ELF {} as {}",
+            echo.display(),
+            staged_echo.display()
         )
     })?;
 

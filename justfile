@@ -37,6 +37,9 @@ build-user-read-file:
 build-user-shell:
     cargo xtask build-user-shell
 
+build-user-echo:
+    cargo xtask build-user-echo
+
 build-initramfs:
     cargo xtask build-initramfs
 

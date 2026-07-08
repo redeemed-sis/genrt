@@ -1,6 +1,8 @@
 #include "syscall.h"
 
 #define SHELL_LINE_MAX 256
+#define SHELL_ARG_MAX 16
+#define SHELL_PATH_MAX 128
 
 static size_t strlen_lit(const char *s) {
     size_t len = 0;
@@ -23,6 +25,86 @@ static int streq(const char *a, const char *b) {
         i++;
     }
     return a[i] == b[i];
+}
+
+static int contains_char(const char *s, char needle) {
+    for (size_t i = 0; s[i] != '\0'; i++) {
+        if (s[i] == needle) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int starts_with(const char *s, const char *prefix) {
+    size_t i = 0;
+    while (prefix[i] != '\0') {
+        if (s[i] != prefix[i]) {
+            return 0;
+        }
+        i++;
+    }
+    return 1;
+}
+
+static void copy_str(char *dst, const char *src, size_t dst_len) {
+    if (dst_len == 0) {
+        return;
+    }
+
+    size_t i = 0;
+    while (i + 1 < dst_len && src[i] != '\0') {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+static int make_bin_path(char *dst, size_t dst_len, const char *cmd) {
+    const char prefix[] = "/bin/";
+    size_t prefix_len = sizeof(prefix) - 1;
+    size_t cmd_len = strlen_lit(cmd);
+
+    if (prefix_len + cmd_len + 1 > dst_len) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < prefix_len; i++) {
+        dst[i] = prefix[i];
+    }
+    for (size_t i = 0; i < cmd_len; i++) {
+        dst[prefix_len + i] = cmd[i];
+    }
+    dst[prefix_len + cmd_len] = '\0';
+    return 0;
+}
+
+static int split_words(char *line, char **argv, int max_args) {
+    int argc = 0;
+    char *p = line;
+
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        if (argc == max_args) {
+            return -1;
+        }
+
+        argv[argc++] = p;
+        while (*p != '\0' && *p != ' ' && *p != '\t') {
+            p++;
+        }
+        if (*p != '\0') {
+            *p++ = '\0';
+        }
+    }
+
+    argv[argc] = NULL;
+    return argc;
 }
 
 static void print_file(const char *path) {
@@ -49,7 +131,60 @@ static void print_file(const char *path) {
     close(fd);
 }
 
-int main(void) {
+static void run_command(char *line) {
+    char *argv[SHELL_ARG_MAX + 1];
+    char path[SHELL_PATH_MAX];
+    int argc = split_words(line, argv, SHELL_ARG_MAX);
+
+    if (argc < 0) {
+        puts_lit("too many args\n");
+        return;
+    }
+    if (argc == 0) {
+        return;
+    }
+    if (streq(argv[0], "exit")) {
+        exit(0);
+    }
+
+    if (argv[0][0] == '/' && argc == 1 && !starts_with(argv[0], "/bin/")) {
+        print_file(argv[0]);
+        return;
+    }
+
+    if (contains_char(argv[0], '/')) {
+        copy_str(path, argv[0], sizeof(path));
+    } else if (make_bin_path(path, sizeof(path), argv[0]) != 0) {
+        puts_lit("command path too long\n");
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        puts_lit("fork failed\n");
+        return;
+    }
+    if (pid == 0) {
+        execve(path, argv, NULL);
+        puts_lit("exec failed\n");
+        exit(127);
+    }
+
+    int status = 0;
+    pid_t waited = waitpid(pid, &status, 0);
+    if (waited < 0) {
+        puts_lit("wait failed\n");
+        return;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        puts_lit("command failed\n");
+    }
+}
+
+int main(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
     char line[SHELL_LINE_MAX + 1];
     int skip_lf = 0;
 
@@ -109,10 +244,6 @@ int main(void) {
         if (len == 0) {
             continue;
         }
-        if (streq(line, "exit")) {
-            return 0;
-        }
-
-        print_file(line);
+        run_command(line);
     }
 }
