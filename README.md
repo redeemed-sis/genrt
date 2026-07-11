@@ -58,11 +58,12 @@ The current AArch64 path already has:
 * minimal TTBR0 user address space with 4 KiB user page mappings
 * scheduler TTBR0 activation for user threads and TTBR0 clear for kernel threads
 * lower-EL `svc #0` syscall dispatch separated from EL1 task-call `svc #0`
-* POSIX-like `open` / `read` / `write` / `close` syscall path for the first user process
+* POSIX-like `open` / `read` / `write` / `close` syscall path for userspace
+* Linux-like `getdents64` directory iteration over readonly ramfs directories
 * POSIX-like `fork` / `execve` / `waitpid` process-control path for child processes
 * blocking `read(0)` over UART stdin using a bounded kernel RX ring and scheduler wakeup
-* readonly initramfs-backed ramfs and per-process bounded FD table
-* interactive userspace shell demo that opens files and runs `/bin/echo` from initramfs
+* readonly initramfs-backed ramfs and per-process bounded file/directory FD table
+* interactive userspace shell demo that runs `/bin/echo`, `/bin/cat`, and `/bin/ls` from initramfs
 * bounded process table with generation-checked `ProcessId`
 * process exit/fault status and kernel-side `process_join`
 * lower-EL user fault policy that terminates the current process instead of panicking the kernel
@@ -327,14 +328,15 @@ and loads `/init` through the ELF loader.
 
 The initial user syscall ABI is AArch64-style: `x8` is the syscall number,
 `x0..x5` are arguments, and `x0` is the return value. The current POSIX-like
-subset includes `open`, `read`, `write`, `close`, and `exit`; errors are
-reported as negative errno values.
+subset includes `open`, `read`, `write`, `close`, `getdents64`, `fork`,
+`execve`, `waitpid`, and `exit`; errors are reported as negative errno values.
 
 The first readonly filesystem is an initramfs-backed ramfs with exact path
-lookup. `xtask` builds a deterministic uncompressed `newc` cpio archive from
-`user/initramfs/` plus `/init`, currently `shell.elf`. The shell can open
-`/hello.txt`, `/etc/banner`, and `/readme.txt`; pathname scanning is bounded by
-`GENRT_PATH_MAX = 4096` bytes.
+lookup plus immediate-child directory iteration. `xtask` builds a deterministic
+uncompressed `newc` cpio archive from `user/initramfs/` plus `/init`, currently
+`shell.elf`, and stages `/bin/echo`, `/bin/cat`, and `/bin/ls`. The shell can
+run those commands and open `/hello.txt`, `/etc/banner`, and `/readme.txt`;
+pathname scanning is bounded by `GENRT_PATH_MAX = 4096` bytes.
 
 `read(0)` is backed by PL011 RX interrupts rather than polling. The kernel keeps
 only raw bytes in a bounded stdin ring and does not implement terminal line
@@ -404,6 +406,8 @@ just build-user-hello
 just build-user-fault
 just build-user-read-file
 just build-user-shell
+just build-user-cat
+just build-user-ls
 just build-initramfs
 just run-aarch64
 just run-aarch64-read-file
@@ -436,9 +440,10 @@ Interactive shell:
 just run-aarch64-shell
 ```
 
-The shell accepts paths such as `/hello.txt`, `/etc/banner`, and `/readme.txt`;
-`exit` terminates the userspace process. The shell recipes default to `info`
-logs so UART input remains readable. Default QEMU runs load
+The shell accepts external commands such as `echo hello`, `cat /hello.txt`,
+`cat /etc/banner`, `ls /`, and `ls /bin`; `exit` terminates the userspace
+process. The shell recipes default to `info` logs so UART input remains
+readable. Default QEMU runs load
 `target/aarch64-unknown-none-softfloat/debug/initramfs.cpio` at the reserved
 initramfs physical window.
 
@@ -453,7 +458,7 @@ QEMU monitor escape commands are still available:
 The best next steps are:
 
 1. refine VM permissions and page-table ownership invariants
-2. add richer initramfs/VFS lookup semantics such as readdir/stat
+2. add richer initramfs/VFS metadata such as stat/fstat
 3. fault-aware `copy_from_user` recovery for faults during actual loads/stores
 4. evolve UART stdin into a real TTY/console subsystem without changing the fd ABI
 5. growable heap design on top of frame allocation
@@ -462,6 +467,7 @@ The best next steps are:
 
 * `docs/month1-plan.md` — month 1 closure and actual outcome
 * `docs/month2-plan.md` — roadmap for the next month
+* `ai-docs/rustdoc.md` — rustdoc contract for public and crate-visible APIs
 * `ai-docs/decision-records/ADR-0001-architecture-strategy.md`
 * `ai-docs/decision-records/ADR-0002-aarch64-irq-path-gicv2-timer.md`
 * `ai-docs/decision-records/ADR-0003-aarch64-preemptive-irq-return-switching.md`
@@ -483,3 +489,5 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0019-readonly-ramfs-and-fd-table.md`
 * `ai-docs/decision-records/ADR-0020-uart-stdin-and-shell.md`
 * `ai-docs/decision-records/ADR-0021-initramfs-cpio-root.md`
+* `ai-docs/decision-records/ADR-0022-fork-exec-waitpid-echo.md`
+* `ai-docs/decision-records/ADR-0023-directory-fds-and-getdents64.md`

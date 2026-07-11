@@ -35,10 +35,11 @@ initramfs and passing that exact file slice to the existing ELF loader.
 - The default userspace payload is `initramfs.cpio`, not a direct user ELF.
 - Static kernel-compiled ramfs file contents are removed.
 - The initramfs physical region remains reserved for the lifetime of the kernel.
-- `cpio_reader` is not the filesystem layer; normal `fs::open` and FD-table
-  paths continue to own lookup/read semantics.
-- The model remains readonly and exact-lookup only; symlinks, device nodes,
-  writable files, `readdir`, and `exec(path)` are future work.
+- `cpio_reader` is not the filesystem layer; normal `fs::open`, directory
+  iteration, and FD-table paths continue to own lookup/read semantics.
+- The model remains readonly; symlinks, device nodes, writable files, richer
+  metadata, and mount tables are future work. Minimal immediate-child directory
+  iteration is described in ADR-0023.
 
 ## Determinism
 

@@ -4,9 +4,10 @@
 Accepted
 
 Superseded for filesystem backing by
-[`ADR-0021`](ADR-0021-initramfs-cpio-root.md). The FD table and syscall ABI from
-this ADR remain active; the file data source moved from compiled-in entries to a
-mounted initramfs index.
+[`ADR-0021`](ADR-0021-initramfs-cpio-root.md). Extended for directory handles and
+`getdents64` by [`ADR-0023`](ADR-0023-directory-fds-and-getdents64.md). The FD
+table and syscall ABI from this ADR remain active; the file data source moved
+from compiled-in entries to a mounted initramfs index.
 
 ## Context
 The first EL0 userspace path can load ELF images, dispatch lower-EL syscalls,
@@ -47,5 +48,6 @@ walking page tables for every byte.
   stdout, close the descriptor, and exit.
 - This establishes the userspace ABI shape for future VFS/initramfs work while
   keeping the current implementation small and deterministic.
-- Directory traversal, path normalization, writable files, `lseek`, `dup`,
-  `stat`, `readdir`, and blocking I/O remain out of scope.
+- Path normalization, writable files, `lseek`, `dup`, `stat`, and richer
+  directory APIs remain out of scope. Minimal directory FD iteration is covered
+  by ADR-0023.
