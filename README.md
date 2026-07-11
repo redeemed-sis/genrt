@@ -171,7 +171,7 @@ Key milestone already reached:
 * process control is intentionally minimal: one main user thread per process
 * `fork` uses eager address-space copying; no copy-on-write yet
 * `waitpid` supports a specific child pid with options `0`; no `waitpid(-1)` yet
-* `execve` supports `argv` but rejects non-null `envp`
+* `execve` supports bounded `argv` and `envp` strings on the initial user stack
 * shell command lookup is limited to `/bin/<command>` for names without `/`
 * no ASIDs or multiple per-process TTBR0 roots yet
 * VM API currently supports only 2 MiB-aligned TTBR1 kernel mappings
