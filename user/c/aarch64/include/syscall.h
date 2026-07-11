@@ -12,6 +12,7 @@
 #define SYS_FORK 5
 #define SYS_EXECVE 6
 #define SYS_WAITPID 7
+#define SYS_GETDENTS64 8
 
 typedef long ssize_t;
 typedef unsigned long size_t;
@@ -24,9 +25,22 @@ typedef int pid_t;
 #define O_CREAT 0100
 #define O_TRUNC 01000
 #define O_APPEND 02000
+#define O_DIRECTORY 0200000
+
+#define DT_UNKNOWN 0
+#define DT_DIR 4
+#define DT_REG 8
 
 #define WIFEXITED(status) (((status) & 0x7f) == 0)
 #define WEXITSTATUS(status) (((status) >> 8) & 0xff)
+
+struct genrt_dirent64 {
+    unsigned long long d_ino;
+    long long d_off;
+    unsigned short d_reclen;
+    unsigned char d_type;
+    char d_name[];
+};
 
 static inline long genrt_syscall0(long nr) {
     register long x0 __asm__("x0");
@@ -77,6 +91,10 @@ static inline int execve(const char *path, char *const argv[], char *const envp[
 
 static inline pid_t waitpid(pid_t pid, int *status, int options) {
     return (pid_t)genrt_syscall3(SYS_WAITPID, pid, (long)status, options);
+}
+
+static inline long getdents64(int fd, void *dirp, size_t count) {
+    return genrt_syscall3(SYS_GETDENTS64, fd, (long)dirp, (long)count);
 }
 
 __attribute__((noreturn)) static inline void _exit(int code) {

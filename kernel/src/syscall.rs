@@ -5,7 +5,10 @@ use crate::{
         path::{self, PathError},
         ramfs,
     },
-    memory::user::{self, UserCopyError},
+    memory::{
+        self,
+        user::{self, UserCopyError},
+    },
     process,
 };
 
@@ -17,6 +20,8 @@ pub const SYS_CLOSE: usize = 4;
 pub const SYS_FORK: usize = 5;
 pub const SYS_EXECVE: usize = 6;
 pub const SYS_WAITPID: usize = 7;
+/// Read Linux-like `dirent64` records from a directory file descriptor.
+pub const SYS_GETDENTS64: usize = 8;
 
 const X0: usize = 0;
 const X1: usize = 1;
@@ -30,7 +35,30 @@ const O_ACCMODE: usize = 0o3;
 const O_CREAT: usize = 0o100;
 const O_TRUNC: usize = 0o1000;
 const O_APPEND: usize = 0o2000;
-const SUPPORTED_OPEN_FLAGS: usize = O_ACCMODE | O_CREAT | O_TRUNC | O_APPEND;
+const O_DIRECTORY: usize = 0o200000;
+const SUPPORTED_OPEN_FLAGS: usize = O_ACCMODE | O_CREAT | O_TRUNC | O_APPEND | O_DIRECTORY;
+
+const DIRENT64_ALIGN: usize = 8;
+const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
+
+/// Fixed-width prefix of the userspace `genrt_dirent64` ABI record.
+///
+/// `packed` keeps the flexible `d_name[]` payload immediately after `d_type`
+/// instead of including the trailing padding of a standalone C structure. The
+/// integer fields use the target's native byte order, matching userspace built
+/// for the same target architecture.
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct Dirent64Header {
+    ino: u64,
+    off: i64,
+    record_len: u16,
+    entry_type: u8,
+}
+
+const DIRENT64_HEADER_SIZE: usize = core::mem::size_of::<Dirent64Header>();
+const _: [(); 19] = [(); DIRENT64_HEADER_SIZE];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DispatchError {
@@ -74,6 +102,10 @@ pub fn dispatch(frame_words: *mut u64) -> Result<(), DispatchError> {
         }
         SYS_WAITPID => {
             sys_waitpid(frame_words);
+            Ok(())
+        }
+        SYS_GETDENTS64 => {
+            sys_getdents64(frame_words);
             Ok(())
         }
         _ => Err(DispatchError::UnknownSyscall(nr)),
@@ -196,10 +228,14 @@ fn sys_open(frame_words: *mut u64) {
         validate_open_flags(flags)?;
         let path = user::copy_path_cstr_from_user(path_ptr).map_err(path_copy_errno)?;
         let path = path::root_relative(&path).map_err(path_errno)?;
-        if ramfs::is_dir(&path) {
-            return Err(errno::EINVAL);
+        if let Some(dir_index) = ramfs::lookup_dir(&path) {
+            return process::open_current_ram_dir(dir_index).map_err(fd_errno);
         }
-        let file_index = ramfs::lookup(&path).ok_or(errno::ENOENT)?;
+
+        let file_index = ramfs::lookup_file(&path).ok_or(errno::ENOENT)?;
+        if flags & O_DIRECTORY != 0 {
+            return Err(errno::ENOTDIR);
+        }
         process::open_current_ram_file(file_index).map_err(fd_errno)
     })();
 
@@ -257,6 +293,68 @@ fn sys_waitpid(frame_words: *mut u64) {
     }
 }
 
+fn sys_getdents64(frame_words: *mut u64) {
+    let fd = frame_word(frame_words, X0) as usize;
+    let ptr = frame_word(frame_words, X1) as usize;
+    let count = frame_word(frame_words, X2) as usize;
+    let result = sys_getdents64_impl(fd, ptr, count);
+    set_return(frame_words, errno::syscall_ret(result));
+}
+
+fn sys_getdents64_impl(fd: usize, ptr: usize, count: usize) -> Result<usize, errno::Errno> {
+    if count == 0 {
+        return Err(errno::EINVAL);
+    }
+
+    let first_entry = process::current_fd_dir_entry_at(fd, 0).map_err(fd_errno)?;
+    let max_len = count.min(user::MAX_USER_COPY);
+    user::validate_user_write_range(ptr, max_len).map_err(user_copy_errno)?;
+
+    let mut buffer = [0u8; user::MAX_USER_COPY];
+    let mut written = 0usize;
+    let mut emitted = 0usize;
+
+    loop {
+        let dir_entry = if emitted == 0 {
+            first_entry
+        } else {
+            process::current_fd_dir_entry_at(fd, emitted).map_err(fd_errno)?
+        };
+        let Some(dir_entry) = dir_entry else {
+            break;
+        };
+        let d_type = match dir_entry.entry.kind {
+            ramfs::DirEntryKind::Directory => DT_DIR,
+            ramfs::DirEntryKind::File => DT_REG,
+        };
+        let next_offset = dir_entry.offset.saturating_add(1) as i64;
+
+        let Some(record_len) = encode_dirent64(
+            &mut buffer[written..max_len],
+            dir_entry.entry.ino,
+            next_offset,
+            d_type,
+            dir_entry.entry.name,
+        ) else {
+            if written == 0 {
+                return Err(errno::EINVAL);
+            }
+            break;
+        };
+
+        written += record_len;
+        emitted += 1;
+    }
+
+    if written == 0 {
+        return Ok(0);
+    }
+
+    user::copy_to_user(ptr, &buffer[..written]).map_err(user_copy_errno)?;
+    process::advance_current_fd_dir_read(fd, emitted).map_err(fd_errno)?;
+    Ok(written)
+}
+
 fn validate_open_flags(flags: usize) -> Result<(), errno::Errno> {
     if flags & !SUPPORTED_OPEN_FLAGS != 0 {
         return Err(errno::EINVAL);
@@ -309,9 +407,39 @@ fn path_errno(err: PathError) -> errno::Errno {
 fn fd_errno(err: FdError) -> errno::Errno {
     match err {
         FdError::BadFd => errno::EBADF,
+        FdError::IsDirectory => errno::EISDIR,
+        FdError::NotDirectory => errno::ENOTDIR,
         FdError::TooManyOpenFiles => errno::EMFILE,
         FdError::Unsupported => errno::ENOTSUP,
     }
+}
+
+fn encode_dirent64(dst: &mut [u8], ino: u64, off: i64, d_type: u8, name: &[u8]) -> Option<usize> {
+    let raw_len = DIRENT64_HEADER_SIZE
+        .checked_add(name.len())?
+        .checked_add(1)?;
+    let record_len = memory::align_up(raw_len, DIRENT64_ALIGN)?;
+    if record_len > dst.len() || record_len > u16::MAX as usize || name.contains(&b'/') {
+        return None;
+    }
+
+    for byte in &mut dst[..record_len] {
+        *byte = 0;
+    }
+    let header = Dirent64Header {
+        ino,
+        off,
+        record_len: record_len as u16,
+        entry_type: d_type,
+    };
+    // SAFETY: the size check above guarantees space for the complete header.
+    // `write_unaligned` does not require the byte slice to satisfy the header's
+    // alignment and writes native-endian fields for the current target ABI.
+    unsafe {
+        core::ptr::write_unaligned(dst.as_mut_ptr().cast::<Dirent64Header>(), header);
+    }
+    dst[DIRENT64_HEADER_SIZE..DIRENT64_HEADER_SIZE + name.len()].copy_from_slice(name);
+    Some(record_len)
 }
 
 fn frame_word(frame_words: *mut u64, index: usize) -> u64 {

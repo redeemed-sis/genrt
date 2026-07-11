@@ -85,7 +85,8 @@ pub fn mount_from_cpio_newc(image: &'static [u8]) -> Result<(), InitramfsError> 
         return Err(InitramfsError::MissingInit);
     }
 
-    ramfs::mount(MountedRamfs::new(files, dirs)).map_err(|_| InitramfsError::AlreadyMounted)?;
+    let fs = MountedRamfs::new(files, dirs).map_err(mount_index_error)?;
+    ramfs::mount(fs).map_err(mount_index_error)?;
     let (file_count, dir_count) = ramfs::counts();
     crate::info!("initramfs: mounted {file_count} files, {dir_count} directories");
     Ok(())
@@ -152,4 +153,13 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+fn mount_index_error(err: ramfs::MountError) -> InitramfsError {
+    match err {
+        ramfs::MountError::AlreadyMounted => InitramfsError::AlreadyMounted,
+        ramfs::MountError::DuplicatePath => InitramfsError::DuplicatePath,
+        ramfs::MountError::InvalidPath => InitramfsError::InvalidPath,
+        ramfs::MountError::OutOfMemory => InitramfsError::OutOfMemory,
+    }
 }
