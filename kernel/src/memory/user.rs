@@ -11,6 +11,8 @@
 
 use alloc::vec::Vec;
 
+pub use crate::limits::GENRT_PATH_MAX;
+
 use super::{
     PAGE_SIZE, VirtAddr, align_down,
     vm::{self, UserMappingInfo},
@@ -24,13 +26,6 @@ pub const USER_STACK_TOP: VirtAddr = 0x0000_0080_0000_0000;
 /// This prevents early syscalls from copying unbounded user buffers before the
 /// kernel has fault-recovering copy loops and a richer process memory model.
 pub const MAX_USER_COPY: usize = 1024;
-
-/// POSIX-like pathname bound, excluding the terminating NUL byte.
-///
-/// `open()` receives NUL-terminated userspace pathnames, but the kernel must
-/// bound userspace scanning for RT predictability and memory safety. Paths
-/// longer than `GENRT_PATH_MAX` fail with `UserCopyError::NameTooLong`.
-pub const GENRT_PATH_MAX: usize = 4096;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum UserCopyError {
@@ -64,24 +59,96 @@ pub fn copy_from_user(dst: &mut [u8], user_src: VirtAddr) -> Result<(), UserCopy
     Ok(())
 }
 
+/// Copy at most `MAX_USER_COPY` kernel bytes into the current user address space.
+///
+/// # Arguments
+///
+/// * `user_dst` - Destination virtual address in the active user address space.
+/// * `src` - Kernel bytes to copy.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after copying every byte. An empty source succeeds without
+/// validating `user_dst`.
+///
+/// # Errors
+///
+/// Returns `UserCopyError::TooLarge` when `src` exceeds `MAX_USER_COPY`, or the
+/// permission/range errors returned while validating the active user mapping.
 pub fn copy_to_user(user_dst: VirtAddr, src: &[u8]) -> Result<(), UserCopyError> {
     if src.is_empty() {
         return Ok(());
     }
-    validate_user_write_range(user_dst, src.len())?;
+    if src.len() > MAX_USER_COPY {
+        return Err(UserCopyError::TooLarge);
+    }
+    validate_user_range_unbounded(user_dst, src.len(), AccessKind::Write)?;
+    write_validated_user_bytes(user_dst, src)
+}
 
+/// Copy a bounded kernel byte string and terminating NUL into userspace.
+///
+/// The complete destination range is validated before either part is written,
+/// and no temporary pathname-sized kernel buffer is allocated.
+///
+/// # Arguments
+///
+/// * `user_dst` - Destination virtual address in the active user address space.
+/// * `value` - Kernel string bytes without a terminating NUL.
+/// * `max_len` - Maximum total byte count including the terminating NUL.
+///
+/// # Returns
+///
+/// Returns the number of bytes copied, including the terminating NUL.
+///
+/// # Errors
+///
+/// Returns `UserCopyError::TooLarge` when `value` plus NUL exceeds `max_len`,
+/// `UserCopyError::AddressOverflow` when the size cannot be represented, or the
+/// permission/range errors returned while validating the active user mapping.
+pub fn copy_cstr_to_user(
+    user_dst: VirtAddr,
+    value: &[u8],
+    max_len: usize,
+) -> Result<usize, UserCopyError> {
+    let required = value
+        .len()
+        .checked_add(1)
+        .ok_or(UserCopyError::AddressOverflow)?;
+    if required > max_len {
+        return Err(UserCopyError::TooLarge);
+    }
+    validate_user_range_unbounded(user_dst, required, AccessKind::Write)?;
+    write_validated_user_bytes(user_dst, value)?;
+    let nul_dst = user_dst
+        .checked_add(value.len())
+        .ok_or(UserCopyError::AddressOverflow)?;
+    // SAFETY: the complete value-plus-NUL range was validated as writable.
+    unsafe { (nul_dst as *mut u8).write_volatile(0) };
+    Ok(required)
+}
+
+fn write_validated_user_bytes(user_dst: VirtAddr, src: &[u8]) -> Result<(), UserCopyError> {
     let mut offset = 0usize;
     while offset < src.len() {
-        // SAFETY: validation checked the full range against the current TTBR0
-        // mapping and write permissions. This is bring-up-only: it assumes user
-        // mappings remain stable during the syscall and does not yet provide
-        // fault recovery if the actual store faults.
-        unsafe {
-            (user_dst as *mut u8)
-                .add(offset)
-                .write_volatile(src[offset])
-        };
-        offset += 1;
+        let chunk_start = user_dst
+            .checked_add(offset)
+            .ok_or(UserCopyError::AddressOverflow)?;
+        let page_remaining = PAGE_SIZE - (chunk_start & (PAGE_SIZE - 1));
+        let chunk_len = page_remaining.min(src.len() - offset);
+        let mut chunk_offset = 0usize;
+        while chunk_offset < chunk_len {
+            // SAFETY: validation checked the full range against the current
+            // TTBR0 mapping and write permissions. This is bring-up-only and
+            // does not yet recover from a faulting store.
+            unsafe {
+                (chunk_start as *mut u8)
+                    .add(chunk_offset)
+                    .write_volatile(src[offset + chunk_offset])
+            };
+            chunk_offset += 1;
+        }
+        offset += chunk_len;
     }
     Ok(())
 }
@@ -94,6 +161,20 @@ pub fn validate_user_write_range(ptr: VirtAddr, len: usize) -> Result<(), UserCo
     validate_user_range(ptr, len, AccessKind::Write)
 }
 
+/// Copy one bounded non-empty pathname C string from the current userspace.
+///
+/// # Arguments
+///
+/// * `path_ptr` - Userspace address of the NUL-terminated pathname.
+///
+/// # Returns
+///
+/// Returns owned pathname bytes without the terminating NUL.
+///
+/// # Errors
+///
+/// Returns `UserCopyError::Empty` for an empty pathname and otherwise
+/// propagates bounded C-string copy errors from `copy_cstr_from_user()`.
 pub fn copy_path_cstr_from_user(path_ptr: VirtAddr) -> Result<Vec<u8>, UserCopyError> {
     let path = copy_cstr_from_user(path_ptr, GENRT_PATH_MAX)?;
     if path.is_empty() {
@@ -102,10 +183,27 @@ pub fn copy_path_cstr_from_user(path_ptr: VirtAddr) -> Result<Vec<u8>, UserCopyE
     Ok(path)
 }
 
+/// Copy a bounded NUL-terminated string from the current userspace.
+///
+/// Allocation grows in small fallible chunks instead of reserving `max_len`
+/// immediately. User pages are validated once per scanned page chunk.
+///
+/// # Arguments
+///
+/// * `ptr` - Userspace address of the first string byte.
+/// * `max_len` - Maximum returned bytes excluding the terminating NUL.
+///
+/// # Returns
+///
+/// Returns owned bytes before the first NUL.
+///
+/// # Errors
+///
+/// Returns `UserCopyError::NameTooLong` when no NUL appears within the bound,
+/// `UserCopyError::OutOfMemory` if allocation fails, or a user mapping/range
+/// validation error for inaccessible input.
 pub fn copy_cstr_from_user(ptr: VirtAddr, max_len: usize) -> Result<Vec<u8>, UserCopyError> {
     let mut path = Vec::new();
-    path.try_reserve_exact(max_len)
-        .map_err(|_| UserCopyError::OutOfMemory)?;
 
     let mut cursor = ptr;
     let mut scanned = 0usize;
@@ -127,6 +225,11 @@ pub fn copy_cstr_from_user(ptr: VirtAddr, max_len: usize) -> Result<Vec<u8>, Use
             }
             if path.len() == max_len {
                 return Err(UserCopyError::NameTooLong);
+            }
+            if path.len() == path.capacity() {
+                let additional = (max_len - path.len()).min(64);
+                path.try_reserve_exact(additional)
+                    .map_err(|_| UserCopyError::OutOfMemory)?;
             }
             path.push(byte);
             offset += 1;
