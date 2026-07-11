@@ -60,10 +60,11 @@ The current AArch64 path already has:
 * lower-EL `svc #0` syscall dispatch separated from EL1 task-call `svc #0`
 * POSIX-like `open` / `read` / `write` / `close` syscall path for userspace
 * Linux-like `getdents64` directory iteration over readonly ramfs directories
+* process-wide cwd with POSIX-like `chdir` / `getcwd` and canonical relative path resolution
 * POSIX-like `fork` / `execve` / `waitpid` process-control path for child processes
 * blocking `read(0)` over UART stdin using a bounded kernel RX ring and scheduler wakeup
 * readonly initramfs-backed ramfs and per-process bounded file/directory FD table
-* interactive userspace shell demo that runs `/bin/echo`, `/bin/cat`, and `/bin/ls` from initramfs
+* interactive userspace shell demo with builtin `cd` and `/bin/echo`, `/bin/cat`, `/bin/ls`, `/bin/pwd`
 * bounded process table with generation-checked `ProcessId`
 * process exit/fault status and kernel-side `process_join`
 * lower-EL user fault policy that terminates the current process instead of panicking the kernel
@@ -174,6 +175,7 @@ Key milestone already reached:
 * `waitpid` supports a specific child pid with options `0`; no `waitpid(-1)` yet
 * `execve` supports bounded `argv` and `envp` strings on the initial user stack
 * shell command lookup is limited to `/bin/<command>` for names without `/`
+* cwd uses an immutable ramfs directory index; no writable VFS vnode/dentry model yet
 * no ASIDs or multiple per-process TTBR0 roots yet
 * VM API currently supports only 2 MiB-aligned TTBR1 kernel mappings
 * user VM bring-up supports only explicit 4 KiB mappings created by the first process path
@@ -328,15 +330,18 @@ and loads `/init` through the ELF loader.
 
 The initial user syscall ABI is AArch64-style: `x8` is the syscall number,
 `x0..x5` are arguments, and `x0` is the return value. The current POSIX-like
-subset includes `open`, `read`, `write`, `close`, `getdents64`, `fork`,
-`execve`, `waitpid`, and `exit`; errors are reported as negative errno values.
+subset includes `open`, `read`, `write`, `close`, `getdents64`, `chdir`,
+`getcwd`, `fork`, `execve`, `waitpid`, and `exit`; errors are reported as
+negative errno values.
 
 The first readonly filesystem is an initramfs-backed ramfs with exact path
 lookup plus immediate-child directory iteration. `xtask` builds a deterministic
 uncompressed `newc` cpio archive from `user/initramfs/` plus `/init`, currently
-`shell.elf`, and stages `/bin/echo`, `/bin/cat`, and `/bin/ls`. The shell can
-run those commands and open `/hello.txt`, `/etc/banner`, and `/readme.txt`;
-pathname scanning is bounded by `GENRT_PATH_MAX = 4096` bytes.
+`shell.elf`, and stages `/bin/echo`, `/bin/cat`, `/bin/ls`, and `/bin/pwd`.
+Processes start at `/`, inherit cwd across `fork`, and preserve it across
+`execve`. Relative `open` and `execve` paths resolve against cwd with canonical
+`.`, `..`, and repeated-slash handling. Pathname scanning and canonical results
+are bounded by `GENRT_PATH_MAX = 4096` bytes.
 
 `read(0)` is backed by PL011 RX interrupts rather than polling. The kernel keeps
 only raw bytes in a bounded stdin ring and does not implement terminal line
@@ -408,6 +413,7 @@ just build-user-read-file
 just build-user-shell
 just build-user-cat
 just build-user-ls
+just build-user-pwd
 just build-initramfs
 just run-aarch64
 just run-aarch64-read-file
@@ -441,9 +447,10 @@ just run-aarch64-shell
 ```
 
 The shell accepts external commands such as `echo hello`, `cat /hello.txt`,
-`cat /etc/banner`, `ls /`, and `ls /bin`; `exit` terminates the userspace
-process. The shell recipes default to `info` logs so UART input remains
-readable. Default QEMU runs load
+`ls`, and `pwd`. Its builtin `cd` changes the shell process cwd, so `cd /etc`,
+`pwd`, `ls`, and `cat banner` exercise cwd inheritance through fork/exec.
+`exit` terminates the userspace process. The shell recipes default to `info`
+logs so UART input remains readable. Default QEMU runs load
 `target/aarch64-unknown-none-softfloat/debug/initramfs.cpio` at the reserved
 initramfs physical window.
 
@@ -491,3 +498,4 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0021-initramfs-cpio-root.md`
 * `ai-docs/decision-records/ADR-0022-fork-exec-waitpid-echo.md`
 * `ai-docs/decision-records/ADR-0023-directory-fds-and-getdents64.md`
+* `ai-docs/decision-records/ADR-0024-process-cwd-and-path-resolution.md`

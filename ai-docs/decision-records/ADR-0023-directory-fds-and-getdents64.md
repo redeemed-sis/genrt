@@ -35,7 +35,8 @@ entries sorted lexicographically per directory. This keeps `ls /` deterministic
 without sorting in userspace.
 
 The default initramfs stages `/bin/echo`, `/bin/cat`, and `/bin/ls`. `cat` uses
-only `open/read/write/close`; `ls` uses `open/getdents64/close`.
+only `open/read/write/close`; `ls` uses `open/getdents64/close`. Process cwd and
+relative directory lookup are added by ADR-0024.
 
 ## Invariants
 
@@ -53,5 +54,6 @@ only `open/read/write/close`; `ls` uses `open/getdents64/close`.
   `cat /etc/banner` through normal fork/exec/waitpid command execution.
 - Directory iteration is sufficient for future `readdir` wrappers and simple
   tools, but not for rich metadata.
-- `stat`, `fstat`, `lseek`, `dup`, writable files, symlinks, mount tables, and
-  current working directory semantics remain future work.
+- `stat`, `fstat`, `lseek`, `dup`, writable files, symlinks, and mount tables
+  remain future work. Current working directory semantics are described in
+  ADR-0024.

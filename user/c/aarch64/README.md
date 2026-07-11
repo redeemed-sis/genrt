@@ -52,3 +52,15 @@ SPSR_EL1 EL0t
 
 The stub loads `argc` from `[sp]`, computes `argv = sp + 8`, calls `main`, then
 terminates the process with `SYS_EXIT`.
+
+## Path and cwd syscall ABI
+
+The AArch64 syscall wrappers use `x8` for the syscall number and `x0..x2` for
+arguments. `chdir(path)` changes the current process cwd. `getcwd(buf, size)`
+invokes a kernel ABI that returns the byte count including the terminating NUL;
+the C wrapper translates success to `buf` and any negative errno to `NULL`.
+
+The initial process cwd is `/`. Forked children inherit the parent's stable cwd
+directory identity, and successful `execve` preserves it. Relative `open`,
+`chdir`, and `execve` paths are canonicalized against cwd. The pathname ABI is
+bounded by `GENRT_PATH_MAX = 4096` bytes excluding NUL.
