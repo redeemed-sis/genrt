@@ -158,12 +158,22 @@ pub enum ProcessFaultError {
     InvalidProcess,
 }
 
+/// Errors returned by process current-working-directory operations.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessPathError {
+    /// The caller is not running as a userspace process.
+    NoCurrentProcess,
+    /// The stored or requested ramfs directory index is invalid.
+    InvalidDirectory,
+}
+
 struct ProcessSlot {
     generation: u32,
     state: ProcessState,
     address_space: Option<UserAddressSpace>,
     user_image: Option<UserElfImage>,
     fds: FdTable,
+    cwd_dir: Option<usize>,
     parent: Option<ProcessId>,
     main_thread: Option<ThreadId>,
     stack: FrameRange,
@@ -180,6 +190,7 @@ impl ProcessSlot {
             address_space: None,
             user_image: None,
             fds: FdTable::new(),
+            cwd_dir: None,
             parent: None,
             main_thread: None,
             stack: FrameRange::empty(),
@@ -320,7 +331,8 @@ unsafe extern "C" {
 }
 
 pub(crate) fn spawn_first_user_process() -> Result<ProcessId, ProcessError> {
-    let pid = allocate_process_slot(None, FdTable::new())?;
+    let cwd_dir = ramfs::root_dir_index().ok_or(ProcessError::InvalidProcess)?;
+    let pid = allocate_process_slot(None, FdTable::new(), cwd_dir)?;
     let address_space = vm::create_user_address_space().map_err(|err| {
         free_process_slot(pid);
         ProcessError::Vm(err)
@@ -460,7 +472,8 @@ pub(crate) fn fork_current(active_frame_words: *mut u64) -> Result<usize, errno:
 
     let snapshot = fork_snapshot_current()?;
     let child_pid =
-        allocate_process_slot(Some(snapshot.parent_pid), snapshot.fds).map_err(fork_errno)?;
+        allocate_process_slot(Some(snapshot.parent_pid), snapshot.fds, snapshot.cwd_dir)
+            .map_err(fork_errno)?;
     let mut address_space = None;
     let mut user_image = None;
     let mut stack = FrameRange::empty();
@@ -522,9 +535,30 @@ pub(crate) fn fork_current(active_frame_words: *mut u64) -> Result<usize, errno:
     result
 }
 
+/// Replace the current process image while preserving process-owned state.
+///
+/// File descriptors, PID relationships, and cwd remain unchanged. Only the
+/// address space, loaded ELF segments, user stack, and active trap frame are
+/// replaced.
+///
+/// # Arguments
+///
+/// * `active_frame_words` - Live architecture trap-frame storage for the
+///   current userspace syscall.
+/// * `path` - Canonical resolved executable path and directory requirement.
+/// * `args` - Kernel-owned argv/envp strings for the new image.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after committing the new image.
+///
+/// # Errors
+///
+/// Returns a POSIX errno for invalid process state, missing/invalid executable,
+/// allocation failure, ELF rejection, or VM setup failure.
 pub(crate) fn execve_current(
     active_frame_words: *mut u64,
-    path: Vec<u8>,
+    path: path::ResolvedPath,
     args: ExecArgs,
 ) -> Result<(), errno::Errno> {
     if active_frame_words.is_null() {
@@ -658,7 +692,11 @@ fn finish_current_process(
 fn allocate_process_slot(
     parent: Option<ProcessId>,
     fds: FdTable,
+    cwd_dir: usize,
 ) -> Result<ProcessId, ProcessError> {
+    if ramfs::dir_path(cwd_dir).is_none() {
+        return Err(ProcessError::InvalidProcess);
+    }
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let table = table_mut();
     let Some(index) = table
@@ -677,6 +715,7 @@ fn allocate_process_slot(
         address_space: None,
         user_image: None,
         fds,
+        cwd_dir: Some(cwd_dir),
         parent,
         main_thread: None,
         stack: FrameRange::empty(),
@@ -736,6 +775,7 @@ fn finish_process(pid: ProcessId, status: ProcessExitStatus) -> Option<ProcessWa
     }
 
     slot.fds.close_all();
+    slot.cwd_dir = None;
     slot.state = ProcessState::Zombie;
     slot.exit_status = Some(status);
     let joiner = slot.joiner;
@@ -748,6 +788,7 @@ struct ForkSnapshot {
     user_image: *const UserElfImage,
     stack: FrameRange,
     fds: FdTable,
+    cwd_dir: usize,
 }
 
 impl ForkSnapshot {
@@ -771,12 +812,14 @@ fn fork_snapshot_current() -> Result<ForkSnapshot, errno::Errno> {
     let table = table_mut();
     let slot = table.slot_mut(parent_pid).ok_or(errno::EINVAL)?;
     let user_image = slot.user_image.as_ref().ok_or(errno::EINVAL)? as *const UserElfImage;
+    let cwd_dir = slot.cwd_dir.ok_or(errno::EINVAL)?;
 
     Ok(ForkSnapshot {
         parent_pid,
         user_image,
         stack: slot.stack,
         fds: slot.fds,
+        cwd_dir,
     })
 }
 
@@ -835,14 +878,14 @@ fn clone_user_stack(
 }
 
 fn stage_exec_image(
-    path_bytes: &[u8],
+    path: &path::ResolvedPath,
     args: &ExecArgs,
 ) -> Result<StagedProcessImage, errno::Errno> {
-    let path = path::root_relative(path_bytes).map_err(path_errno)?;
-    if ramfs::is_dir(&path) {
-        return Err(errno::EACCES);
-    }
-    let image = ramfs::data_by_path(&path).ok_or(errno::ENOENT)?;
+    let file_index = match path.node {
+        path::ResolvedNode::File { file_index } => file_index,
+        path::ResolvedNode::Directory { .. } => return Err(errno::EACCES),
+    };
+    let image = ramfs::data(file_index).ok_or(errno::ENOENT)?;
 
     let address_space = vm::create_user_address_space().map_err(exec_vm_errno)?;
     let mut stack = FrameRange::empty();
@@ -1240,13 +1283,6 @@ fn wait_user_copy_errno(_err: user::UserCopyError) -> errno::Errno {
     errno::EFAULT
 }
 
-fn path_errno(err: path::PathError) -> errno::Errno {
-    match err {
-        path::PathError::Empty => errno::EINVAL,
-        path::PathError::NoMemory => errno::ENOMEM,
-    }
-}
-
 // Process terminal status is single-consumer. A terminal process may be
 // reclaimed only by the registered joiner, if one exists, or by the first
 // thread that atomically consumes an unclaimed terminal process. Reading status
@@ -1319,6 +1355,78 @@ fn free_process_slot(pid: ProcessId) {
             ..ProcessSlot::free()
         };
     }
+}
+
+/// Return the current user process ramfs cwd directory index.
+///
+/// The process-table read runs in a short IRQ-disabled critical section.
+///
+/// # Returns
+///
+/// Returns the stable directory index stored in the current process.
+///
+/// # Errors
+///
+/// Returns `ProcessPathError::NoCurrentProcess` outside a user process, or
+/// `ProcessPathError::InvalidDirectory` if process state lacks a cwd.
+pub(crate) fn current_cwd_dir() -> Result<usize, ProcessPathError> {
+    let pid = sched::current_user_process_id().ok_or(ProcessPathError::NoCurrentProcess)?;
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    let table = table_mut();
+    let slot = table
+        .slot_mut(pid)
+        .ok_or(ProcessPathError::NoCurrentProcess)?;
+    slot.cwd_dir.ok_or(ProcessPathError::InvalidDirectory)
+}
+
+/// Return the current user process canonical absolute cwd pathname.
+///
+/// The stable ramfs lookup occurs after the process-table critical section.
+///
+/// # Returns
+///
+/// Returns a static slice borrowed from the immutable mounted ramfs index.
+///
+/// # Errors
+///
+/// Returns `ProcessPathError::NoCurrentProcess` outside a user process, or
+/// `ProcessPathError::InvalidDirectory` for an invalid stored directory index.
+pub(crate) fn current_cwd_path() -> Result<&'static [u8], ProcessPathError> {
+    let cwd_dir = current_cwd_dir()?;
+    ramfs::dir_path(cwd_dir).ok_or(ProcessPathError::InvalidDirectory)
+}
+
+/// Replace the current user process cwd with a ramfs directory index.
+///
+/// Directory validation happens before the short IRQ-disabled process-table
+/// mutation. No allocation or pathname resolution occurs in the critical
+/// section.
+///
+/// # Arguments
+///
+/// * `dir_index` - Stable index returned by `ramfs::lookup_dir()`.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after updating the current process cwd.
+///
+/// # Errors
+///
+/// Returns `ProcessPathError::InvalidDirectory` for an invalid index, or
+/// `ProcessPathError::NoCurrentProcess` outside a user process.
+pub(crate) fn set_current_cwd(dir_index: usize) -> Result<(), ProcessPathError> {
+    if ramfs::dir_path(dir_index).is_none() {
+        return Err(ProcessPathError::InvalidDirectory);
+    }
+
+    let pid = sched::current_user_process_id().ok_or(ProcessPathError::NoCurrentProcess)?;
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    let table = table_mut();
+    let slot = table
+        .slot_mut(pid)
+        .ok_or(ProcessPathError::NoCurrentProcess)?;
+    slot.cwd_dir = Some(dir_index);
+    Ok(())
 }
 
 /// Open a ramfs regular file in the current user process FD table.

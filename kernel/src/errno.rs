@@ -15,6 +15,7 @@ pub const EISDIR: Errno = 21;
 pub const EINVAL: Errno = 22;
 pub const EMFILE: Errno = 24;
 pub const EROFS: Errno = 30;
+pub const ERANGE: Errno = 34;
 pub const ENAMETOOLONG: Errno = 36;
 pub const ENOSYS: Errno = 38;
 pub const ENOTSUP: Errno = 95;

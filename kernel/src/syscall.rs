@@ -22,6 +22,10 @@ pub const SYS_EXECVE: usize = 6;
 pub const SYS_WAITPID: usize = 7;
 /// Read Linux-like `dirent64` records from a directory file descriptor.
 pub const SYS_GETDENTS64: usize = 8;
+/// Change the current user process working directory.
+pub const SYS_CHDIR: usize = 9;
+/// Copy the current user process canonical working directory to userspace.
+pub const SYS_GETCWD: usize = 10;
 
 const X0: usize = 0;
 const X1: usize = 1;
@@ -106,6 +110,14 @@ pub fn dispatch(frame_words: *mut u64) -> Result<(), DispatchError> {
         }
         SYS_GETDENTS64 => {
             sys_getdents64(frame_words);
+            Ok(())
+        }
+        SYS_CHDIR => {
+            sys_chdir(frame_words);
+            Ok(())
+        }
+        SYS_GETCWD => {
+            sys_getcwd(frame_words);
             Ok(())
         }
         _ => Err(DispatchError::UnknownSyscall(nr)),
@@ -226,17 +238,19 @@ fn sys_open(frame_words: *mut u64) {
 
     let result = (|| {
         validate_open_flags(flags)?;
-        let path = user::copy_path_cstr_from_user(path_ptr).map_err(path_copy_errno)?;
-        let path = path::root_relative(&path).map_err(path_errno)?;
-        if let Some(dir_index) = ramfs::lookup_dir(&path) {
-            return process::open_current_ram_dir(dir_index).map_err(fd_errno);
+        let input = user::copy_path_cstr_from_user(path_ptr).map_err(path_copy_errno)?;
+        let path = resolve_current_path(&input)?;
+        match path.node {
+            path::ResolvedNode::Directory { dir_index } => {
+                process::open_current_ram_dir(dir_index).map_err(fd_errno)
+            }
+            path::ResolvedNode::File { file_index } => {
+                if flags & O_DIRECTORY != 0 {
+                    return Err(errno::ENOTDIR);
+                }
+                process::open_current_ram_file(file_index).map_err(fd_errno)
+            }
         }
-
-        let file_index = ramfs::lookup_file(&path).ok_or(errno::ENOENT)?;
-        if flags & O_DIRECTORY != 0 {
-            return Err(errno::ENOTDIR);
-        }
-        process::open_current_ram_file(file_index).map_err(fd_errno)
     })();
 
     set_return(frame_words, errno::syscall_ret(result));
@@ -265,8 +279,9 @@ fn sys_execve(frame_words: *mut u64) {
     let envp_ptr = frame_word(frame_words, X2) as usize;
 
     let result = (|| {
-        let path = user::copy_path_cstr_from_user(path_ptr).map_err(path_copy_errno)?;
-        let args = process::copy_exec_args_from_user(&path, argv_ptr, envp_ptr)?;
+        let input = user::copy_path_cstr_from_user(path_ptr).map_err(path_copy_errno)?;
+        let path = resolve_current_path(&input)?;
+        let args = process::copy_exec_args_from_user(&path.absolute, argv_ptr, envp_ptr)?;
         process::execve_current(frame_words, path, args)
     })();
 
@@ -355,6 +370,39 @@ fn sys_getdents64_impl(fd: usize, ptr: usize, count: usize) -> Result<usize, err
     Ok(written)
 }
 
+fn sys_chdir(frame_words: *mut u64) {
+    let path_ptr = frame_word(frame_words, X0) as usize;
+    let result = (|| {
+        let input = user::copy_path_cstr_from_user(path_ptr).map_err(path_copy_errno)?;
+        let path = resolve_current_path(&input)?;
+        match path.node {
+            path::ResolvedNode::Directory { dir_index } => {
+                process::set_current_cwd(dir_index).map_err(process_path_errno)?;
+                Ok(0)
+            }
+            path::ResolvedNode::File { .. } => Err(errno::ENOTDIR),
+        }
+    })();
+    set_return(frame_words, errno::syscall_ret(result));
+}
+
+fn sys_getcwd(frame_words: *mut u64) {
+    let ptr = frame_word(frame_words, X0) as usize;
+    let size = frame_word(frame_words, X1) as usize;
+    let result = (|| {
+        let cwd = process::current_cwd_path().map_err(process_path_errno)?;
+        let required = cwd.len().checked_add(1).ok_or(errno::ERANGE)?;
+        if size < required {
+            return Err(errno::ERANGE);
+        }
+
+        user::copy_cstr_to_user(ptr, cwd, crate::limits::GENRT_PATH_MAX + 1)
+            .map_err(user_copy_errno)?;
+        Ok(required)
+    })();
+    set_return(frame_words, errno::syscall_ret(result));
+}
+
 fn validate_open_flags(flags: usize) -> Result<(), errno::Errno> {
     if flags & !SUPPORTED_OPEN_FLAGS != 0 {
         return Err(errno::EINVAL);
@@ -391,7 +439,7 @@ fn user_copy_errno(err: UserCopyError) -> errno::Errno {
 fn path_copy_errno(err: UserCopyError) -> errno::Errno {
     match err {
         UserCopyError::NameTooLong => errno::ENAMETOOLONG,
-        UserCopyError::Empty => errno::EINVAL,
+        UserCopyError::Empty => errno::ENOENT,
         UserCopyError::OutOfMemory => errno::ENOMEM,
         _ => errno::EFAULT,
     }
@@ -399,9 +447,25 @@ fn path_copy_errno(err: UserCopyError) -> errno::Errno {
 
 fn path_errno(err: PathError) -> errno::Errno {
     match err {
-        PathError::Empty => errno::EINVAL,
+        PathError::Empty => errno::ENOENT,
+        PathError::NotFound => errno::ENOENT,
+        PathError::NotDirectory => errno::ENOTDIR,
+        PathError::NameTooLong => errno::ENAMETOOLONG,
+        PathError::InvalidBase => errno::EINVAL,
         PathError::NoMemory => errno::ENOMEM,
     }
+}
+
+fn process_path_errno(err: process::ProcessPathError) -> errno::Errno {
+    match err {
+        process::ProcessPathError::NoCurrentProcess
+        | process::ProcessPathError::InvalidDirectory => errno::EINVAL,
+    }
+}
+
+fn resolve_current_path(input: &[u8]) -> Result<path::ResolvedPath, errno::Errno> {
+    let cwd_dir = process::current_cwd_dir().map_err(process_path_errno)?;
+    path::resolve_existing_path(cwd_dir, input).map_err(path_errno)
 }
 
 fn fd_errno(err: FdError) -> errno::Errno {

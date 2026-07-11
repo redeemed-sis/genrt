@@ -275,6 +275,33 @@ pub fn lookup_dir(path: &[u8]) -> Option<usize> {
     ramfs()?.lookup_dir(path)
 }
 
+/// Return the stable directory index for the mounted ramfs root.
+///
+/// # Returns
+///
+/// Returns `Some(index)` for canonical path `/`, or `None` before ramfs mount.
+pub fn root_dir_index() -> Option<usize> {
+    lookup_dir(b"/")
+}
+
+/// Return the canonical absolute path for a stable ramfs directory index.
+///
+/// Directory indexes remain valid because the mounted initramfs-backed ramfs
+/// is immutable. A future writable VFS must replace this identity with a
+/// refcounted vnode/dentry handle.
+///
+/// # Arguments
+///
+/// * `dir_index` - Directory index returned by `lookup_dir()`.
+///
+/// # Returns
+///
+/// Returns the directory's canonical absolute path, or `None` before mount or
+/// for an invalid index.
+pub fn dir_path(dir_index: usize) -> Option<&'static [u8]> {
+    ramfs()?.dirs.get(dir_index).map(|dir| dir.path.as_slice())
+}
+
 /// Return whether `path` names a mounted ramfs directory.
 ///
 /// # Arguments
