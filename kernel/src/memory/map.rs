@@ -153,7 +153,7 @@ pub(crate) fn push_usable_frame_range(
     range: PhysRange,
 ) -> Result<()> {
     let aligned = FrameRange {
-        start: align_up(range.start, PAGE_SIZE),
+        start: align_up(range.start, PAGE_SIZE).ok_or(MemoryError::AddressOutOfRange)?,
         end: align_down(range.end, PAGE_SIZE),
     };
     if aligned.start >= aligned.end {

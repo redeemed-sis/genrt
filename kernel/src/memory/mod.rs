@@ -18,6 +18,7 @@ pub use types::{
     AddrRange, AddrRegion, FrameRange, PAGE_SIZE, PhysAddr, PhysRange, PhysRegion, RegionKind,
     VirtAddr, VirtRange, VirtRegion,
 };
+pub(crate) use types::{align_down, align_up};
 
 const KERNEL_HEAP_BOOTSTRAP_SIZE: usize = 16 * 1024 * 1024;
 const MAX_RAM_RANGES: usize = 16;

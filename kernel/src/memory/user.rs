@@ -12,7 +12,7 @@
 use alloc::vec::Vec;
 
 use super::{
-    PAGE_SIZE, VirtAddr,
+    PAGE_SIZE, VirtAddr, align_down,
     vm::{self, UserMappingInfo},
 };
 
@@ -199,8 +199,4 @@ fn check_mapping(mapping: UserMappingInfo, access: AccessKind) -> Result<(), Use
         AccessKind::Write if !mapping.writable => Err(UserCopyError::NotWritable),
         _ => Ok(()),
     }
-}
-
-const fn align_down(value: usize, align: usize) -> usize {
-    (value / align) * align
 }

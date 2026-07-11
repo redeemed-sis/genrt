@@ -61,14 +61,37 @@ impl AddrRange<usize> {
     }
 }
 
+/// Round `value` up to the next `align` boundary.
+///
+/// # Arguments
+///
+/// * `value` - Address or size to round up.
+/// * `align` - Required alignment. `0` is treated as "no alignment" and returns
+///   `value`.
+///
+/// # Returns
+///
+/// Returns `Some(aligned)` when the rounded value fits in `usize`. Returns
+/// `None` if rounding would overflow.
 #[inline(always)]
-pub(crate) fn align_up(value: usize, align: usize) -> usize {
+pub(crate) fn align_up(value: usize, align: usize) -> Option<usize> {
     if align == 0 {
-        return value;
+        return Some(value);
     }
-    value.div_ceil(align).saturating_mul(align)
+    Some(value.checked_add(align.checked_sub(1)?)? / align * align)
 }
 
+/// Round `value` down to the previous `align` boundary.
+///
+/// # Arguments
+///
+/// * `value` - Address or size to round down.
+/// * `align` - Required alignment. `0` is treated as "no alignment" and returns
+///   `value`.
+///
+/// # Returns
+///
+/// Returns the greatest aligned value that is less than or equal to `value`.
 #[inline(always)]
 pub(crate) fn align_down(value: usize, align: usize) -> usize {
     if align == 0 {

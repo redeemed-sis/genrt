@@ -176,8 +176,9 @@ fn load_segment(
         .ok_or(ElfLoadError::SegmentAddressOverflow)?;
     validate_user_range(vaddr, memsz)?;
 
-    let map_start = align_down(vaddr, PAGE_SIZE);
-    let map_end = align_up(seg_end, PAGE_SIZE).ok_or(ElfLoadError::SegmentAddressOverflow)?;
+    let map_start = memory::align_down(vaddr, PAGE_SIZE);
+    let map_end =
+        memory::align_up(seg_end, PAGE_SIZE).ok_or(ElfLoadError::SegmentAddressOverflow)?;
     validate_user_range(map_start, map_end - map_start)?;
     let map_size = map_end
         .checked_sub(map_start)
@@ -290,16 +291,6 @@ fn map_flags_from_program_flags(flags: u32) -> UserMapFlags {
 
 fn u64_to_usize(value: u64) -> Result<usize, ElfLoadError> {
     usize::try_from(value).map_err(|_| ElfLoadError::SegmentAddressOverflow)
-}
-
-fn align_down(value: usize, align: usize) -> usize {
-    (value / align) * align
-}
-
-fn align_up(value: usize, align: usize) -> Option<usize> {
-    value
-        .checked_add(align - 1)
-        .map(|value| align_down(value, align))
 }
 
 fn map_vm_error(err: VmError) -> ElfLoadError {
