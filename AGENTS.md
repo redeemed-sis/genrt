@@ -8,6 +8,9 @@ This repository contains a hard real-time OS project. Changes must preserve dete
 - Do not introduce heap allocation in interrupt context or scheduler core.
 - Keep `unsafe` localized and document its invariants.
 - Do not widen architecture-specific code into generic kernel code without an ADR.
+- New or changed public and `pub(crate)` Rust APIs must have rustdoc that
+  documents purpose, all arguments, return values, and error cases. Include
+  `# Safety` / `# Panics` sections when relevant.
 
 ## Main commands
 - `just help`
