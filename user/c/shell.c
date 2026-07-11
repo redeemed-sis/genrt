@@ -176,8 +176,8 @@ static void run_command(char *line) {
         puts_lit("wait failed\n");
         return;
     }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        puts_lit("command failed\n");
+    if (!WIFEXITED(status)) {
+        puts_lit("command faulted\n");
     }
 }
 

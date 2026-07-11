@@ -50,6 +50,8 @@ enum Commands {
     BuildUserReadFile,
     BuildUserShell,
     BuildUserEcho,
+    BuildUserCat,
+    BuildUserLs,
     BuildInitramfs {
         #[arg(long)]
         root: Option<PathBuf>,
@@ -134,6 +136,12 @@ fn main() -> Result<()> {
         }
         Commands::BuildUserEcho => {
             build_aarch64_user_elf("echo", "user/c/echo.c", echo_user_elf_path()).map(|_| ())
+        }
+        Commands::BuildUserCat => {
+            build_aarch64_user_elf("cat", "user/c/cat.c", cat_user_elf_path()).map(|_| ())
+        }
+        Commands::BuildUserLs => {
+            build_aarch64_user_elf("ls", "user/c/ls.c", ls_user_elf_path()).map(|_| ())
         }
         Commands::BuildInitramfs { root, init, output } => {
             build_initramfs(root, init, output).map(|_| ())
@@ -435,6 +443,14 @@ fn echo_user_elf_path() -> PathBuf {
     PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/echo.elf"))
 }
 
+fn cat_user_elf_path() -> PathBuf {
+    PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/cat.elf"))
+}
+
+fn ls_user_elf_path() -> PathBuf {
+    PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/ls.elf"))
+}
+
 fn default_initramfs_path() -> PathBuf {
     PathBuf::from(format!("target/{AARCH64_TARGET}/debug/initramfs.cpio"))
 }
@@ -475,6 +491,8 @@ fn build_initramfs(
         None => build_aarch64_user_elf("shell", "user/c/shell.c", shell_user_elf_path())?,
     };
     let echo = build_aarch64_user_elf("echo", "user/c/echo.c", echo_user_elf_path())?;
+    let cat = build_aarch64_user_elf("cat", "user/c/cat.c", cat_user_elf_path())?;
+    let ls = build_aarch64_user_elf("ls", "user/c/ls.c", ls_user_elf_path())?;
 
     let output = output.unwrap_or_else(default_initramfs_path);
     let staging = initramfs_staging_root();
@@ -503,25 +521,32 @@ fn build_initramfs(
     let staged_bin = staging.join("bin");
     fs::create_dir_all(&staged_bin)
         .with_context(|| format!("failed to create {}", staged_bin.display()))?;
-    let staged_echo = staged_bin.join("echo");
-    if staged_echo.exists() {
-        bail!(
-            "initramfs root {} already contains bin/echo; remove it or build a custom archive",
-            root.display()
-        );
-    }
-    fs::copy(&echo, &staged_echo).with_context(|| {
-        format!(
-            "failed to stage echo ELF {} as {}",
-            echo.display(),
-            staged_echo.display()
-        )
-    })?;
+    stage_bin_elf(&root, &staged_bin, "echo", &echo)?;
+    stage_bin_elf(&root, &staged_bin, "cat", &cat)?;
+    stage_bin_elf(&root, &staged_bin, "ls", &ls)?;
 
     write_initramfs_cpio(&staging, &output)?;
     let size = validate_initramfs_payload(&output)?;
     println!("built {} ({} bytes)", output.display(), size);
     Ok(output)
+}
+
+fn stage_bin_elf(root: &Path, staged_bin: &Path, name: &str, elf: &Path) -> Result<()> {
+    let staged = staged_bin.join(name);
+    if staged.exists() {
+        bail!(
+            "initramfs root {} already contains bin/{name}; remove it or build a custom archive",
+            root.display()
+        );
+    }
+    fs::copy(elf, &staged).with_context(|| {
+        format!(
+            "failed to stage {name} ELF {} as {}",
+            elf.display(),
+            staged.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[derive(Debug)]

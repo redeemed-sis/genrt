@@ -40,6 +40,12 @@ build-user-shell:
 build-user-echo:
     cargo xtask build-user-echo
 
+build-user-cat:
+    cargo xtask build-user-cat
+
+build-user-ls:
+    cargo xtask build-user-ls
+
 build-initramfs:
     cargo xtask build-initramfs
 
