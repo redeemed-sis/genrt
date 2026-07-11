@@ -13,6 +13,11 @@
 #define SYS_EXECVE 6
 #define SYS_WAITPID 7
 #define SYS_GETDENTS64 8
+#define SYS_CHDIR 9
+#define SYS_GETCWD 10
+
+#define GENRT_PATH_MAX 4096
+#define PATH_MAX GENRT_PATH_MAX
 
 typedef long ssize_t;
 typedef unsigned long size_t;
@@ -47,6 +52,23 @@ static inline long genrt_syscall0(long nr) {
     register long x8 __asm__("x8") = nr;
 
     __asm__ volatile("svc #0" : "=r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+static inline long genrt_syscall1(long nr, long a0) {
+    register long x0 __asm__("x0") = a0;
+    register long x8 __asm__("x8") = nr;
+
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+
+static inline long genrt_syscall2(long nr, long a0, long a1) {
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x8 __asm__("x8") = nr;
+
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory");
     return x0;
 }
 
@@ -95,6 +117,15 @@ static inline pid_t waitpid(pid_t pid, int *status, int options) {
 
 static inline long getdents64(int fd, void *dirp, size_t count) {
     return genrt_syscall3(SYS_GETDENTS64, fd, (long)dirp, (long)count);
+}
+
+static inline int chdir(const char *path) {
+    return (int)genrt_syscall1(SYS_CHDIR, (long)path);
+}
+
+static inline char *getcwd(char *buf, size_t size) {
+    long result = genrt_syscall2(SYS_GETCWD, (long)buf, (long)size);
+    return result < 0 ? NULL : buf;
 }
 
 __attribute__((noreturn)) static inline void _exit(int code) {

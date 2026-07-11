@@ -51,7 +51,7 @@ static int list_path(const char *path) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        return list_path("/");
+        return list_path(".");
     }
 
     int failed = 0;

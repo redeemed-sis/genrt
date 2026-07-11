@@ -52,6 +52,7 @@ enum Commands {
     BuildUserEcho,
     BuildUserCat,
     BuildUserLs,
+    BuildUserPwd,
     BuildInitramfs {
         #[arg(long)]
         root: Option<PathBuf>,
@@ -142,6 +143,9 @@ fn main() -> Result<()> {
         }
         Commands::BuildUserLs => {
             build_aarch64_user_elf("ls", "user/c/ls.c", ls_user_elf_path()).map(|_| ())
+        }
+        Commands::BuildUserPwd => {
+            build_aarch64_user_elf("pwd", "user/c/pwd.c", pwd_user_elf_path()).map(|_| ())
         }
         Commands::BuildInitramfs { root, init, output } => {
             build_initramfs(root, init, output).map(|_| ())
@@ -451,6 +455,10 @@ fn ls_user_elf_path() -> PathBuf {
     PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/ls.elf"))
 }
 
+fn pwd_user_elf_path() -> PathBuf {
+    PathBuf::from(format!("target/{AARCH64_TARGET}/debug/user/pwd.elf"))
+}
+
 fn default_initramfs_path() -> PathBuf {
     PathBuf::from(format!("target/{AARCH64_TARGET}/debug/initramfs.cpio"))
 }
@@ -493,6 +501,7 @@ fn build_initramfs(
     let echo = build_aarch64_user_elf("echo", "user/c/echo.c", echo_user_elf_path())?;
     let cat = build_aarch64_user_elf("cat", "user/c/cat.c", cat_user_elf_path())?;
     let ls = build_aarch64_user_elf("ls", "user/c/ls.c", ls_user_elf_path())?;
+    let pwd = build_aarch64_user_elf("pwd", "user/c/pwd.c", pwd_user_elf_path())?;
 
     let output = output.unwrap_or_else(default_initramfs_path);
     let staging = initramfs_staging_root();
@@ -524,6 +533,7 @@ fn build_initramfs(
     stage_bin_elf(&root, &staged_bin, "echo", &echo)?;
     stage_bin_elf(&root, &staged_bin, "cat", &cat)?;
     stage_bin_elf(&root, &staged_bin, "ls", &ls)?;
+    stage_bin_elf(&root, &staged_bin, "pwd", &pwd)?;
 
     write_initramfs_cpio(&staging, &output)?;
     let size = validate_initramfs_payload(&output)?;

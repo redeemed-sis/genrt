@@ -146,6 +146,17 @@ static void run_command(char *line) {
     if (streq(argv[0], "exit")) {
         exit(0);
     }
+    if (streq(argv[0], "cd")) {
+        if (argc > 2) {
+            puts_lit("cd: usage\n");
+            return;
+        }
+        const char *target = argc == 1 ? "/" : argv[1];
+        if (chdir(target) < 0) {
+            puts_lit("cd: failed\n");
+        }
+        return;
+    }
 
     if (argv[0][0] == '/' && argc == 1 && !starts_with(argv[0], "/bin/")) {
         print_file(argv[0]);

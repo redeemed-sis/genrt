@@ -46,6 +46,9 @@ build-user-cat:
 build-user-ls:
     cargo xtask build-user-ls
 
+build-user-pwd:
+    cargo xtask build-user-pwd
+
 build-initramfs:
     cargo xtask build-initramfs
 
