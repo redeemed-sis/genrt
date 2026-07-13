@@ -1,6 +1,7 @@
 # ADR-0012: Bounded Mailbox IPC for Kernel Tasks
 
 ## Status
+
 Accepted
 
 ## Context

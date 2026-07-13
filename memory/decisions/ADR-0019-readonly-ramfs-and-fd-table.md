@@ -1,6 +1,7 @@
 # ADR-0019: Readonly ramfs and POSIX-like FD table
 
 ## Status
+
 Accepted
 
 Superseded for filesystem backing by

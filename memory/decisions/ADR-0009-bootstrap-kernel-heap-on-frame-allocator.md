@@ -1,6 +1,7 @@
 # ADR-0009: Bootstrap Kernel Heap on Top of Contiguous Frame Allocation
 
 ## Status
+
 Accepted
 
 ## Context

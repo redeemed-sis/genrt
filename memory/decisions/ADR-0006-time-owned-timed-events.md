@@ -1,6 +1,7 @@
 # ADR-0006: Time-Owned Timed Events
 
 ## Status
+
 Accepted
 
 ## Context

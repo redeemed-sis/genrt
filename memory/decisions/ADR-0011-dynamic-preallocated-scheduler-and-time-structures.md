@@ -1,6 +1,7 @@
 # ADR-0011: Dynamic Preallocated Scheduler and Time Structures
 
 ## Status
+
 Accepted
 
 ## Context

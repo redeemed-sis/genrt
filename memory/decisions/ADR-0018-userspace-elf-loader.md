@@ -1,6 +1,7 @@
 # ADR-0018: Userspace ELF Loader Only
 
 ## Status
+
 Accepted
 
 ## Context

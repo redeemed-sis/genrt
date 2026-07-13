@@ -1,6 +1,7 @@
 # ADR-0002: AArch64 IRQ Path via GICv2 + Architected Physical Timer
 
 ## Status
+
 Accepted
 
 ## Context

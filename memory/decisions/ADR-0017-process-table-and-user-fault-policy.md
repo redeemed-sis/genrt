@@ -1,6 +1,7 @@
 # ADR-0017: Bounded Process Table And User Fault Policy
 
 ## Status
+
 Accepted
 
 ## Context

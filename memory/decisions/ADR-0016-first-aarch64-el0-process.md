@@ -1,6 +1,7 @@
 # ADR-0016: First AArch64 EL0 Process Bring-Up
 
 ## Status
+
 Accepted
 
 ## Context

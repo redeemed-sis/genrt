@@ -1,6 +1,7 @@
 # ADR-0013: Mailbox Timeout Semantics
 
 ## Status
+
 Accepted
 
 ## Context

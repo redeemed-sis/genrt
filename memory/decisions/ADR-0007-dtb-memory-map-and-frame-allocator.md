@@ -1,6 +1,7 @@
 # ADR-0007: DTB Memory Map and Physical Frame Allocator
 
 ## Status
+
 Accepted
 
 ## Context

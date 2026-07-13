@@ -1,6 +1,7 @@
 # ADR-0014: Bounded Kernel Thread Lifecycle
 
 ## Status
+
 Accepted
 
 ## Context

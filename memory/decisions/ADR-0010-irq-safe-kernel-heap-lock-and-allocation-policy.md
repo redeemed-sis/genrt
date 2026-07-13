@@ -1,6 +1,7 @@
 # ADR-0010: IRQ-Safe Kernel Heap Lock and Allocation Policy
 
 ## Status
+
 Accepted
 
 ## Context

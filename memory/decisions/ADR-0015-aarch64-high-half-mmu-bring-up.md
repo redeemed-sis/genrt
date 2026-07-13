@@ -1,6 +1,7 @@
 # ADR-0015: AArch64 High-Half MMU Bring-Up
 
 ## Status
+
 Accepted
 
 ## Context

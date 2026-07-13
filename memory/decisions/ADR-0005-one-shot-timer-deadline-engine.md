@@ -1,6 +1,7 @@
 # ADR-0005: One-Shot Timer Deadline Engine
 
 ## Status
+
 Accepted
 
 ## Context

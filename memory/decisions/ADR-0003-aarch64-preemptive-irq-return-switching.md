@@ -1,6 +1,7 @@
 # ADR-0003: AArch64 Preemptive IRQ-Return Context Switching
 
 ## Status
+
 Accepted
 
 ## Context

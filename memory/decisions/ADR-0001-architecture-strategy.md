@@ -1,6 +1,7 @@
 # ADR-0001: Start with AArch64 on QEMU virt
 
 ## Status
+
 Accepted
 
 ## Context

@@ -1,6 +1,7 @@
 # ADR-0004: AArch64 Boot/Exception Separation and Fatal Exception Path
 
 ## Status
+
 Accepted
 
 ## Context
