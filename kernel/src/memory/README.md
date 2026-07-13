@@ -1,0 +1,61 @@
+# Memory subsystem
+
+The generic memory layer owns physical-resource policy and architecture-neutral
+VM contracts. AArch64 page-table encodings and register operations remain in
+`arch/aarch64`.
+
+## Bootstrap and physical map
+
+`memory::init` consumes `BootInfo`, normalizes DTB RAM ranges, and carves out the
+kernel image, boot stack, DTB, and initramfs loader window. Fixed-capacity arrays
+bound early range processing. The frame allocator manages page-aligned physical
+frames and stores free-list metadata through explicit high direct-map aliases.
+
+The bootstrap heap is one contiguous 16 MiB frame range. Once allocated, it is
+removed from the frame free list and initialized through its HVA. Allocation is
+allowed during bootstrap and task context, with local IRQ exclusion around the
+single-core allocator lock.
+
+## Kernel mappings
+
+TTBR1 is the kernel address-space owner. Boot-owned tables establish the first
+high mappings; runtime tables are allocated from the frame allocator and become
+active before mutable VM APIs are enabled. Mapping mutation before that switch
+returns `VmError::NotInitialized`, preventing lost mappings or accidental
+reclaim of `.boot.bss` page tables.
+
+The VM API exposes explicit physical/direct-map conversion, translation, and
+kernel map/unmap/protect operations. Current kernel region mutation is limited
+to its documented alignment and granularity.
+
+## User address spaces
+
+Each process owns an allocator-backed TTBR0 root. User ELF segments and stacks
+use 4 KiB page mappings with descriptor-derived user, write, and execute
+permissions. Scheduler handoff activates the selected user root or clears TTBR0
+for a kernel thread.
+
+Address-space destruction walks allocator-owned tables only. ELF segment and
+stack frames have separate ownership and are released by process lifecycle
+cleanup; QEMU/initramfs source bytes are not process-owned frames.
+
+## User copies
+
+`memory::user` validates complete multi-page ranges against the current active
+user address space and actual page permissions. Read and write validation are
+separate. Copies are bounded and intended for syscall/trap context where active
+TTBR0 matches the current process.
+
+The current copy loop assumes mappings stay stable and has no exception-table
+fault recovery if an actual load/store faults after validation. Future recovery
+belongs inside this module, not in individual syscalls.
+
+## Fast-path rules
+
+- No heap allocation in IRQ, scheduler, or timed-event paths.
+- Preallocate dynamic scheduler/time capacity before enabling those paths.
+- Convert PA to HVA only at explicit dereference boundaries.
+- Do not free boot tables through the runtime allocator.
+- Keep user-copy, parsing, and frame destruction outside IRQ-disabled sections.
+
+Related decisions: ADR-0007, ADR-0009 through ADR-0011, ADR-0015, and ADR-0016.

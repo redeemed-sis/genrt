@@ -31,10 +31,10 @@ The production initramfs is not driven through a content-specific shell smoke.
 Instead, xtask reopens the newc archive and compares every canonical path,
 kind, mode, size, and SHA-256 with its generated manifest. Executable entries
 must be ELF64 little-endian AArch64 `ET_EXEC`; duplicates, traversal paths,
-non-production provenance, the retained `.genrt.test_marker` section, and its
+non-production provenance, test-marker metadata, and the
 `GENRT_TEST_ARTIFACT_V1` payload are rejected. Executable protocol magic is an
-additional defense-in-depth check. Human documentation may mention the protocol, and ordinary
-`test`/`fixtures` path names are not reserved. Repeated serialization of the
+additional defense-in-depth check. Human documentation may mention the
+protocol, and ordinary `test`/`fixtures` path names are not reserved. Repeated serialization of the
 same staging tree must be byte-identical.
 
 ## Bundle

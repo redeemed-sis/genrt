@@ -92,10 +92,12 @@ Each case writes `serial.log`, `qemu-stderr.log`, and `result.json` below
 `target/test-results/<case>/`; the suite writes `summary.json`. Failure output
 includes the serial tail and full log path.
 
-Test protocol implementations carry `GENRT_TEST_ARTIFACT_V1` in a retained
-`.genrt.test_marker` ELF section. Production verification rejects that section
-or marker in the kernel and executable initramfs entries, rejects protocol code
-as defense in depth, and also enforces provenance. Test files live below the reserved
+Test protocol implementations carry the retained
+`GENRT_TEST_ARTIFACT_V1` payload. Test userspace keeps it in a dedicated
+`.genrt.test_marker` ELF section; the test kernel linker folds the test-only
+input section into high-linked rodata so production ELF metadata does not name
+the section. Production verification rejects marker payloads/metadata and
+protocol code, and also enforces provenance. Test files live below the reserved
 `/.__genrt_test__/` namespace and carry explicit fixture/supervisor provenance
 in generated manifests; ordinary names such as `/test` and `/fixtures` remain
 available to products.

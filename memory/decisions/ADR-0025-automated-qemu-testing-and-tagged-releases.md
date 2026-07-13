@@ -18,9 +18,11 @@ allows a userspace test to report success before its process is reaped.
 - Test-enabled kernels and test-only userspace use the versioned
   `RS GTRT/1|producer|seq|event|subject|detail` protocol. Production kernel and
   release initramfs contain neither its implementation nor its magic strings.
-  Test artifacts carry `GENRT_TEST_ARTIFACT_V1` in a retained
-  `.genrt.test_marker` section so artifact classification does not depend on
-  how the wire record is assembled at runtime.
+  Test artifacts carry retained `GENRT_TEST_ARTIFACT_V1` bytes so artifact
+  classification does not depend on how the wire record is assembled at
+  runtime. Test userspace keeps a dedicated `.genrt.test_marker` output
+  section; the kernel folds its test-only input section into high-linked
+  rodata so production ELF metadata does not name the test section.
 - Kernel contracts run with scenario-specific `qemu-test` features. System
   contracts run the byte-identical production kernel with controlled test
   initramfs images.
