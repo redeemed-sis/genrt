@@ -1,7 +1,7 @@
 /target/
+/dist/
 /.idea/
 /.DS_Store
-Cargo.lock
 *.log
 *.elf
 *.bin

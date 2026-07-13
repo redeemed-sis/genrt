@@ -1,5 +1,5 @@
 [alias]
-xtask = "run -p xtask --"
+xtask = "run --locked -p xtask --"
 
 [build]
 target-dir = "target"

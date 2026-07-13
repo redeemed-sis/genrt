@@ -7,10 +7,10 @@ pub(crate) fn kernel_init_thread(_arg: sched::ThreadArg) -> usize {
     match process::spawn_first_user_process() {
         Ok(pid) => match process::process_join(pid) {
             Ok(process::ProcessExitStatus::Exited(code)) => {
-                crate::info!("init: user process exited code={code}")
+                crate::info!("init: user process exited code={code}");
             }
             Ok(process::ProcessExitStatus::Faulted(fault)) => {
-                crate::warn!("init: user process faulted kind={:?}", fault.kind)
+                crate::warn!("init: user process faulted kind={:?}", fault.kind);
             }
             Err(err) => crate::error!("init: user process join failed: {err:?}"),
         },
