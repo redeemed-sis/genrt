@@ -40,7 +40,6 @@ pub(crate) enum Commands {
         #[arg(long, default_value = "dist")]
         output_dir: PathBuf,
     },
-    Phase0Check,
     RepoTree,
     QemuCmd {
         #[arg(long, value_enum)]

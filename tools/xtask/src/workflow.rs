@@ -53,7 +53,6 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         }),
         Commands::Ci => ci(),
         Commands::Dist { tag, output_dir } => crate::dist::run(&tag, &output_dir),
-        Commands::Phase0Check => phase0_check(),
         Commands::RepoTree => repo_tree(),
         Commands::QemuCmd {
             arch,
@@ -207,47 +206,25 @@ fn ci() -> Result<()> {
     crate::test::run(crate::test::Options::ci_default())
 }
 
-fn phase0_check() -> Result<()> {
-    let required_paths = [
-        "AGENTS.md",
-        "justfile",
-        "rust-toolchain.toml",
-        "ai-docs/decision-records/ADR-0001-architecture-strategy.md",
-        "ai-docs/commits.md",
-        "ai-docs/debugging.md",
-        "tools/xtask/src/main.rs",
-        "kernel/src/lib.rs",
-        "crates/bootinfo/src/lib.rs",
-        "arch/aarch64/src/boot.s",
-        "arch/aarch64/link/qemu-virt.ld",
-    ];
-
-    println!("== phase 0 week 1 + week 2 checklist ==");
-    for path in required_paths {
-        ensure_exists(path)?;
-        println!("[ok] {path}");
-    }
-
-    println!("\nPhase 0 / Week 1 scaffold and Week 2 AArch64 bring-up files are present.");
-    Ok(())
-}
-
 fn repo_tree() -> Result<()> {
     println!("genrt/");
     for line in [
+        "├── .agents/",
+        "├── .codex/",
         "├── AGENTS.md",
         "├── Cargo.toml",
         "├── justfile",
         "├── rust-toolchain.toml",
-        "├── kernel/",
         "├── arch/",
-        "├── platform/",
+        "├── kernel/",
         "├── crates/",
         "├── drivers/",
-        "├── tools/xtask/",
+        "├── platform/",
+        "├── user/",
         "├── tests/",
-        "├── docs/",
-        "└── ai-docs/",
+        "├── tools/xtask/",
+        "├── memory/",
+        "└── docs/",
     ] {
         println!("{line}");
     }

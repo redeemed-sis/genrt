@@ -21,9 +21,6 @@ ci:
 dist tag output_dir="dist":
     cargo xtask dist --tag {{ tag }} --output-dir {{ output_dir }}
 
-phase0-check:
-    cargo xtask phase0-check
-
 qemu-cmd-aarch64 initramfs="":
     cargo xtask qemu-cmd --arch aarch64 {{ if initramfs != "" { "--initramfs " + initramfs } else { "" } }}
 
