@@ -70,6 +70,12 @@ The current AArch64 path already has:
 * lower-EL user fault policy that terminates the current process instead of panicking the kernel
 * minimal allocation-free formatted logging with log levels
 * improved fatal exception diagnostics
+* Rust-hosted black-box QEMU test runner with declarative serial scenarios
+* versioned test-only QEMU protocol and isolated contract initramfs images
+* declarative `user/c/programs.toml` release composition plus a one-to-one
+  `tests/qemu/program-contracts.toml` dynamic invocation plan
+* pinned Rust toolchain and tracked Cargo.lock for reproducible dependency resolution
+* tagged-release packaging of dynamically tested and structurally verified production artifacts
 * `xtask` post-link `.boot.text` autonomy check using `readelf` and `llvm-objdump`
 
 In one sentence:
@@ -440,6 +446,43 @@ cargo xtask run-aarch64 --log-level trace
 cargo xtask build-initramfs --root user/initramfs --output target/aarch64-unknown-none-softfloat/debug/initramfs.cpio
 ```
 
+### Local verification
+
+~~~bash
+cargo xtask doctor
+cargo xtask check
+cargo xtask test-aarch64 --list
+cargo xtask test-aarch64
+cargo xtask test-aarch64 --case shell-contract
+cargo xtask ci
+~~~
+
+check runs formatting, host tests, xtask clippy, the AArch64 build and post-link
+boot-autonomy check, and all production userspace/initramfs builds.
+test-aarch64 runs declarative cases from tests/qemu/cases/; serial logs and
+machine-readable results are written below target/test-results/. See
+docs/testing.md for the protocol, timeout model, and case authoring.
+
+### CI
+
+Pull requests and pushes to main or dev run the same xtask commands on
+ubuntu-24.04. Workflow code installs tools and delegates repository semantics
+to xtask; failed QEMU logs are retained for 14 days. CI jobs have read-only
+repository contents permission.
+
+### Releases
+
+Tags such as v0.2.0 or v0.3.0-rc.1 trigger a release gate. Locally:
+
+~~~bash
+cargo xtask dist --tag v0.0.0-test.1 --output-dir /tmp/genrt-dist
+~~~
+
+The command runs all checks and contract suites, dynamically tests the exact
+production kernel and userspace ELF files in controlled test initramfs images,
+then structurally verifies and packages the release initramfs without rebuilding
+it. See docs/releases.md for manifest, tag, and rerun semantics.
+
 Interactive shell:
 
 ```bash
@@ -454,11 +497,17 @@ logs so UART input remains readable. Default QEMU runs load
 `target/aarch64-unknown-none-softfloat/debug/initramfs.cpio` at the reserved
 initramfs physical window.
 
-QEMU is run with `-serial mon:stdio`, so stdin goes to the emulated UART while
-QEMU monitor escape commands are still available:
+QEMU is run with `-display none -monitor none -serial stdio`. stdin goes
+directly to the emulated UART and the QEMU monitor cannot consume shell input.
+Use `Ctrl-c` to terminate an interactive local run.
 
-* `Ctrl-a x` exits QEMU.
-* `Ctrl-a c` switches between serial and monitor.
+## Definition of Done
+
+A change is ready when the workspace remains reproducible from the tracked
+lockfile/toolchain, cargo xtask check passes, the relevant QEMU case or full
+cargo xtask test-aarch64 suite passes, and git diff --check reports no whitespace
+errors. Release changes additionally require cargo xtask dist to pass production
+contract tests, structural image verification, and checksum verification.
 
 ## Immediate priorities
 
@@ -474,6 +523,8 @@ The best next steps are:
 
 * `docs/month1-plan.md` — month 1 closure and actual outcome
 * `docs/month2-plan.md` — roadmap for the next month
+* `docs/testing.md` — local/CI QEMU test runner and case format
+* `docs/releases.md` — tagged release gate and bundle format
 * `ai-docs/rustdoc.md` — rustdoc contract for public and crate-visible APIs
 * `ai-docs/decision-records/ADR-0001-architecture-strategy.md`
 * `ai-docs/decision-records/ADR-0002-aarch64-irq-path-gicv2-timer.md`
@@ -499,3 +550,4 @@ The best next steps are:
 * `ai-docs/decision-records/ADR-0022-fork-exec-waitpid-echo.md`
 * `ai-docs/decision-records/ADR-0023-directory-fds-and-getdents64.md`
 * `ai-docs/decision-records/ADR-0024-process-cwd-and-path-resolution.md`
+* `ai-docs/decision-records/ADR-0025-automated-qemu-testing-and-tagged-releases.md`

@@ -16,11 +16,18 @@ This repository contains a hard real-time OS project. Changes must preserve dete
 - `just help`
 - `just doctor`
 - `just phase0-check`
+- `cargo xtask check`
+- `cargo xtask test-aarch64`
+- `cargo xtask ci`
+- `cargo xtask dist --tag vX.Y.Z --output-dir dist`
 - `just qemu-cmd-aarch64`
 - `just gdb-cmd-aarch64`
 
 ## Definition of done
 - Workspace builds.
 - Phase 0 checks pass.
+- Host checks and the AArch64 QEMU suite pass.
+- Release artifacts are produced only after production contract tests and
+  structural initramfs verification.
 - Commands are reproducible from repo root.
 - Any architectural decision is captured in `ai-docs/decision-records/`.
