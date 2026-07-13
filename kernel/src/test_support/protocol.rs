@@ -45,9 +45,6 @@ impl Write for RecordBuffer {
 }
 
 fn emit(event: &str, subject: &str, detail: Option<&str>) {
-    // SAFETY: the marker is a valid static byte. The volatile read creates a
-    // retained reference so the dedicated ELF section survives link GC.
-    unsafe { core::ptr::read_volatile(TEST_ARTIFACT_MARKER.as_ptr()) };
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let mut record = RecordBuffer::new();
     let mut result = write!(record, "\x1eGTRT/1|kernel|{sequence:06}|{event}|{subject}");

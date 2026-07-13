@@ -44,6 +44,13 @@ SECTIONS
 
     .rodata : AT(ADDR(.rodata) - KERNEL_HVA_OFFSET) ALIGN(4K) {
         *(.rodata .rodata.*)
+        /*
+         * Test-enabled kernels retain their artifact identity marker here.
+         * Folding the test-only input section into high-linked rodata avoids
+         * linker-dependent orphan placement without adding a test section
+         * name to production ELF metadata.
+         */
+        KEEP(*(.genrt.test_marker))
         . = ALIGN(8);
         __kernel_image_phys_start_value = .;
         QUAD(__kernel_image_phys_start);
