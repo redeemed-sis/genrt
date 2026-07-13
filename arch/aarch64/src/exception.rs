@@ -226,15 +226,17 @@ fn user_fault_kind(raw_esr: u64) -> kernel::process::UserFaultKind {
     let fault_status = iss & 0x3f;
 
     match ec {
-        esr::EC_INST_ABORT_LOWER | esr::EC_DATA_ABORT_LOWER
-            if is_translation_fault(fault_status) =>
-        {
-            kernel::process::UserFaultKind::TranslationFault
+        esr::EC_INST_ABORT_LOWER if is_translation_fault(fault_status) => {
+            kernel::process::UserFaultKind::InstructionTranslationFault
         }
-        esr::EC_INST_ABORT_LOWER | esr::EC_DATA_ABORT_LOWER
-            if is_permission_fault(fault_status) =>
-        {
-            kernel::process::UserFaultKind::PermissionFault
+        esr::EC_DATA_ABORT_LOWER if is_translation_fault(fault_status) => {
+            kernel::process::UserFaultKind::DataTranslationFault
+        }
+        esr::EC_INST_ABORT_LOWER if is_permission_fault(fault_status) => {
+            kernel::process::UserFaultKind::InstructionPermissionFault
+        }
+        esr::EC_DATA_ABORT_LOWER if is_permission_fault(fault_status) => {
+            kernel::process::UserFaultKind::DataPermissionFault
         }
         esr::EC_INST_ABORT_LOWER => kernel::process::UserFaultKind::InstructionAbort,
         esr::EC_DATA_ABORT_LOWER => kernel::process::UserFaultKind::DataAbort,

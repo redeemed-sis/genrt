@@ -124,12 +124,23 @@ impl UserFault {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+/// Stable classification of a fault attributed to a lower-EL process.
 pub enum UserFaultKind {
+    /// Userspace requested a syscall number not implemented by the kernel.
     UnknownSyscall(usize),
+    /// Non-translation/non-permission instruction abort.
     InstructionAbort,
+    /// Non-translation/non-permission data abort.
     DataAbort,
-    PermissionFault,
-    TranslationFault,
+    /// Instruction fetch failed address translation.
+    InstructionTranslationFault,
+    /// Data access failed address translation.
+    DataTranslationFault,
+    /// Instruction fetch violated page permissions.
+    InstructionPermissionFault,
+    /// Data access violated page permissions.
+    DataPermissionFault,
+    /// Other lower-EL synchronous exception.
     OtherSync,
 }
 
