@@ -55,18 +55,6 @@ pub(crate) struct BootPlatformInfo {
 
 impl BootPlatformInfo {
     #[unsafe(link_section = ".boot.text")]
-    pub(crate) const fn zeroed() -> Self {
-        Self {
-            dtb_pa: 0,
-            dtb_size: 0,
-            ram: BootDeviceRange { start: 0, size: 0 },
-            uart: BootDeviceRange { start: 0, size: 0 },
-            gic_distributor: BootDeviceRange { start: 0, size: 0 },
-            gic_cpu_interface: BootDeviceRange { start: 0, size: 0 },
-        }
-    }
-
-    #[unsafe(link_section = ".boot.text")]
     fn reset(&mut self, dtb_pa: usize) {
         self.dtb_pa = dtb_pa;
         self.dtb_size = 0;

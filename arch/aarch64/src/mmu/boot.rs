@@ -5,7 +5,7 @@
 //! initial page tables в `.boot.bss` и передает assembly trampoline значения для
 //! MAIR/TCR/TTBR/SP.
 
-use core::ptr::addr_of_mut;
+use core::{arch::asm, mem::MaybeUninit, ptr::addr_of_mut};
 
 use super::hva::{
     ATTR_DEVICE_NG_RN_E, ATTR_NORMAL_NC, ATTR_NORMAL_WB, BLOCK_SIZE_2M, DESC_ADDR_MASK, DESC_AF,
@@ -147,10 +147,14 @@ pub unsafe extern "C" fn boot_build_page_tables(params: *mut BootMmuParams) {
     let image_start = align_down_2m(core::ptr::addr_of!(__kernel_image_phys_start) as usize);
     let image_end = align_up_2m(core::ptr::addr_of!(__kernel_image_phys_end) as usize);
     let image_size = image_end.wrapping_sub(image_start);
-    let mut platform = BootPlatformInfo::zeroed();
-    unsafe { parse_boot_platform(crate::platform::qemu::BOOT_DTB_PA, &mut platform) };
-    if !platform_info_complete(&platform) {
-        crate::platform::qemu::apply_fallback_platform_info(&mut platform);
+    let mut platform = MaybeUninit::<BootPlatformInfo>::uninit();
+    unsafe { zero_boot_platform_info(platform.as_mut_ptr()) };
+    // SAFETY: zero_boot_platform_info writes every byte of the integer-only
+    // BootPlatformInfo layout before this reference is created.
+    let platform = unsafe { platform.assume_init_mut() };
+    unsafe { parse_boot_platform(crate::platform::qemu::BOOT_DTB_PA, platform) };
+    if !platform_info_complete(platform) {
+        crate::platform::qemu::apply_fallback_platform_info(platform);
     }
     let ram_map = aligned_range_or_image(platform.ram, image_start, image_size);
     let gic_map = cover_ranges(platform.gic_distributor, platform.gic_cpu_interface);
@@ -275,8 +279,28 @@ pub unsafe extern "C" fn boot_build_page_tables(params: *mut BootMmuParams) {
         );
         crate::platform::write_boot_platform_params(
             core::ptr::addr_of_mut!((*params).platform),
-            &platform,
+            platform,
         );
+    }
+}
+
+#[inline(always)]
+#[unsafe(link_section = ".boot.text")]
+unsafe fn zero_boot_platform_info(info: *mut BootPlatformInfo) {
+    let mut offset = 0usize;
+    while offset < core::mem::size_of::<BootPlatformInfo>() {
+        // SAFETY: caller provides writable stack storage for one
+        // BootPlatformInfo. Inline assembly prevents release optimization from
+        // replacing this pre-MMU initialization with a high-linked memset.
+        unsafe {
+            asm!(
+                "strb wzr, [{base}, {offset}]",
+                base = in(reg) info,
+                offset = in(reg) offset,
+                options(nostack, preserves_flags)
+            );
+        }
+        offset = offset.wrapping_add(1);
     }
 }
 
