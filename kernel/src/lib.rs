@@ -22,6 +22,8 @@ pub(crate) mod sync;
 pub mod syscall;
 pub mod task;
 pub mod task_call;
+#[cfg(feature = "qemu-test")]
+mod test_support;
 pub mod time;
 
 use bootinfo::BootInfo;
@@ -61,12 +63,15 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
         panic!("initramfs: failed to mount loader image");
     }
 
+    #[cfg(not(any(feature = "qemu-test-kernel-runtime", feature = "qemu-test-user-fault")))]
     demo::init();
+    #[cfg(feature = "qemu-test-kernel-runtime")]
+    test_support::kernel_runtime::init();
 
     if sched::bootstrap(
         idle_task,
         sched::ThreadArg::empty(),
-        &demo::TASKS,
+        static_tasks(),
         TEST_RR_QUANTUM_MS,
         TEST_THREAD_CAPACITY,
     )
@@ -77,9 +82,23 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
 
     log_bootstrap_stack_usage("before first task");
     crate::info!("sched: irq-return preemptive switching initialized");
-
     // Enters the running task through architecture trap-frame restore and never returns.
     sched::enter_running_task()
+}
+
+fn static_tasks() -> &'static [sched::StaticTask] {
+    #[cfg(feature = "qemu-test-kernel-runtime")]
+    {
+        &test_support::kernel_runtime::TASKS
+    }
+    #[cfg(feature = "qemu-test-user-fault")]
+    {
+        &test_support::user_fault::TASKS
+    }
+    #[cfg(not(any(feature = "qemu-test-kernel-runtime", feature = "qemu-test-user-fault")))]
+    {
+        &demo::TASKS
+    }
 }
 
 fn idle_task(_arg: sched::ThreadArg) -> usize {

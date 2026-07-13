@@ -6,6 +6,17 @@ edition = "2024"
 [lib]
 crate-type = ["staticlib"]
 
+[features]
+default = []
+log-level-error = ["kernel/log-level-error"]
+log-level-warn = ["kernel/log-level-warn"]
+log-level-info = ["kernel/log-level-info"]
+log-level-debug = ["kernel/log-level-debug"]
+log-level-trace = ["kernel/log-level-trace"]
+qemu-test = ["kernel/qemu-test"]
+qemu-test-kernel-runtime = ["kernel/qemu-test-kernel-runtime"]
+qemu-test-user-fault = ["kernel/qemu-test-user-fault"]
+
 [dependencies]
 kernel = { path = "../../kernel" }
 bootinfo = { path = "../../crates/bootinfo" }

@@ -1,0 +1,48 @@
+name = "userspace-contract"
+suite = "userspace-contract"
+supervisor = "api-supervisor"
+profile = "debug"
+log_level = "info"
+init = "userspace-contract"
+timeout_secs = 60
+step_timeout_secs = 20
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
+subject = "file-io"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
+subject = "directory-io"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
+subject = "cwd-paths"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
+subject = "process-control"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
+subject = "production-echo-exec-smoke"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
+subject = "production-cat-exec-smoke"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
+subject = "production-ls-exec-smoke"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
+subject = "production-pwd-exec-smoke"

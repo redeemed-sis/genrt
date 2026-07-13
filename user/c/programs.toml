@@ -1,0 +1,37 @@
+schema = 1
+
+[[program]]
+name = "shell"
+source = "user/c/shell.c"
+install = "init"
+contract = "shell"
+contract_install = "bin/shell"
+contract_case = "shell-exit"
+
+[[program]]
+name = "echo"
+source = "user/c/echo.c"
+install = "bin/echo"
+contract = "userspace"
+contract_case = "production-echo-exec-smoke"
+
+[[program]]
+name = "cat"
+source = "user/c/cat.c"
+install = "bin/cat"
+contract = "userspace"
+contract_case = "production-cat-exec-smoke"
+
+[[program]]
+name = "ls"
+source = "user/c/ls.c"
+install = "bin/ls"
+contract = "userspace"
+contract_case = "production-ls-exec-smoke"
+
+[[program]]
+name = "pwd"
+source = "user/c/pwd.c"
+install = "bin/pwd"
+contract = "userspace"
+contract_case = "production-pwd-exec-smoke"

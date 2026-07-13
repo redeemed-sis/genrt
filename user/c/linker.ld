@@ -23,6 +23,11 @@ SECTIONS
     *(.rodata .rodata.*)
   } :text
 
+  .genrt.test_marker : ALIGN(1)
+  {
+    KEEP(*(.genrt.test_marker))
+  } :text
+
   . = ALIGN(0x1000);
 
   .data : ALIGN(0x1000)

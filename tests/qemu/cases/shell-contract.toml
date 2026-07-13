@@ -1,0 +1,78 @@
+name = "shell-contract"
+suite = "shell-contract"
+supervisor = "shell-supervisor"
+profile = "debug"
+log_level = "info"
+init = "shell-contract"
+timeout_secs = 60
+step_timeout_secs = 15
+
+[[steps]]
+action = "expect"
+producer = "shell-supervisor"
+event = "CASE_START"
+subject = "shell-exit"
+
+[[steps]]
+action = "send_line"
+value = "cd /.__genrt_test__/bin"
+
+[[steps]]
+action = "send_line"
+value = "./p argv alpha beta"
+
+[[steps]]
+action = "expect_case"
+producer = "shell-argv"
+subject = "argv"
+
+[[steps]]
+action = "send_line"
+value = "cd ../fixtures/directory"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p cwd"
+
+[[steps]]
+action = "expect_case"
+producer = "shell-cwd"
+subject = "cwd"
+
+[[steps]]
+action = "challenge"
+command = "../../bin/p nonce"
+producer = "shell-nonce"
+subject = "uart-rx"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p exit-seven"
+
+[[steps]]
+action = "expect_case"
+producer = "shell-exit-seven"
+subject = "abnormal-child"
+
+[[steps]]
+action = "send_line"
+value = "x"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p recovered"
+
+[[steps]]
+action = "expect_case"
+producer = "shell-recovery"
+subject = "recovered"
+
+[[steps]]
+action = "send_line"
+value = "exit"
+
+[[steps]]
+action = "expect"
+producer = "shell-supervisor"
+event = "PASS"
+subject = "shell-exit"

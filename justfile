@@ -9,6 +9,18 @@ help:
 doctor:
     cargo xtask doctor
 
+check:
+    cargo xtask check
+
+test:
+    cargo xtask test-aarch64
+
+ci:
+    cargo xtask ci
+
+dist tag output_dir="dist":
+    cargo xtask dist --tag {{ tag }} --output-dir {{ output_dir }}
+
 phase0-check:
     cargo xtask phase0-check
 

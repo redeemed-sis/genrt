@@ -1,0 +1,36 @@
+schema = 1
+
+[[invocation]]
+program = "shell"
+case = "shell-exit"
+path = "/bin/shell"
+args = ["shell"]
+expected_exit = 0
+
+[[invocation]]
+program = "echo"
+case = "production-echo-exec-smoke"
+path = "/bin/echo"
+args = ["echo", "contract"]
+expected_exit = 0
+
+[[invocation]]
+program = "cat"
+case = "production-cat-exec-smoke"
+path = "/bin/cat"
+args = ["cat", "/.__genrt_test__/fixtures/known-content"]
+expected_exit = 0
+
+[[invocation]]
+program = "ls"
+case = "production-ls-exec-smoke"
+path = "/bin/ls"
+args = ["ls", "/.__genrt_test__/fixtures/directory"]
+expected_exit = 0
+
+[[invocation]]
+program = "pwd"
+case = "production-pwd-exec-smoke"
+path = "/bin/pwd"
+args = ["pwd"]
+expected_exit = 0

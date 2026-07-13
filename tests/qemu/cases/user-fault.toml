@@ -1,0 +1,14 @@
+name = "user-fault"
+suite = "user-fault"
+supervisor = "kernel"
+profile = "debug"
+log_level = "info"
+kernel_features = ["qemu-test-user-fault"]
+init = "user-fault"
+timeout_secs = 45
+step_timeout_secs = 15
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "null-data-abort"

@@ -1,0 +1,39 @@
+name = "kernel-contract"
+suite = "kernel-contract"
+supervisor = "kernel"
+profile = "debug"
+log_level = "info"
+kernel_features = ["qemu-test-kernel-runtime"]
+init = "kernel-contract"
+timeout_secs = 45
+step_timeout_secs = 15
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "sleep-deadline"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "mailbox-blocked-wakeup"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "mailbox-timeout"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "thread-join"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "timer-preemption"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "post-test-liveness"
