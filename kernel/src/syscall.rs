@@ -69,11 +69,37 @@ pub enum DispatchError {
     UnknownSyscall(usize),
 }
 
+/// Dispatch one syscall from the active lower-EL trap frame.
+///
+/// # Arguments
+///
+/// * `frame_words` - Mutable architecture trap-frame storage whose register
+///   words follow the kernel syscall ABI.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after a known syscall is handled. Blocking or terminating
+/// syscalls may transfer control through the scheduler before this function
+/// can return normally.
+///
+/// # Errors
+///
+/// Returns [`DispatchError::UnknownSyscall`] with the unrecognized syscall
+/// number.
+///
+/// # Panics
+///
+/// Panics when `frame_words` is null.
+///
+/// # Safety
+///
+/// Although this is a safe Rust entry point for the architecture layer, the
+/// caller must provide live, writable trap-frame storage with the expected
+/// register layout for the duration of dispatch.
 pub fn dispatch(frame_words: *mut u64) -> Result<(), DispatchError> {
     if frame_words.is_null() {
         panic!("syscall: null trap frame");
     }
-
     let nr = frame_word(frame_words, X8) as usize;
     match nr {
         SYS_READ => {
