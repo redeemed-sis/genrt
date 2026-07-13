@@ -21,6 +21,7 @@ use super::{
 };
 
 const SERIAL_CHANNEL_CAPACITY: usize = 64;
+const UART_INPUT_BYTE_INTERVAL: Duration = Duration::from_millis(2);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -297,7 +298,13 @@ fn execute_case(
     for (index, step) in case.steps.iter().enumerate() {
         let step_number = index + 1;
         match step {
-            Step::SendLine { value } => send_line(&mut stdin, value, step_number)?,
+            Step::SendLine { value } => send_line(
+                &mut stdin,
+                value,
+                step_number,
+                execution.case_deadline,
+                execution.step_timeout,
+            )?,
             Step::Expect {
                 producer,
                 event,
@@ -320,7 +327,13 @@ fn execute_case(
                 subject,
             } => {
                 let nonce = challenge_nonce(&case.name, step_number);
-                send_line(&mut stdin, &format!("{command} {nonce}"), step_number)?;
+                send_line(
+                    &mut stdin,
+                    &format!("{command} {nonce}"),
+                    step_number,
+                    execution.case_deadline,
+                    execution.step_timeout,
+                )?;
                 execution.wait_for(step_number, producer, Event::CaseStart, subject, None)?;
                 execution.wait_for(step_number, producer, Event::Pass, subject, Some(&nonce))?;
             }
@@ -344,15 +357,54 @@ fn execute_case(
     Ok(())
 }
 
-fn send_line(output: &mut impl Write, value: &str, step: usize) -> Result<(), Failure> {
-    output
-        .write_all(value.as_bytes())
-        .and_then(|()| output.write_all(b"\n"))
-        .and_then(|()| output.flush())
-        .map_err(|err| Failure::Failed {
-            step,
-            reason: format!("failed to send line: {err}"),
-        })
+fn send_line(
+    output: &mut impl Write,
+    value: &str,
+    step: usize,
+    case_deadline: Instant,
+    step_timeout: Duration,
+) -> Result<(), Failure> {
+    let deadline = case_deadline.min(Instant::now() + step_timeout);
+    send_line_paced(output, value, step, deadline, UART_INPUT_BYTE_INTERVAL)
+}
+
+fn send_line_paced(
+    output: &mut impl Write,
+    value: &str,
+    step: usize,
+    deadline: Instant,
+    byte_interval: Duration,
+) -> Result<(), Failure> {
+    // A pipe can hand QEMU a complete command before the guest drains PL011's
+    // finite RX FIFO. Pace the test transport itself instead of depending on
+    // production shell prompts or other human-readable UART output.
+    let mut bytes = value.bytes().chain(core::iter::once(b'\n')).peekable();
+    while let Some(byte) = bytes.next() {
+        if Instant::now() >= deadline {
+            return Err(Failure::Timeout {
+                step,
+                expected: "paced UART line delivery".to_owned(),
+            });
+        }
+        output
+            .write_all(&[byte])
+            .and_then(|()| output.flush())
+            .map_err(|err| Failure::Failed {
+                step,
+                reason: format!("failed to send line: {err}"),
+            })?;
+
+        if bytes.peek().is_some() && !byte_interval.is_zero() {
+            if Instant::now() + byte_interval >= deadline {
+                return Err(Failure::Timeout {
+                    step,
+                    expected: "paced UART line delivery".to_owned(),
+                });
+            }
+            thread::sleep(byte_interval);
+        }
+    }
+    Ok(())
 }
 
 fn challenge_nonce(case: &str, step: usize) -> String {
@@ -468,6 +520,26 @@ mod tests {
     use super::*;
     use crate::test::cases::InitImage;
 
+    #[derive(Default)]
+    struct RecordingWriter {
+        bytes: Vec<u8>,
+        write_sizes: Vec<usize>,
+        flushes: usize,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buffer);
+            self.write_sizes.push(buffer.len());
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
     fn test_case() -> Case {
         Case {
             name: "tail".to_owned(),
@@ -492,6 +564,22 @@ mod tests {
         let nonce = challenge_nonce("case", 1);
         assert_eq!(nonce.len(), 8);
         assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn paced_uart_line_flushes_every_byte_and_newline() {
+        let mut output = RecordingWriter::default();
+        let result = send_line_paced(
+            &mut output,
+            "./p argv alpha beta",
+            1,
+            Instant::now() + Duration::from_secs(1),
+            Duration::ZERO,
+        );
+        assert!(result.is_ok());
+        assert_eq!(output.bytes, b"./p argv alpha beta\n");
+        assert!(output.write_sizes.iter().all(|size| *size == 1));
+        assert_eq!(output.flushes, output.bytes.len());
     }
 
     #[test]

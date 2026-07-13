@@ -57,7 +57,10 @@ test markers/provenance, and are rejected by production artifact policy.
 
 The runner uses bounded UART channels and failure tails, applies step/case/suite
 deadlines, drains output to EOF, reparses the complete serial log, and always
-terminates and reaps QEMU.
+terminates and reaps QEMU. Host input is delivered with fixed per-byte pacing so
+a pipe cannot overrun the emulated PL011 RX FIFO when QEMU runs more slowly than
+the host writer. This transport pacing is bounded by the existing step and case
+deadlines; prompts and echoed input remain outside the assertion contract.
 
 See [`docs/testing.md`](../../docs/testing.md) and ADR-0025 for gate and release
 integration.
