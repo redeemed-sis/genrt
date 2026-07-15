@@ -11,6 +11,12 @@ Changes that invalidate one require architecture review and an ADR.
   controlled platform protocol, or parsed firmware data. Do not guess it.
 - AArch64 pre-MMU code and every dependency it reaches remain in `.boot.*`.
 - Rust and assembly trap-frame layouts are one ABI and must change together.
+- Generic kernel live-context APIs use an opaque, non-null, exclusive
+  `ActiveContext`; syscall register decoding and live-frame mutation remain in
+  the architecture layer.
+- Live exception contexts and scheduler-saved contexts are distinct ownership
+  domains. Raw live-frame words may cross only the documented temporary
+  scheduler saved-frame copy/clone bridge.
 
 ## Real-time behavior
 

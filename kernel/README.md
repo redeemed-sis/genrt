@@ -17,6 +17,7 @@ hooks.
 | `loader` | Static userspace ELF validation and segment loading |
 | `syscall` | Architecture-neutral syscall behavior and errno mapping |
 | `console`, `log` | Allocation-free output and bounded stdin buffering |
+| `arch` | Opaque live exception context and decoded syscall request facade |
 
 Detailed ownership lives in the [memory](src/memory/README.md),
 [scheduler](src/sched/README.md), and [filesystem](src/fs/README.md) guides.
@@ -42,6 +43,13 @@ Timer IRQs collect expired typed events and may choose a different return frame.
 Blocking syscall/task-call paths record a reason, commit scheduler state, and
 resume another task. Wakeup owners remain in time, IPC, process, or console
 layers; the scheduler owns runnable state and queue visibility.
+
+Architecture entry code wraps each live exception frame in one non-null,
+exclusive `ActiveContext`. Generic syscall handlers receive a decoded
+`SyscallRequest` and mutate return state only through that context. A temporary
+crate-only scheduler bridge exposes frame words solely to existing saved-frame
+copy and fork-clone code; saved scheduler storage remains a separate hardening
+boundary.
 
 ## Allocation and synchronization
 

@@ -47,6 +47,13 @@ Current-EL SVC handles kernel task calls; lower-EL SVC dispatches userspace
 syscalls. Lower-EL frames save `SP_EL0` while retaining a valid EL1 kernel stack.
 Restore selects EL1 or EL0 from SPSR mode bits and returns with `eret`.
 
+Rust exception entry wraps each live `TrapFrame` once as the generic kernel's
+opaque `ActiveContext`. The AArch64 context adapter alone decodes `x8` and
+`x0..x5` into `SyscallRequest`, stores syscall results in `x0`, rewinds `ELR_EL1`
+for restartable SVC, and replaces EL0 state after exec while preserving
+`kernel_sp`. Scheduler-owned saved frames and their word-based architecture
+hooks are unchanged.
+
 GICv2 dispatches the architected timer and PL011 RX IRQ. Timer expiry enters the
 generic time/scheduler path and may replace the return frame. UART IRQ drains a
 bounded RX FIFO path and wakes stdin waiters without allocation.
@@ -60,5 +67,5 @@ bounded RX FIFO path and wakes stdin waiters without allocation.
 - Boot, linker, exception, MMU, and IRQ changes require post-link verification
   and the relevant QEMU contracts.
 
-Related decisions: ADR-0002 through ADR-0004, ADR-0008, and ADR-0015 in
+Related decisions: ADR-0002 through ADR-0004, ADR-0008, ADR-0015, and ADR-0027 in
 [`memory/decisions/`](../../memory/decisions/README.md).

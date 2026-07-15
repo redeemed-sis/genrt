@@ -48,6 +48,12 @@ accepted ADRs remain authoritative when details differ.
   thread; the latter launches and joins userspace `/init`.
 - Context switching replaces the saved trap frame selected for IRQ or syscall
   return rather than using a normal function-call switch.
+- Architecture entry owns each live exception frame through one non-null,
+  exclusive `ActiveContext`. Generic syscall dispatch consumes a decoded
+  six-argument request and has no AArch64 register-layout knowledge.
+- Scheduler saved frames remain fixed word arrays. Raw access to a live context
+  is limited to the temporary low-level scheduler copy/clone bridge pending
+  saved-context hardening.
 - The architected timer runs in one-shot nearest-deadline mode.
 - `kernel::time` owns the preallocated deadline queue for wakeups, mailbox
   timeouts, and scheduler quantum expiration.

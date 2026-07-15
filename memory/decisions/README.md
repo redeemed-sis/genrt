@@ -32,5 +32,6 @@ growth.
 | [0024](ADR-0024-process-cwd-and-path-resolution.md) | Process cwd and path traversal | Accepted | Filesystem/process | - | - |
 | [0025](ADR-0025-automated-qemu-testing-and-tagged-releases.md) | Automated testing and releases | Accepted | Verification/release | - | - |
 | [0026](ADR-0026-agent-oriented-development-workflow.md) | Agent-oriented development workflow | Accepted | Repository workflow | - | - |
+| [0027](ADR-0027-typed-active-context-and-syscall-boundary.md) | Typed active context and syscall boundary | Accepted | Kernel/AArch64 context boundary | - | - |
 
 Use [`TEMPLATE.md`](TEMPLATE.md) for new decisions.
