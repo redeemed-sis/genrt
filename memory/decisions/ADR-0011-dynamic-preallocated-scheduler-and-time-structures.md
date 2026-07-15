@@ -4,6 +4,14 @@
 
 Accepted
 
+## Subsequent refinement
+
+[ADR-0028](ADR-0028-typed-saved-context-and-scheduler-ownership.md) replaces
+only this decision's boxed saved-frame backing with inline `SavedContext`
+ownership inside the already preallocated `Vec<Task>`. Boxed task stacks,
+bootstrap reservation, bounded capacities, and allocation-free handoff remain
+unchanged.
+
 ## Context
 
 `genrt` had already separated scheduler and time ownership correctly:

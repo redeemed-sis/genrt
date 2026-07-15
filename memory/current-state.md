@@ -51,9 +51,12 @@ accepted ADRs remain authoritative when details differ.
 - Architecture entry owns each live exception frame through one non-null,
   exclusive `ActiveContext`. Generic syscall dispatch consumes a decoded
   six-argument request and has no AArch64 register-layout knowledge.
-- Scheduler saved frames remain fixed word arrays. Raw access to a live context
-  is limited to the temporary low-level scheduler copy/clone bridge pending
-  saved-context hardening.
+- Each occupied scheduler slot owns one inline, non-copyable `SavedContext`;
+  free slots own none. Generic scheduling uses typed save, restore, entry, and
+  fork construction without frame-word or register-layout knowledge.
+- Raw context pointers and `TrapFrame` casts are confined to the AArch64 facade
+  and assembly entry boundary. Context switching remains bounded and
+  allocation-free.
 - The architected timer runs in one-shot nearest-deadline mode.
 - `kernel::time` owns the preallocated deadline queue for wakeups, mailbox
   timeouts, and scheduler quantum expiration.

@@ -7,9 +7,6 @@ explicit acceptance criteria.
 ## High-value architecture work
 
 1. **Scheduler and frame lifecycle**
-   - replace the temporary raw-word bridge between typed live contexts and
-     scheduler-saved frames without changing the assembly frame ABI casually;
-   - audit saved-frame construction across bootstrap, spawn, fork, and exec;
    - consolidate duplicated block/wake entry points and clarify Task/Thread
      ownership without erasing the user/kernel distinction;
    - measure bounded queue behavior and critical-section length.
@@ -24,11 +21,9 @@ explicit acceptance criteria.
 
 ## Boundary cleanup
 
-4. Extend typed context ownership to scheduler-saved frames only after their
-   initialization, clone, copy, and assembly-return lifecycle is audited.
-5. Evolve stdin waiting into a console/TTY ownership model rather than a
+4. Evolve stdin waiting into a console/TTY ownership model rather than a
    scheduler-special case, without changing fd semantics prematurely.
-6. Consolidate trap-frame initialization and remove interfaces no longer used by
+5. Consolidate trap-frame initialization and remove interfaces no longer used by
    the established EL1/EL0 restore model.
 
 ## Maintainability

@@ -1,13 +1,14 @@
 # Scheduler, time, and blocking
 
 The scheduler is a bounded single-core round-robin engine. Context switches are
-committed by selecting the trap frame restored on IRQ or controlled synchronous
-return.
+committed by saving a borrowed `ActiveContext` into the current slot's owned
+`SavedContext` and restoring the selected slot into the live return context.
 
 ## Task states
 
-- `Free`: preallocated slot, frame, and stack available for spawn.
-- `Ready`: runnable with a valid saved frame and queued unless it is idle.
+- `Free`: preallocated slot and stack available for spawn, with no saved-context
+  ownership.
+- `Ready`: runnable with one valid `SavedContext` and queued unless it is idle.
 - `Running`: the sole committed resume target.
 - `Blocked(reason)`: excluded from selection until the owning subsystem wakes
   it.
@@ -42,14 +43,15 @@ console owns stdin availability. The scheduler owns task state and queue order.
 
 ## Thread lifecycle
 
-Thread slots and stacks are allocated/prepared at scheduler bootstrap. Runtime
-spawn initializes a free slot without growing scheduler containers. `ThreadId`
+Thread slots and stacks are allocated/prepared at scheduler bootstrap. An
+occupied slot owns exactly one inline `SavedContext`; runtime spawn initializes
+a free slot without growing scheduler containers. `ThreadId`
 contains index and generation, so stale handles fail after reuse. Joinable exits
 retain one result for one joiner; detached exits reclaim automatically.
 
-Kernel and user threads share scheduling mechanics but have distinct frame and
-address-space initialization. User threads reference a process and TTBR0 root;
-kernel threads run with TTBR0 cleared.
+Kernel and user threads share scheduling mechanics but use distinct typed
+context constructors and address-space initialization. User threads reference a
+process and TTBR0 root; kernel threads run with TTBR0 cleared.
 
 Production bootstrap preallocates the permanent idle thread and one static init
 thread, which launches userspace `/init`. Dedicated QEMU kernel features select
@@ -60,7 +62,8 @@ their own finite static-task arrays without changing round-robin behavior.
 - Single core; local IRQ exclusion is not SMP synchronization.
 - No heap allocation or unbounded work in scheduling/timer fast paths.
 - Idle is the permanent fallback and is never joinable or reclaimed.
-- Rust and architecture trap-frame handoff contracts change together.
+- `SavedContext` layout is opaque to scheduler policy; Rust and architecture
+  trap-frame handoff contracts change together inside the architecture facade.
 
 Related decisions: ADR-0003, ADR-0005, ADR-0006, ADR-0011 through ADR-0014,
-and ADR-0020.
+ADR-0020, ADR-0027, and ADR-0028.

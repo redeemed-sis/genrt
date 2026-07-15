@@ -17,7 +17,7 @@ hooks.
 | `loader` | Static userspace ELF validation and segment loading |
 | `syscall` | Architecture-neutral syscall behavior and errno mapping |
 | `console`, `log` | Allocation-free output and bounded stdin buffering |
-| `arch` | Opaque live exception context and decoded syscall request facade |
+| `arch` | Opaque live/saved context ownership and decoded syscall request facade |
 
 Detailed ownership lives in the [memory](src/memory/README.md),
 [scheduler](src/sched/README.md), and [filesystem](src/fs/README.md) guides.
@@ -46,10 +46,11 @@ layers; the scheduler owns runnable state and queue visibility.
 
 Architecture entry code wraps each live exception frame in one non-null,
 exclusive `ActiveContext`. Generic syscall handlers receive a decoded
-`SyscallRequest` and mutate return state only through that context. A temporary
-crate-only scheduler bridge exposes frame words solely to existing saved-frame
-copy and fork-clone code; saved scheduler storage remains a separate hardening
-boundary.
+`SyscallRequest` and mutate return state only through that context. Each
+occupied scheduler slot owns one inline, non-copyable `SavedContext`; bootstrap,
+spawn, fork, block, preemption, and first entry use typed facade operations.
+Only the architecture adapter interprets saved storage as a concrete trap
+frame.
 
 ## Allocation and synchronization
 

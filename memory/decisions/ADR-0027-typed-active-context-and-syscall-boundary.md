@@ -4,6 +4,13 @@
 
 Accepted
 
+## Subsequent refinement
+
+[ADR-0028](ADR-0028-typed-saved-context-and-scheduler-ownership.md) replaces
+only the temporary raw-word scheduler bridge deliberately deferred by this
+decision. `ActiveContext`, `SyscallRequest`, and the live exception-frame
+ownership established here remain unchanged.
+
 ## Context
 
 The AArch64 exception layer saved a complete `TrapFrame`, but generic kernel

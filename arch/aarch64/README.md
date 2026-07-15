@@ -51,8 +51,11 @@ Rust exception entry wraps each live `TrapFrame` once as the generic kernel's
 opaque `ActiveContext`. The AArch64 context adapter alone decodes `x8` and
 `x0..x5` into `SyscallRequest`, stores syscall results in `x0`, rewinds `ELR_EL1`
 for restartable SVC, and replaces EL0 state after exec while preserving
-`kernel_sp`. Scheduler-owned saved frames and their word-based architecture
-hooks are unchanged.
+`kernel_sp`. Scheduler slots own opaque inline `SavedContext` values. The
+AArch64 adapter alone interprets their storage as `TrapFrame`, initializes
+kernel/user/fork entry state, and performs bounded live-to-saved transfers.
+Compile-time checks require the architecture frame to fit with compatible
+alignment; the assembly restore layout remains unchanged.
 
 GICv2 dispatches the architected timer and PL011 RX IRQ. Timer expiry enters the
 generic time/scheduler path and may replace the return frame. UART IRQ drains a
@@ -61,11 +64,14 @@ bounded RX FIFO path and wakes stdin waiters without allocation.
 ## Build invariants
 
 - Rust `TrapFrame` layout and assembly offsets change together.
+- `SavedContext` storage must fit and align `TrapFrame`; generic scheduler code
+  must not cast or inspect either representation.
 - Kernel code does not own FP/SIMD state; the soft-float target prevents
   implicit assumptions.
 - MMIO accesses use documented Device mappings and localized volatile `unsafe`.
 - Boot, linker, exception, MMU, and IRQ changes require post-link verification
   and the relevant QEMU contracts.
 
-Related decisions: ADR-0002 through ADR-0004, ADR-0008, ADR-0015, and ADR-0027 in
+Related decisions: ADR-0002 through ADR-0004, ADR-0008, ADR-0015, ADR-0027, and
+ADR-0028 in
 [`memory/decisions/`](../../memory/decisions/README.md).

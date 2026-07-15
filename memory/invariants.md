@@ -15,8 +15,11 @@ Changes that invalidate one require architecture review and an ADR.
   `ActiveContext`; syscall register decoding and live-frame mutation remain in
   the architecture layer.
 - Live exception contexts and scheduler-saved contexts are distinct ownership
-  domains. Raw live-frame words may cross only the documented temporary
-  scheduler saved-frame copy/clone bridge.
+  domains. Each occupied scheduler slot owns exactly one inline, non-copyable
+  `SavedContext`; free slots own none.
+- Generic scheduler and process code neither expose raw context pointers nor
+  inspect saved-frame layout. Representation casts and assembly pointers remain
+  inside the documented architecture/FFI boundary.
 
 ## Real-time behavior
 
