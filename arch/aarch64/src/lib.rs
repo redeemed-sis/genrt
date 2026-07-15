@@ -127,60 +127,6 @@ pub extern "C" fn arch_task_call(request: *const core::ffi::c_void) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn arch_init_thread_frame(
-    frame_words: *mut u64,
-    stack_top: usize,
-    entry_addr: usize,
-    arg: usize,
-    bootstrap_pc: usize,
-) {
-    if frame_words.is_null() {
-        return;
-    }
-
-    // SAFETY: kernel passes valid task-owned frame storage matching TrapFrame ABI.
-    let frame = unsafe { &mut *(frame_words as *mut trap_frame::TrapFrame) };
-    frame.init_kernel_el1(bootstrap_pc, stack_top, entry_addr, arg);
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn arch_init_user_trap_frame(
-    frame_words: *mut u64,
-    user_entry: usize,
-    user_sp: usize,
-    kernel_sp: usize,
-    arg0: usize,
-) {
-    if frame_words.is_null() {
-        return;
-    }
-
-    // SAFETY: caller passes task-owned frame storage matching TrapFrame ABI.
-    let frame = unsafe { &mut *(frame_words as *mut trap_frame::TrapFrame) };
-    frame.init_user_el0(user_entry, user_sp, kernel_sp, arg0);
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn arch_clone_user_trap_frame_for_fork(
-    dst_frame_words: *mut u64,
-    src_frame_words: *const u64,
-    child_kernel_sp: usize,
-) {
-    if dst_frame_words.is_null() || src_frame_words.is_null() {
-        return;
-    }
-
-    // SAFETY: scheduler passes valid TrapFrame storage for both pointers. The
-    // child inherits the userspace resume state, but fork returns 0 in the child
-    // and must use a distinct EL1 kernel stack for future lower-EL exceptions.
-    let src = unsafe { &*(src_frame_words as *const trap_frame::TrapFrame) };
-    let dst = unsafe { &mut *(dst_frame_words as *mut trap_frame::TrapFrame) };
-    *dst = *src;
-    dst.x[0] = 0;
-    dst.kernel_sp = child_kernel_sp as u64 & !0xf;
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn arch_initramfs_load_pa() -> usize {
     platform::qemu::INITRAMFS_LOAD_PA
 }

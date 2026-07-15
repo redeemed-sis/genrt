@@ -32,6 +32,7 @@ impl TrapFrame {
     pub const OFFSET_SPSR: usize = 33 * 8;
     pub const OFFSET_KERNEL_SP: usize = 34 * 8;
     pub const SIZE_BYTES: usize = 35 * 8;
+    pub const STACK_SIZE_BYTES: usize = 36 * 8;
     pub const WORDS: usize = 35;
 
     pub const SPSR_MODE_MASK: u64 = 0b1111;

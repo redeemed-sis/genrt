@@ -2,4 +2,4 @@
 
 mod context;
 
-pub use context::{ActiveContext, SyscallRequest};
+pub use context::{ActiveContext, SavedContext, SyscallRequest};

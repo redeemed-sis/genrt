@@ -1,18 +1,14 @@
 use core::mem;
 
 use crate::{
-    arch::ActiveContext,
+    arch::{ActiveContext, SavedContext},
     memory::vm::UserAddressSpace,
     process::ProcessId,
     sync::LocalIrqGuard,
     task::{TaskId, ThreadId},
 };
 
-use super::{
-    IDLE_TASK_ID, Scheduler, arch_clone_user_trap_frame_for_fork, arch_init_thread_frame,
-    arch_init_user_trap_frame, copy_words, live_frame_words, preempt, scheduler_mut,
-    try_scheduler_mut,
-};
+use super::{IDLE_TASK_ID, Scheduler, preempt, scheduler_mut, try_scheduler_mut};
 
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -323,11 +319,16 @@ impl Scheduler {
         let Some(id) = self.find_free_slot() else {
             return Err(SpawnError::NoThreadSlots);
         };
+        let context = SavedContext::kernel_entry(
+            self.task(id).stack_top(),
+            entry as *const () as usize,
+            arg.as_usize(),
+            thread_entry_bootstrap as *const () as usize,
+        );
 
         let thread_id = {
             let task = self.task_mut(id);
             task.generation = next_generation(task.generation);
-            task.state = preempt::TaskState::Ready;
             task.joinable = attrs.joinable;
             task.exit_code = None;
             task.joiner = None;
@@ -336,10 +337,10 @@ impl Scheduler {
             task.entry = free_task_entry;
             task.arg = ThreadArg::empty();
             task.kind = preempt::ThreadKind::Kernel;
+            task.install_context(context);
+            task.state = preempt::TaskState::Ready;
             ThreadId::new(id.index(), task.generation)
         };
-
-        self.initialize_spawned_thread_frame(id, entry, arg);
         if id != IDLE_TASK_ID {
             let was_empty = self.ready_queue.is_empty();
             self.ready_push_back(id);
@@ -368,11 +369,12 @@ impl Scheduler {
         let Some(id) = self.find_free_slot() else {
             return Err(SpawnError::NoThreadSlots);
         };
+        let context =
+            SavedContext::user_entry(user_entry, user_sp, self.task(id).stack_top(), arg0);
 
         let thread_id = {
             let task = self.task_mut(id);
             task.generation = next_generation(task.generation);
-            task.state = preempt::TaskState::Ready;
             task.joinable = attrs.joinable;
             task.exit_code = None;
             task.joiner = None;
@@ -384,10 +386,10 @@ impl Scheduler {
                 process_id,
                 address_space,
             };
+            task.install_context(context);
+            task.state = preempt::TaskState::Ready;
             ThreadId::new(id.index(), task.generation)
         };
-
-        self.initialize_spawned_user_thread_frame(id, user_entry, user_sp, arg0);
         if id != IDLE_TASK_ID {
             let was_empty = self.ready_queue.is_empty();
             self.ready_push_back(id);
@@ -403,37 +405,6 @@ impl Scheduler {
         Ok(thread_id)
     }
 
-    fn initialize_spawned_thread_frame(&mut self, id: TaskId, entry: ThreadEntry, arg: ThreadArg) {
-        let stack_top = self.task(id).stack_top();
-        let frame_words = self.frame_words_mut_ptr(id);
-        // SAFETY: scheduler owns stable frame and stack storage for this slot.
-        unsafe {
-            arch_init_thread_frame(
-                frame_words,
-                stack_top,
-                entry as *const () as usize,
-                arg.as_usize(),
-                thread_entry_bootstrap as *const () as usize,
-            );
-        }
-    }
-
-    fn initialize_spawned_user_thread_frame(
-        &mut self,
-        id: TaskId,
-        user_entry: usize,
-        user_sp: usize,
-        arg0: usize,
-    ) {
-        let kernel_sp = self.task(id).stack_top();
-        let frame_words = self.frame_words_mut_ptr(id);
-        // SAFETY: scheduler owns stable frame and kernel stack storage. The
-        // process layer already mapped `user_entry` and `user_sp` in TTBR0.
-        unsafe {
-            arch_init_user_trap_frame(frame_words, user_entry, user_sp, kernel_sp, arg0);
-        }
-    }
-
     fn spawn_user_thread_from_context(
         &mut self,
         process_id: ProcessId,
@@ -444,11 +415,11 @@ impl Scheduler {
         let Some(id) = self.find_free_slot() else {
             return Err(SpawnError::NoThreadSlots);
         };
+        let child_context = SavedContext::fork_child(context, self.task(id).stack_top());
 
         let thread_id = {
             let task = self.task_mut(id);
             task.generation = next_generation(task.generation);
-            task.state = preempt::TaskState::Ready;
             task.joinable = attrs.joinable;
             task.exit_code = None;
             task.joiner = None;
@@ -460,22 +431,10 @@ impl Scheduler {
                 process_id,
                 address_space,
             };
+            task.install_context(child_context);
+            task.state = preempt::TaskState::Ready;
             ThreadId::new(id.index(), task.generation)
         };
-
-        let kernel_sp = self.task(id).stack_top();
-        let source_frame_words = live_frame_words(context) as *const u64;
-        // SAFETY: scheduler owns the destination frame and child kernel stack.
-        // The source frame is the live lower-EL syscall frame supplied by the
-        // caller. The arch helper copies the userspace resume state and fixes
-        // the child-only return value/kernel stack.
-        unsafe {
-            arch_clone_user_trap_frame_for_fork(
-                self.frame_words_mut_ptr(id),
-                source_frame_words,
-                kernel_sp,
-            );
-        }
 
         if id != IDLE_TASK_ID {
             let was_empty = self.ready_queue.is_empty();
@@ -512,8 +471,7 @@ impl Scheduler {
         self.finish_current_exit(current, exited, code);
 
         let next = self.dequeue_next_ready().unwrap_or(IDLE_TASK_ID);
-        let active_frame_words = live_frame_words(context);
-        copy_words(active_frame_words, self.frame_words_ptr(next));
+        self.saved_context(next).restore_into(context);
         self.make_running(next);
         self.finish_block_current(current, next);
         crate::debug!("thread: exited id={exited} code={code}");
@@ -648,7 +606,6 @@ impl Scheduler {
 
         let generation = self.task(id).generation;
         let task = self.task_mut(id);
-        task.state = preempt::TaskState::Free;
         task.joinable = false;
         task.exit_code = None;
         task.joiner = None;
@@ -657,6 +614,8 @@ impl Scheduler {
         task.entry = free_task_entry;
         task.arg = ThreadArg::empty();
         task.kind = preempt::ThreadKind::Kernel;
+        task.release_context();
+        task.state = preempt::TaskState::Free;
         crate::debug!(
             "thread: reclaimed slot={} generation={generation}",
             id.index()

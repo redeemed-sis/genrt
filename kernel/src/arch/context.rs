@@ -1,9 +1,37 @@
 use core::{ffi::c_void, marker::PhantomData, ptr::NonNull};
 
+const SAVED_CONTEXT_PAYLOAD_BYTES: usize = 280;
+const SAVED_CONTEXT_PADDING_BYTES: usize = 8;
+const SAVED_CONTEXT_STORAGE_BYTES: usize =
+    SAVED_CONTEXT_PAYLOAD_BYTES + SAVED_CONTEXT_PADDING_BYTES;
+const SAVED_CONTEXT_STORAGE_ALIGN: usize = 16;
+
 unsafe extern "C" {
     fn arch_active_context_set_syscall_result(frame: *mut c_void, value: isize);
     fn arch_active_context_restart_syscall(frame: *mut c_void);
     fn arch_active_context_replace_user(frame: *mut c_void, user_entry: usize, user_sp: usize);
+    fn arch_saved_context_init_kernel(
+        saved: *mut SavedContext,
+        stack_top: usize,
+        entry_addr: usize,
+        arg: usize,
+        bootstrap_pc: usize,
+    );
+    fn arch_saved_context_init_user(
+        saved: *mut SavedContext,
+        user_entry: usize,
+        user_sp: usize,
+        kernel_sp: usize,
+        arg0: usize,
+    );
+    fn arch_saved_context_init_fork_child(
+        saved: *mut SavedContext,
+        active: *const c_void,
+        child_kernel_sp: usize,
+    );
+    fn arch_saved_context_save(saved: *mut SavedContext, active: *const c_void);
+    fn arch_saved_context_restore(saved: *const SavedContext, active: *mut c_void);
+    fn arch_saved_context_enter(saved: *const SavedContext) -> !;
 }
 
 /// Exclusive access to the live architecture exception frame.
@@ -33,10 +61,9 @@ impl<'a> ActiveContext<'a> {
     /// # Safety
     ///
     /// `frame` must identify the active architecture's complete writable trap
-    /// frame and remain live and exclusively borrowed for `'a`. Its layout and
-    /// alignment must also match the saved-frame word ABI used by the temporary
-    /// scheduler migration bridge. The caller must not create another context
-    /// or access the frame directly until the returned value is dropped.
+    /// frame and remain live and exclusively borrowed for `'a`. The caller must
+    /// not create another context or access the frame directly until the
+    /// returned value is dropped.
     pub unsafe fn from_raw(frame: NonNull<c_void>) -> Self {
         Self {
             frame,
@@ -99,20 +126,180 @@ impl<'a> ActiveContext<'a> {
             arch_active_context_replace_user(self.frame.as_ptr(), user_entry, user_sp);
         }
     }
+}
 
-    /// Expose the temporary saved-frame word bridge to scheduler handoff code.
+/// Owned architecture context retained by one occupied scheduler slot.
+///
+/// The storage is inline, fully initialized, and deliberately opaque outside
+/// the architecture facade. It is not `Copy` or `Clone`; moving the value
+/// transfers ownership of the saved execution state. Construction and handoff
+/// operations are bounded and allocation-free.
+#[repr(C, align(16))]
+pub struct SavedContext {
+    payload: [u8; SAVED_CONTEXT_PAYLOAD_BYTES],
+    alignment_tail: [u8; SAVED_CONTEXT_PADDING_BYTES],
+}
+
+impl SavedContext {
+    /// Number of architecture payload bytes available at offset zero.
     ///
     /// # Returns
     ///
-    /// Returns a non-null pointer to the first word of the live frame. Only the
-    /// low-level scheduler saved-frame copy and fork-clone paths may consume it.
-    /// The pointer remains covered by this context's exclusive borrow and must
-    /// not be stored. This operation does not allocate, block, or alter IRQ
-    /// state.
-    pub(crate) fn scheduler_frame_words(&mut self) -> NonNull<u64> {
-        self.frame.cast()
+    /// This associated constant is the exact payload size that an architecture
+    /// adapter must match with its saved frame.
+    pub const PAYLOAD_BYTES: usize = SAVED_CONTEXT_PAYLOAD_BYTES;
+
+    /// Total inline storage footprint, including explicit alignment tail bytes.
+    ///
+    /// # Returns
+    ///
+    /// This associated constant is the exact size of `SavedContext` in a task
+    /// slot.
+    pub const STORAGE_BYTES: usize = SAVED_CONTEXT_STORAGE_BYTES;
+
+    /// Required alignment of scheduler-owned saved context storage.
+    ///
+    /// # Returns
+    ///
+    /// This associated constant is the exact alignment architecture adapters
+    /// may rely on.
+    pub const STORAGE_ALIGN: usize = SAVED_CONTEXT_STORAGE_ALIGN;
+
+    /// Build the initial context for a kernel thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `stack_top` - Exclusive upper bound of the thread's kernel stack.
+    /// * `entry_addr` - Address of the kernel thread entry function.
+    /// * `arg` - Raw [`crate::sched::ThreadArg`] payload for the entry function.
+    /// * `bootstrap_pc` - Architecture return PC for the common thread bootstrap.
+    ///
+    /// # Returns
+    ///
+    /// Returns an owned kernel-entry context. The operation is bounded and does
+    /// not allocate, block, or alter IRQ state.
+    pub(crate) fn kernel_entry(
+        stack_top: usize,
+        entry_addr: usize,
+        arg: usize,
+        bootstrap_pc: usize,
+    ) -> Self {
+        let mut saved = Self::zeroed();
+        // SAFETY: `saved` is aligned opaque storage owned exclusively by this
+        // constructor. The architecture compile-time contract verifies that
+        // its complete saved frame fits in the storage.
+        unsafe {
+            arch_saved_context_init_kernel(&mut saved, stack_top, entry_addr, arg, bootstrap_pc);
+        }
+        saved
+    }
+
+    /// Build the initial context for a userspace thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_entry` - EL0 virtual address at which execution begins.
+    /// * `user_sp` - Initial EL0 stack pointer.
+    /// * `kernel_sp` - EL1 exception stack pointer owned by the thread.
+    /// * `arg0` - Initial userspace argument register value.
+    ///
+    /// # Returns
+    ///
+    /// Returns an owned userspace-entry context. The operation is bounded and
+    /// does not allocate, block, or alter IRQ state.
+    pub(crate) fn user_entry(
+        user_entry: usize,
+        user_sp: usize,
+        kernel_sp: usize,
+        arg0: usize,
+    ) -> Self {
+        let mut saved = Self::zeroed();
+        // SAFETY: the destination is exclusive, aligned, fully initialized
+        // storage whose size is checked by the architecture adapter.
+        unsafe {
+            arch_saved_context_init_user(&mut saved, user_entry, user_sp, kernel_sp, arg0);
+        }
+        saved
+    }
+
+    /// Derive a fork child's saved userspace context from the live parent.
+    ///
+    /// # Arguments
+    ///
+    /// * `parent` - Exclusively borrowed live parent syscall context.
+    /// * `child_kernel_sp` - EL1 exception stack pointer owned by the child.
+    ///
+    /// # Returns
+    ///
+    /// Returns an owned child context with architecture-defined fork return
+    /// state. The operation is bounded and allocation-free.
+    pub(crate) fn fork_child(parent: &mut ActiveContext<'_>, child_kernel_sp: usize) -> Self {
+        let mut saved = Self::zeroed();
+        // SAFETY: `parent` uniquely owns its live frame and `saved` uniquely
+        // owns correctly sized/aligned destination storage.
+        unsafe {
+            arch_saved_context_init_fork_child(&mut saved, parent.frame.as_ptr(), child_kernel_sp);
+        }
+        saved
+    }
+
+    /// Save one live exception context into this scheduler-owned context.
+    ///
+    /// # Arguments
+    ///
+    /// * `active` - Exclusively borrowed live context being switched out.
+    ///
+    /// # Returns
+    ///
+    /// Returns no value. The operation performs a bounded architecture frame
+    /// copy and does not allocate, block, or alter IRQ state.
+    pub(crate) fn save_from(&mut self, active: &mut ActiveContext<'_>) {
+        // SAFETY: both contexts are exclusively borrowed and represent distinct
+        // architecture-owned live and scheduler-owned saved storage.
+        unsafe { arch_saved_context_save(self, active.frame.as_ptr()) }
+    }
+
+    /// Restore this scheduler-owned context into a live exception context.
+    ///
+    /// # Arguments
+    ///
+    /// * `active` - Exclusively borrowed live context that will resume the task.
+    ///
+    /// # Returns
+    ///
+    /// Returns no value. The operation performs a bounded architecture frame
+    /// copy and does not allocate, block, or alter IRQ state.
+    pub(crate) fn restore_into(&self, active: &mut ActiveContext<'_>) {
+        // SAFETY: `self` contains a typed, initialized saved frame and `active`
+        // uniquely owns the writable live return frame.
+        unsafe { arch_saved_context_restore(self, active.frame.as_ptr()) }
+    }
+
+    /// Enter this saved context as the scheduler's first running task.
+    ///
+    /// # Returns
+    ///
+    /// This function does not return. It transfers control to the architecture
+    /// restore path. The operation is bounded and allocation-free.
+    pub(crate) fn enter(&self) -> ! {
+        // SAFETY: typed construction guarantees an initialized saved frame and
+        // scheduler ownership keeps this inline storage stable while it runs.
+        unsafe { arch_saved_context_enter(self) }
+    }
+
+    const fn zeroed() -> Self {
+        Self {
+            payload: [0; SAVED_CONTEXT_PAYLOAD_BYTES],
+            alignment_tail: [0; SAVED_CONTEXT_PADDING_BYTES],
+        }
     }
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<SavedContext>() == SAVED_CONTEXT_STORAGE_BYTES);
+    assert!(core::mem::align_of::<SavedContext>() == SAVED_CONTEXT_STORAGE_ALIGN);
+    assert!(core::mem::offset_of!(SavedContext, payload) == 0);
+};
 
 /// Architecture-neutral decoded userspace syscall request.
 ///

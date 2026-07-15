@@ -1,7 +1,7 @@
 use alloc::{collections::VecDeque, vec::Vec};
 use core::cell::UnsafeCell;
 
-use crate::{arch::ActiveContext, arch_consts::TASK_FRAME_WORDS, task::TaskId};
+use crate::task::TaskId;
 
 mod bootstrap;
 mod ipc;
@@ -39,29 +39,6 @@ const THREAD_STACK_SIZE: usize = 32768;
 const IDLE_TASK_ID: TaskId = TaskId::new(0);
 const INITIAL_THREAD_GENERATION: u32 = 1;
 
-unsafe extern "C" {
-    fn arch_init_thread_frame(
-        frame_words: *mut u64,
-        stack_top: usize,
-        entry_addr: usize,
-        arg: usize,
-        bootstrap_pc: usize,
-    );
-    fn arch_init_user_trap_frame(
-        frame_words: *mut u64,
-        user_entry: usize,
-        user_sp: usize,
-        kernel_sp: usize,
-        arg0: usize,
-    );
-    fn arch_clone_user_trap_frame_for_fork(
-        dst_frame_words: *mut u64,
-        src_frame_words: *const u64,
-        child_kernel_sp: usize,
-    );
-    fn arch_enter_task_frame(frame_words: *const u64) -> !;
-}
-
 struct SchedulerCell(UnsafeCell<Option<Scheduler>>);
 
 // SAFETY: genrt currently mutates scheduler state only on a single core.
@@ -78,7 +55,9 @@ pub(crate) enum SchedError {
 
 pub(crate) struct Scheduler {
     // Scheduler storage is dynamic-but-preallocated at bootstrap:
-    // - `tasks` owns boxed stacks and saved frames for stable addresses,
+    // - `tasks` owns boxed stacks and inline SavedContext values; the task Vec
+    //   is fully reserved and populated before first entry, so addresses remain
+    //   stable while scheduling is active,
     // - `ready_queue` owns round-robin order for non-idle runnable tasks,
     // - no allocation or queue growth is allowed in IRQ fast paths.
     tasks: Vec<preempt::Task>,
@@ -108,26 +87,6 @@ fn scheduler_mut() -> &'static mut Scheduler {
 #[inline(always)]
 fn try_scheduler_mut() -> Option<&'static mut Scheduler> {
     scheduler_slot_mut().as_mut()
-}
-
-#[inline(always)]
-fn copy_words(dst: *mut u64, src: *const u64) {
-    // SAFETY: caller guarantees both buffers are valid and non-overlapping
-    // `TASK_FRAME_WORDS` storage.
-    unsafe {
-        for i in 0..TASK_FRAME_WORDS {
-            *dst.add(i) = *src.add(i);
-        }
-    }
-}
-
-/// Borrow the live frame as words for the temporary scheduler migration bridge.
-///
-/// The returned pointer may be used only by low-level saved-frame copy and
-/// architecture clone hooks during the current handoff; it must not be stored.
-#[inline(always)]
-fn live_frame_words(context: &mut ActiveContext<'_>) -> *mut u64 {
-    context.scheduler_frame_words().as_ptr()
 }
 
 fn log_switch(prev: TaskId, next: TaskId) {

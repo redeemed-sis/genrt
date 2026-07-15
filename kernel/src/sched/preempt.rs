@@ -1,8 +1,7 @@
 use alloc::boxed::Box;
 
 use crate::{
-    arch::ActiveContext,
-    arch_consts::TASK_FRAME_WORDS,
+    arch::{ActiveContext, SavedContext},
     memory::vm::UserAddressSpace,
     process::ProcessId,
     task::{TaskId, ThreadId},
@@ -10,8 +9,8 @@ use crate::{
 };
 
 use super::{
-    IDLE_TASK_ID, INITIAL_THREAD_GENERATION, Scheduler, THREAD_STACK_SIZE, arch_enter_task_frame,
-    copy_words, ipc as sched_ipc, live_frame_words, log_switch, scheduler_mut, thread,
+    IDLE_TASK_ID, INITIAL_THREAD_GENERATION, Scheduler, THREAD_STACK_SIZE, ipc as sched_ipc,
+    log_switch, scheduler_mut, thread,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -24,9 +23,9 @@ pub(super) enum BlockReason {
 }
 
 // Task-state semantics:
-// - Free: preallocated slot, stack, and frame storage are available for spawn.
-// - Running: the sole task whose saved frame matches the scheduler's committed resume target.
-// - Ready: runnable, owns a valid saved frame, and sits in the ready queue unless it is idle.
+// - Free: preallocated slot and stack are available for spawn; no SavedContext is owned.
+// - Running: the sole task whose SavedContext matches the committed resume target.
+// - Ready: runnable, owns a valid SavedContext, and sits in the ready queue unless it is idle.
 // - Blocked(reason): not runnable and not considered during round-robin
 //   selection. Wakeup ownership still lives outside the scheduler: deadlines in
 //   `kernel::time` and wait queues in `kernel::ipc`. The scheduler keeps an
@@ -67,21 +66,6 @@ impl TaskStack {
     }
 }
 
-#[repr(C, align(16))]
-struct TaskFrameStorage {
-    words: [u64; TASK_FRAME_WORDS],
-}
-
-impl TaskFrameStorage {
-    fn as_words_ptr(&self) -> *const u64 {
-        self.words.as_ptr()
-    }
-
-    fn as_mut_words_ptr(&mut self) -> *mut u64 {
-        self.words.as_mut_ptr()
-    }
-}
-
 pub(super) struct Task {
     pub(super) generation: u32,
     pub(super) state: TaskState,
@@ -94,7 +78,7 @@ pub(super) struct Task {
     pub(super) arg: thread::ThreadArg,
     pub(super) kind: ThreadKind,
     stack: Box<TaskStack>,
-    frame: Box<TaskFrameStorage>,
+    context: Option<SavedContext>,
 }
 
 impl Task {
@@ -104,6 +88,13 @@ impl Task {
         state: TaskState,
         joinable: bool,
     ) -> Self {
+        let stack = boxed_zeroed_stack();
+        let context = SavedContext::kernel_entry(
+            stack.top(),
+            entry as *const () as usize,
+            arg.as_usize(),
+            thread::thread_entry_bootstrap as *const () as usize,
+        );
         Self {
             generation: INITIAL_THREAD_GENERATION,
             state,
@@ -115,8 +106,8 @@ impl Task {
             entry,
             arg,
             kind: ThreadKind::Kernel,
-            stack: boxed_zeroed(),
-            frame: boxed_zeroed(),
+            stack,
+            context: Some(context),
         }
     }
 
@@ -132,8 +123,8 @@ impl Task {
             entry: thread::free_task_entry,
             arg: thread::ThreadArg::empty(),
             kind: ThreadKind::Kernel,
-            stack: boxed_zeroed(),
-            frame: boxed_zeroed(),
+            stack: boxed_zeroed_stack(),
+            context: None,
         }
     }
 
@@ -152,18 +143,29 @@ impl Task {
     pub(super) fn is_runnable(&self) -> bool {
         matches!(self.state, TaskState::Ready | TaskState::Running)
     }
+
+    pub(super) fn install_context(&mut self, context: SavedContext) {
+        debug_assert!(self.is_free());
+        debug_assert!(self.context.is_none());
+        self.context = Some(context);
+    }
+
+    pub(super) fn release_context(&mut self) {
+        debug_assert!(!self.is_free());
+        debug_assert!(self.context.is_some());
+        self.context = None;
+    }
 }
 
-fn boxed_zeroed<T>() -> Box<T> {
-    let mut boxed = Box::<T>::new_uninit();
-    // SAFETY: the allocation is valid for `T`; writing zero bytes initializes
-    // these scheduler storage types to their intended all-zero state without
-    // materializing large temporaries on the current boot/kernel stack.
+fn boxed_zeroed_stack() -> Box<TaskStack> {
+    let mut boxed = Box::<TaskStack>::new_uninit();
+    // SAFETY: TaskStack is a byte array whose all-zero value is valid. Initialize
+    // it in place to avoid materializing 32 KiB on the boot/kernel stack.
     unsafe {
         core::ptr::write_bytes(
             boxed.as_mut_ptr().cast::<u8>(),
             0,
-            core::mem::size_of::<T>(),
+            core::mem::size_of::<TaskStack>(),
         );
         boxed.assume_init()
     }
@@ -213,12 +215,8 @@ impl Scheduler {
         if self.resched_requested || must_leave_idle {
             let next = self.dequeue_next_ready().unwrap_or(current);
             if next != current {
-                let active_frame_words = live_frame_words(context);
-                copy_words(
-                    self.frame_words_mut_ptr(current),
-                    active_frame_words as *const u64,
-                );
-                copy_words(active_frame_words, self.frame_words_ptr(next));
+                self.saved_context_mut(current).save_from(context);
+                self.saved_context(next).restore_into(context);
                 self.commit_switch(current, next);
                 log_switch(current, next);
             }
@@ -262,15 +260,9 @@ impl Scheduler {
         reason: BlockReason,
     ) -> TaskId {
         let next = self.dequeue_next_ready().unwrap_or(IDLE_TASK_ID);
-        let active_frame_words = live_frame_words(context);
-
         // Save the current task's post-SVC resume frame before making it unrunnable.
-        copy_words(
-            self.frame_words_mut_ptr(current),
-            active_frame_words as *const u64,
-        );
-
-        copy_words(active_frame_words, self.frame_words_ptr(next));
+        self.saved_context_mut(current).save_from(context);
+        self.saved_context(next).restore_into(context);
         self.commit_block(current, next, reason);
         next
     }
@@ -287,15 +279,13 @@ impl Scheduler {
         let running = self
             .running_task()
             .unwrap_or_else(|| panic!("scheduler has no running task"));
-        let frame_words = self.frame_words_ptr(running);
         let now = crate::time::now_counter();
 
         self.entered_running_task = true;
         self.ensure_quantum_event(now);
         debug_assert_eq!(self.current, Some(running));
         debug_assert_eq!(self.task(running).state, TaskState::Running);
-        // SAFETY: scheduler bootstrap prepared the running task trap frame.
-        unsafe { arch_enter_task_frame(frame_words) }
+        self.saved_context(running).enter()
     }
 
     pub(super) fn running_task(&self) -> Option<TaskId> {
@@ -473,11 +463,17 @@ impl Scheduler {
         &mut self.tasks[id.index()]
     }
 
-    pub(super) fn frame_words_ptr(&self, id: TaskId) -> *const u64 {
-        self.task(id).frame.as_words_ptr()
+    pub(super) fn saved_context(&self, id: TaskId) -> &SavedContext {
+        self.task(id)
+            .context
+            .as_ref()
+            .unwrap_or_else(|| panic!("sched: occupied task {id} has no saved context"))
     }
 
-    pub(super) fn frame_words_mut_ptr(&mut self, id: TaskId) -> *mut u64 {
-        self.task_mut(id).frame.as_mut_words_ptr()
+    pub(super) fn saved_context_mut(&mut self, id: TaskId) -> &mut SavedContext {
+        self.task_mut(id)
+            .context
+            .as_mut()
+            .unwrap_or_else(|| panic!("sched: occupied task {id} has no saved context"))
     }
 }

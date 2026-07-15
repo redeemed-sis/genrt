@@ -3,8 +3,8 @@ use alloc::{collections::VecDeque, vec::Vec};
 use crate::{task::TaskId, time::TimeHandlers};
 
 use super::{
-    IDLE_TASK_ID, Result, SchedError, Scheduler, THREAD_STACK_SIZE, arch_init_thread_frame,
-    ipc as sched_ipc, preempt, scheduler_slot_mut, thread,
+    IDLE_TASK_ID, Result, SchedError, Scheduler, THREAD_STACK_SIZE, ipc as sched_ipc, preempt,
+    scheduler_slot_mut, thread,
 };
 
 #[derive(Copy, Clone)]
@@ -88,7 +88,6 @@ impl Scheduler {
         for task in tasks {
             scheduler.push_bootstrap_task(task.entry, task.arg);
         }
-        scheduler.initialize_bootstrap_task_frames()?;
         scheduler.fill_free_slots(thread_capacity);
 
         let first = scheduler.dequeue_next_ready().unwrap_or(IDLE_TASK_ID);
@@ -149,36 +148,5 @@ impl Scheduler {
             self.tasks.push(preempt::Task::free());
             crate::trace!("sched: prepared free thread slot {id}");
         }
-    }
-
-    fn initialize_bootstrap_task_frames(&mut self) -> Result<()> {
-        for index in 0..self.tasks.len() {
-            self.initialize_task_frame(TaskId::new(index))?;
-        }
-        Ok(())
-    }
-
-    fn initialize_task_frame(&mut self, id: TaskId) -> Result<()> {
-        if !self.is_valid_task(id) {
-            return Err(SchedError::InvalidTaskId);
-        }
-
-        let (stack_top, entry, arg) = {
-            let task = self.task(id);
-            (task.stack_top(), task.entry, task.arg.as_usize())
-        };
-        let frame_words = self.frame_words_mut_ptr(id);
-        // SAFETY: scheduler owns frame storage; stack top, entry pointer, and
-        // argument were fixed during bootstrap task-table setup.
-        unsafe {
-            arch_init_thread_frame(
-                frame_words,
-                stack_top,
-                entry as *const () as usize,
-                arg,
-                thread::thread_entry_bootstrap as *const () as usize,
-            );
-        }
-        Ok(())
     }
 }

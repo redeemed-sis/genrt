@@ -7,7 +7,6 @@
 extern crate alloc;
 
 pub mod arch;
-pub mod arch_consts;
 pub mod boot;
 mod config;
 pub mod console;
