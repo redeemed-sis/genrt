@@ -1,4 +1,8 @@
 #![no_std]
+// QEMU scenario features replace production roots with finite test
+// coordinators, so production-only call graphs are intentionally unreachable
+// in those artifacts. Production builds retain the normal dead-code lint.
+#![cfg_attr(feature = "qemu-test", allow(dead_code))]
 
 extern crate alloc;
 
