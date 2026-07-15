@@ -51,6 +51,23 @@ parallel writers are outside the default workflow.
 Every subagent handoff includes summary, evidence, relevant invariants, risks or
 findings, recommended action, validation performed, and unverified assumptions.
 
+## Model allocation
+
+Project roles pin models according to the cost and reasoning demands of their
+work. Exact settings live in `.codex/agents/*.toml`.
+
+| Role | Model | Reasoning | Rationale |
+| --- | --- | --- | --- |
+| Architect | `gpt-5.6-sol` | High | Cross-layer design and invariant analysis |
+| Reviewer | `gpt-5.6-sol` | High | Independent correctness and safety review |
+| Developer | `gpt-5.6-terra` | High | Focused implementation after scope consolidation |
+| Tester | `gpt-5.6-terra` | Medium | Test execution and artifact diagnosis |
+| Explorer | `gpt-5.6-luna` | Medium | Fast read-heavy tracing and evidence gathering |
+
+This keeps the strongest model on architecture and review while avoiding the
+cost of inheriting the main session model for routine exploration, test runs,
+and bounded implementation work.
+
 ## Skills
 
 - `genrt-change-workflow`: nontrivial implementation lifecycle.

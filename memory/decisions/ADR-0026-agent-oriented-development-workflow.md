@@ -37,6 +37,15 @@ conflicts and weaken ownership.
 - The root README is a landing page. Detailed implementation ownership lives
   in module READMEs, workflow documentation, and project memory.
 
+## Subsequent refinement
+
+The initial decision let every role inherit the user-selected model. Project
+agent files now pin role-specific models and reasoning effort: architecture and
+review retain the strongest configuration, while exploration, testing, and
+implementation use lower-cost models suited to their bounded responsibilities.
+The exact current mapping is owned by `.codex/agents/*.toml` and summarized in
+`docs/development/agent-workflow.md`.
+
 ## Invariants
 
 - Delegation must not weaken the active `AGENTS.md` chain or repository
