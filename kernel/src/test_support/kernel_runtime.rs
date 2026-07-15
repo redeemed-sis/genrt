@@ -42,10 +42,10 @@ static PROGRESS_B: AtomicUsize = AtomicUsize::new(0);
 
 /// Finite test-only scheduler tasks selected by the kernel runtime feature.
 pub(crate) const TASKS: [sched::StaticTask; 4] = [
-    sched::StaticTask::new(crate::TEST_PRIORITY, coordinator, ThreadArg::empty()),
-    sched::StaticTask::new(crate::TEST_PRIORITY, blocked_receiver, ThreadArg::empty()),
-    sched::StaticTask::new(crate::TEST_PRIORITY, progress_a, ThreadArg::empty()),
-    sched::StaticTask::new(crate::TEST_PRIORITY, progress_b, ThreadArg::empty()),
+    sched::StaticTask::new(coordinator, ThreadArg::empty()),
+    sched::StaticTask::new(blocked_receiver, ThreadArg::empty()),
+    sched::StaticTask::new(progress_a, ThreadArg::empty()),
+    sched::StaticTask::new(progress_b, ThreadArg::empty()),
 ];
 
 /// Initialize bounded fixtures before scheduler entry.

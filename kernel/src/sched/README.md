@@ -51,6 +51,10 @@ Kernel and user threads share scheduling mechanics but have distinct frame and
 address-space initialization. User threads reference a process and TTBR0 root;
 kernel threads run with TTBR0 cleared.
 
+Production bootstrap preallocates the permanent idle thread and one static init
+thread, which launches userspace `/init`. Dedicated QEMU kernel features select
+their own finite static-task arrays without changing round-robin behavior.
+
 ## Constraints
 
 - Single core; local IRQ exclusion is not SMP synchronization.

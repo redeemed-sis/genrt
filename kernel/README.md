@@ -28,6 +28,11 @@ runtime TTBR1 tables, mounts initramfs, bootstraps scheduler storage, and enters
 the first selected trap frame. The init kernel thread spawns `/init` as a normal
 user process and joins it.
 
+The production scheduler starts with exactly two kernel tasks: the permanent
+idle thread and one non-idle `kernel_init_thread`. QEMU scenario features replace
+the non-idle static-task set with their bounded test coordinators; production
+does not carry unrelated background workloads.
+
 Tasks are schedulable contexts. Kernel threads have only kernel state; user
 threads reference their owning process and TTBR0 address space. A process owns
 the userspace resources shared across its current single main thread: loaded

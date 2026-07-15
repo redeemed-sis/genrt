@@ -44,6 +44,8 @@ accepted ADRs remain authoritative when details differ.
 ## Scheduling and time
 
 - The scheduler is round-robin, preemptive, and single-core.
+- Production bootstrap starts only the permanent idle thread and one kernel init
+  thread; the latter launches and joins userspace `/init`.
 - Context switching replaces the saved trap frame selected for IRQ or syscall
   return rather than using a normal function-call switch.
 - The architected timer runs in one-shot nearest-deadline mode.

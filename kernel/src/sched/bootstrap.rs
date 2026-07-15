@@ -8,23 +8,28 @@ use super::{
 };
 
 #[derive(Copy, Clone)]
+/// Immutable entry descriptor for a kernel task created during bootstrap.
 pub(crate) struct StaticTask {
-    priority: u8,
     entry: thread::ThreadEntry,
     arg: thread::ThreadArg,
 }
 
 impl StaticTask {
-    pub(crate) const fn new(
-        priority: u8,
-        entry: thread::ThreadEntry,
-        arg: thread::ThreadArg,
-    ) -> Self {
-        Self {
-            priority,
-            entry,
-            arg,
-        }
+    /// Create a static bootstrap task descriptor.
+    ///
+    /// This constructor records task metadata only. Stack/frame allocation and
+    /// ready-queue insertion occur later during scheduler bootstrap.
+    ///
+    /// # Arguments
+    ///
+    /// - `entry`: Kernel thread entry function invoked by the bootstrap frame.
+    /// - `arg`: Value passed to `entry` when the task first runs.
+    ///
+    /// # Returns
+    ///
+    /// Returns an immutable descriptor containing `entry` and `arg`.
+    pub(crate) const fn new(entry: thread::ThreadEntry, arg: thread::ThreadArg) -> Self {
+        Self { entry, arg }
     }
 }
 
@@ -81,7 +86,7 @@ impl Scheduler {
         let mut scheduler = Self::new(thread_capacity, rr_quantum_ms);
         scheduler.push_idle_task(idle_entry, idle_arg);
         for task in tasks {
-            scheduler.push_bootstrap_task(task.priority, task.entry, task.arg);
+            scheduler.push_bootstrap_task(task.entry, task.arg);
         }
         scheduler.initialize_bootstrap_task_frames()?;
         scheduler.fill_free_slots(thread_capacity);
@@ -126,12 +131,7 @@ impl Scheduler {
         ));
     }
 
-    fn push_bootstrap_task(
-        &mut self,
-        priority: u8,
-        entry: thread::ThreadEntry,
-        arg: thread::ThreadArg,
-    ) {
+    fn push_bootstrap_task(&mut self, entry: thread::ThreadEntry, arg: thread::ThreadArg) {
         let id = TaskId::new(self.tasks.len());
         self.tasks.push(preempt::Task::bootstrap(
             entry,
@@ -140,7 +140,7 @@ impl Scheduler {
             false,
         ));
         self.ready_push_back(id);
-        crate::debug!("sched: bootstrap task {} priority={priority}", id);
+        crate::debug!("sched: bootstrap task {id}");
     }
 
     fn fill_free_slots(&mut self, thread_capacity: usize) {

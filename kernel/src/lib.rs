@@ -4,8 +4,8 @@ extern crate alloc;
 
 pub mod arch_consts;
 pub mod boot;
+mod config;
 pub mod console;
-mod demo;
 mod dtb;
 pub mod errno;
 pub mod fs;
@@ -28,9 +28,11 @@ pub mod time;
 
 use bootinfo::BootInfo;
 
-pub const TEST_PRIORITY: u8 = 10;
-pub const TEST_RR_QUANTUM_MS: u64 = 10;
-pub const TEST_THREAD_CAPACITY: usize = 12;
+#[cfg(not(any(feature = "qemu-test-kernel-runtime", feature = "qemu-test-user-fault")))]
+const PRODUCTION_TASKS: [sched::StaticTask; 1] = [sched::StaticTask::new(
+    crate::init::kernel_init_thread,
+    sched::ThreadArg::empty(),
+)];
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
@@ -63,8 +65,6 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
         panic!("initramfs: failed to mount loader image");
     }
 
-    #[cfg(not(any(feature = "qemu-test-kernel-runtime", feature = "qemu-test-user-fault")))]
-    demo::init();
     #[cfg(feature = "qemu-test-kernel-runtime")]
     test_support::kernel_runtime::init();
 
@@ -72,8 +72,8 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
         idle_task,
         sched::ThreadArg::empty(),
         static_tasks(),
-        TEST_RR_QUANTUM_MS,
-        TEST_THREAD_CAPACITY,
+        config::SCHED_RR_QUANTUM_MS,
+        config::KERNEL_THREAD_CAPACITY,
     )
     .is_err()
     {
@@ -97,7 +97,7 @@ fn static_tasks() -> &'static [sched::StaticTask] {
     }
     #[cfg(not(any(feature = "qemu-test-kernel-runtime", feature = "qemu-test-user-fault")))]
     {
-        &demo::TASKS
+        &PRODUCTION_TASKS
     }
 }
 
