@@ -2,6 +2,5 @@
   "rust-analyzer.check.command": "clippy",
   "rust-analyzer.cargo.buildScripts.enable": true,
   "editor.formatOnSave": true,
-  "rust-analyzer.check.allTargets": false,
-  "rust-analyzer.cargo.target": "aarch64-unknown-none"
+  "rust-analyzer.check.allTargets": false
 }
