@@ -1,7 +1,7 @@
 use alloc::{collections::VecDeque, vec::Vec};
 use core::cell::UnsafeCell;
 
-use crate::{arch_consts::TASK_FRAME_WORDS, task::TaskId};
+use crate::{arch::ActiveContext, arch_consts::TASK_FRAME_WORDS, task::TaskId};
 
 mod bootstrap;
 mod ipc;
@@ -21,7 +21,7 @@ pub(crate) use self::{
         block_current_on_process_wait, block_current_on_stdin_read, complete_process_wait,
         complete_stdin_read, current_user_address_space, current_user_process_id,
         on_thread_exit_sync, on_thread_join_sync, replace_current_user_address_space,
-        thread_spawn_user, thread_spawn_user_from_frame,
+        thread_spawn_user, thread_spawn_user_from_context,
     },
 };
 pub use self::{
@@ -119,6 +119,15 @@ fn copy_words(dst: *mut u64, src: *const u64) {
             *dst.add(i) = *src.add(i);
         }
     }
+}
+
+/// Borrow the live frame as words for the temporary scheduler migration bridge.
+///
+/// The returned pointer may be used only by low-level saved-frame copy and
+/// architecture clone hooks during the current handoff; it must not be stored.
+#[inline(always)]
+fn live_frame_words(context: &mut ActiveContext<'_>) -> *mut u64 {
+    context.scheduler_frame_words().as_ptr()
 }
 
 fn log_switch(prev: TaskId, next: TaskId) {

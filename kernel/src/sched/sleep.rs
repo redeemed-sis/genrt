@@ -1,4 +1,4 @@
-use crate::time::TimedEvent;
+use crate::{arch::ActiveContext, time::TimedEvent};
 
 use super::{Scheduler, preempt::BlockReason, scheduler_mut};
 
@@ -33,13 +33,25 @@ pub fn sleep_until(deadline: u64) {
     sleep_until_counter(deadline);
 }
 
-pub(crate) fn on_sleep_sync(active_frame_words: *mut u64, deadline: u64) {
-    scheduler_mut().block_current_until(active_frame_words, deadline);
+/// Block the current task until an absolute counter deadline.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live task-call context saved and replaced by the
+///   scheduler.
+/// * `deadline` - Absolute architecture counter value for the wake event.
+///
+/// # Returns
+///
+/// Returns after the task is later resumed. Event insertion uses preallocated
+/// storage and this scheduler handoff does not allocate.
+pub(crate) fn on_sleep_sync(context: &mut ActiveContext<'_>, deadline: u64) {
+    scheduler_mut().block_current_until(context, deadline);
 }
 
 impl Scheduler {
-    fn block_current_until(&mut self, active_frame_words: *mut u64, deadline: u64) {
-        let (current, next) = self.begin_block_current(active_frame_words, BlockReason::Sleep);
+    fn block_current_until(&mut self, context: &mut ActiveContext<'_>, deadline: u64) {
+        let (current, next) = self.begin_block_current(context, BlockReason::Sleep);
         crate::time::schedule_event(deadline, TimedEvent::WakeTask(current));
         self.finish_block_current(current, next);
         crate::trace!("sched: task {current} sleeping until counter {deadline}");

@@ -1,11 +1,10 @@
 use core::cell::UnsafeCell;
 
-use crate::{sched, sync::LocalIrqGuard, task::ThreadId};
+use crate::{arch::ActiveContext, sched, sync::LocalIrqGuard, task::ThreadId};
 
 unsafe extern "C" {
     fn arch_console_init_once();
     fn arch_console_putc_raw(c: u8);
-    fn arch_restart_current_syscall(frame_words: *mut u64);
 }
 
 const STDIN_RX_CAPACITY: usize = 256;
@@ -127,7 +126,31 @@ pub fn read_stdin(buffer: &mut [u8]) -> usize {
     stdin_mut().pop_into(buffer)
 }
 
-pub fn block_current_stdin_read_if_empty(active_frame_words: *mut u64) -> Result<bool, ()> {
+/// Register and block the current stdin reader if the RX ring is still empty.
+///
+/// The lost-wakeup check, waiter registration, syscall restart, and scheduler
+/// handoff occur under one short local IRQ-disabled section. The operation does
+/// not allocate; when it blocks, control resumes through the scheduler-selected
+/// live context.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live userspace syscall context to restart and hand
+///   to the scheduler when input is unavailable.
+///
+/// # Returns
+///
+/// Returns `Ok(true)` after registering and blocking, `Ok(false)` when input
+/// became available before registration, or `Err(())` when no current thread
+/// exists or another stdin waiter owns the single waiter slot.
+///
+/// # Errors
+///
+/// Returns `Err(())` for unavailable scheduler identity or waiter-slot
+/// conflict.
+pub(crate) fn block_current_stdin_read_if_empty(
+    context: &mut ActiveContext<'_>,
+) -> Result<bool, ()> {
     let _irq_guard = LocalIrqGuard::save_and_disable();
     if !stdin_ref().is_empty() {
         return Ok(false);
@@ -138,11 +161,10 @@ pub fn block_current_stdin_read_if_empty(active_frame_words: *mut u64) -> Result
         return Err(());
     }
 
-    // SAFETY: this is called only from lower-EL AArch64 `read(0)` syscall
-    // before any bytes have been copied. AArch64 SVC is one fixed 4-byte
-    // instruction, so rewinding ELR makes the syscall transparent after wake.
-    unsafe { arch_restart_current_syscall(active_frame_words) };
-    sched::block_current_on_stdin_read(active_frame_words);
+    // The architecture facade owns the instruction-width and resume-PC detail.
+    // This call occurs before any bytes are copied, so retry is transparent.
+    context.restart_current_syscall();
+    sched::block_current_on_stdin_read(context);
     Ok(true)
 }
 

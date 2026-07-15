@@ -2,6 +2,7 @@ use alloc::vec::Vec;
 use core::{cell::UnsafeCell, fmt, mem};
 
 use crate::{
+    arch::ActiveContext,
     errno,
     fs::fd::{FdError, FdTable},
     fs::initramfs::{self, InitramfsError},
@@ -336,11 +337,6 @@ unsafe impl Sync for ProcessTableCell {}
 
 static PROCESS_TABLE: ProcessTableCell = ProcessTableCell(UnsafeCell::new(ProcessTable::new()));
 
-unsafe extern "C" {
-    fn arch_init_user_exec_frame(frame_words: *mut u64, user_entry: usize, user_sp: usize);
-    fn arch_restart_current_syscall(frame_words: *mut u64);
-}
-
 pub(crate) fn spawn_first_user_process() -> Result<ProcessId, ProcessError> {
     let cwd_dir = ramfs::root_dir_index().ok_or(ProcessError::InvalidProcess)?;
     let pid = allocate_process_slot(None, FdTable::new(), cwd_dir)?;
@@ -435,7 +431,19 @@ pub(crate) fn process_join(pid: ProcessId) -> Result<ProcessExitStatus, ProcessJ
     cleanup_reclaimed_process(pid, reclaimed)
 }
 
-pub(crate) fn on_process_join_sync(active_frame_words: *mut u64, pid: ProcessId) {
+/// Register and block the current kernel task waiting for a process to finish.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live task-call context for scheduler handoff.
+/// * `pid` - Generation-checked process whose terminal state is awaited.
+///
+/// # Returns
+///
+/// Returns without blocking when registration is invalid or unnecessary;
+/// otherwise returns after the scheduler later resumes the waiter. The
+/// registration and handoff are bounded and do not allocate.
+pub(crate) fn on_process_join_sync(context: &mut ActiveContext<'_>, pid: ProcessId) {
     let Some(joiner) = sched::current_thread_id() else {
         return;
     };
@@ -456,31 +464,76 @@ pub(crate) fn on_process_join_sync(active_frame_words: *mut u64, pid: ProcessId)
         slot.joiner = Some(joiner);
     }
 
-    sched::block_current_on_process_wait(active_frame_words, pid);
+    sched::block_current_on_process_wait(context, pid);
     crate::debug!("process: join blocking current={joiner} pid={pid}");
 }
 
-pub(crate) fn process_exit_current(active_frame_words: *mut u64, code: usize) {
-    finish_current_process(active_frame_words, ProcessExitStatus::Exited(code), code)
+/// Store normal process exit status and switch away from its current thread.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live userspace context replaced by scheduler exit.
+/// * `code` - Userspace exit code stored in process and thread state.
+///
+/// # Returns
+///
+/// Returns only in the exception handler after the live frame has been replaced
+/// with another runnable task; the exiting userspace thread does not resume.
+/// The terminal transition is bounded and does not allocate.
+///
+/// # Panics
+///
+/// Panics if no current process can own the exit.
+pub(crate) fn process_exit_current(context: &mut ActiveContext<'_>, code: usize) {
+    finish_current_process(context, ProcessExitStatus::Exited(code), code)
         .unwrap_or_else(|err| panic!("process: sys_exit without current process: {err:?}"));
 }
 
+/// Attribute a lower-EL fault to the current process and switch it out.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live lower-EL fault context replaced by scheduler
+///   exit.
+/// * `fault` - Architecture-classified userspace fault record.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after storing fault status, waking registered waiters, and
+/// replacing the live context. The path is bounded and does not allocate.
+///
+/// # Errors
+///
+/// Returns [`ProcessFaultError::NoCurrentProcess`] when no user process is
+/// running or [`ProcessFaultError::InvalidProcess`] for stale process state.
 pub fn kill_current_process_on_user_fault(
-    active_frame_words: *mut u64,
+    context: &mut ActiveContext<'_>,
     fault: UserFault,
 ) -> Result<(), ProcessFaultError> {
-    finish_current_process(
-        active_frame_words,
-        ProcessExitStatus::Faulted(fault),
-        usize::MAX,
-    )
+    finish_current_process(context, ProcessExitStatus::Faulted(fault), usize::MAX)
 }
 
-pub(crate) fn fork_current(active_frame_words: *mut u64) -> Result<usize, errno::Errno> {
-    if active_frame_words.is_null() {
-        return Err(errno::EINVAL);
-    }
-
+/// Eagerly clone the current process and live userspace resume context.
+///
+/// This task-context operation may allocate and copy process-owned memory. Only
+/// the final child publication and scheduler-frame clone run in a short local
+/// IRQ-disabled section; scheduler storage remains preallocated.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live parent syscall context cloned into the child
+///   before the parent return value is written.
+///
+/// # Returns
+///
+/// Returns the generation-encoded child PID to the parent. The architecture
+/// saved-frame clone hook preserves existing fork child return semantics.
+///
+/// # Errors
+///
+/// Returns a POSIX errno for invalid process state, exhausted process/thread or
+/// frame capacity, VM failure, or eager-copy failure.
+pub(crate) fn fork_current(context: &mut ActiveContext<'_>) -> Result<usize, errno::Errno> {
     let snapshot = fork_snapshot_current()?;
     let child_pid =
         allocate_process_slot(Some(snapshot.parent_pid), snapshot.fds, snapshot.cwd_dir)
@@ -507,10 +560,10 @@ pub(crate) fn fork_current(active_frame_words: *mut u64) -> Result<usize, errno:
 
         {
             let _irq_guard = LocalIrqGuard::save_and_disable();
-            let child_thread = sched::thread_spawn_user_from_frame(
+            let child_thread = sched::thread_spawn_user_from_context(
                 child_pid,
                 child_aspace,
-                active_frame_words as *const u64,
+                context,
                 ThreadAttrs::detached(),
             )
             .map_err(spawn_errno)?;
@@ -549,13 +602,13 @@ pub(crate) fn fork_current(active_frame_words: *mut u64) -> Result<usize, errno:
 /// Replace the current process image while preserving process-owned state.
 ///
 /// File descriptors, PID relationships, and cwd remain unchanged. Only the
-/// address space, loaded ELF segments, user stack, and active trap frame are
+/// address space, loaded ELF segments, user stack, and active user context are
 /// replaced.
 ///
 /// # Arguments
 ///
-/// * `active_frame_words` - Live architecture trap-frame storage for the
-///   current userspace syscall.
+/// * `context` - Exclusive live userspace syscall context to replace after
+///   committing the new image.
 /// * `path` - Canonical resolved executable path and directory requirement.
 /// * `args` - Kernel-owned argv/envp strings for the new image.
 ///
@@ -567,18 +620,17 @@ pub(crate) fn fork_current(active_frame_words: *mut u64) -> Result<usize, errno:
 ///
 /// Returns a POSIX errno for invalid process state, missing/invalid executable,
 /// allocation failure, ELF rejection, or VM setup failure.
+///
+/// This task-context operation may allocate, parse ELF data, and copy process
+/// memory. Those operations occur outside scheduler and IRQ fast paths.
 pub(crate) fn execve_current(
-    active_frame_words: *mut u64,
+    context: &mut ActiveContext<'_>,
     path: path::ResolvedPath,
     args: ExecArgs,
 ) -> Result<(), errno::Errno> {
-    if active_frame_words.is_null() {
-        return Err(errno::EINVAL);
-    }
-
     let pid = sched::current_user_process_id().ok_or(errno::EINVAL)?;
     let staged = stage_exec_image(&path, &args)?;
-    let old = commit_exec_image(pid, staged, active_frame_words)?;
+    let old = commit_exec_image(pid, staged, context)?;
     cleanup_process_resources(pid, old);
     Ok(())
 }
@@ -603,8 +655,25 @@ pub(crate) fn copy_exec_args_from_user(
     Ok(args)
 }
 
+/// Consume or block for one specific child process status.
+///
+/// The prepare/register/block transition runs in a short IRQ-disabled section
+/// and does not allocate. Resource cleanup and userspace status copying occur
+/// after that section.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live syscall context restarted and handed to the
+///   scheduler when the child is still running.
+/// * `raw_pid` - Positive generation-encoded child PID from userspace.
+/// * `status_ptr` - Optional userspace pointer receiving encoded wait status.
+///
+/// # Returns
+///
+/// Returns [`WaitPidAction::Return`] with a PID or errno when complete, or
+/// [`WaitPidAction::Blocked`] after registering a restartable wait.
 pub(crate) fn waitpid_current(
-    active_frame_words: *mut u64,
+    context: &mut ActiveContext<'_>,
     raw_pid: isize,
     status_ptr: usize,
 ) -> WaitPidAction {
@@ -640,11 +709,10 @@ pub(crate) fn waitpid_current(
         let _irq_guard = LocalIrqGuard::save_and_disable();
         let prepare = prepare_wait_child_locked(parent_pid, child_pid, caller);
         if matches!(prepare, WaitChildPrepare::WouldBlock) {
-            // SAFETY: waitpid blocks before producing side effects visible to
-            // userspace. Restarting the fixed-width AArch64 SVC lets the woken
-            // thread re-run validation and consume the zombie child.
-            unsafe { arch_restart_current_syscall(active_frame_words) };
-            sched::block_current_on_process_wait(active_frame_words, child_pid);
+            // waitpid blocks before producing userspace-visible side effects.
+            // The architecture facade restarts the syscall after wake.
+            context.restart_current_syscall();
+            sched::block_current_on_process_wait(context, child_pid);
         }
         prepare
     };
@@ -670,7 +738,7 @@ pub(crate) fn waitpid_current(
 }
 
 fn finish_current_process(
-    active_frame_words: *mut u64,
+    context: &mut ActiveContext<'_>,
     status: ProcessExitStatus,
     thread_code: usize,
 ) -> Result<(), ProcessFaultError> {
@@ -696,7 +764,7 @@ fn finish_current_process(
     if let Some(waiter) = wake.waiter {
         sched::complete_process_wait(waiter, pid);
     }
-    sched::on_thread_exit_sync(active_frame_words, thread_code);
+    sched::on_thread_exit_sync(context, thread_code);
     Ok(())
 }
 
@@ -941,7 +1009,7 @@ fn stage_exec_image(
 fn commit_exec_image(
     pid: ProcessId,
     staged: StagedProcessImage,
-    active_frame_words: *mut u64,
+    context: &mut ActiveContext<'_>,
 ) -> Result<ProcessResources, errno::Errno> {
     let entry = staged.entry;
     let initial_sp = staged.initial_sp;
@@ -950,10 +1018,10 @@ fn commit_exec_image(
     let old = replace_process_resources(pid, staged.address_space, staged.user_image, staged.stack)
         .ok_or(errno::EINVAL)?;
 
-    // SAFETY: the current thread now points at the new TTBR0 root and the stack
-    // was populated through HVA before commit. The arch helper preserves the
-    // EL1 kernel stack and replaces all EL0-visible state.
-    unsafe { arch_init_user_exec_frame(active_frame_words, entry, initial_sp) };
+    // The current thread now points at the new TTBR0 root and the stack was
+    // populated through HVA before commit. The architecture facade preserves
+    // the EL1 kernel stack while replacing all EL0-visible state.
+    context.replace_user_context_after_exec(entry, initial_sp);
 
     Ok(old)
 }

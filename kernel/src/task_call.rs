@@ -4,7 +4,7 @@ const TASK_CALL_THREAD_EXIT: u64 = 3;
 const TASK_CALL_THREAD_JOIN: u64 = 4;
 const TASK_CALL_PROCESS_JOIN: u64 = 5;
 
-use crate::{process::ProcessId, task::ThreadId};
+use crate::{arch::ActiveContext, process::ProcessId, task::ThreadId};
 
 unsafe extern "C" {
     fn arch_task_call(request: *const core::ffi::c_void);
@@ -178,7 +178,30 @@ pub(crate) fn process_join(id: ProcessId) {
     unsafe { arch_task_call(&request as *const TaskCallRequest as *const core::ffi::c_void) }
 }
 
-pub fn on_arch_task_call(active_frame_words: *mut u64, request: *const core::ffi::c_void) {
+/// Dispatch one controlled EL1 task call against the live exception context.
+///
+/// Requests are consumed synchronously from the calling task's stack. Blocking
+/// operations hand the context to the scheduler without allocation; they may
+/// resume only after the owning subsystem wakes the task.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live current-EL exception context used for scheduler
+///   save/replace handoff.
+/// * `request` - Non-null pointer to the private task-call request created by
+///   this module on the caller's stack.
+///
+/// # Returns
+///
+/// Returns after a non-blocking task call or after a blocked task is later
+/// resumed. Thread exit replaces the live context and does not resume the
+/// exiting task.
+///
+/// # Panics
+///
+/// Panics for a null request, an unknown operation tag, or malformed scheduler
+/// state reached by the selected operation.
+pub fn on_arch_task_call(context: &mut ActiveContext<'_>, request: *const core::ffi::c_void) {
     if request.is_null() {
         panic!("task-call: null request");
     }
@@ -192,13 +215,13 @@ pub fn on_arch_task_call(active_frame_words: *mut u64, request: *const core::ffi
         TASK_CALL_SLEEP_UNTIL => {
             // SAFETY: the `op` tag selects this payload variant.
             let args = unsafe { request.args.sleep_until };
-            crate::sched::on_sleep_sync(active_frame_words, args.deadline);
+            crate::sched::on_sleep_sync(context, args.deadline);
         }
         TASK_CALL_MAILBOX_WAIT => {
             // SAFETY: the `op` tag selects this payload variant.
             let args = unsafe { request.args.mailbox_wait };
             crate::ipc::on_mailbox_wait_sync(
-                active_frame_words,
+                context,
                 args.mailbox.cast_mut(),
                 args.wait_kind,
                 if args.timeout_enabled != 0 {
@@ -211,21 +234,18 @@ pub fn on_arch_task_call(active_frame_words: *mut u64, request: *const core::ffi
         TASK_CALL_THREAD_EXIT => {
             // SAFETY: the `op` tag selects this payload variant.
             let args = unsafe { request.args.thread_exit };
-            crate::sched::on_thread_exit_sync(active_frame_words, args.code);
+            crate::sched::on_thread_exit_sync(context, args.code);
         }
         TASK_CALL_THREAD_JOIN => {
             // SAFETY: the `op` tag selects this payload variant.
             let args = unsafe { request.args.thread_join };
-            crate::sched::on_thread_join_sync(
-                active_frame_words,
-                ThreadId::new(args.index, args.generation),
-            );
+            crate::sched::on_thread_join_sync(context, ThreadId::new(args.index, args.generation));
         }
         TASK_CALL_PROCESS_JOIN => {
             // SAFETY: the `op` tag selects this payload variant.
             let args = unsafe { request.args.process_join };
             crate::process::on_process_join_sync(
-                active_frame_words,
+                context,
                 ProcessId::new(args.index, args.generation),
             );
         }

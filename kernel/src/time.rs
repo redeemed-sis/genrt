@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
-use crate::task::TaskId;
+use crate::{arch::ActiveContext, task::TaskId};
 
 unsafe extern "C" {
     fn arch_counter_now() -> u64;
@@ -10,7 +10,7 @@ unsafe extern "C" {
     fn arch_timer_disarm();
 }
 
-type FinishTimerInterruptHandler = fn(*mut u64, u64);
+type FinishTimerInterruptHandler = fn(&mut ActiveContext<'_>, u64);
 type TimedTaskHandler = fn(TaskId);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -327,11 +327,22 @@ pub(crate) fn event_pending(event: TimedEvent) -> bool {
     time_ref().event_pending(event)
 }
 
-pub fn on_timer_interrupt(active_frame_words: *mut u64) {
-    if active_frame_words.is_null() {
-        return;
-    }
-
+/// Dispatch expired timed events and complete scheduler IRQ-return handoff.
+///
+/// This IRQ path uses only bounded, preallocated state. It does not allocate,
+/// block, or extend the local IRQ-disabled interval with parsing, user copies,
+/// or resource destruction.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live IRQ return context that the scheduler may save
+///   and replace after timed-event dispatch.
+///
+/// # Returns
+///
+/// Returns after all events expired at the sampled counter value are handled,
+/// the scheduler handoff is committed, and the one-shot timer is rearmed.
+pub fn on_timer_interrupt(context: &mut ActiveContext<'_>) {
     if try_time_mut().is_none() {
         // Keep stray early-boot timer IRQs from ever reaching scheduler
         // callbacks before `time::init()` installs their handler table.
@@ -353,7 +364,7 @@ pub fn on_timer_interrupt(active_frame_words: *mut u64) {
         dispatch_expired_event(handlers, event);
     }
 
-    (handlers.finish_timer_interrupt)(active_frame_words, now);
+    (handlers.finish_timer_interrupt)(context, now);
 
     let time = time_mut();
     time.dispatching_irq = false;

@@ -5,6 +5,7 @@ use core::arch::{asm, global_asm};
 use bootinfo::BootInfo;
 
 mod console;
+mod context;
 mod esr;
 mod exception;
 mod gic;
@@ -13,8 +14,6 @@ mod mmu;
 mod platform;
 mod timer;
 mod trap_frame;
-
-use trap_frame::TrapFrame;
 
 global_asm!(include_str!("boot.s"));
 global_asm!(include_str!("exceptions.s"));
@@ -128,22 +127,6 @@ pub extern "C" fn arch_task_call(request: *const core::ffi::c_void) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn arch_restart_current_syscall(frame_words: *mut u64) {
-    if frame_words.is_null() {
-        return;
-    }
-
-    // SAFETY: lower-EL syscall dispatch passes a live TrapFrame pointer. AArch64
-    // `svc #imm` is a fixed 4-byte instruction, so subtracting 4 from ELR_EL1
-    // restarts the same userspace syscall after the blocked thread wakes.
-    let frame = unsafe { &mut *(frame_words as *mut TrapFrame) };
-    frame.elr = frame
-        .elr
-        .checked_sub(4)
-        .unwrap_or_else(|| panic!("arch: cannot restart syscall at ELR=0"));
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn arch_init_thread_frame(
     frame_words: *mut u64,
     stack_top: usize,
@@ -156,7 +139,7 @@ pub extern "C" fn arch_init_thread_frame(
     }
 
     // SAFETY: kernel passes valid task-owned frame storage matching TrapFrame ABI.
-    let frame = unsafe { &mut *(frame_words as *mut TrapFrame) };
+    let frame = unsafe { &mut *(frame_words as *mut trap_frame::TrapFrame) };
     frame.init_kernel_el1(bootstrap_pc, stack_top, entry_addr, arg);
 }
 
@@ -173,7 +156,7 @@ pub extern "C" fn arch_init_user_trap_frame(
     }
 
     // SAFETY: caller passes task-owned frame storage matching TrapFrame ABI.
-    let frame = unsafe { &mut *(frame_words as *mut TrapFrame) };
+    let frame = unsafe { &mut *(frame_words as *mut trap_frame::TrapFrame) };
     frame.init_user_el0(user_entry, user_sp, kernel_sp, arg0);
 }
 
@@ -190,29 +173,11 @@ pub extern "C" fn arch_clone_user_trap_frame_for_fork(
     // SAFETY: scheduler passes valid TrapFrame storage for both pointers. The
     // child inherits the userspace resume state, but fork returns 0 in the child
     // and must use a distinct EL1 kernel stack for future lower-EL exceptions.
-    let src = unsafe { &*(src_frame_words as *const TrapFrame) };
-    let dst = unsafe { &mut *(dst_frame_words as *mut TrapFrame) };
+    let src = unsafe { &*(src_frame_words as *const trap_frame::TrapFrame) };
+    let dst = unsafe { &mut *(dst_frame_words as *mut trap_frame::TrapFrame) };
     *dst = *src;
     dst.x[0] = 0;
     dst.kernel_sp = child_kernel_sp as u64 & !0xf;
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn arch_init_user_exec_frame(
-    frame_words: *mut u64,
-    user_entry: usize,
-    user_sp: usize,
-) {
-    if frame_words.is_null() {
-        return;
-    }
-
-    // SAFETY: lower-EL syscall dispatch passes the live TrapFrame for the
-    // current user thread. execve preserves the thread's EL1 kernel stack while
-    // replacing all EL0-visible register state and resume PC/SP.
-    let frame = unsafe { &mut *(frame_words as *mut TrapFrame) };
-    let kernel_sp = frame.kernel_sp as usize;
-    frame.init_user_el0(user_entry, user_sp, kernel_sp, 0);
 }
 
 #[unsafe(no_mangle)]

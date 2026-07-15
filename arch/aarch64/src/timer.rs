@@ -135,11 +135,21 @@ pub unsafe fn enable_cpu_irq() {
     }
 }
 
-pub fn on_timer_irq(frame_words: *mut u64) {
+/// Record timer diagnostics and dispatch the bounded generic timer IRQ path.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live IRQ return context for scheduler handoff.
+///
+/// # Returns
+///
+/// Returns after generic timed-event dispatch and any scheduler frame
+/// replacement. The path does not allocate or block.
+pub(crate) fn on_timer_irq(context: &mut kernel::arch::ActiveContext<'_>) {
     unsafe {
         BOOT_TIMER_COUNTER = counter();
         BOOT_TIMER_CTL = control() as u64;
     }
 
-    kernel::time::on_timer_interrupt(frame_words);
+    kernel::time::on_timer_interrupt(context);
 }

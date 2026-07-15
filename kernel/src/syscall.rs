@@ -1,4 +1,5 @@
 use crate::{
+    arch::{ActiveContext, SyscallRequest},
     console, errno,
     fs::{
         fd::{self, FdError},
@@ -26,11 +27,6 @@ pub const SYS_GETDENTS64: usize = 8;
 pub const SYS_CHDIR: usize = 9;
 /// Copy the current user process canonical working directory to userspace.
 pub const SYS_GETCWD: usize = 10;
-
-const X0: usize = 0;
-const X1: usize = 1;
-const X2: usize = 2;
-const X8: usize = 8;
 
 const O_RDONLY: usize = 0;
 const O_WRONLY: usize = 1;
@@ -69,12 +65,13 @@ pub enum DispatchError {
     UnknownSyscall(usize),
 }
 
-/// Dispatch one syscall from the active lower-EL trap frame.
+/// Dispatch one architecture-decoded userspace syscall.
 ///
 /// # Arguments
 ///
-/// * `frame_words` - Mutable architecture trap-frame storage whose register
-///   words follow the kernel syscall ABI.
+/// * `context` - Exclusive live exception context used for results, blocking,
+///   process transitions, and scheduler handoff.
+/// * `request` - Architecture-neutral syscall number and six arguments.
 ///
 /// # Returns
 ///
@@ -87,84 +84,80 @@ pub enum DispatchError {
 /// Returns [`DispatchError::UnknownSyscall`] with the unrecognized syscall
 /// number.
 ///
-/// # Panics
-///
-/// Panics when `frame_words` is null.
-///
-/// # Safety
-///
-/// Although this is a safe Rust entry point for the architecture layer, the
-/// caller must provide live, writable trap-frame storage with the expected
-/// register layout for the duration of dispatch.
-pub fn dispatch(frame_words: *mut u64) -> Result<(), DispatchError> {
-    if frame_words.is_null() {
-        panic!("syscall: null trap frame");
-    }
-    let nr = frame_word(frame_words, X8) as usize;
+/// Individual handlers may allocate, copy userspace memory, or block only in
+/// synchronous task/syscall context. Dispatch itself adds no allocation, and
+/// IRQ entry never calls this API.
+pub fn dispatch(
+    context: &mut ActiveContext<'_>,
+    request: SyscallRequest,
+) -> Result<(), DispatchError> {
+    let nr = request.number();
     match nr {
         SYS_READ => {
-            sys_read(frame_words);
+            sys_read(context, request);
             Ok(())
         }
         SYS_WRITE => {
-            sys_write(frame_words);
+            sys_write(context, request);
             Ok(())
         }
         SYS_EXIT => {
-            sys_exit(frame_words);
+            sys_exit(context, request);
             Ok(())
         }
         SYS_OPEN => {
-            sys_open(frame_words);
+            sys_open(context, request);
             Ok(())
         }
         SYS_CLOSE => {
-            sys_close(frame_words);
+            sys_close(context, request);
             Ok(())
         }
         SYS_FORK => {
-            sys_fork(frame_words);
+            sys_fork(context);
             Ok(())
         }
         SYS_EXECVE => {
-            sys_execve(frame_words);
+            sys_execve(context, request);
             Ok(())
         }
         SYS_WAITPID => {
-            sys_waitpid(frame_words);
+            sys_waitpid(context, request);
             Ok(())
         }
         SYS_GETDENTS64 => {
-            sys_getdents64(frame_words);
+            sys_getdents64(context, request);
             Ok(())
         }
         SYS_CHDIR => {
-            sys_chdir(frame_words);
+            sys_chdir(context, request);
             Ok(())
         }
         SYS_GETCWD => {
-            sys_getcwd(frame_words);
+            sys_getcwd(context, request);
             Ok(())
         }
         _ => Err(DispatchError::UnknownSyscall(nr)),
     }
 }
 
-fn sys_read(frame_words: *mut u64) {
-    let fd = frame_word(frame_words, X0) as usize;
-    let ptr = frame_word(frame_words, X1) as usize;
-    let count = frame_word(frame_words, X2) as usize;
+fn sys_read(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    let fd = request.arg(0);
+    let ptr = request.arg(1);
+    let count = request.arg(2);
 
     if fd == fd::STDIN {
-        match sys_read_stdin(frame_words, ptr, count) {
-            ReadAction::Return(result) => set_return(frame_words, errno::syscall_ret(result)),
+        match sys_read_stdin(context, ptr, count) {
+            ReadAction::Return(result) => {
+                context.set_syscall_result(errno::syscall_ret(result));
+            }
             ReadAction::Blocked => {}
         }
         return;
     }
 
     let result = sys_read_file(fd, ptr, count);
-    set_return(frame_words, errno::syscall_ret(result));
+    context.set_syscall_result(errno::syscall_ret(result));
 }
 
 enum ReadAction {
@@ -172,7 +165,7 @@ enum ReadAction {
     Blocked,
 }
 
-fn sys_read_stdin(frame_words: *mut u64, ptr: usize, count: usize) -> ReadAction {
+fn sys_read_stdin(context: &mut ActiveContext<'_>, ptr: usize, count: usize) -> ReadAction {
     if count == 0 {
         return ReadAction::Return(Ok(0));
     }
@@ -191,7 +184,7 @@ fn sys_read_stdin(frame_words: *mut u64, ptr: usize, count: usize) -> ReadAction
         return ReadAction::Return(result);
     }
 
-    match console::block_current_stdin_read_if_empty(frame_words) {
+    match console::block_current_stdin_read_if_empty(context) {
         Ok(true) => ReadAction::Blocked,
         Ok(false) => {
             let len = console::read_stdin(&mut buffer[..max_len]);
@@ -227,10 +220,10 @@ fn sys_read_file(fd: usize, ptr: usize, count: usize) -> Result<usize, errno::Er
     Ok(chunk.len())
 }
 
-fn sys_write(frame_words: *mut u64) {
-    let fd = frame_word(frame_words, X0) as usize;
-    let ptr = frame_word(frame_words, X1) as usize;
-    let len = frame_word(frame_words, X2) as usize;
+fn sys_write(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    let fd = request.arg(0);
+    let ptr = request.arg(1);
+    let len = request.arg(2);
 
     let result = (|| {
         if fd != fd::STDOUT && fd != fd::STDERR {
@@ -254,13 +247,13 @@ fn sys_write(frame_words: *mut u64) {
         Ok(len)
     })();
 
-    set_return(frame_words, errno::syscall_ret(result));
+    context.set_syscall_result(errno::syscall_ret(result));
 }
 
-fn sys_open(frame_words: *mut u64) {
-    let path_ptr = frame_word(frame_words, X0) as usize;
-    let flags = frame_word(frame_words, X1) as usize;
-    let _mode = frame_word(frame_words, X2) as usize;
+fn sys_open(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    let path_ptr = request.arg(0);
+    let flags = request.arg(1);
+    let _mode = request.arg(2);
 
     let result = (|| {
         validate_open_flags(flags)?;
@@ -279,67 +272,67 @@ fn sys_open(frame_words: *mut u64) {
         }
     })();
 
-    set_return(frame_words, errno::syscall_ret(result));
+    context.set_syscall_result(errno::syscall_ret(result));
 }
 
-fn sys_close(frame_words: *mut u64) {
-    let fd = frame_word(frame_words, X0) as usize;
+fn sys_close(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    let fd = request.arg(0);
     let result = process::close_current_fd(fd).map(|()| 0).map_err(fd_errno);
-    set_return(frame_words, errno::syscall_ret(result));
+    context.set_syscall_result(errno::syscall_ret(result));
 }
 
-fn sys_exit(frame_words: *mut u64) {
-    let code = frame_word(frame_words, X0) as usize;
+fn sys_exit(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    let code = request.arg(0);
     crate::debug!("syscall: exit code={code}");
-    process::process_exit_current(frame_words, code);
+    process::process_exit_current(context, code);
 }
 
-fn sys_fork(frame_words: *mut u64) {
-    let result = process::fork_current(frame_words);
-    set_return(frame_words, errno::syscall_ret(result));
+fn sys_fork(context: &mut ActiveContext<'_>) {
+    let result = process::fork_current(context);
+    context.set_syscall_result(errno::syscall_ret(result));
 }
 
-fn sys_execve(frame_words: *mut u64) {
-    let path_ptr = frame_word(frame_words, X0) as usize;
-    let argv_ptr = frame_word(frame_words, X1) as usize;
-    let envp_ptr = frame_word(frame_words, X2) as usize;
+fn sys_execve(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    let path_ptr = request.arg(0);
+    let argv_ptr = request.arg(1);
+    let envp_ptr = request.arg(2);
 
     let result = (|| {
         let input = user::copy_path_cstr_from_user(path_ptr).map_err(path_copy_errno)?;
         let path = resolve_current_path(&input)?;
         let args = process::copy_exec_args_from_user(&path.absolute, argv_ptr, envp_ptr)?;
-        process::execve_current(frame_words, path, args)
+        process::execve_current(context, path, args)
     })();
 
     if let Err(errno) = result {
-        set_return(frame_words, -errno);
+        context.set_syscall_result(-errno);
     }
 }
 
-fn sys_waitpid(frame_words: *mut u64) {
-    let pid = frame_word(frame_words, X0) as isize;
-    let status_ptr = frame_word(frame_words, X1) as usize;
-    let options = frame_word(frame_words, X2) as usize;
+fn sys_waitpid(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    let pid = request.arg(0) as isize;
+    let status_ptr = request.arg(1);
+    let options = request.arg(2);
 
     if options != 0 {
-        set_return(frame_words, -errno::ENOTSUP);
+        context.set_syscall_result(-errno::ENOTSUP);
         return;
     }
 
-    match process::waitpid_current(frame_words, pid, status_ptr) {
+    match process::waitpid_current(context, pid, status_ptr) {
         process::WaitPidAction::Return(result) => {
-            set_return(frame_words, errno::syscall_ret(result));
+            context.set_syscall_result(errno::syscall_ret(result));
         }
         process::WaitPidAction::Blocked => {}
     }
 }
 
-fn sys_getdents64(frame_words: *mut u64) {
-    let fd = frame_word(frame_words, X0) as usize;
-    let ptr = frame_word(frame_words, X1) as usize;
-    let count = frame_word(frame_words, X2) as usize;
+fn sys_getdents64(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    let fd = request.arg(0);
+    let ptr = request.arg(1);
+    let count = request.arg(2);
     let result = sys_getdents64_impl(fd, ptr, count);
-    set_return(frame_words, errno::syscall_ret(result));
+    context.set_syscall_result(errno::syscall_ret(result));
 }
 
 fn sys_getdents64_impl(fd: usize, ptr: usize, count: usize) -> Result<usize, errno::Errno> {
@@ -396,8 +389,8 @@ fn sys_getdents64_impl(fd: usize, ptr: usize, count: usize) -> Result<usize, err
     Ok(written)
 }
 
-fn sys_chdir(frame_words: *mut u64) {
-    let path_ptr = frame_word(frame_words, X0) as usize;
+fn sys_chdir(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    let path_ptr = request.arg(0);
     let result = (|| {
         let input = user::copy_path_cstr_from_user(path_ptr).map_err(path_copy_errno)?;
         let path = resolve_current_path(&input)?;
@@ -409,12 +402,12 @@ fn sys_chdir(frame_words: *mut u64) {
             path::ResolvedNode::File { .. } => Err(errno::ENOTDIR),
         }
     })();
-    set_return(frame_words, errno::syscall_ret(result));
+    context.set_syscall_result(errno::syscall_ret(result));
 }
 
-fn sys_getcwd(frame_words: *mut u64) {
-    let ptr = frame_word(frame_words, X0) as usize;
-    let size = frame_word(frame_words, X1) as usize;
+fn sys_getcwd(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    let ptr = request.arg(0);
+    let size = request.arg(1);
     let result = (|| {
         let cwd = process::current_cwd_path().map_err(process_path_errno)?;
         let required = cwd.len().checked_add(1).ok_or(errno::ERANGE)?;
@@ -426,7 +419,7 @@ fn sys_getcwd(frame_words: *mut u64) {
             .map_err(user_copy_errno)?;
         Ok(required)
     })();
-    set_return(frame_words, errno::syscall_ret(result));
+    context.set_syscall_result(errno::syscall_ret(result));
 }
 
 fn validate_open_flags(flags: usize) -> Result<(), errno::Errno> {
@@ -530,14 +523,4 @@ fn encode_dirent64(dst: &mut [u8], ino: u64, off: i64, d_type: u8, name: &[u8]) 
     }
     dst[DIRENT64_HEADER_SIZE..DIRENT64_HEADER_SIZE + name.len()].copy_from_slice(name);
     Some(record_len)
-}
-
-fn frame_word(frame_words: *mut u64, index: usize) -> u64 {
-    // SAFETY: exception assembly passed a live TrapFrame storage pointer.
-    unsafe { frame_words.add(index).read_volatile() }
-}
-
-fn set_return(frame_words: *mut u64, value: isize) {
-    // SAFETY: x0 is the syscall return register in the saved TrapFrame.
-    unsafe { frame_words.add(X0).write_volatile(value as u64) };
 }

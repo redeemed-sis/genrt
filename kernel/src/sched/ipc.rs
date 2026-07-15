@@ -1,4 +1,5 @@
 use crate::{
+    arch::ActiveContext,
     ipc::{IpcWaitRegistration, IpcWaitToken},
     sync::LocalIrqGuard,
     task::TaskId,
@@ -65,13 +66,29 @@ pub(crate) fn take_current_wait_result() -> Option<WaitResult> {
     scheduler_mut().take_current_wait_result()
 }
 
-pub(crate) fn block_current_on_ipc(active_frame_words: *mut u64, wait: IpcWaitRegistration) {
-    scheduler_mut().block_current_on_ipc(active_frame_words, wait);
+/// Commit the current task to a registered IPC wait.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live task-call context saved and replaced by the
+///   scheduler.
+/// * `wait` - Owning IPC token and optional prevalidated timeout deadline.
+///
+/// # Returns
+///
+/// Returns after the task is later resumed. Timeout and scheduler queues are
+/// preallocated, so the handoff does not allocate.
+///
+/// # Panics
+///
+/// Panics for missing running-task state or exhausted bounded event capacity.
+pub(crate) fn block_current_on_ipc(context: &mut ActiveContext<'_>, wait: IpcWaitRegistration) {
+    scheduler_mut().block_current_on_ipc(context, wait);
 }
 
 impl Scheduler {
-    fn block_current_on_ipc(&mut self, active_frame_words: *mut u64, wait: IpcWaitRegistration) {
-        let current = self.blocking_current(active_frame_words);
+    fn block_current_on_ipc(&mut self, context: &mut ActiveContext<'_>, wait: IpcWaitRegistration) {
+        let current = self.blocking_current();
         let timeout_event = wait.timeout_deadline().map(|deadline| {
             let event = TimedEvent::IpcTimeout(current);
             crate::time::schedule_event(deadline, event);
@@ -83,7 +100,7 @@ impl Scheduler {
             timeout_event,
         });
 
-        let next = self.block_current_with_reason(active_frame_words, current, reason);
+        let next = self.block_current_with_reason(context, current, reason);
         self.finish_block_current(current, next);
         crate::trace!(
             "sched: task {current} blocked on IPC token={:?} timeout_event={:?}",

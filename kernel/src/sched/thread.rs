@@ -1,6 +1,7 @@
 use core::mem;
 
 use crate::{
+    arch::ActiveContext,
     memory::vm::UserAddressSpace,
     process::ProcessId,
     sync::LocalIrqGuard,
@@ -9,7 +10,8 @@ use crate::{
 
 use super::{
     IDLE_TASK_ID, Scheduler, arch_clone_user_trap_frame_for_fork, arch_init_thread_frame,
-    arch_init_user_trap_frame, copy_words, preempt, scheduler_mut, try_scheduler_mut,
+    arch_init_user_trap_frame, copy_words, live_frame_words, preempt, scheduler_mut,
+    try_scheduler_mut,
 };
 
 #[repr(transparent)]
@@ -182,10 +184,32 @@ pub(crate) fn thread_spawn_user(
     scheduler.spawn_user_thread(process_id, address_space, user_entry, user_sp, arg0, attrs)
 }
 
-pub(crate) fn thread_spawn_user_from_frame(
+/// Spawn a user thread by cloning a live userspace context.
+///
+/// The scheduler uses preallocated task/frame storage and keeps local IRQs
+/// disabled only while publishing the child and invoking the saved-frame clone
+/// hook. No allocation occurs in this function.
+///
+/// # Arguments
+///
+/// * `process_id` - Process identity assigned to the new user thread.
+/// * `address_space` - Child TTBR0 address space already built by the process
+///   layer.
+/// * `context` - Exclusive live parent context used only as the clone source.
+/// * `attrs` - Joinability attributes for the new scheduler task.
+///
+/// # Returns
+///
+/// Returns the generation-checked child thread ID.
+///
+/// # Errors
+///
+/// Returns [`SpawnError::SchedulerNotInitialized`] when scheduler state is not
+/// published or [`SpawnError::NoThreadSlots`] when bounded capacity is full.
+pub(crate) fn thread_spawn_user_from_context(
     process_id: ProcessId,
     address_space: UserAddressSpace,
-    frame_words: *const u64,
+    context: &mut ActiveContext<'_>,
     attrs: ThreadAttrs,
 ) -> core::result::Result<ThreadId, SpawnError> {
     let _irq_guard = LocalIrqGuard::save_and_disable();
@@ -193,7 +217,7 @@ pub(crate) fn thread_spawn_user_from_frame(
         return Err(SpawnError::SchedulerNotInitialized);
     };
 
-    scheduler.spawn_user_thread_from_frame(process_id, address_space, frame_words, attrs)
+    scheduler.spawn_user_thread_from_context(process_id, address_space, context, attrs)
 }
 
 pub(crate) fn replace_current_user_address_space(
@@ -207,24 +231,77 @@ pub(crate) fn replace_current_user_address_space(
     scheduler.replace_current_user_address_space(address_space)
 }
 
-pub(crate) fn on_thread_exit_sync(active_frame_words: *mut u64, code: usize) {
-    scheduler_mut().exit_current(active_frame_words, code);
+/// Terminate the current thread and replace its live return context.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live context replaced with the next runnable saved
+///   frame.
+/// * `code` - Thread exit result retained for join semantics when applicable.
+///
+/// # Returns
+///
+/// Returns only to the exception handler after frame replacement; the exiting
+/// thread does not resume. This path does not allocate.
+///
+/// # Panics
+///
+/// Panics when no non-idle thread is currently running.
+pub(crate) fn on_thread_exit_sync(context: &mut ActiveContext<'_>, code: usize) {
+    scheduler_mut().exit_current(context, code);
 }
 
-pub(crate) fn on_thread_join_sync(active_frame_words: *mut u64, target: ThreadId) {
-    scheduler_mut().join_thread(active_frame_words, target);
+/// Complete immediately or block the current thread joining `target`.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live task-call context used only if the join blocks.
+/// * `target` - Generation-checked thread identity to join.
+///
+/// # Returns
+///
+/// Returns after recording an immediate result or after the blocked joiner is
+/// resumed. This bounded path does not allocate.
+///
+/// # Panics
+///
+/// Panics when scheduler running-state invariants are absent.
+pub(crate) fn on_thread_join_sync(context: &mut ActiveContext<'_>, target: ThreadId) {
+    scheduler_mut().join_thread(context, target);
 }
 
-pub(crate) fn block_current_on_process_wait(active_frame_words: *mut u64, pid: ProcessId) {
-    scheduler_mut().block_current_on_process_wait(active_frame_words, pid);
+/// Block the current task on one process identity.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live context saved and replaced by the scheduler.
+/// * `pid` - Generation-checked process associated with the wait reason.
+///
+/// # Returns
+///
+/// Returns after the task is later resumed. The handoff is bounded and does not
+/// allocate.
+pub(crate) fn block_current_on_process_wait(context: &mut ActiveContext<'_>, pid: ProcessId) {
+    scheduler_mut().block_current_on_process_wait(context, pid);
 }
 
 pub(crate) fn complete_process_wait(waiter: ThreadId, pid: ProcessId) {
     scheduler_mut().complete_process_wait(waiter, pid);
 }
 
-pub(crate) fn block_current_on_stdin_read(active_frame_words: *mut u64) {
-    scheduler_mut().block_current_on_stdin_read(active_frame_words);
+/// Block the current task on the singleton stdin wait reason.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live syscall context saved and replaced by the
+///   scheduler.
+///
+/// # Returns
+///
+/// Returns after UART input wakes and the scheduler resumes the task. The
+/// handoff is bounded and does not allocate.
+pub(crate) fn block_current_on_stdin_read(context: &mut ActiveContext<'_>) {
+    scheduler_mut().block_current_on_stdin_read(context);
 }
 
 pub(crate) fn complete_stdin_read(waiter: ThreadId) {
@@ -357,17 +434,13 @@ impl Scheduler {
         }
     }
 
-    fn spawn_user_thread_from_frame(
+    fn spawn_user_thread_from_context(
         &mut self,
         process_id: ProcessId,
         address_space: UserAddressSpace,
-        source_frame_words: *const u64,
+        context: &mut ActiveContext<'_>,
         attrs: ThreadAttrs,
     ) -> core::result::Result<ThreadId, SpawnError> {
-        if source_frame_words.is_null() {
-            return Err(SpawnError::NoThreadSlots);
-        }
-
         let Some(id) = self.find_free_slot() else {
             return Err(SpawnError::NoThreadSlots);
         };
@@ -391,6 +464,7 @@ impl Scheduler {
         };
 
         let kernel_sp = self.task(id).stack_top();
+        let source_frame_words = live_frame_words(context) as *const u64;
         // SAFETY: scheduler owns the destination frame and child kernel stack.
         // The source frame is the live lower-EL syscall frame supplied by the
         // caller. The arch helper copies the userspace resume state and fixes
@@ -426,11 +500,7 @@ impl Scheduler {
             .find_map(|(index, task)| task.is_free().then_some(TaskId::new(index)))
     }
 
-    fn exit_current(&mut self, active_frame_words: *mut u64, code: usize) {
-        if active_frame_words.is_null() {
-            panic!("thread: exit without active frame");
-        }
-
+    fn exit_current(&mut self, context: &mut ActiveContext<'_>, code: usize) {
         let current = self
             .running_task()
             .unwrap_or_else(|| panic!("thread: exit without running thread"));
@@ -442,17 +512,14 @@ impl Scheduler {
         self.finish_current_exit(current, exited, code);
 
         let next = self.dequeue_next_ready().unwrap_or(IDLE_TASK_ID);
+        let active_frame_words = live_frame_words(context);
         copy_words(active_frame_words, self.frame_words_ptr(next));
         self.make_running(next);
         self.finish_block_current(current, next);
         crate::debug!("thread: exited id={exited} code={code}");
     }
 
-    fn join_thread(&mut self, active_frame_words: *mut u64, target: ThreadId) {
-        if active_frame_words.is_null() {
-            panic!("thread: join without active frame");
-        }
-
+    fn join_thread(&mut self, context: &mut ActiveContext<'_>, target: ThreadId) {
         let current = self
             .running_task()
             .unwrap_or_else(|| panic!("thread: join without running thread"));
@@ -502,11 +569,8 @@ impl Scheduler {
         }
 
         self.task_mut(target_task).joiner = Some(current_thread);
-        let next = self.block_current_with_reason(
-            active_frame_words,
-            current,
-            preempt::BlockReason::Join(target),
-        );
+        let next =
+            self.block_current_with_reason(context, current, preempt::BlockReason::Join(target));
         self.finish_block_current(current, next);
         crate::debug!("thread: join blocking current={current_thread} target={target}");
     }
@@ -642,23 +706,17 @@ impl Scheduler {
         Ok(())
     }
 
-    fn block_current_on_process_wait(&mut self, active_frame_words: *mut u64, pid: ProcessId) {
-        let current = self.blocking_current(active_frame_words);
-        let next = self.block_current_with_reason(
-            active_frame_words,
-            current,
-            preempt::BlockReason::Process(pid),
-        );
+    fn block_current_on_process_wait(&mut self, context: &mut ActiveContext<'_>, pid: ProcessId) {
+        let current = self.blocking_current();
+        let next =
+            self.block_current_with_reason(context, current, preempt::BlockReason::Process(pid));
         self.finish_block_current(current, next);
     }
 
-    fn block_current_on_stdin_read(&mut self, active_frame_words: *mut u64) {
-        let current = self.blocking_current(active_frame_words);
-        let next = self.block_current_with_reason(
-            active_frame_words,
-            current,
-            preempt::BlockReason::StdinRead,
-        );
+    fn block_current_on_stdin_read(&mut self, context: &mut ActiveContext<'_>) {
+        let current = self.blocking_current();
+        let next =
+            self.block_current_with_reason(context, current, preempt::BlockReason::StdinRead);
         self.finish_block_current(current, next);
     }
 

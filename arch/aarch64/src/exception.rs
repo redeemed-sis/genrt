@@ -1,21 +1,24 @@
 use core::arch::asm;
 
-use crate::{console, esr, gic, platform, timer, trap_frame::TrapFrame};
+use crate::{console, context, esr, gic, platform, timer, trap_frame::TrapFrame};
 
 const VECTOR_CURRENT_EL_SPX_SYNC: u64 = 4;
 const ISS_SVC_TASK_CALL: u32 = 0;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn irq_entry(frame: *mut TrapFrame) {
-    // SAFETY: exception entry assembly always passes a valid trap frame pointer.
-    let frame_words = frame as *mut u64;
+    // SAFETY: exception assembly supplies the live frame for this entry.
+    let frame = unsafe { live_trap_frame(frame) };
+    // SAFETY: exception assembly owns this one live frame for the complete IRQ
+    // entry and no other ActiveContext is created before return.
+    let mut active = unsafe { context::active_context(frame) };
 
     let iar = gic::acknowledge_irq();
     let irq_id = gic::irq_id_from_iar(iar);
 
     if !gic::is_spurious(irq_id) {
         if irq_id == timer::TIMER_IRQ_ID_PHYS {
-            timer::on_timer_irq(frame_words);
+            timer::on_timer_irq(&mut active);
         } else if irq_id == platform::qemu::UART0_IRQ_ID {
             console::on_uart_irq();
         } else {
@@ -46,11 +49,16 @@ pub extern "C" fn sync_entry(vector: u64, frame: *mut TrapFrame) {
     // `exception_entry()` for diagnostics + halt.
     if vector == VECTOR_CURRENT_EL_SPX_SYNC && ec == esr::EC_SVC_AARCH64 && iss == ISS_SVC_TASK_CALL
     {
+        // SAFETY: exception assembly supplies the live frame for this entry.
+        let frame = unsafe { live_trap_frame(frame) };
         // SAFETY: `exceptions.s` saved a live trap frame for the current EL1 task before
         // calling into Rust. `x0` carries a pointer to the typed task-call request
         // from `arch_task_call()`.
-        let request = unsafe { (*frame).x[0] as *const core::ffi::c_void };
-        kernel::task_call::on_arch_task_call(frame as *mut u64, request);
+        let request = frame.x[0] as *const core::ffi::c_void;
+        // SAFETY: this controlled current-EL SVC owns one live frame until the
+        // task-call dispatcher returns or replaces it through the scheduler.
+        let mut active = unsafe { context::active_context(frame) };
+        kernel::task_call::on_arch_task_call(&mut active, request);
         return;
     }
 
@@ -67,31 +75,38 @@ pub extern "C" fn lower_el_sync_entry(vector: u64, frame: *mut TrapFrame) {
     // from `sync_entry()`, whose SVC #0 ABI is reserved for controlled EL1 task
     // calls such as sleep, mailbox wait, exit, and join.
     let far = read_far_el1();
-    let tf = unsafe { &*frame };
+    // SAFETY: exception assembly supplies the live frame for this entry.
+    let frame = unsafe { live_trap_frame(frame) };
+    let frame_ptr = frame as *mut TrapFrame as *const TrapFrame;
+    let diagnostic_frame = *frame;
+    let request = (ec == esr::EC_SVC_AARCH64).then(|| context::syscall_request(frame));
+    // SAFETY: lower-EL synchronous entry owns this one live frame for syscall,
+    // fault policy, and any scheduler handoff performed before return.
+    let mut active = unsafe { context::active_context(frame) };
 
-    if ec == esr::EC_SVC_AARCH64 {
-        match kernel::syscall::dispatch(frame as *mut u64) {
+    if let Some(request) = request {
+        let syscall_number = request.number();
+        match kernel::syscall::dispatch(&mut active, request) {
             Ok(()) => return,
             Err(kernel::syscall::DispatchError::UnknownSyscall(nr)) => {
                 let fault = kernel::process::UserFault::unknown_syscall(nr);
-                log_lower_el_user_fault("unknown syscall", &fault, raw_esr, far, tf);
-                if kernel::process::kill_current_process_on_user_fault(frame as *mut u64, fault)
-                    .is_ok()
-                {
+                log_lower_el_user_fault("unknown syscall", &fault, raw_esr, far, &diagnostic_frame);
+                if kernel::process::kill_current_process_on_user_fault(&mut active, fault).is_ok() {
                     return;
                 }
             }
         }
         kernel::error!(
             "exception: lower EL syscall fault without current process nr={}",
-            tf.x[8]
+            syscall_number
         );
-        exception_entry(vector, frame as *const TrapFrame)
+        drop(active);
+        exception_entry(vector, frame_ptr)
     }
 
     let fault = kernel::process::UserFault::sync_exception(user_fault_kind(raw_esr));
-    log_lower_el_user_fault("sync fault", &fault, raw_esr, far, tf);
-    if kernel::process::kill_current_process_on_user_fault(frame as *mut u64, fault).is_ok() {
+    log_lower_el_user_fault("sync fault", &fault, raw_esr, far, &diagnostic_frame);
+    if kernel::process::kill_current_process_on_user_fault(&mut active, fault).is_ok() {
         return;
     }
 
@@ -99,7 +114,20 @@ pub extern "C" fn lower_el_sync_entry(vector: u64, frame: *mut TrapFrame) {
         "exception: lower EL sync fault without current process EC=0x{ec:02x} ({}) ISS=0x{iss:08x}",
         esr::ec_name(ec)
     );
-    exception_entry(vector, frame as *const TrapFrame)
+    drop(active);
+    exception_entry(vector, frame_ptr)
+}
+
+/// Borrow the frame supplied by exception assembly for one entry invocation.
+///
+/// # Safety
+///
+/// `frame` must be non-null, aligned, writable, and exclusively owned by the
+/// current exception entry for the returned lifetime.
+unsafe fn live_trap_frame<'a>(frame: *mut TrapFrame) -> &'a mut TrapFrame {
+    // SAFETY: every Rust exception entry is called by `exceptions.s` with a
+    // non-null, aligned, writable frame that remains live until entry returns.
+    unsafe { frame.as_mut() }.unwrap_or_else(|| panic!("exception: null live trap frame"))
 }
 
 fn log_lower_el_user_fault(

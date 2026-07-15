@@ -1,7 +1,7 @@
 use alloc::{collections::VecDeque, vec::Vec};
 use core::{cell::UnsafeCell, fmt};
 
-use crate::{sync::IrqSpinLock, task::TaskId};
+use crate::{arch::ActiveContext, sync::IrqSpinLock, task::TaskId};
 
 const MAILBOX_WAIT_SEND: u64 = 1;
 const MAILBOX_WAIT_RECV: u64 = 2;
@@ -410,15 +410,34 @@ impl MailboxControl {
     }
 }
 
-pub fn on_mailbox_wait_sync(
-    active_frame_words: *mut u64,
+/// Commit a controlled mailbox wait from the task-call exception path.
+///
+/// The mailbox lock remains held through bounded waiter registration, optional
+/// timeout registration, and scheduler blocking so no wakeup window is exposed.
+/// Runtime queues are preallocated and this path does not allocate.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live task context for scheduler handoff.
+/// * `control` - Opaque pointer to the stable mailbox control lock.
+/// * `raw_wait_kind` - Private task-call tag selecting send or receive wait.
+/// * `timeout_deadline` - Optional absolute counter deadline.
+///
+/// # Returns
+///
+/// Returns immediately if the mailbox no longer requires waiting or after the
+/// blocked task is later resumed.
+///
+/// # Panics
+///
+/// Panics for a null control pointer, invalid wait tag, missing current task,
+/// exhausted bounded waiter storage, or inconsistent scheduler state.
+pub(crate) fn on_mailbox_wait_sync(
+    context: &mut ActiveContext<'_>,
     control: *mut core::ffi::c_void,
     raw_wait_kind: u64,
     timeout_deadline: Option<u64>,
 ) {
-    if active_frame_words.is_null() {
-        panic!("ipc: mailbox wait without active frame");
-    }
     if control.is_null() {
         panic!("ipc: mailbox wait with null control block");
     }
@@ -461,7 +480,7 @@ pub fn on_mailbox_wait_sync(
     // blocking. Local IRQs stay masked, so no producer/consumer or timer IRQ can
     // observe "queued but not blocked" or "timed event without wait state".
     crate::sched::block_current_on_ipc(
-        active_frame_words,
+        context,
         IpcWaitRegistration::mailbox(control_ptr, wait_kind, timeout_deadline),
     );
 }

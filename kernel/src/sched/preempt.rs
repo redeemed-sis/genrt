@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 
 use crate::{
+    arch::ActiveContext,
     arch_consts::TASK_FRAME_WORDS,
     memory::vm::UserAddressSpace,
     process::ProcessId,
@@ -10,7 +11,7 @@ use crate::{
 
 use super::{
     IDLE_TASK_ID, INITIAL_THREAD_GENERATION, Scheduler, THREAD_STACK_SIZE, arch_enter_task_frame,
-    copy_words, ipc as sched_ipc, log_switch, scheduler_mut, thread,
+    copy_words, ipc as sched_ipc, live_frame_words, log_switch, scheduler_mut, thread,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -168,12 +169,9 @@ fn boxed_zeroed<T>() -> Box<T> {
     }
 }
 
-pub(super) fn finish_timer_interrupt(active_frame_words: *mut u64, now: u64) {
-    if active_frame_words.is_null() {
-        return;
-    }
-
-    scheduler_mut().finish_timer_interrupt(active_frame_words, now);
+/// Finish one bounded timer IRQ and optionally replace its return context.
+pub(super) fn finish_timer_interrupt(context: &mut ActiveContext<'_>, now: u64) {
+    scheduler_mut().finish_timer_interrupt(context, now);
 }
 
 pub(super) fn on_wake_task(task_id: TaskId) {
@@ -197,7 +195,7 @@ pub(crate) fn enter_running_task() -> ! {
 }
 
 impl Scheduler {
-    pub(super) fn finish_timer_interrupt(&mut self, active_frame_words: *mut u64, now: u64) {
+    pub(super) fn finish_timer_interrupt(&mut self, context: &mut ActiveContext<'_>, now: u64) {
         if !self.entered_running_task {
             return;
         }
@@ -215,6 +213,7 @@ impl Scheduler {
         if self.resched_requested || must_leave_idle {
             let next = self.dequeue_next_ready().unwrap_or(current);
             if next != current {
+                let active_frame_words = live_frame_words(context);
                 copy_words(
                     self.frame_words_mut_ptr(current),
                     active_frame_words as *const u64,
@@ -237,19 +236,15 @@ impl Scheduler {
 
     pub(super) fn begin_block_current(
         &mut self,
-        active_frame_words: *mut u64,
+        context: &mut ActiveContext<'_>,
         reason: BlockReason,
     ) -> (TaskId, TaskId) {
-        let current = self.blocking_current(active_frame_words);
-        let next = self.block_current_with_reason(active_frame_words, current, reason);
+        let current = self.blocking_current();
+        let next = self.block_current_with_reason(context, current, reason);
         (current, next)
     }
 
-    pub(super) fn blocking_current(&self, active_frame_words: *mut u64) -> TaskId {
-        if active_frame_words.is_null() {
-            panic!("sched: block without active frame");
-        }
-
+    pub(super) fn blocking_current(&self) -> TaskId {
         let current = self
             .running_task()
             .unwrap_or_else(|| panic!("block requested without a running task"));
@@ -262,11 +257,12 @@ impl Scheduler {
 
     pub(super) fn block_current_with_reason(
         &mut self,
-        active_frame_words: *mut u64,
+        context: &mut ActiveContext<'_>,
         current: TaskId,
         reason: BlockReason,
     ) -> TaskId {
         let next = self.dequeue_next_ready().unwrap_or(IDLE_TASK_ID);
+        let active_frame_words = live_frame_words(context);
 
         // Save the current task's post-SVC resume frame before making it unrunnable.
         copy_words(
