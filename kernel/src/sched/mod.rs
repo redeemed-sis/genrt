@@ -15,7 +15,7 @@ pub(crate) use self::{
         WaitResult, block_current_on_ipc, clear_current_wait_result, complete_ipc_wait,
         set_current_wait_result, take_current_wait_result,
     },
-    preempt::enter_running_task,
+    preempt::{enter_running_task, on_preempt_checkpoint},
     sleep::on_sleep_sync,
     thread::{
         block_current_on_process_wait, block_current_on_stdin_read, complete_process_wait,
@@ -25,7 +25,7 @@ pub(crate) use self::{
     },
 };
 pub use self::{
-    preempt::{current_task_id, wake_task},
+    preempt::{current_task_id, wake_task, yield_now},
     sleep::{msleep, sleep_until, sleep_until_counter, usleep},
     thread::{
         JoinError, SpawnError, ThreadArg, ThreadAttrs, ThreadEntry, current_thread_id, thread_exit,
@@ -64,10 +64,6 @@ pub(crate) struct Scheduler {
     ready_queue: VecDeque<TaskId>,
     current: Option<TaskId>,
     rr_quantum_ms: u64,
-    // Set when `kernel::time` dispatches `QuantumExpired(current_task)`.
-    // The actual switch decision is still committed only in the scheduler's
-    // frame-handoff path.
-    resched_requested: bool,
     entered_running_task: bool,
 }
 

@@ -3,6 +3,7 @@ const TASK_CALL_MAILBOX_WAIT: u64 = 2;
 const TASK_CALL_THREAD_EXIT: u64 = 3;
 const TASK_CALL_THREAD_JOIN: u64 = 4;
 const TASK_CALL_PROCESS_JOIN: u64 = 5;
+const TASK_CALL_PREEMPT_CHECKPOINT: u64 = 6;
 
 use crate::{arch::ActiveContext, process::ProcessId, task::ThreadId};
 
@@ -23,6 +24,7 @@ union TaskCallArgs {
     thread_exit: TaskCallThreadExit,
     thread_join: TaskCallThreadJoin,
     process_join: TaskCallProcessJoin,
+    preempt_checkpoint: TaskCallPreemptCheckpoint,
 }
 
 #[repr(C)]
@@ -59,6 +61,10 @@ struct TaskCallProcessJoin {
     index: usize,
     generation: u32,
 }
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct TaskCallPreemptCheckpoint;
 
 impl TaskCallRequest {
     fn sleep_until(deadline: u64) -> Self {
@@ -125,6 +131,32 @@ impl TaskCallRequest {
             },
         }
     }
+
+    fn preempt_checkpoint() -> Self {
+        Self {
+            op: TASK_CALL_PREEMPT_CHECKPOINT,
+            args: TaskCallArgs {
+                preempt_checkpoint: TaskCallPreemptCheckpoint,
+            },
+        }
+    }
+}
+
+/// Enter the private EL1 scheduler checkpoint task call.
+///
+/// The checkpoint services an already pending request only when preemption is
+/// enabled. It is bounded and allocation-free; it may replace the live task
+/// context but does not itself create a reschedule request.
+///
+/// # Returns
+///
+/// Returns after the private EL1 task call retains or replaces the task's live
+/// context. It leaves a request pending when preemption is disabled.
+pub(crate) fn preempt_checkpoint() {
+    let request = TaskCallRequest::preempt_checkpoint();
+    // SAFETY: the request has no borrowed payload and is consumed synchronously
+    // by the controlled current-EL task-call path before this function returns.
+    unsafe { arch_task_call(&request as *const TaskCallRequest as *const core::ffi::c_void) }
 }
 
 pub(crate) fn sleep_until_counter(deadline: u64) {
@@ -248,6 +280,12 @@ pub fn on_arch_task_call(context: &mut ActiveContext<'_>, request: *const core::
                 context,
                 ProcessId::new(args.index, args.generation),
             );
+        }
+        TASK_CALL_PREEMPT_CHECKPOINT => {
+            // SAFETY: the `op` tag selects this payload variant, whose unit
+            // representation has no data to inspect.
+            let _ = unsafe { request.args.preempt_checkpoint };
+            crate::sched::on_preempt_checkpoint(context);
         }
         op => panic!("task-call: unknown operation {op}"),
     }

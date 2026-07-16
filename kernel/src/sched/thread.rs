@@ -242,8 +242,12 @@ pub(crate) fn replace_current_user_address_space(
 ///
 /// # Panics
 ///
-/// Panics when no non-idle thread is currently running.
+/// Panics when no non-idle thread is currently running or a
+/// [`crate::sync::preempt::PreemptGuard`] is active before terminal state changes.
 pub(crate) fn on_thread_exit_sync(context: &mut ActiveContext<'_>, code: usize) {
+    // Safe point: terminal handoff is permitted only after this enabled-state
+    // assertion, before the exiting task's scheduler state is changed.
+    crate::sync::preempt::assert_preemption_enabled("thread exit state change");
     scheduler_mut().exit_current(context, code);
 }
 
@@ -526,6 +530,7 @@ impl Scheduler {
             return;
         }
 
+        crate::sync::preempt::assert_preemption_enabled("thread joiner publication");
         self.task_mut(target_task).joiner = Some(current_thread);
         let next =
             self.block_current_with_reason(context, current, preempt::BlockReason::Join(target));

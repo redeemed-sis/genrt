@@ -431,7 +431,8 @@ impl MailboxControl {
 /// # Panics
 ///
 /// Panics for a null control pointer, invalid wait tag, missing current task,
-/// exhausted bounded waiter storage, or inconsistent scheduler state.
+/// exhausted bounded waiter storage, inconsistent scheduler state, or an active
+/// [`crate::sync::preempt::PreemptGuard`] before waiter publication.
 pub(crate) fn on_mailbox_wait_sync(
     context: &mut ActiveContext<'_>,
     control: *mut core::ffi::c_void,
@@ -467,6 +468,7 @@ pub(crate) fn on_mailbox_wait_sync(
         }
     }
 
+    crate::sync::preempt::assert_preemption_enabled("mailbox waiter enqueue");
     control.enqueue_waiter(wait_kind, task_id);
     if let Some(deadline) = timeout_deadline {
         crate::debug!(

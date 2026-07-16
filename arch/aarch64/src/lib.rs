@@ -90,6 +90,23 @@ pub extern "C" fn arch_local_irq_restore(saved_daif: u64) {
 }
 
 #[unsafe(no_mangle)]
+/// Classify whether restoring an opaque saved IRQ state permits an EL1 task call.
+///
+/// # Arguments
+///
+/// * `saved_daif` - DAIF value returned by the local-IRQ save hook.
+///
+/// # Returns
+///
+/// Returns `true` when IRQ delivery would be enabled after restoration. This
+/// is a register-only, allocation-free architecture classification.
+pub extern "C" fn arch_irq_state_allows_task_call(saved_daif: u64) -> bool {
+    // DAIF.I is bit 7. The generic kernel asks only whether restoring the saved
+    // state permits a controlled EL1 task call; it never interprets DAIF.
+    (saved_daif & (1 << 7)) == 0
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn arch_counter_now() -> u64 {
     timer::counter()
 }

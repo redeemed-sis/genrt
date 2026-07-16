@@ -19,9 +19,9 @@ use crate::sync::PreemptLock;
 // - protected against task preemption by the task-only allocator lock,
 // - still forbidden in timer/scheduler/exception fast paths.
 //
-// The current transitional PreemptLock backend masks local IRQs. This preserves
-// runtime behavior while keeping task-only ownership distinct from state that
-// is intentionally shared with interrupt handlers.
+// PreemptLock preserves the caller's IRQ state. Timer/deadline IRQ bookkeeping
+// may continue while allocator state is borrowed, but task handoff is deferred
+// until the outermost allocator guard releases the lock.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum HeapInitError {
     AlreadyInitialized,

@@ -443,6 +443,11 @@ pub(crate) fn process_join(pid: ProcessId) -> Result<ProcessExitStatus, ProcessJ
 /// Returns without blocking when registration is invalid or unnecessary;
 /// otherwise returns after the scheduler later resumes the waiter. The
 /// registration and handoff are bounded and do not allocate.
+///
+/// # Panics
+///
+/// Panics when a [`crate::sync::preempt::PreemptGuard`] is active before publishing the
+/// process joiner.
 pub(crate) fn on_process_join_sync(context: &mut ActiveContext<'_>, pid: ProcessId) {
     let Some(joiner) = sched::current_thread_id() else {
         return;
@@ -461,6 +466,7 @@ pub(crate) fn on_process_join_sync(context: &mut ActiveContext<'_>, pid: Process
             return;
         }
 
+        crate::sync::preempt::assert_preemption_enabled("process joiner publication");
         slot.joiner = Some(joiner);
     }
 
@@ -483,8 +489,12 @@ pub(crate) fn on_process_join_sync(context: &mut ActiveContext<'_>, pid: Process
 ///
 /// # Panics
 ///
-/// Panics if no current process can own the exit.
+/// Panics if no current process can own the exit or a
+/// [`crate::sync::preempt::PreemptGuard`] is active before terminal state changes.
 pub(crate) fn process_exit_current(context: &mut ActiveContext<'_>, code: usize) {
+    // Safe point: a terminal process handoff cannot publish exit state while a
+    // task-only preemption guard still owns its protected access.
+    crate::sync::preempt::assert_preemption_enabled("process exit state change");
     finish_current_process(context, ProcessExitStatus::Exited(code), code)
         .unwrap_or_else(|err| panic!("process: sys_exit without current process: {err:?}"));
 }
@@ -506,10 +516,16 @@ pub(crate) fn process_exit_current(context: &mut ActiveContext<'_>, code: usize)
 ///
 /// Returns [`ProcessFaultError::NoCurrentProcess`] when no user process is
 /// running or [`ProcessFaultError::InvalidProcess`] for stale process state.
+///
+/// # Panics
+///
+/// Panics when a `crate::sync::preempt::PreemptGuard` is active before terminal state
+/// changes.
 pub fn kill_current_process_on_user_fault(
     context: &mut ActiveContext<'_>,
     fault: UserFault,
 ) -> Result<(), ProcessFaultError> {
+    crate::sync::preempt::assert_preemption_enabled("process fault exit state change");
     finish_current_process(context, ProcessExitStatus::Faulted(fault), usize::MAX)
 }
 
@@ -742,6 +758,7 @@ fn finish_current_process(
     status: ProcessExitStatus,
     thread_code: usize,
 ) -> Result<(), ProcessFaultError> {
+    crate::sync::preempt::assert_preemption_enabled("process terminal state change");
     let pid = sched::current_user_process_id().ok_or(ProcessFaultError::NoCurrentProcess)?;
     let thread = sched::current_thread_id();
     let wake = finish_process(pid, status).ok_or(ProcessFaultError::InvalidProcess)?;
@@ -1172,6 +1189,7 @@ fn prepare_wait_child_locked(
     }
 
     let Some(status) = slot.exit_status.take() else {
+        crate::sync::preempt::assert_preemption_enabled("process waiter publication");
         slot.waiter = Some(caller);
         return WaitChildPrepare::WouldBlock;
     };

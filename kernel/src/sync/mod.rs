@@ -1,9 +1,14 @@
 use core::{
     cell::UnsafeCell,
     marker::PhantomData,
+    mem::ManuallyDrop,
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicBool, Ordering},
 };
+
+pub(crate) mod preempt;
+
+use preempt::PreemptGuard;
 
 unsafe extern "C" {
     fn arch_local_irq_save_and_disable() -> u64;
@@ -39,6 +44,17 @@ impl LocalIrqGuard {
             saved_daif,
             _not_send: PhantomData,
         }
+    }
+
+    #[inline(always)]
+    /// Return the architecture-owned IRQ state saved when this guard entered.
+    ///
+    /// # Returns
+    ///
+    /// Returns the opaque architecture IRQ-state value. Reading it is bounded,
+    /// allocation-free, and does not alter IRQ state or scheduler policy.
+    pub(crate) fn saved_state(&self) -> u64 {
+        self.saved_daif
     }
 }
 
@@ -141,38 +157,13 @@ impl<T> Drop for LocalIrqLockGuard<'_, T> {
     }
 }
 
-/// Excludes task preemption until dropped.
-///
-/// This primitive is for state accessed during bootstrap or from task context
-/// and must not be used by interrupt handlers. The current transitional backend
-/// delegates to [`LocalIrqGuard`], so IRQs are masked while the guard exists. A
-/// later deferred-reschedule implementation may replace that backend without
-/// changing task-only lock ownership. Entry is bounded and allocation-free.
-pub(crate) struct PreemptGuard {
-    _irq_guard: LocalIrqGuard,
-}
-
-impl PreemptGuard {
-    /// Enter a task-context preemption-excluded section.
-    ///
-    /// # Returns
-    ///
-    /// Returns a non-copyable guard that ends preemption exclusion when
-    /// dropped. The current backend masks local IRQs; the operation is bounded
-    /// and allocation-free.
-    pub(crate) fn enter() -> Self {
-        Self {
-            _irq_guard: LocalIrqGuard::save_and_disable(),
-        }
-    }
-}
-
 /// Task-preemption exclusion lock for bootstrap and task-only mutable state.
 ///
 /// This lock must not be acquired from interrupt context. Recursive or
-/// contended entry is a bug. The current single-core implementation uses
-/// [`PreemptGuard`], which temporarily masks local IRQs; it provides no SMP
-/// synchronization guarantee. Locking is bounded and allocation-free.
+/// contended entry is a bug. It keeps local IRQs enabled while the value is
+/// borrowed, deferring a requested reschedule until its [`PreemptGuard`] drops.
+/// It provides no SMP synchronization guarantee. Locking is bounded and
+/// allocation-free.
 pub(crate) struct PreemptLock<T> {
     locked: AtomicBool,
     value: UnsafeCell<T>,
@@ -181,10 +172,12 @@ pub(crate) struct PreemptLock<T> {
 /// Exclusive borrow returned by [`PreemptLock::lock`].
 ///
 /// Dropping the guard releases the value and ends task preemption exclusion.
-/// The guard is intentionally neither `Copy` nor `Clone`.
+/// An outermost drop may suspend at the private scheduler checkpoint after the
+/// lock has been published as free. The guard is intentionally neither `Copy`
+/// nor `Clone`.
 pub(crate) struct PreemptLockGuard<'a, T> {
     owner: &'a PreemptLock<T>,
-    _preempt_guard: PreemptGuard,
+    preempt_guard: ManuallyDrop<PreemptGuard>,
 }
 
 // SAFETY: task-context access to `value` is serialized by preemption exclusion
@@ -214,8 +207,9 @@ impl<T> PreemptLock<T> {
     ///
     /// # Returns
     ///
-    /// Returns a guard that ends preemption exclusion when dropped. The current
-    /// backend masks local IRQs. The operation is bounded and allocation-free.
+    /// Returns a guard that ends preemption exclusion when dropped. Local IRQs
+    /// remain enabled; an outermost drop can enter the bounded task-call
+    /// scheduler checkpoint. The operation is bounded and allocation-free.
     ///
     /// # Panics
     ///
@@ -233,7 +227,7 @@ impl<T> PreemptLock<T> {
 
         PreemptLockGuard {
             owner: self,
-            _preempt_guard: preempt_guard,
+            preempt_guard: ManuallyDrop::new(preempt_guard),
         }
     }
 }
@@ -258,6 +252,12 @@ impl<T> DerefMut for PreemptLockGuard<'_, T> {
 
 impl<T> Drop for PreemptLockGuard<'_, T> {
     fn drop(&mut self) {
+        // Release the protected access before ending preemption exclusion: the
+        // guard drop may synchronously hand off to another task.
         self.owner.locked.store(false, Ordering::Release);
+        // SAFETY: this is the sole owner of the manually dropped guard. The
+        // Release store above makes a deferred checkpoint unable to observe the
+        // lock as still held.
+        unsafe { ManuallyDrop::drop(&mut self.preempt_guard) };
     }
 }

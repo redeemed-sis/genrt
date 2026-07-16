@@ -192,8 +192,42 @@ pub fn wake_task(task_id: TaskId) {
     scheduler_mut().wake_task(task_id);
 }
 
+/// Request one cooperative scheduler checkpoint.
+///
+/// This requests, but does not itself require, a task switch. The controlled
+/// task-call checkpoint services the request when preemption is enabled; under
+/// `crate::sync::preempt::PreemptGuard` it returns with the request pending for the
+/// outermost guard drop. This operation allocates nothing and does not block.
+///
+/// # Returns
+///
+/// Returns after the checkpoint either services the request or leaves it
+/// pending because preemption remains disabled.
+pub fn yield_now() {
+    crate::sync::preempt::request_reschedule();
+    crate::task_call::preempt_checkpoint();
+}
+
 pub(crate) fn enter_running_task() -> ! {
     scheduler_mut().enter_running_task()
+}
+
+/// Service one private EL1 preemption checkpoint against the active context.
+///
+/// This is a bounded, allocation-free scheduler safe point. It may replace
+/// `context` only after consuming a pending request at depth zero.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live EL1 task-call context available for optional
+///   saved-context handoff.
+///
+/// # Returns
+///
+/// Returns after retaining the current context or replacing it with the next
+/// ready task. It does not create a new reschedule request.
+pub(crate) fn on_preempt_checkpoint(context: &mut ActiveContext<'_>) {
+    scheduler_mut().preempt_checkpoint(context);
 }
 
 impl Scheduler {
@@ -212,7 +246,14 @@ impl Scheduler {
         let must_leave_idle = current == IDLE_TASK_ID && !self.ready_queue.is_empty();
         let mut refreshed_quantum_event = false;
 
-        if self.resched_requested || must_leave_idle {
+        if must_leave_idle {
+            crate::sync::preempt::request_reschedule();
+        }
+
+        // Safe point: timer IRQ return may replace the active frame, but only
+        // after the deferred-preemption state confirms depth zero. Timed-event
+        // dispatch and timer rearm continue even while a task holds a guard.
+        if crate::sync::preempt::checkpoint_consume() {
             let next = self.dequeue_next_ready().unwrap_or(current);
             if next != current {
                 self.saved_context_mut(current).save_from(context);
@@ -228,8 +269,26 @@ impl Scheduler {
         if !refreshed_quantum_event {
             self.ensure_quantum_event(now);
         }
+    }
 
-        self.resched_requested = false;
+    fn preempt_checkpoint(&mut self, context: &mut ActiveContext<'_>) {
+        // Safe point: the private EL1 task-call checkpoint owns the optional
+        // task-context handoff. It acknowledges only an existing request.
+        if !crate::sync::preempt::checkpoint_consume() {
+            return;
+        }
+
+        let Some(current) = self.running_task() else {
+            return;
+        };
+        let next = self.dequeue_next_ready().unwrap_or(current);
+        if next != current {
+            self.saved_context_mut(current).save_from(context);
+            self.saved_context(next).restore_into(context);
+            self.commit_switch(current, next);
+            log_switch(current, next);
+        }
+        self.replace_quantum_event(crate::time::now_counter(), current);
     }
 
     pub(super) fn begin_block_current(
@@ -243,6 +302,9 @@ impl Scheduler {
     }
 
     pub(super) fn blocking_current(&self) -> TaskId {
+        // Safe point: mandatory blocking handoffs require enabled preemption
+        // before they mutate scheduler state or replace the active context.
+        crate::sync::preempt::assert_preemption_enabled("scheduler blocking_current");
         let current = self
             .running_task()
             .unwrap_or_else(|| panic!("block requested without a running task"));
@@ -268,6 +330,9 @@ impl Scheduler {
     }
 
     pub(super) fn finish_block_current(&mut self, current: TaskId, next: TaskId) {
+        // A mandatory handoff also acknowledges any stale request at its
+        // depth-zero checkpoint; it never needs to select a second task.
+        let _ = crate::sync::preempt::checkpoint_consume();
         let now = crate::time::now_counter();
         self.replace_quantum_event(now, current);
         if next != current {
@@ -285,6 +350,7 @@ impl Scheduler {
         self.ensure_quantum_event(now);
         debug_assert_eq!(self.current, Some(running));
         debug_assert_eq!(self.task(running).state, TaskState::Running);
+        crate::sync::preempt::mark_scheduler_online();
         self.saved_context(running).enter()
     }
 
@@ -352,7 +418,7 @@ impl Scheduler {
 
     pub(super) fn note_quantum_expired(&mut self, task_id: TaskId) {
         if self.current == Some(task_id) {
-            self.resched_requested = true;
+            crate::sync::preempt::request_reschedule();
             crate::trace!("sched: quantum expired task {task_id}");
         }
     }
@@ -419,6 +485,7 @@ impl Scheduler {
 
     pub(super) fn note_runnable_peer_available(&mut self) {
         if self.current.is_some() && self.has_runnable_peer() {
+            crate::sync::preempt::request_reschedule();
             self.ensure_quantum_event(crate::time::now_counter());
         }
     }

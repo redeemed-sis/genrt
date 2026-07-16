@@ -148,6 +148,11 @@ pub fn read_stdin(buffer: &mut [u8]) -> usize {
 ///
 /// Returns `Err(())` for unavailable scheduler identity or waiter-slot
 /// conflict.
+///
+/// # Panics
+///
+/// Panics when a [`crate::sync::preempt::PreemptGuard`] is active before stdin waiter
+/// registration.
 pub(crate) fn block_current_stdin_read_if_empty(
     context: &mut ActiveContext<'_>,
 ) -> Result<bool, ()> {
@@ -157,6 +162,7 @@ pub(crate) fn block_current_stdin_read_if_empty(
     }
 
     let current = sched::current_thread_id().ok_or(())?;
+    crate::sync::preempt::assert_preemption_enabled("stdin waiter registration");
     if !stdin_mut().register_waiter(current) {
         return Err(());
     }

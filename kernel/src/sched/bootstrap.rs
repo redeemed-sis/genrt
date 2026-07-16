@@ -114,7 +114,6 @@ impl Scheduler {
             ready_queue,
             current: None,
             rr_quantum_ms: rr_quantum_ms.max(1),
-            resched_requested: false,
             entered_running_task: false,
         }
     }
