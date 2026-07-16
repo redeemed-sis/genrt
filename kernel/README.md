@@ -54,10 +54,12 @@ frame.
 
 ## Allocation and synchronization
 
-The active system is single-core. Local IRQ guards prevent same-core interrupt
-reentrancy; they are not SMP locks. Heap use is allowed in bootstrap and normal
-task context. IRQ, scheduler, timed-event, and frame-handoff paths operate on
-bounded preallocated storage.
+The active system is single-core. `LocalIrqLock`/`LocalIrqGuard` protect state
+shared with interrupt handlers. `PreemptLock` identifies task-only state such
+as the fixed heap and runtime frame allocator; its transitional backend still
+masks local IRQs. Neither domain is an SMP lock. Heap use is allowed in
+bootstrap and normal task context. IRQ, scheduler, timed-event, and
+frame-handoff paths operate on bounded preallocated storage.
 
 Resource cleanup occurs after ownership has been atomically removed under a
 short critical section. Parsing, filesystem traversal, user copies, and heavy

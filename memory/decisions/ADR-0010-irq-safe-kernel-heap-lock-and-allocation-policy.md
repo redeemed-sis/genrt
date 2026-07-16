@@ -4,6 +4,13 @@
 
 Accepted
 
+## Subsequent refinement
+
+[ADR-0029](ADR-0029-local-irq-and-task-preemption-exclusion.md) replaces the
+heap lock's IRQ-shared name and ownership contract with task-only
+`PreemptLock`. The fixed heap, OOM behavior, and prohibition on allocation in
+IRQ and scheduler fast paths remain unchanged.
+
 ## Context
 
 `genrt` already has a fixed-size bootstrap heap built on top of one contiguous

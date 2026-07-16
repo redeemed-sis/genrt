@@ -30,8 +30,12 @@ accepted ADRs remain authoritative when details differ.
   frame ranges.
 - A fixed 16 MiB bootstrap heap is allocated from physical frames and exposed
   through the high direct map.
-- Heap allocation is permitted during bootstrap and task context, protected
-  against local IRQ reentrancy.
+- Heap allocation is permitted during bootstrap and task context. The heap and
+  runtime physical frame allocator use task-only `PreemptLock`; its current
+  backend masks local IRQs and is forbidden in IRQ paths.
+- Boot-discovered physical regions and the heap range are immutable after
+  initialization. Runtime free-list state is separately locked and does not
+  expose references outside its guard.
 - Scheduler and timed-event containers allocate and reserve capacity before
   entering IRQ-sensitive operation.
 - Runtime TTBR1 APIs map, unmap, protect, and translate kernel regions after

@@ -4,6 +4,13 @@
 
 Accepted
 
+## Subsequent refinement
+
+[ADR-0029](ADR-0029-local-irq-and-task-preemption-exclusion.md) renames the
+mailbox's non-spinning single-core lock to `LocalIrqLock`, making its task/IRQ
+sharing contract explicit. Mailbox queue, waiter, timeout, and scheduler
+handoff semantics remain unchanged.
+
 ## Context
 
 `genrt` already has the scheduler and time foundations needed for a first IPC

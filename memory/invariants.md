@@ -26,8 +26,14 @@ Changes that invalidate one require architecture review and an ADR.
 - Interrupt handlers, scheduler core, frame handoff, and timed-event dispatch
   do not allocate from the heap.
 - Runtime structures touched by those paths are bounded and preallocated.
-- IRQ-disabled critical sections are short and never contain unbounded parsing,
-  user copies, filesystem traversal, or resource destruction.
+- Local-IRQ critical sections for IRQ-shared state are short and never contain
+  unbounded parsing, user copies, filesystem traversal, or resource
+  destruction. Transitional task-preemption sections may cover finite
+  allocator traversal; their latency is not yet certified.
+- Local IRQ exclusion protects state shared with interrupt handlers;
+  task-preemption exclusion protects task-only state and must not be acquired
+  from IRQ context. The current `PreemptGuard` backend still masks local IRQs.
+- Neither local IRQ nor task-preemption exclusion provides SMP synchronization.
 - Blocking task operations hand ownership to the scheduler; they do not poll.
 - Human-readable logging is diagnostic and may perturb timing. It is never a
   functional test protocol.
@@ -35,6 +41,9 @@ Changes that invalidate one require architecture review and an ADR.
 ## Memory ownership
 
 - The frame allocator owns physical frames and does not imply a virtual alias.
+- Boot-discovered memory metadata is immutable after initialization. Runtime
+  frame free-list mutation is serialized, and no protected reference escapes
+  the allocator guard.
 - TTBR1 owns kernel high-half mappings; a process-owned TTBR0 root owns its EL0
   mappings.
 - Boot-owned page tables are never reclaimed through the runtime frame

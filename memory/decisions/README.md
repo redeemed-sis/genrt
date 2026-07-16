@@ -15,9 +15,9 @@ growth.
 | [0007](ADR-0007-dtb-memory-map-and-frame-allocator.md) | DTB memory map and frame allocator | Accepted | Memory | - | - |
 | [0008](ADR-0008-aarch64-softfloat-kernel-target.md) | AArch64 soft-float target | Accepted | Build/ABI | - | - |
 | [0009](ADR-0009-bootstrap-kernel-heap-on-frame-allocator.md) | Bootstrap heap on frame allocation | Accepted | Memory | - | - |
-| [0010](ADR-0010-irq-safe-kernel-heap-lock-and-allocation-policy.md) | IRQ-safe heap policy | Accepted | Memory/RT | - | - |
+| [0010](ADR-0010-irq-safe-kernel-heap-lock-and-allocation-policy.md) | IRQ-safe heap policy | Accepted | Memory/RT | - | [0029](ADR-0029-local-irq-and-task-preemption-exclusion.md) (heap lock ownership only) |
 | [0011](ADR-0011-dynamic-preallocated-scheduler-and-time-structures.md) | Preallocated scheduler/time structures | Accepted | Scheduler/time | - | [0028](ADR-0028-typed-saved-context-and-scheduler-ownership.md) (saved-frame backing only) |
-| [0012](ADR-0012-bounded-mailbox-ipc.md) | Bounded mailbox IPC | Accepted | IPC | - | - |
+| [0012](ADR-0012-bounded-mailbox-ipc.md) | Bounded mailbox IPC | Accepted | IPC | - | [0029](ADR-0029-local-irq-and-task-preemption-exclusion.md) (lock naming only) |
 | [0013](ADR-0013-mailbox-timeout-semantics.md) | Mailbox timeout semantics | Accepted | IPC/time | - | - |
 | [0014](ADR-0014-bounded-kernel-thread-lifecycle.md) | Bounded kernel thread lifecycle | Accepted | Threads | - | - |
 | [0015](ADR-0015-aarch64-high-half-mmu-bring-up.md) | AArch64 high-half MMU | Accepted | AArch64/MMU | - | - |
@@ -34,5 +34,6 @@ growth.
 | [0026](ADR-0026-agent-oriented-development-workflow.md) | Agent-oriented development workflow | Accepted | Repository workflow | - | - |
 | [0027](ADR-0027-typed-active-context-and-syscall-boundary.md) | Typed active context and syscall boundary | Accepted | Kernel/AArch64 context boundary | - | [0028](ADR-0028-typed-saved-context-and-scheduler-ownership.md) (saved-frame bridge only) |
 | [0028](ADR-0028-typed-saved-context-and-scheduler-ownership.md) | Typed saved context and scheduler ownership | Accepted | Scheduler/AArch64 context ownership | [0011](ADR-0011-dynamic-preallocated-scheduler-and-time-structures.md) (saved-frame backing), [0027](ADR-0027-typed-active-context-and-syscall-boundary.md) (saved-frame bridge) | - |
+| [0029](ADR-0029-local-irq-and-task-preemption-exclusion.md) | Local IRQ and task preemption exclusion | Accepted | Synchronization/memory/RT | [0010](ADR-0010-irq-safe-kernel-heap-lock-and-allocation-policy.md) (heap lock ownership), [0012](ADR-0012-bounded-mailbox-ipc.md) (lock naming) | - |
 
 Use [`TEMPLATE.md`](TEMPLATE.md) for new decisions.

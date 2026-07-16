@@ -60,10 +60,14 @@ their own finite static-task arrays without changing round-robin behavior.
 ## Constraints
 
 - Single core; local IRQ exclusion is not SMP synchronization.
+- Scheduler, ready-queue, deadline, mailbox timeout, and console wake
+  transitions retain local IRQ exclusion. Task-only `PreemptLock` state is not
+  part of scheduler handoff and its current IRQ-masking backend does not change
+  scheduling semantics.
 - No heap allocation or unbounded work in scheduling/timer fast paths.
 - Idle is the permanent fallback and is never joinable or reclaimed.
 - `SavedContext` layout is opaque to scheduler policy; Rust and architecture
   trap-frame handoff contracts change together inside the architecture facade.
 
 Related decisions: ADR-0003, ADR-0005, ADR-0006, ADR-0011 through ADR-0014,
-ADR-0020, ADR-0027, and ADR-0028.
+ADR-0020, and ADR-0027 through ADR-0029.

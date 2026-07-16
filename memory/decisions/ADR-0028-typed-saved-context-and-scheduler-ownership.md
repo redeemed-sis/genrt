@@ -4,6 +4,12 @@
 
 Accepted
 
+## Subsequent refinement
+
+[ADR-0029](ADR-0029-local-irq-and-task-preemption-exclusion.md) establishes the
+IRQ/preemption ownership distinction deferred by this decision without
+changing typed context ownership or scheduler handoff semantics.
+
 ## Context
 
 ADR-0027 introduced the lifetime-bound `ActiveContext` for a live exception

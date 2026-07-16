@@ -17,6 +17,11 @@ explicit acceptance criteria.
 3. **Interrupt API boundaries**
    - replace ad hoc architecture dispatch wiring with explicit IRQ ownership
      interfaces while keeping GIC/ESR details in AArch64 code;
+   - replace the transitional IRQ-masking `PreemptGuard` backend with an
+     IRQ-enabled preemption counter and deferred reschedule only after the
+     scheduler state transition contract is specified;
+   - measure heap/frame allocator critical-section latency before claiming a
+     hard upper bound;
    - retain allocation-free bounded handlers.
 
 ## Boundary cleanup
