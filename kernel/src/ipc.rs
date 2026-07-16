@@ -1,7 +1,7 @@
 use alloc::{collections::VecDeque, vec::Vec};
 use core::{cell::UnsafeCell, fmt};
 
-use crate::{arch::ActiveContext, sync::IrqSpinLock, task::TaskId};
+use crate::{arch::ActiveContext, sync::LocalIrqLock, task::TaskId};
 
 const MAILBOX_WAIT_SEND: u64 = 1;
 const MAILBOX_WAIT_RECV: u64 = 2;
@@ -113,7 +113,7 @@ impl IpcWaitRegistration {
 /// those events before making the task runnable, while timeout dispatch removes
 /// the task from this mailbox's bounded wait queue before waking it.
 pub struct Mailbox<T> {
-    control: IrqSpinLock<MailboxControl>,
+    control: LocalIrqLock<MailboxControl>,
     buffer: UnsafeCell<Vec<Option<T>>>,
 }
 
@@ -134,7 +134,7 @@ impl<T> Mailbox<T> {
         }
 
         Self {
-            control: IrqSpinLock::new(MailboxControl::with_capacity(capacity, waiter_capacity)),
+            control: LocalIrqLock::new(MailboxControl::with_capacity(capacity, waiter_capacity)),
             buffer: UnsafeCell::new(buffer),
         }
     }
@@ -310,7 +310,7 @@ impl<T> Mailbox<T> {
 
     fn wait(&self, wait_kind: MailboxWaitKind) {
         crate::task_call::mailbox_wait(
-            &self.control as *const IrqSpinLock<MailboxControl> as *const core::ffi::c_void,
+            &self.control as *const LocalIrqLock<MailboxControl> as *const core::ffi::c_void,
             wait_kind.raw(),
         );
     }
@@ -321,7 +321,7 @@ impl<T> Mailbox<T> {
         deadline: u64,
     ) -> Option<crate::sched::WaitResult> {
         crate::task_call::mailbox_wait_until_counter(
-            &self.control as *const IrqSpinLock<MailboxControl> as *const core::ffi::c_void,
+            &self.control as *const LocalIrqLock<MailboxControl> as *const core::ffi::c_void,
             wait_kind.raw(),
             deadline,
         );
@@ -451,7 +451,7 @@ pub(crate) fn on_mailbox_wait_sync(
     // SAFETY: blocking mailbox operations pass a pointer to their non-generic
     // control lock. The containing mailbox must remain alive while tasks wait.
     let control_ptr = control;
-    let control = unsafe { &*(control_ptr.cast::<IrqSpinLock<MailboxControl>>()) };
+    let control = unsafe { &*(control_ptr.cast::<LocalIrqLock<MailboxControl>>()) };
     let mut control = control.lock();
 
     if !control.should_wait(wait_kind) {
@@ -505,7 +505,7 @@ fn remove_timed_out_mailbox_waiter(
     // SAFETY: scheduler stores the same control pointer supplied by a blocking
     // mailbox wait. The mailbox owner must keep the mailbox alive and unmoved
     // until all waiters have completed or timed out.
-    let control = unsafe { &*(control.cast::<IrqSpinLock<MailboxControl>>()) };
+    let control = unsafe { &*(control.cast::<LocalIrqLock<MailboxControl>>()) };
     let mut control = control.lock();
     let removed = control.remove_waiter(wait_kind, task_id);
     if removed {

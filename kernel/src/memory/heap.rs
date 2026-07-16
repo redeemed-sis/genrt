@@ -11,17 +11,17 @@ use core::{
 
 use linked_list_allocator::Heap;
 
-use crate::sync::IrqSpinLock;
+use crate::sync::PreemptLock;
 
 // Heap allocation policy for the current single-core kernel:
 // - allowed during bootstrap/init code,
 // - allowed in ordinary task context,
-// - protected against local IRQ reentrancy by saving/restoring the local IRQ mask,
+// - protected against task preemption by the task-only allocator lock,
 // - still forbidden in timer/scheduler/exception fast paths.
 //
-// The allocator uses the shared IRQ-save lock abstraction. In the current
-// no-SMP build it masks local IRQs; the same call sites can later gain a real
-// SMP spin acquisition inside `kernel::sync`.
+// The current transitional PreemptLock backend masks local IRQs. This preserves
+// runtime behavior while keeping task-only ownership distinct from state that
+// is intentionally shared with interrupt handlers.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum HeapInitError {
     AlreadyInitialized,
@@ -37,25 +37,25 @@ pub enum HeapSmokeError {
     BTreeMap,
 }
 
-struct IrqSafeHeap {
-    heap: IrqSpinLock<Heap>,
+struct KernelHeap {
+    heap: PreemptLock<Heap>,
     initialized: AtomicBool,
 }
 
 // SAFETY: allocator state is shared globally, but access is serialized through
-// the shared IRQ-save lock.
-unsafe impl Sync for IrqSafeHeap {}
+// the task-only preemption lock. Allocation from IRQ context remains forbidden.
+unsafe impl Sync for KernelHeap {}
 
 #[global_allocator]
-static KERNEL_HEAP: IrqSafeHeap = IrqSafeHeap::empty();
+static KERNEL_HEAP: KernelHeap = KernelHeap::empty();
 
 // OOM currently follows the default alloc panic path, which then converges
 // into genrt's existing panic -> arch_hard_fault termination policy.
 
-impl IrqSafeHeap {
+impl KernelHeap {
     const fn empty() -> Self {
         Self {
-            heap: IrqSpinLock::new(Heap::empty()),
+            heap: PreemptLock::new(Heap::empty()),
             initialized: AtomicBool::new(false),
         }
     }
@@ -85,7 +85,7 @@ impl IrqSafeHeap {
     }
 }
 
-unsafe impl GlobalAlloc for IrqSafeHeap {
+unsafe impl GlobalAlloc for KernelHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut guard = self.heap.lock();
         guard
