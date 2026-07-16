@@ -31,12 +31,42 @@ subject = "thread-join"
 [[steps]]
 action = "expect_case"
 producer = "kernel"
-subject = "allocator-lifecycle"
+subject = "timer-preemption"
 
 [[steps]]
 action = "expect_case"
 producer = "kernel"
-subject = "timer-preemption"
+subject = "preempt-lock-keeps-irqs-enabled"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "deferred-reschedule-after-unlock"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "nested-preempt-guard"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "irq-masked-unlock-preserves-pending"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "deferred-wakeup"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "yield-inside-preempt-guard"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "allocator-preemption-lifecycle"
 
 [[steps]]
 action = "expect_case"

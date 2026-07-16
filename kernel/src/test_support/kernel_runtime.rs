@@ -4,13 +4,17 @@ use alloc::vec::Vec;
 use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
-    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
 
 use crate::{
     ipc::{Mailbox, RecvTimeoutError},
     memory,
     sched::{self, ThreadArg, ThreadAttrs},
+    sync::{
+        LocalIrqGuard, PreemptLock,
+        preempt::{PreemptGuard, reschedule_pending},
+    },
 };
 
 use super::protocol;
@@ -48,6 +52,24 @@ static DELIVERY_ELAPSED_MS: AtomicUsize = AtomicUsize::new(0);
 static PREEMPT_STAGE: AtomicUsize = AtomicUsize::new(0);
 static PROGRESS_A: AtomicUsize = AtomicUsize::new(0);
 static PROGRESS_B: AtomicUsize = AtomicUsize::new(0);
+static TIMER_IRQ_COUNT: AtomicUsize = AtomicUsize::new(0);
+static GUARD_PEER_STAGE: AtomicUsize = AtomicUsize::new(0);
+static GUARD_PEER_PROGRESS: AtomicUsize = AtomicUsize::new(0);
+static WAKEUP_STAGE: AtomicUsize = AtomicUsize::new(0);
+static WAKEUP_DEADLINE: AtomicU64 = AtomicU64::new(0);
+static TEST_PREEMPT_LOCK: PreemptLock<usize> = PreemptLock::new(0);
+
+/// Record one timer IRQ for bounded kernel-runtime contract coordination.
+///
+/// This test-only hook increments a lock-free counter, allocates nothing, and
+/// never participates in production kernels or scheduler policy.
+///
+/// # Returns
+///
+/// Returns after recording the IRQ for the bounded contract coordinator.
+pub(crate) fn note_timer_irq() {
+    TIMER_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Finite test-only scheduler tasks selected by the kernel runtime feature.
 pub(crate) const TASKS: [sched::StaticTask; 4] = [
@@ -131,33 +153,6 @@ fn coordinator(_arg: ThreadArg) -> usize {
     }
     protocol::pass("thread-join");
 
-    protocol::case_start("allocator-lifecycle");
-    let free_frames_before = memory::free_frame_count()
-        .unwrap_or_else(|| protocol::fail("allocator-lifecycle", "NOT_INITIALIZED"));
-    let mut workers = [None; ALLOCATOR_WORKER_COUNT];
-    for (index, worker) in workers.iter_mut().enumerate() {
-        *worker = Some(
-            sched::thread_spawn(
-                allocator_worker,
-                ThreadArg::from_usize(index + 1),
-                ThreadAttrs::joinable(),
-            )
-            .unwrap_or_else(|_| protocol::fail("allocator-lifecycle", "SPAWN")),
-        );
-    }
-    for worker in workers {
-        if sched::thread_join(
-            worker.unwrap_or_else(|| protocol::fail("allocator-lifecycle", "MISSING_WORKER")),
-        ) != Ok(ALLOCATOR_WORKER_OK)
-        {
-            protocol::fail("allocator-lifecycle", "WORKER_FAILED");
-        }
-    }
-    if memory::free_frame_count() != Some(free_frames_before) {
-        protocol::fail("allocator-lifecycle", "FRAME_LEAK");
-    }
-    protocol::pass("allocator-lifecycle");
-
     protocol::case_start("timer-preemption");
     PREEMPT_STAGE.store(1, Ordering::Release);
     sched::msleep(50);
@@ -166,6 +161,59 @@ fn coordinator(_arg: ThreadArg) -> usize {
         protocol::fail("timer-preemption", "NO_PEER_PROGRESS");
     }
     protocol::pass("timer-preemption");
+
+    protocol::case_start("preempt-lock-keeps-irqs-enabled");
+    run_preempt_lock_case();
+    protocol::pass("preempt-lock-keeps-irqs-enabled");
+
+    protocol::case_start("deferred-reschedule-after-unlock");
+    run_deferred_reschedule_case();
+    protocol::pass("deferred-reschedule-after-unlock");
+
+    protocol::case_start("nested-preempt-guard");
+    run_nested_preempt_guard_case();
+    protocol::pass("nested-preempt-guard");
+
+    protocol::case_start("irq-masked-unlock-preserves-pending");
+    run_irq_masked_unlock_case();
+    protocol::pass("irq-masked-unlock-preserves-pending");
+
+    protocol::case_start("deferred-wakeup");
+    run_deferred_wakeup_case();
+    protocol::pass("deferred-wakeup");
+
+    protocol::case_start("yield-inside-preempt-guard");
+    run_yield_inside_preempt_guard_case();
+    protocol::pass("yield-inside-preempt-guard");
+
+    protocol::case_start("allocator-preemption-lifecycle");
+    let free_frames_before = memory::free_frame_count()
+        .unwrap_or_else(|| protocol::fail("allocator-preemption-lifecycle", "NOT_INITIALIZED"));
+    let mut workers = [None; ALLOCATOR_WORKER_COUNT];
+    for (index, worker) in workers.iter_mut().enumerate() {
+        *worker = Some(
+            sched::thread_spawn(
+                allocator_worker,
+                ThreadArg::from_usize(index + 1),
+                ThreadAttrs::joinable(),
+            )
+            .unwrap_or_else(|_| protocol::fail("allocator-preemption-lifecycle", "SPAWN")),
+        );
+    }
+    for worker in workers {
+        if sched::thread_join(
+            worker.unwrap_or_else(|| {
+                protocol::fail("allocator-preemption-lifecycle", "MISSING_WORKER")
+            }),
+        ) != Ok(ALLOCATOR_WORKER_OK)
+        {
+            protocol::fail("allocator-preemption-lifecycle", "WORKER_FAILED");
+        }
+    }
+    if memory::free_frame_count() != Some(free_frames_before) {
+        protocol::fail("allocator-preemption-lifecycle", "FRAME_LEAK");
+    }
+    protocol::pass("allocator-preemption-lifecycle");
 
     protocol::case_start("post-test-liveness");
     sched::msleep(10);
@@ -211,6 +259,161 @@ fn spin_progress(counter: &AtomicUsize) -> usize {
 fn worker(_arg: ThreadArg) -> usize {
     sched::msleep(10);
     WORKER_EXIT
+}
+
+fn run_preempt_lock_case() {
+    let mut lock = TEST_PREEMPT_LOCK.lock();
+    let worker = prepare_guard_peer("preempt-lock-keeps-irqs-enabled");
+    let baseline = TIMER_IRQ_COUNT.load(Ordering::Acquire);
+    if !crate::sync::preempt::is_disabled() || !crate::sync::preempt::scheduler_online() {
+        protocol::fail("preempt-lock-keeps-irqs-enabled", "BAD_PREEMPT_STATE");
+    }
+    *lock = lock.wrapping_add(1);
+    GUARD_PEER_STAGE.store(1, Ordering::Release);
+    wait_for_timer_irqs_after(baseline, 3);
+    if GUARD_PEER_PROGRESS.load(Ordering::Acquire) != 0 || !reschedule_pending() {
+        protocol::fail("preempt-lock-keeps-irqs-enabled", "BAD_DEFERRED_STATE");
+    }
+    drop(lock);
+    wait_for_guard_peer("preempt-lock-keeps-irqs-enabled", worker);
+}
+
+fn run_deferred_reschedule_case() {
+    let guard = PreemptGuard::enter();
+    let worker = prepare_guard_peer("deferred-reschedule-after-unlock");
+    GUARD_PEER_STAGE.store(1, Ordering::Release);
+    crate::sync::preempt::request_reschedule();
+    if GUARD_PEER_PROGRESS.load(Ordering::Acquire) != 0 || !reschedule_pending() {
+        protocol::fail("deferred-reschedule-after-unlock", "BAD_DEFERRED_STATE");
+    }
+    drop(guard);
+    // No explicit yield or timer wait occurs between outermost drop and proof.
+    wait_for_guard_peer("deferred-reschedule-after-unlock", worker);
+}
+
+fn run_nested_preempt_guard_case() {
+    let outer = PreemptGuard::enter();
+    let inner = PreemptGuard::enter();
+    let worker = prepare_guard_peer("nested-preempt-guard");
+    GUARD_PEER_STAGE.store(1, Ordering::Release);
+    sched::yield_now();
+    drop(inner);
+    if GUARD_PEER_PROGRESS.load(Ordering::Acquire) != 0 || !reschedule_pending() {
+        protocol::fail("nested-preempt-guard", "INNER_DROP_CONSUMED_REQUEST");
+    }
+    drop(outer);
+    wait_for_guard_peer("nested-preempt-guard", worker);
+}
+
+fn run_irq_masked_unlock_case() {
+    let irq_guard = LocalIrqGuard::save_and_disable();
+    let guard = PreemptGuard::enter();
+    let worker = prepare_guard_peer("irq-masked-unlock-preserves-pending");
+    GUARD_PEER_STAGE.store(1, Ordering::Release);
+    crate::sync::preempt::request_reschedule();
+    drop(guard);
+    if GUARD_PEER_PROGRESS.load(Ordering::Acquire) != 0 || !reschedule_pending() {
+        protocol::fail(
+            "irq-masked-unlock-preserves-pending",
+            "MASKED_DROP_SERVICED_REQUEST",
+        );
+    }
+    drop(irq_guard);
+    sched::yield_now();
+    wait_for_guard_peer("irq-masked-unlock-preserves-pending", worker);
+}
+
+fn run_deferred_wakeup_case() {
+    WAKEUP_STAGE.store(0, Ordering::Release);
+    let worker = sched::thread_spawn(wakeup_peer, ThreadArg::empty(), ThreadAttrs::joinable())
+        .unwrap_or_else(|_| protocol::fail("deferred-wakeup", "SPAWN"));
+    while WAKEUP_STAGE.load(Ordering::Acquire) == 0 {
+        sched::yield_now();
+    }
+    let deadline = WAKEUP_DEADLINE.load(Ordering::Acquire);
+    if deadline == 0 {
+        protocol::fail("deferred-wakeup", "NO_DEADLINE");
+    }
+
+    {
+        let _guard = PreemptGuard::enter();
+        while crate::time::now_counter() < deadline {
+            core::hint::spin_loop();
+        }
+        let irq_at_deadline = TIMER_IRQ_COUNT.load(Ordering::Acquire);
+        wait_for_timer_irqs_after(irq_at_deadline, 1);
+        if WAKEUP_STAGE.load(Ordering::Acquire) != 1 || !reschedule_pending() {
+            protocol::fail("deferred-wakeup", "WAKE_NOT_DEFERRED");
+        }
+    }
+    if WAKEUP_STAGE.load(Ordering::Acquire) != 2 {
+        protocol::fail("deferred-wakeup", "NO_UNLOCK_CHECKPOINT");
+    }
+    if sched::thread_join(worker) != Ok(0) {
+        protocol::fail("deferred-wakeup", "JOIN");
+    }
+}
+
+fn run_yield_inside_preempt_guard_case() {
+    let guard = PreemptGuard::enter();
+    let worker = prepare_guard_peer("yield-inside-preempt-guard");
+    GUARD_PEER_STAGE.store(1, Ordering::Release);
+    sched::yield_now();
+    if GUARD_PEER_PROGRESS.load(Ordering::Acquire) != 0 || !reschedule_pending() {
+        protocol::fail("yield-inside-preempt-guard", "YIELD_ESCAPED_GUARD");
+    }
+    drop(guard);
+    wait_for_guard_peer("yield-inside-preempt-guard", worker);
+}
+
+fn prepare_guard_peer(case: &str) -> crate::task::ThreadId {
+    GUARD_PEER_STAGE.store(0, Ordering::Release);
+    GUARD_PEER_PROGRESS.store(0, Ordering::Release);
+    sched::thread_spawn(guard_peer, ThreadArg::empty(), ThreadAttrs::joinable())
+        .unwrap_or_else(|_| protocol::fail(case, "SPAWN"))
+}
+
+fn wait_for_guard_peer(case: &str, worker: crate::task::ThreadId) {
+    if GUARD_PEER_PROGRESS.load(Ordering::Acquire) == 0
+        || GUARD_PEER_STAGE.load(Ordering::Acquire) != 2
+    {
+        protocol::fail(case, "NO_UNLOCK_CHECKPOINT");
+    }
+    if reschedule_pending() {
+        protocol::fail(case, "STALE_PENDING_REQUEST");
+    }
+    if sched::thread_join(worker) != Ok(0) {
+        protocol::fail(case, "JOIN");
+    }
+}
+
+fn wait_for_timer_irqs_after(baseline: usize, count: usize) {
+    let target = baseline.saturating_add(count);
+    while TIMER_IRQ_COUNT.load(Ordering::Acquire) < target {
+        core::hint::spin_loop();
+    }
+}
+
+fn guard_peer(_arg: ThreadArg) -> usize {
+    while GUARD_PEER_STAGE.load(Ordering::Acquire) == 0 {
+        core::hint::spin_loop();
+    }
+    // Acquiring the same lock used by `run_preempt_lock_case` proves that the
+    // previous owner publishes `locked = false` before its deferred checkpoint.
+    let lock = TEST_PREEMPT_LOCK.lock();
+    GUARD_PEER_PROGRESS.store(1, Ordering::Release);
+    GUARD_PEER_STAGE.store(2, Ordering::Release);
+    drop(lock);
+    0
+}
+
+fn wakeup_peer(_arg: ThreadArg) -> usize {
+    let deadline = crate::time::now_counter().wrapping_add(crate::time::ms_to_counts(2));
+    WAKEUP_DEADLINE.store(deadline, Ordering::Release);
+    WAKEUP_STAGE.store(1, Ordering::Release);
+    sched::sleep_until_counter(deadline);
+    WAKEUP_STAGE.store(2, Ordering::Release);
+    0
 }
 
 fn allocator_worker(arg: ThreadArg) -> usize {

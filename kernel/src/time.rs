@@ -343,6 +343,9 @@ pub(crate) fn event_pending(event: TimedEvent) -> bool {
 /// Returns after all events expired at the sampled counter value are handled,
 /// the scheduler handoff is committed, and the one-shot timer is rearmed.
 pub fn on_timer_interrupt(context: &mut ActiveContext<'_>) {
+    #[cfg(feature = "qemu-test-kernel-runtime")]
+    crate::test_support::kernel_runtime::note_timer_irq();
+
     if try_time_mut().is_none() {
         // Keep stray early-boot timer IRQs from ever reaching scheduler
         // callbacks before `time::init()` installs their handler table.
