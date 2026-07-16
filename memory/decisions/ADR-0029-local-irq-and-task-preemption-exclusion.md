@@ -4,6 +4,10 @@
 
 Accepted
 
+The transitional `PreemptGuard` backend described here is superseded by
+[ADR-0030](ADR-0030-nested-preemption-control-and-deferred-rescheduling.md).
+The ownership split and lock classification remain accepted.
+
 ## Context
 
 The single-core kernel used one `IrqSpinLock` name for two different ownership

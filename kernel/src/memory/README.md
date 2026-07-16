@@ -14,9 +14,11 @@ frames and stores free-list metadata through explicit high direct-map aliases.
 The bootstrap heap is one contiguous 16 MiB frame range. Once allocated, it is
 removed from the frame free list and initialized through its HVA. Allocation is
 allowed during bootstrap and task context. The heap and runtime frame free list
-use task-only `PreemptLock` ownership; its current backend masks local IRQs.
-Boot-discovered regions and the heap range become immutable metadata after
-initialization and can be read without holding the allocator lock.
+use task-only `PreemptLock` ownership. IRQs remain enabled when permitted by the
+caller, while nested preemption exclusion prevents another task from observing
+allocator mutation; a requested switch is deferred until the outermost lock is
+released. Boot-discovered regions and the heap range become immutable metadata
+after initialization and can be read without holding the allocator lock.
 
 ## Kernel mappings
 
@@ -63,4 +65,4 @@ belongs inside this module, not in individual syscalls.
 - No reference into mutable frame allocator state may escape its guard.
 
 Related decisions: ADR-0007, ADR-0009 through ADR-0011, ADR-0015, ADR-0016, and
-ADR-0029.
+ADR-0029 and ADR-0030.

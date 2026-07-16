@@ -28,11 +28,15 @@ Changes that invalidate one require architecture review and an ADR.
 - Runtime structures touched by those paths are bounded and preallocated.
 - Local-IRQ critical sections for IRQ-shared state are short and never contain
   unbounded parsing, user copies, filesystem traversal, or resource
-  destruction. Transitional task-preemption sections may cover finite
-  allocator traversal; their latency is not yet certified.
+  destruction. Task-preemption sections may cover finite allocator traversal;
+  their latency is not yet certified, but they do not suppress IRQ progress.
 - Local IRQ exclusion protects state shared with interrupt handlers;
   task-preemption exclusion protects task-only state and must not be acquired
-  from IRQ context. The current `PreemptGuard` backend still masks local IRQs.
+  from IRQ context. Nested task-preemption exclusion preserves IRQ state and
+  defers optional handoff until a depth-zero controlled scheduler checkpoint.
+- Reschedule requests coalesce and are consumed only by scheduler checkpoints.
+  Yield cannot bypass a guard, and blocking or terminal transitions fail fast
+  while task preemption is disabled.
 - Neither local IRQ nor task-preemption exclusion provides SMP synchronization.
 - Blocking task operations hand ownership to the scheduler; they do not poll.
 - Human-readable logging is diagnostic and may perturb timing. It is never a

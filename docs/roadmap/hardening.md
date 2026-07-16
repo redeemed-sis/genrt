@@ -9,6 +9,8 @@ explicit acceptance criteria.
 1. **Scheduler and frame lifecycle**
    - consolidate duplicated block/wake entry points and clarify Task/Thread
      ownership without erasing the user/kernel distinction;
+   - centralize scheduler state transitions and eliminate direct thread-slot
+     state mutation outside that transition layer;
    - measure bounded queue behavior and critical-section length.
 2. **Process decomposition**
    - separate process table/lifecycle, image loading, wait/join, FD access, and
@@ -17,9 +19,6 @@ explicit acceptance criteria.
 3. **Interrupt API boundaries**
    - replace ad hoc architecture dispatch wiring with explicit IRQ ownership
      interfaces while keeping GIC/ESR details in AArch64 code;
-   - replace the transitional IRQ-masking `PreemptGuard` backend with an
-     IRQ-enabled preemption counter and deferred reschedule only after the
-     scheduler state transition contract is specified;
    - measure heap/frame allocator critical-section latency before claiming a
      hard upper bound;
    - retain allocation-free bounded handlers.

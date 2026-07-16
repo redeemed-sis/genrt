@@ -56,10 +56,17 @@ frame.
 
 The active system is single-core. `LocalIrqLock`/`LocalIrqGuard` protect state
 shared with interrupt handlers. `PreemptLock` identifies task-only state such
-as the fixed heap and runtime frame allocator; its transitional backend still
-masks local IRQs. Neither domain is an SMP lock. Heap use is allowed in
-bootstrap and normal task context. IRQ, scheduler, timed-event, and
-frame-handoff paths operate on bounded preallocated storage.
+as the fixed heap and runtime frame allocator. Its nested `PreemptGuard` leaves
+IRQs in their caller-selected state, coalesces scheduler requests, and performs
+a deferred handoff only at a typed timer-return or private task-call checkpoint.
+Neither domain is an SMP lock. Heap use is allowed in bootstrap and normal task
+context. IRQ, scheduler, timed-event, and frame-handoff paths operate on bounded
+preallocated storage.
+
+Blocking and terminal task transitions are forbidden under `PreemptGuard`.
+Kernel yield under a guard records a pending reschedule and returns to the same
+task; release of the outermost guard triggers the controlled checkpoint when
+the saved IRQ state permits it.
 
 Resource cleanup occurs after ownership has been atomically removed under a
 short critical section. Parsing, filesystem traversal, user copies, and heavy

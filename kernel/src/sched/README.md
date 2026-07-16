@@ -30,6 +30,13 @@ Ready-queue insertion notifies the scheduler when a runnable peer appears so
 idle cannot remain selected indefinitely. A quantum switch is committed only at
 the frame-handoff boundary.
 
+Task-only preemption exclusion is nested and IRQ-enabled. Quantum expiration
+and deadline wakeups continue their bounded IRQ bookkeeping while a guard is
+active, but optional handoff leaves the current task `Running` and records one
+coalesced pending request. Timer IRQ return and the private EL1
+`PreemptCheckpoint` task call consume that request only at depth zero. Kernel
+yield uses the same checkpoint and therefore cannot bypass a guard.
+
 ## Block and wake
 
 A blocking operation joins waiter registration with scheduler blocking under a
@@ -37,6 +44,10 @@ short local IRQ critical section, closing lost-wakeup windows. The current frame
 is saved before another task or idle is selected. Wake paths validate the
 expected block identity, transition the task to ready, enqueue it, and request
 rescheduling when needed.
+
+Sleep, blocking IPC/stdin/join/process waits, and thread/process exit fail fast
+if task preemption is disabled. They do not defer ownership publication across
+an active guard.
 
 IPC queues and time own timeout removal; process lifecycle owns process wait;
 console owns stdin availability. The scheduler owns task state and queue order.
@@ -61,13 +72,13 @@ their own finite static-task arrays without changing round-robin behavior.
 
 - Single core; local IRQ exclusion is not SMP synchronization.
 - Scheduler, ready-queue, deadline, mailbox timeout, and console wake
-  transitions retain local IRQ exclusion. Task-only `PreemptLock` state is not
-  part of scheduler handoff and its current IRQ-masking backend does not change
-  scheduling semantics.
+  transitions retain local IRQ exclusion. Task-only `PreemptLock` state uses a
+  nested disable depth and deferred scheduler checkpoint while allowing IRQ
+  progress.
 - No heap allocation or unbounded work in scheduling/timer fast paths.
 - Idle is the permanent fallback and is never joinable or reclaimed.
 - `SavedContext` layout is opaque to scheduler policy; Rust and architecture
   trap-frame handoff contracts change together inside the architecture facade.
 
 Related decisions: ADR-0003, ADR-0005, ADR-0006, ADR-0011 through ADR-0014,
-ADR-0020, and ADR-0027 through ADR-0029.
+ADR-0020, and ADR-0027 through ADR-0030.

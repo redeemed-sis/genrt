@@ -31,8 +31,9 @@ accepted ADRs remain authoritative when details differ.
 - A fixed 16 MiB bootstrap heap is allocated from physical frames and exposed
   through the high direct map.
 - Heap allocation is permitted during bootstrap and task context. The heap and
-  runtime physical frame allocator use task-only `PreemptLock`; its current
-  backend masks local IRQs and is forbidden in IRQ paths.
+  runtime physical frame allocator use task-only `PreemptLock`. Its nested
+  disable depth permits IRQ progress, forbids task handoff until unlock, and is
+  forbidden in IRQ paths.
 - Boot-discovered physical regions and the heap range are immutable after
   initialization. Runtime free-list state is separately locked and does not
   expose references outside its guard.
@@ -64,6 +65,12 @@ accepted ADRs remain authoritative when details differ.
 - The architected timer runs in one-shot nearest-deadline mode.
 - `kernel::time` owns the preallocated deadline queue for wakeups, mailbox
   timeouts, and scheduler quantum expiration.
+- Reschedule requests coalesce in `kernel::sync::preempt`. Timer IRQ return and
+  a private typed task-call checkpoint may consume them only at disable depth
+  zero; outermost guard release invokes that checkpoint automatically when the
+  saved IRQ state is safe.
+- Kernel yield under preemption exclusion returns to the same task. Blocking
+  waits and terminal task/process transitions fail fast under a guard.
 - Kernel thread slots, stacks, ready queues, and handles are bounded and
   generation-checked.
 - Sleep, thread join, process wait, mailbox waits, and stdin waits block through
