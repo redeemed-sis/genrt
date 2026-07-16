@@ -1,6 +1,11 @@
-use core::cell::UnsafeCell;
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use bootinfo::BootInfo;
+
+use crate::sync::PreemptLock;
 
 mod frame_alloc;
 pub mod heap;
@@ -76,20 +81,17 @@ impl FreeListStorage<PhysAddr> for PhysFrameStorage {
     }
 }
 
-struct MemoryState {
-    initialized: bool,
+struct MemoryMetadata {
     phys_regions: [PhysRegion; MAX_PHYS_REGIONS],
     phys_region_count: usize,
     usable_ranges: [FrameRange; MAX_USABLE_RANGES],
     usable_range_count: usize,
     heap_range: Option<FrameRange>,
-    allocator: FrameAllocator<PhysAddr, PhysFrameStorage>,
 }
 
-impl MemoryState {
+impl MemoryMetadata {
     const fn new() -> Self {
         Self {
-            initialized: false,
             phys_regions: [PhysRegion {
                 range: PhysRange::empty(),
                 kind: RegionKind::Reserved,
@@ -98,16 +100,13 @@ impl MemoryState {
             usable_ranges: [FrameRange::empty(); MAX_USABLE_RANGES],
             usable_range_count: 0,
             heap_range: None,
-            allocator: FrameAllocator::new(),
         }
     }
 
     fn reset(&mut self) {
-        self.initialized = false;
         self.phys_region_count = 0;
         self.usable_range_count = 0;
         self.heap_range = None;
-        self.allocator.reset();
         for region in &mut self.phys_regions {
             *region = PhysRegion {
                 range: PhysRange::empty(),
@@ -120,13 +119,59 @@ impl MemoryState {
     }
 }
 
-struct MemoryCell(UnsafeCell<MemoryState>);
+struct MemoryMetadataCell(UnsafeCell<MemoryMetadata>);
 
-// SAFETY: genrt currently mutates memory state only on a single core during bring-up.
-unsafe impl Sync for MemoryCell {}
+// SAFETY: metadata is written only during single-core boot before scheduler
+// entry and remains immutable for the rest of runtime.
+unsafe impl Sync for MemoryMetadataCell {}
 
-static MEMORY: MemoryCell = MemoryCell(UnsafeCell::new(MemoryState::new()));
+static MEMORY_METADATA: MemoryMetadataCell =
+    MemoryMetadataCell(UnsafeCell::new(MemoryMetadata::new()));
+static MEMORY_METADATA_READY: AtomicBool = AtomicBool::new(false);
 
+struct RuntimeFrameAllocator {
+    initialized: bool,
+    allocator: FrameAllocator<PhysAddr, PhysFrameStorage>,
+}
+
+impl RuntimeFrameAllocator {
+    const fn new() -> Self {
+        Self {
+            initialized: false,
+            allocator: FrameAllocator::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.initialized = false;
+        self.allocator.reset();
+    }
+}
+
+static FRAME_ALLOCATOR: PreemptLock<RuntimeFrameAllocator> =
+    PreemptLock::new(RuntimeFrameAllocator::new());
+
+/// Initialize immutable physical-memory metadata and the runtime allocators.
+///
+/// This boot-only operation normalizes firmware ranges, reserves kernel-owned
+/// regions, initializes the task-only frame allocator, extracts the fixed heap
+/// range, and initializes the kernel heap. It runs before scheduler entry.
+///
+/// # Arguments
+///
+/// * `boot` - Immutable boot information containing the firmware memory map and
+///   optional DTB range.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after publishing immutable metadata and initialized frame
+/// and heap allocators.
+///
+/// # Errors
+///
+/// Returns [`MemoryError`] for unusable or over-capacity boot maps, invalid
+/// addresses, unavailable heap frames, heap initialization failure, or a failed
+/// heap smoke check.
 pub(crate) fn init(boot: &'static BootInfo) -> Result<()> {
     let mut ram_ranges = [PhysRange::empty(); MAX_RAM_RANGES];
     let mut ram_count = 0usize;
@@ -172,24 +217,24 @@ pub(crate) fn init(boot: &'static BootInfo) -> Result<()> {
     sort_ranges(&mut reserved_ranges, reserved_count);
     reserved_count = merge_ranges(&mut reserved_ranges, reserved_count);
 
-    let state = memory_mut();
-    state.reset();
+    let metadata = metadata_mut();
+    metadata.reset();
 
     build_memory_map(
         &ram_ranges[..ram_count],
         &reserved_ranges[..reserved_count],
-        &mut state.phys_regions,
-        &mut state.phys_region_count,
-        &mut state.usable_ranges,
-        &mut state.usable_range_count,
+        &mut metadata.phys_regions,
+        &mut metadata.phys_region_count,
+        &mut metadata.usable_ranges,
+        &mut metadata.usable_range_count,
     )?;
 
-    let usable = &state.usable_ranges[..state.usable_range_count];
+    let usable = &metadata.usable_ranges[..metadata.usable_range_count];
     if usable.is_empty() {
         return Err(MemoryError::NoUsableRam);
     }
 
-    for region in &state.phys_regions[..state.phys_region_count] {
+    for region in &metadata.phys_regions[..metadata.phys_region_count] {
         match region.kind {
             RegionKind::Usable => {
                 crate::debug!("memory: usable region {:?}", region.range);
@@ -209,21 +254,30 @@ pub(crate) fn init(boot: &'static BootInfo) -> Result<()> {
         );
     }
 
-    state.allocator.init_from_ranges(usable, PAGE_SIZE);
-    // The bootstrap heap is allocated from the frame allocator before the rest
-    // of the kernel starts using heap-backed containers. Ownership is therefore
-    // transferred from the frame allocator to the heap subsystem at this point,
-    // even though `usable_ranges()` still describes the broader usable RAM set.
-    crate::debug!("memory: allocating bootstrap heap from frame allocator");
-    let bootstrap_heap_range = state
-        .allocator
-        .alloc_contiguous(KERNEL_HEAP_BOOTSTRAP_SIZE / PAGE_SIZE, PAGE_SIZE)
-        .ok_or(MemoryError::NoBootstrapHeapRange)?;
+    let bootstrap_heap_range = {
+        let mut runtime = FRAME_ALLOCATOR.lock();
+        runtime.reset();
+        runtime.allocator.init_from_ranges(usable, PAGE_SIZE);
+
+        // The bootstrap heap is allocated from the frame allocator before the
+        // rest of the kernel starts using heap-backed containers. Ownership is
+        // transferred to the heap subsystem even though `usable_ranges()`
+        // continues to describe the broader immutable usable RAM set.
+        crate::debug!("memory: allocating bootstrap heap from frame allocator");
+        let bootstrap_heap_range = runtime
+            .allocator
+            .alloc_contiguous(KERNEL_HEAP_BOOTSTRAP_SIZE / PAGE_SIZE, PAGE_SIZE)
+            .ok_or(MemoryError::NoBootstrapHeapRange)?;
+        run_allocator_self_check(&mut runtime.allocator)?;
+        runtime.initialized = true;
+        bootstrap_heap_range
+    };
     crate::debug!(
         "memory: bootstrap heap allocated {:?}",
         bootstrap_heap_range
     );
-    state.heap_range = Some(bootstrap_heap_range);
+    metadata.heap_range = Some(bootstrap_heap_range);
+    let usable_range_count = metadata.usable_range_count;
 
     crate::debug!("memory: initializing linked_list_allocator heap");
     let bootstrap_heap_va = phys_to_kernel_va(bootstrap_heap_range.start);
@@ -235,12 +289,12 @@ pub(crate) fn init(boot: &'static BootInfo) -> Result<()> {
     crate::debug!("memory: running heap smoke tests");
     heap::run_heap_smoke_tests().map_err(MemoryError::HeapSmokeTest)?;
     crate::debug!("memory: heap smoke tests completed");
-    state.initialized = true;
+    MEMORY_METADATA_READY.store(true, Ordering::Release);
 
     crate::info!(
         "memory: initialized usable_ranges={} free_frames={} heap_kib={} heap_phys_range={:?} heap_virt_range={:?}",
-        state.usable_range_count,
-        state.allocator.free_frames(),
+        usable_range_count,
+        free_frame_count().unwrap_or(0),
         KERNEL_HEAP_BOOTSTRAP_SIZE / 1024,
         bootstrap_heap_range,
         VirtRange {
@@ -248,50 +302,114 @@ pub(crate) fn init(boot: &'static BootInfo) -> Result<()> {
             end: bootstrap_heap_va + (bootstrap_heap_range.end - bootstrap_heap_range.start),
         }
     );
-    run_allocator_self_check(state)?;
     Ok(())
 }
 
+/// Allocate one physical frame from the runtime free list.
+///
+/// # Returns
+///
+/// Returns the physical address of one page-aligned frame, or `None` when the
+/// allocator is not initialized or no frame remains. The task-only allocator
+/// lock is held for free-list mutation; the operation does not allocate from
+/// the kernel heap or block.
 pub fn alloc_frame() -> Option<PhysAddr> {
-    let state = memory_mut();
-    if !state.initialized {
+    let mut runtime = FRAME_ALLOCATOR.lock();
+    if !runtime.initialized {
         return None;
     }
 
-    state.allocator.alloc_frame()
+    runtime.allocator.alloc_frame()
 }
 
+/// Allocate one contiguous physical frame range.
+///
+/// # Arguments
+///
+/// * `frames` - Number of contiguous page-sized frames to allocate.
+///
+/// # Returns
+///
+/// Returns the allocated page-aligned range, or `None` for zero frames, an
+/// uninitialized allocator, or insufficient contiguous space. The task-only
+/// allocator lock is held during free-list traversal; the operation does not
+/// allocate from the kernel heap or block.
 pub fn alloc_contiguous_frames(frames: usize) -> Option<FrameRange> {
-    let state = memory_mut();
-    if !state.initialized {
+    let mut runtime = FRAME_ALLOCATOR.lock();
+    if !runtime.initialized {
         return None;
     }
 
-    state.allocator.alloc_contiguous(frames, PAGE_SIZE)
+    runtime.allocator.alloc_contiguous(frames, PAGE_SIZE)
 }
 
+/// Return one physical frame to the runtime free list.
+///
+/// # Arguments
+///
+/// * `frame_pa` - Page-aligned physical address previously returned by the
+///   frame allocator.
+///
+/// # Returns
+///
+/// Returns after reinserting the frame under the task-only allocator lock. The
+/// operation does not allocate from the kernel heap or block.
+///
+/// # Panics
+///
+/// Panics before allocator initialization or when `frame_pa` is unaligned or
+/// outside immutable boot-discovered usable RAM.
 pub fn free_frame(frame_pa: PhysAddr) {
-    let state = memory_mut();
-    if !state.initialized {
+    let mut runtime = FRAME_ALLOCATOR.lock();
+    if !runtime.initialized {
         panic!("memory: free_frame before init");
     }
-    if !is_valid_usable_frame(&state.usable_ranges[..state.usable_range_count], frame_pa) {
+    if !is_valid_usable_frame(usable_ranges(), frame_pa) {
         panic!("memory: attempted to free invalid frame {frame_pa}");
     }
 
-    state.allocator.free_frame(frame_pa);
+    runtime.allocator.free_frame(frame_pa);
 }
 
+/// Return a contiguous physical frame range to the runtime free list.
+///
+/// # Arguments
+///
+/// * `range` - Non-empty page-aligned range previously returned by the frame
+///   allocator.
+///
+/// # Returns
+///
+/// Returns after reinserting the complete range under the task-only allocator
+/// lock. The operation does not allocate from the kernel heap or block.
+///
+/// # Panics
+///
+/// Panics before allocator initialization or when `range` is empty, unaligned,
+/// or not wholly contained in one immutable boot-discovered usable RAM range.
 pub fn free_contiguous_frames(range: FrameRange) {
-    let state = memory_mut();
-    if !state.initialized {
+    let mut runtime = FRAME_ALLOCATOR.lock();
+    if !runtime.initialized {
         panic!("memory: free_contiguous_frames before init");
     }
-    if !is_valid_usable_frame_range(&state.usable_ranges[..state.usable_range_count], range) {
+    if !is_valid_usable_frame_range(usable_ranges(), range) {
         panic!("memory: attempted to free invalid frame range {:?}", range);
     }
 
-    state.allocator.free_contiguous(range, PAGE_SIZE);
+    runtime.allocator.free_contiguous(range, PAGE_SIZE);
+}
+
+/// Return the current number of free physical frames.
+///
+/// # Returns
+///
+/// Returns `Some(count)` after runtime allocator initialization, or `None`
+/// before initialization. The count is copied while holding the task-only
+/// allocator lock; no protected reference escapes, and the operation does not
+/// allocate or block.
+pub(crate) fn free_frame_count() -> Option<usize> {
+    let runtime = FRAME_ALLOCATOR.lock();
+    runtime.initialized.then(|| runtime.allocator.free_frames())
 }
 
 pub fn zero_phys_range(range: FrameRange) {
@@ -355,35 +473,50 @@ fn copy_phys_range(src_pa: PhysAddr, dst_pa: PhysAddr, size: usize) {
     }
 }
 
+/// Borrow the immutable boot-discovered usable physical ranges.
+///
+/// # Returns
+///
+/// Returns the initialized prefix of static memory metadata. Before memory
+/// initialization the slice is empty. No runtime allocator lock is acquired,
+/// and the returned ranges never change after boot.
 pub fn usable_ranges() -> &'static [FrameRange] {
-    let state = memory_ref();
+    if !MEMORY_METADATA_READY.load(Ordering::Acquire) {
+        return &[];
+    }
+    let metadata = metadata_ref();
     // SAFETY: usable ranges are immutable after memory initialization.
-    unsafe { core::slice::from_raw_parts(state.usable_ranges.as_ptr(), state.usable_range_count) }
+    unsafe {
+        core::slice::from_raw_parts(metadata.usable_ranges.as_ptr(), metadata.usable_range_count)
+    }
 }
 
+/// Return the physical range permanently assigned to the fixed kernel heap.
+///
+/// # Returns
+///
+/// Returns `Some(range)` after the bootstrap heap has been extracted from the
+/// frame allocator, or `None` before that point. The value comes from immutable
+/// boot metadata and requires no runtime allocator lock.
 pub fn heap_range() -> Option<FrameRange> {
-    memory_ref().heap_range
+    if !MEMORY_METADATA_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    metadata_ref().heap_range
 }
 
-fn run_allocator_self_check(state: &mut MemoryState) -> Result<()> {
-    let first = state
-        .allocator
-        .alloc_frame()
-        .ok_or(MemoryError::NoUsableRam)?;
-    let second = state
-        .allocator
-        .alloc_frame()
-        .ok_or(MemoryError::NoUsableRam)?;
-    let third = state
-        .allocator
-        .alloc_frame()
-        .ok_or(MemoryError::NoUsableRam)?;
+fn run_allocator_self_check(
+    allocator: &mut FrameAllocator<PhysAddr, PhysFrameStorage>,
+) -> Result<()> {
+    let first = allocator.alloc_frame().ok_or(MemoryError::NoUsableRam)?;
+    let second = allocator.alloc_frame().ok_or(MemoryError::NoUsableRam)?;
+    let third = allocator.alloc_frame().ok_or(MemoryError::NoUsableRam)?;
 
     crate::debug!("memory: self-check alloc frames {first}, {second}, {third}");
 
-    state.allocator.free_frame(third);
-    state.allocator.free_frame(second);
-    state.allocator.free_frame(first);
+    allocator.free_frame(third);
+    allocator.free_frame(second);
+    allocator.free_frame(first);
     crate::debug!("memory: self-check free frames restored");
     Ok(())
 }
@@ -440,13 +573,15 @@ fn phys_to_kernel_ptr<T>(pa: PhysAddr) -> *mut T {
 }
 
 #[inline(always)]
-fn memory_mut() -> &'static mut MemoryState {
-    // SAFETY: genrt mutates memory state only on one core during bring-up.
-    unsafe { &mut *MEMORY.0.get() }
+fn metadata_mut() -> &'static mut MemoryMetadata {
+    // SAFETY: boot initialization is the sole writer and completes before any
+    // runtime task can observe immutable memory metadata.
+    unsafe { &mut *MEMORY_METADATA.0.get() }
 }
 
 #[inline(always)]
-fn memory_ref() -> &'static MemoryState {
-    // SAFETY: read-only access does not outlive the static backing storage.
-    unsafe { &*MEMORY.0.get() }
+fn metadata_ref() -> &'static MemoryMetadata {
+    // SAFETY: metadata is immutable after boot initialization and has static
+    // backing storage.
+    unsafe { &*MEMORY_METADATA.0.get() }
 }

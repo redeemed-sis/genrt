@@ -1,5 +1,6 @@
 //! Finite scheduler, timing, mailbox, and lifecycle contract scenarios.
 
+use alloc::vec::Vec;
 use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
@@ -8,6 +9,7 @@ use core::{
 
 use crate::{
     ipc::{Mailbox, RecvTimeoutError},
+    memory,
     sched::{self, ThreadArg, ThreadAttrs},
 };
 
@@ -16,6 +18,13 @@ use super::protocol;
 const SUITE: &str = "kernel-contract";
 const WORKER_EXIT: usize = 0x2a;
 const DELIVERY_VALUE: usize = 0x51;
+const ALLOCATOR_WORKER_COUNT: usize = 3;
+const ALLOCATOR_CYCLES: usize = 6;
+const ALLOCATOR_HEAP_ITEMS: usize = 64;
+const ALLOCATOR_WORKER_OK: usize = 0;
+const ALLOCATOR_FRAME_FAILED: usize = 1;
+const ALLOCATOR_RANGE_FAILED: usize = 2;
+const ALLOCATOR_HEAP_FAILED: usize = 3;
 const MAILBOX_UNINITIALIZED: u8 = 0;
 const MAILBOX_INITIALIZING: u8 = 1;
 const MAILBOX_READY: u8 = 2;
@@ -122,6 +131,33 @@ fn coordinator(_arg: ThreadArg) -> usize {
     }
     protocol::pass("thread-join");
 
+    protocol::case_start("allocator-lifecycle");
+    let free_frames_before = memory::free_frame_count()
+        .unwrap_or_else(|| protocol::fail("allocator-lifecycle", "NOT_INITIALIZED"));
+    let mut workers = [None; ALLOCATOR_WORKER_COUNT];
+    for (index, worker) in workers.iter_mut().enumerate() {
+        *worker = Some(
+            sched::thread_spawn(
+                allocator_worker,
+                ThreadArg::from_usize(index + 1),
+                ThreadAttrs::joinable(),
+            )
+            .unwrap_or_else(|_| protocol::fail("allocator-lifecycle", "SPAWN")),
+        );
+    }
+    for worker in workers {
+        if sched::thread_join(
+            worker.unwrap_or_else(|| protocol::fail("allocator-lifecycle", "MISSING_WORKER")),
+        ) != Ok(ALLOCATOR_WORKER_OK)
+        {
+            protocol::fail("allocator-lifecycle", "WORKER_FAILED");
+        }
+    }
+    if memory::free_frame_count() != Some(free_frames_before) {
+        protocol::fail("allocator-lifecycle", "FRAME_LEAK");
+    }
+    protocol::pass("allocator-lifecycle");
+
     protocol::case_start("timer-preemption");
     PREEMPT_STAGE.store(1, Ordering::Release);
     sched::msleep(50);
@@ -175,6 +211,39 @@ fn spin_progress(counter: &AtomicUsize) -> usize {
 fn worker(_arg: ThreadArg) -> usize {
     sched::msleep(10);
     WORKER_EXIT
+}
+
+fn allocator_worker(arg: ThreadArg) -> usize {
+    let seed = arg.as_usize();
+    for cycle in 0..ALLOCATOR_CYCLES {
+        let Some(frame) = memory::alloc_frame() else {
+            return ALLOCATOR_FRAME_FAILED;
+        };
+        let Some(range) = memory::alloc_contiguous_frames(2) else {
+            memory::free_frame(frame);
+            return ALLOCATOR_RANGE_FAILED;
+        };
+
+        let mut values = Vec::with_capacity(ALLOCATOR_HEAP_ITEMS);
+        for item in 0..ALLOCATOR_HEAP_ITEMS {
+            values.push(seed.wrapping_add(cycle).wrapping_add(item));
+        }
+        let heap_ok = values.len() == ALLOCATOR_HEAP_ITEMS
+            && values.first() == Some(&seed.wrapping_add(cycle));
+        drop(values);
+
+        memory::free_contiguous_frames(range);
+        memory::free_frame(frame);
+        if !heap_ok {
+            return ALLOCATOR_HEAP_FAILED;
+        }
+
+        // Yield only after releasing allocator resources so several bounded
+        // worker lifecycles interleave without testing wall-clock timing.
+        sched::msleep(1);
+    }
+
+    ALLOCATOR_WORKER_OK
 }
 
 fn test_mailbox() -> &'static Mailbox<usize> {

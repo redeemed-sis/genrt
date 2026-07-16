@@ -6,7 +6,7 @@ stores complete evidence below `target/test-results/`.
 ## Test layers
 
 - `kernel-contract`: test-enabled kernel coordinator for timer, sleep,
-  preemption, and mailbox contracts.
+  preemption, mailbox, thread lifecycle, and allocator ownership contracts.
 - `user-fault`: test-enabled kernel coordinator that joins a faulting EL0
   process and verifies exact fault classification.
 - `userspace-contract`: production kernel plus test supervisor and exact
