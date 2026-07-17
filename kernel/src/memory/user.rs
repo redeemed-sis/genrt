@@ -14,8 +14,8 @@ use alloc::vec::Vec;
 pub use crate::limits::GENRT_PATH_MAX;
 
 use super::{
-    PAGE_SIZE, VirtAddr, align_down,
-    vm::{self, UserMappingInfo},
+    FrameRange, PAGE_SIZE, VirtAddr, align_down,
+    vm::{self, OwnedUserAddressSpace, UserMapFlags, UserMappingInfo},
 };
 
 pub const USER_TEXT_BASE: VirtAddr = 0x0000_0040_0000_0000;
@@ -26,6 +26,127 @@ pub const USER_STACK_TOP: VirtAddr = 0x0000_0080_0000_0000;
 /// This prevents early syscalls from copying unbounded user buffers before the
 /// kernel has fault-recovering copy loops and a richer process memory model.
 pub const MAX_USER_COPY: usize = 1024;
+
+/// Exclusive ownership of mapped user-stack frames.
+///
+/// The stack can be moved into a schedulable thread but is never copied. Its
+/// destructor releases frames after the owner has been removed from scheduler
+/// state; callers must therefore extract it before any IRQ-disabled lifecycle
+/// transition that will reclaim a thread.
+pub(crate) struct OwnedUserStack {
+    frames: FrameRange,
+    base: VirtAddr,
+    size: usize,
+}
+
+impl OwnedUserStack {
+    /// Allocate, zero, and map one non-executable user stack.
+    ///
+    /// This operation allocates physical frames and mutates a borrowed TTBR0
+    /// owner. It may not run in IRQ or scheduler fast paths.
+    ///
+    /// # Arguments
+    ///
+    /// * `address_space` - Owner of the TTBR0 root receiving the mapping.
+    /// * `size` - Page-aligned stack size ending at [`USER_STACK_TOP`].
+    ///
+    /// # Returns
+    ///
+    /// Returns the uniquely owned mapped stack.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`vm::VmError::OutOfFrames`] when frame allocation fails and
+    /// propagates invalid-range, alignment, or mapping errors.
+    pub(crate) fn allocate(
+        address_space: &OwnedUserAddressSpace,
+        size: usize,
+    ) -> Result<Self, vm::VmError> {
+        if size == 0 || size & (PAGE_SIZE - 1) != 0 || size > USER_STACK_TOP {
+            return Err(vm::VmError::InvalidRange);
+        }
+        let frames =
+            super::alloc_contiguous_frames(size / PAGE_SIZE).ok_or(vm::VmError::OutOfFrames)?;
+        super::zero_phys_range(frames);
+        let base = USER_STACK_TOP - size;
+        if let Err(error) =
+            vm::map_user_page_range(address_space, base, frames.start, size, UserMapFlags::WRITE)
+        {
+            super::free_contiguous_frames(frames);
+            return Err(error);
+        }
+        Ok(Self { frames, base, size })
+    }
+
+    /// Return the backing frames for bounded kernel-side initialization.
+    ///
+    /// # Returns
+    ///
+    /// Returns a copy of the owned frame range without transferring ownership.
+    /// Reading it is bounded and does not allocate, block, or alter IRQ state.
+    pub(crate) const fn frames(&self) -> FrameRange {
+        self.frames
+    }
+
+    /// Return the mapped user virtual base.
+    ///
+    /// # Returns
+    ///
+    /// Returns the lowest mapped user address without transferring ownership.
+    /// Reading it is bounded and does not allocate, block, or alter IRQ state.
+    pub(crate) const fn base(&self) -> VirtAddr {
+        self.base
+    }
+
+    /// Clone this mapped stack into another owned user address space.
+    ///
+    /// # Arguments
+    ///
+    /// * `address_space` - Newly created address-space owner receiving the
+    ///   cloned writable stack mapping.
+    ///
+    /// # Returns
+    ///
+    /// Returns a new stack with copied frames and the same user virtual range.
+    ///
+    /// # Errors
+    ///
+    /// Returns frame-allocation or mapping errors. On error, every partially
+    /// allocated frame is released before returning. This operation may
+    /// allocate and must not run in an IRQ or scheduler fast path.
+    pub(crate) fn clone_into(
+        &self,
+        address_space: &OwnedUserAddressSpace,
+    ) -> Result<Self, vm::VmError> {
+        let frames = super::clone_frame_range(self.frames).map_err(|error| match error {
+            super::FrameRangeCloneError::InvalidRange => vm::VmError::InvalidRange,
+            super::FrameRangeCloneError::OutOfFrames => vm::VmError::OutOfFrames,
+        })?;
+        if let Err(error) = vm::map_user_page_range(
+            address_space,
+            self.base,
+            frames.start,
+            self.size,
+            UserMapFlags::WRITE,
+        ) {
+            super::free_contiguous_frames(frames);
+            return Err(error);
+        }
+        Ok(Self {
+            frames,
+            base: self.base,
+            size: self.size,
+        })
+    }
+}
+
+impl Drop for OwnedUserStack {
+    fn drop(&mut self) {
+        if self.frames.start != 0 {
+            super::free_contiguous_frames(self.frames);
+        }
+    }
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum UserCopyError {

@@ -10,8 +10,8 @@ use super::protocol;
 const SUITE: &str = "user-fault";
 
 /// Single coordinator selected by the user-fault QEMU feature.
-pub(crate) const TASKS: [sched::StaticTask; 1] =
-    [sched::StaticTask::new(coordinator, ThreadArg::empty())];
+pub(crate) const THREADS: [sched::StaticThread; 1] =
+    [sched::StaticThread::new(coordinator, ThreadArg::empty())];
 
 fn coordinator(_arg: ThreadArg) -> usize {
     protocol::ready(SUITE);

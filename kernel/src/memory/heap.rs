@@ -15,12 +15,12 @@ use crate::sync::PreemptLock;
 
 // Heap allocation policy for the current single-core kernel:
 // - allowed during bootstrap/init code,
-// - allowed in ordinary task context,
-// - protected against task preemption by the task-only allocator lock,
+// - allowed in ordinary thread context,
+// - protected against thread preemption by the thread-only allocator lock,
 // - still forbidden in timer/scheduler/exception fast paths.
 //
 // PreemptLock preserves the caller's IRQ state. Timer/deadline IRQ bookkeeping
-// may continue while allocator state is borrowed, but task handoff is deferred
+// may continue while allocator state is borrowed, but thread handoff is deferred
 // until the outermost allocator guard releases the lock.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum HeapInitError {
@@ -43,7 +43,7 @@ struct KernelHeap {
 }
 
 // SAFETY: allocator state is shared globally, but access is serialized through
-// the task-only preemption lock. Allocation from IRQ context remains forbidden.
+// the thread-only preemption lock. Allocation from IRQ context remains forbidden.
 unsafe impl Sync for KernelHeap {}
 
 #[cfg_attr(not(test), global_allocator)]

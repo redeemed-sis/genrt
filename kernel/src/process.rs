@@ -3,20 +3,20 @@ use core::{cell::UnsafeCell, fmt, mem};
 
 use crate::{
     arch::ActiveContext,
+    config::KERNEL_THREAD_CAPACITY,
     errno,
     fs::fd::{FdError, FdTable},
     fs::initramfs::{self, InitramfsError},
     fs::{path, ramfs},
     loader::elf::{self, ElfLoadError, UserElfImage, UserElfSegment},
     memory::{
-        self, FrameRange, PAGE_SIZE,
-        user::{self, USER_STACK_TOP},
-        vm::{self, UserAddressSpace, UserMapFlags, VmError},
+        self,
+        user::{self, OwnedUserStack, USER_STACK_TOP},
+        vm::{self, OwnedUserAddressSpace, VmError},
     },
-    sched::{self, CommitResult, ThreadAttrs, WaitCause, WaitKind, WaitToken},
+    sched::ThreadId,
+    sched::{self, CommitResult, ThreadAttrs, WaitCause, WaitToken},
     sync::LocalIrqGuard,
-    task::ThreadId,
-    task_call::TaskCallWaitOutput,
 };
 
 pub(crate) const USER_STACK_SIZE: usize = 64 * 1024;
@@ -183,15 +183,14 @@ pub(crate) enum ProcessPathError {
 struct ProcessSlot {
     generation: u32,
     state: ProcessState,
-    address_space: Option<UserAddressSpace>,
+    address_space: Option<OwnedUserAddressSpace>,
     user_image: Option<UserElfImage>,
     fds: FdTable,
     cwd_dir: Option<usize>,
     parent: Option<ProcessId>,
     main_thread: Option<ThreadId>,
-    stack: FrameRange,
     exit_status: Option<ProcessExitStatus>,
-    joiner: Option<WaitToken>,
+    process_consumer: Option<ThreadId>,
     waiter: Option<WaitToken>,
 }
 
@@ -206,9 +205,8 @@ impl ProcessSlot {
             cwd_dir: None,
             parent: None,
             main_thread: None,
-            stack: FrameRange::empty(),
             exit_status: None,
-            joiner: None,
+            process_consumer: None,
             waiter: None,
         }
     }
@@ -220,25 +218,27 @@ impl ProcessSlot {
 
 struct ProcessTable {
     slots: [ProcessSlot; MAX_PROCESSES],
+    // O(1) current-process lookup keyed by `ThreadId::index`. An entry is
+    // authoritative only when the referenced process slot still records the
+    // exact generation-bearing `ThreadId` as its main thread.
+    thread_owners: [Option<ProcessId>; KERNEL_THREAD_CAPACITY],
 }
 
 struct ReclaimedProcess {
     status: ProcessExitStatus,
-    address_space: Option<UserAddressSpace>,
+    address_space: Option<OwnedUserAddressSpace>,
     user_image: Option<UserElfImage>,
-    stack: FrameRange,
 }
 
 struct ProcessResources {
-    address_space: Option<UserAddressSpace>,
+    address_space: Option<OwnedUserAddressSpace>,
     user_image: Option<UserElfImage>,
-    stack: FrameRange,
 }
 
 struct StagedProcessImage {
-    address_space: UserAddressSpace,
+    address_space: OwnedUserAddressSpace,
     user_image: UserElfImage,
-    stack: FrameRange,
+    stack: OwnedUserStack,
     entry: usize,
     initial_sp: usize,
 }
@@ -306,9 +306,9 @@ impl ExecArgs {
 struct WaitedProcess {
     pid: ProcessId,
     status: ProcessExitStatus,
-    address_space: Option<UserAddressSpace>,
+    address_space: Option<OwnedUserAddressSpace>,
     user_image: Option<UserElfImage>,
-    stack: FrameRange,
+    main_thread: ThreadId,
     wait_token: Option<WaitToken>,
 }
 
@@ -326,6 +326,7 @@ impl ProcessTable {
     const fn new() -> Self {
         Self {
             slots: [const { ProcessSlot::free() }; MAX_PROCESSES],
+            thread_owners: [None; KERNEL_THREAD_CAPACITY],
         }
     }
 }
@@ -333,56 +334,77 @@ impl ProcessTable {
 struct ProcessTableCell(UnsafeCell<ProcessTable>);
 
 // SAFETY: genrt is single-core for this milestone. Process table mutations run
-// either in short IRQ-disabled task-context sections or in the synchronous
-// lower-EL trap path for the currently running task.
+// either in short IRQ-disabled thread-context sections or in the synchronous
+// lower-EL trap path for the currently running thread.
 unsafe impl Sync for ProcessTableCell {}
 
 static PROCESS_TABLE: ProcessTableCell = ProcessTableCell(UnsafeCell::new(ProcessTable::new()));
 
+/// Find the process that owns the currently scheduled main thread.
+///
+/// A process-owned reverse index maps the current thread slot directly to a
+/// generation-checked process. Scheduler state therefore remains free of
+/// process metadata while lookup stays O(1). The operation runs with local IRQs
+/// disabled, allocates nothing, and is never used from an interrupt handler.
+fn current_process_id() -> Option<ProcessId> {
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    let thread = sched::current_thread_id()?;
+    table_mut().process_for_thread(thread)
+}
+
 pub(crate) fn spawn_first_user_process() -> Result<ProcessId, ProcessError> {
     let cwd_dir = ramfs::root_dir_index().ok_or(ProcessError::InvalidProcess)?;
     let pid = allocate_process_slot(None, FdTable::new(), cwd_dir)?;
-    let address_space = vm::create_user_address_space().map_err(|err| {
+    let mut address_space = Some(vm::create_user_address_space().map_err(|err| {
         free_process_slot(pid);
         ProcessError::Vm(err)
-    })?;
-    let mut stack = FrameRange::empty();
+    })?);
+    let mut stack = None;
     let mut user_image = None;
 
     let result = (|| {
-        let loaded = load_init_image(address_space)?;
+        let aspace = address_space.as_mut().ok_or(ProcessError::InvalidProcess)?;
+        let loaded = load_init_image(aspace)?;
         let entry = loaded.entry;
         user_image = Some(loaded);
 
-        stack = memory::alloc_contiguous_frames(USER_STACK_SIZE / PAGE_SIZE)
-            .ok_or(ProcessError::OutOfFrames)?;
-        memory::zero_phys_range(stack);
-        map_user_stack(address_space, stack)?;
+        stack = Some(OwnedUserStack::allocate(aspace, USER_STACK_SIZE).map_err(ProcessError::Vm)?);
         let mut exec_args = ExecArgs::empty();
         exec_args
             .push(ExecStringVector::Argv, b"/init".to_vec())
             .map_err(|_| ProcessError::OutOfFrames)?;
-        let initial_sp =
-            build_initial_user_stack(stack, &exec_args).ok_or(ProcessError::OutOfFrames)?;
+        let initial_sp = build_initial_user_stack(
+            stack.as_ref().ok_or(ProcessError::InvalidProcess)?,
+            &exec_args,
+        )
+        .ok_or(ProcessError::OutOfFrames)?;
         attach_process_resources(
             pid,
-            address_space,
+            address_space.take().ok_or(ProcessError::InvalidProcess)?,
             user_image.take().ok_or(ProcessError::InvalidProcess)?,
-            stack,
-        )?;
+        );
 
         {
             let _irq_guard = LocalIrqGuard::save_and_disable();
             let main_thread = sched::thread_spawn_user(
-                pid,
-                address_space,
+                table_mut()
+                    .slot_mut(pid)
+                    .ok_or(ProcessError::InvalidProcess)?
+                    .address_space
+                    .as_ref()
+                    .ok_or(ProcessError::InvalidProcess)?
+                    .id(),
+                stack.take().ok_or(ProcessError::InvalidProcess)?,
                 entry,
                 initial_sp,
                 0,
-                ThreadAttrs::detached(),
+                ThreadAttrs::joinable(),
             )
-            .map_err(ProcessError::Spawn)?;
-            attach_process_main_thread(pid, main_thread)?;
+            .map_err(|(error, returned_stack)| {
+                stack = Some(returned_stack);
+                ProcessError::Spawn(error)
+            })?;
+            attach_process_main_thread(pid, main_thread);
         }
         Ok(pid)
     })();
@@ -394,12 +416,11 @@ pub(crate) fn spawn_first_user_process() -> Result<ProcessId, ProcessError> {
         } else if let Some(image) = attached.user_image {
             elf::free_loaded_segments(&image);
         }
-        if attached.stack.start != 0 {
-            memory::free_contiguous_frames(attached.stack);
-        } else if stack.start != 0 {
-            memory::free_contiguous_frames(stack);
-        }
-        let address_space = attached.address_space.unwrap_or(address_space);
+        drop(stack);
+        let address_space = attached
+            .address_space
+            .or(address_space)
+            .ok_or(ProcessError::InvalidProcess)?;
         // SAFETY: a failed spawn path never leaves a runnable user thread that
         // can still reference this address space.
         let _ = unsafe { vm::destroy_user_address_space(address_space) };
@@ -410,18 +431,17 @@ pub(crate) fn spawn_first_user_process() -> Result<ProcessId, ProcessError> {
 }
 
 pub(crate) fn process_join(pid: ProcessId) -> Result<ProcessExitStatus, ProcessJoinError> {
-    if sched::current_user_process_id() == Some(pid) {
+    if current_process_id() == Some(pid) {
         return Err(ProcessJoinError::SelfJoin);
     }
 
     let caller = sched::current_thread_id().ok_or(ProcessJoinError::SchedulerNotInitialized)?;
-    match consume_process_for_join(pid, caller) {
-        Ok(reclaimed) => return cleanup_reclaimed_process(pid, reclaimed),
-        Err(ConsumeProcessError::WouldBlock) => {}
-        Err(ConsumeProcessError::Join(err)) => return Err(err),
-    }
-
-    crate::task_call::process_join(pid);
+    let main_thread = claim_process_consumer(pid, caller)?;
+    sched::thread_join(main_thread).map_err(|error| match error {
+        sched::JoinError::JoinInProgress => ProcessJoinError::JoinInProgress,
+        sched::JoinError::SchedulerNotInitialized => ProcessJoinError::SchedulerNotInitialized,
+        _ => ProcessJoinError::InvalidProcess,
+    })?;
 
     let reclaimed = match consume_process_for_join(pid, caller) {
         Ok(reclaimed) => reclaimed,
@@ -433,62 +453,21 @@ pub(crate) fn process_join(pid: ProcessId) -> Result<ProcessExitStatus, ProcessJ
     cleanup_reclaimed_process(pid, reclaimed)
 }
 
-/// Register and block the current kernel task waiting for a process to finish.
-///
-/// # Arguments
-///
-/// * `context` - Exclusive live task-call context for scheduler handoff.
-/// * `pid` - Generation-checked process whose terminal state is awaited.
-/// * `output` - Stack-owned private task-call output that retains the exact
-///   wait token across a blocked resume.
-///
-/// # Returns
-///
-/// Returns without blocking when registration is invalid or unnecessary;
-/// otherwise returns after the scheduler later resumes the waiter. The
-/// registration and handoff are bounded and do not allocate.
-///
-/// # Panics
-///
-/// Panics when a [`crate::sync::preempt::PreemptGuard`] is active before
-/// publishing the process joiner.
-pub(crate) fn on_process_join_sync(
-    context: &mut ActiveContext<'_>,
-    pid: ProcessId,
-    output: &mut TaskCallWaitOutput,
-) {
-    let Some(joiner) = sched::current_thread_id() else {
-        return;
-    };
-
-    let prepared = {
-        let _irq_guard = LocalIrqGuard::save_and_disable();
-        let table = table_mut();
-        let Some(slot) = table.slot_mut(pid) else {
-            return;
+fn claim_process_consumer(pid: ProcessId, caller: ThreadId) -> Result<ThreadId, ProcessJoinError> {
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    let slot = table_mut()
+        .slot_mut(pid)
+        .ok_or(ProcessJoinError::InvalidProcess)?;
+    if let Some(consumer) = slot.process_consumer {
+        return if consumer == caller {
+            Err(ProcessJoinError::JoinInProgress)
+        } else {
+            Err(ProcessJoinError::JoinInProgress)
         };
-
-        if slot.exit_status.is_some() {
-            return;
-        }
-        if slot.joiner.is_some() {
-            return;
-        }
-
-        crate::sync::preempt::assert_preemption_enabled("process joiner publication");
-        let prepared = sched::prepare_wait(WaitKind::Process);
-        let token = prepared.token();
-        output.record_token(token);
-        slot.joiner = Some(token);
-        prepared
-    };
-
-    match sched::commit_wait(context, prepared) {
-        CommitResult::Blocked(_) => {}
-        CommitResult::Early(cause) => output.record_early(cause),
-        CommitResult::Stale => panic!("process: join wait became stale before commit"),
     }
-    crate::debug!("process: join blocking current={joiner} pid={pid}");
+    let main_thread = slot.main_thread.ok_or(ProcessJoinError::InvalidProcess)?;
+    slot.process_consumer = Some(caller);
+    Ok(main_thread)
 }
 
 /// Store normal process exit status and switch away from its current thread.
@@ -501,7 +480,7 @@ pub(crate) fn on_process_join_sync(
 /// # Returns
 ///
 /// Returns only in the exception handler after the live frame has been replaced
-/// with another runnable task; the exiting userspace thread does not resume.
+/// with another runnable thread; the exiting userspace thread does not resume.
 /// The terminal transition is bounded and does not allocate.
 ///
 /// # Panics
@@ -510,7 +489,7 @@ pub(crate) fn on_process_join_sync(
 /// [`crate::sync::preempt::PreemptGuard`] is active before terminal state changes.
 pub(crate) fn process_exit_current(context: &mut ActiveContext<'_>, code: usize) {
     // Safe point: a terminal process handoff cannot publish exit state while a
-    // task-only preemption guard still owns its protected access.
+    // thread-only preemption guard still owns its protected access.
     crate::sync::preempt::assert_preemption_enabled("process exit state change");
     finish_current_process(context, ProcessExitStatus::Exited(code), code)
         .unwrap_or_else(|err| panic!("process: sys_exit without current process: {err:?}"));
@@ -548,7 +527,7 @@ pub fn kill_current_process_on_user_fault(
 
 /// Eagerly clone the current process and live userspace resume context.
 ///
-/// This task-context operation may allocate and copy process-owned memory. Only
+/// This thread-context operation may allocate and copy process-owned memory. Only
 /// the final child publication and scheduler-frame clone run in a short local
 /// IRQ-disabled section; scheduler storage remains preallocated.
 ///
@@ -566,6 +545,11 @@ pub fn kill_current_process_on_user_fault(
 ///
 /// Returns a POSIX errno for invalid process state, exhausted process/thread or
 /// frame capacity, VM failure, or eager-copy failure.
+///
+/// # Panics
+///
+/// Panics if a reserved child process slot disappears after transactional
+/// publication begins; that would violate single-core process-table ownership.
 pub(crate) fn fork_current(context: &mut ActiveContext<'_>) -> Result<usize, errno::Errno> {
     let snapshot = fork_snapshot_current()?;
     let child_pid =
@@ -573,36 +557,42 @@ pub(crate) fn fork_current(context: &mut ActiveContext<'_>) -> Result<usize, err
             .map_err(fork_errno)?;
     let mut address_space = None;
     let mut user_image = None;
-    let mut stack = FrameRange::empty();
+    let mut stack = None;
 
     let result = (|| {
-        let child_aspace = vm::create_user_address_space().map_err(fork_vm_errno)?;
-        address_space = Some(child_aspace);
+        // Publish ownership to the rollback state before any clone can fail:
+        // OwnedUserAddressSpace has no Drop and must be explicitly destroyed.
+        address_space = Some(vm::create_user_address_space().map_err(fork_vm_errno)?);
+        let child_aspace = address_space.as_ref().ok_or(errno::ENOMEM)?;
 
         let child_image = clone_user_image(snapshot.user_image(), child_aspace)?;
         user_image = Some(child_image);
 
-        stack = clone_user_stack(snapshot.stack, child_aspace)?;
+        // SAFETY: the pointer names the currently running parent thread's
+        // stack. This thread cannot be reaped while it synchronously clones its
+        // own fork image.
+        stack =
+            Some(unsafe { (&*snapshot.stack).clone_into(child_aspace) }.map_err(fork_vm_errno)?);
+        let child_aspace_id = child_aspace.id();
         attach_process_resources(
             child_pid,
-            child_aspace,
+            address_space.take().ok_or(errno::ENOMEM)?,
             user_image.take().ok_or(errno::ENOMEM)?,
-            stack,
-        )
-        .map_err(fork_errno)?;
+        );
 
         {
             let _irq_guard = LocalIrqGuard::save_and_disable();
             let child_thread = sched::thread_spawn_user_from_context(
-                child_pid,
-                child_aspace,
+                child_aspace_id,
+                stack.take().ok_or(errno::ENOMEM)?,
                 context,
-                ThreadAttrs::detached(),
+                ThreadAttrs::joinable(),
             )
-            .map_err(spawn_errno)?;
-            attach_process_main_thread(child_pid, child_thread).unwrap_or_else(|err| {
-                panic!("process: child thread published without process slot: {err:?}")
-            });
+            .map_err(|(error, returned_stack)| {
+                stack = Some(returned_stack);
+                spawn_errno(error)
+            })?;
+            attach_process_main_thread(child_pid, child_thread);
         }
 
         Ok(child_pid.as_raw())
@@ -615,11 +605,7 @@ pub(crate) fn fork_current(context: &mut ActiveContext<'_>) -> Result<usize, err
         } else if let Some(image) = attached.user_image {
             elf::free_loaded_segments(&image);
         }
-        if attached.stack.start != 0 {
-            memory::free_contiguous_frames(attached.stack);
-        } else if stack.start != 0 {
-            memory::free_contiguous_frames(stack);
-        }
+        drop(stack);
         let attached_aspace = attached.address_space;
         if let Some(aspace) = attached_aspace.or(address_space) {
             // SAFETY: failed fork did not publish a runnable child using this
@@ -654,16 +640,17 @@ pub(crate) fn fork_current(context: &mut ActiveContext<'_>) -> Result<usize, err
 /// Returns a POSIX errno for invalid process state, missing/invalid executable,
 /// allocation failure, ELF rejection, or VM setup failure.
 ///
-/// This task-context operation may allocate, parse ELF data, and copy process
+/// This thread-context operation may allocate, parse ELF data, and copy process
 /// memory. Those operations occur outside scheduler and IRQ fast paths.
 pub(crate) fn execve_current(
     context: &mut ActiveContext<'_>,
     path: path::ResolvedPath,
     args: ExecArgs,
 ) -> Result<(), errno::Errno> {
-    let pid = sched::current_user_process_id().ok_or(errno::EINVAL)?;
+    let pid = current_process_id().ok_or(errno::EINVAL)?;
     let staged = stage_exec_image(&path, &args)?;
-    let old = commit_exec_image(pid, staged, context)?;
+    let (old, old_stack) = commit_exec_image(pid, staged, context);
+    drop(old_stack);
     cleanup_process_resources(pid, old);
     Ok(())
 }
@@ -729,7 +716,7 @@ pub(crate) fn waitpid_current(
         return WaitPidAction::Return(Err(errno::EFAULT));
     }
 
-    let parent_pid = match sched::current_user_process_id() {
+    let parent_pid = match current_process_id() {
         Some(pid) => pid,
         None => return WaitPidAction::Return(Err(errno::EINVAL)),
     };
@@ -754,6 +741,9 @@ pub(crate) fn waitpid_current(
                 }
             }
             let encoded = encode_wait_status(waited.status);
+            if sched::thread_join(waited.main_thread).is_err() {
+                return WaitPidAction::Return(Err(errno::ECHILD));
+            }
             cleanup_waited_process(waited);
             if status_ptr != 0 {
                 let bytes = encoded.to_le_bytes();
@@ -783,7 +773,7 @@ fn finish_current_process(
     thread_code: usize,
 ) -> Result<(), ProcessFaultError> {
     crate::sync::preempt::assert_preemption_enabled("process terminal state change");
-    let pid = sched::current_user_process_id().ok_or(ProcessFaultError::NoCurrentProcess)?;
+    let pid = current_process_id().ok_or(ProcessFaultError::NoCurrentProcess)?;
     let thread = sched::current_thread_id();
     let wake = {
         let _irq_guard = LocalIrqGuard::save_and_disable();
@@ -802,10 +792,7 @@ fn finish_current_process(
         }
     }
 
-    if let Some(joiner) = wake.joiner {
-        let _ = sched::complete_wait(joiner, WaitCause::Notified);
-    }
-    if let Some(waiter) = wake.waiter {
+    if let Some(waiter) = wake {
         let _ = sched::complete_wait(waiter, WaitCause::Notified);
     }
     sched::on_thread_exit_sync(context, thread_code);
@@ -841,9 +828,8 @@ fn allocate_process_slot(
         cwd_dir: Some(cwd_dir),
         parent,
         main_thread: None,
-        stack: FrameRange::empty(),
         exit_status: None,
-        joiner: None,
+        process_consumer: None,
         waiter: None,
     };
 
@@ -854,62 +840,49 @@ fn allocate_process_slot(
 
 fn attach_process_resources(
     pid: ProcessId,
-    address_space: UserAddressSpace,
+    address_space: OwnedUserAddressSpace,
     user_image: UserElfImage,
-    stack: FrameRange,
-) -> Result<(), ProcessError> {
+) {
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let table = table_mut();
-    let slot = table.slot_mut(pid).ok_or(ProcessError::InvalidProcess)?;
+    let slot = table
+        .slot_mut(pid)
+        .unwrap_or_else(|| panic!("process: reserved slot disappeared before resource attach"));
     slot.address_space = Some(address_space);
     slot.user_image = Some(user_image);
-    slot.stack = stack;
     slot.state = ProcessState::Running;
-    crate::debug!(
-        "process: pid={pid} resources ready ttbr0=0x{:x}",
-        address_space.root_pa()
-    );
-    Ok(())
+    crate::debug!("process: pid={pid} resources ready",);
 }
 
-fn attach_process_main_thread(pid: ProcessId, main_thread: ThreadId) -> Result<(), ProcessError> {
+fn attach_process_main_thread(pid: ProcessId, main_thread: ThreadId) {
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let table = table_mut();
-    let slot = table.slot_mut(pid).ok_or(ProcessError::InvalidProcess)?;
-    slot.main_thread = Some(main_thread);
+    table.bind_main_thread(pid, main_thread);
     crate::debug!("process: pid={pid} running main={main_thread}");
-    Ok(())
 }
 
-#[derive(Copy, Clone)]
-struct ProcessWake {
-    joiner: Option<WaitToken>,
-    waiter: Option<WaitToken>,
-}
-
-fn finish_process(pid: ProcessId, status: ProcessExitStatus) -> Option<ProcessWake> {
+fn finish_process(pid: ProcessId, status: ProcessExitStatus) -> Option<Option<WaitToken>> {
     let table = table_mut();
-    let slot = table.slot_mut(pid)?;
-    if slot.exit_status.is_some() {
-        return Some(ProcessWake {
-            joiner: None,
-            waiter: None,
-        });
-    }
+    let waiter = {
+        let slot = table.slot_mut(pid)?;
+        if slot.exit_status.is_some() {
+            return Some(None);
+        }
 
-    slot.fds.close_all();
-    slot.cwd_dir = None;
-    slot.state = ProcessState::Zombie;
-    slot.exit_status = Some(status);
-    let joiner = slot.joiner;
-    let waiter = slot.waiter;
-    Some(ProcessWake { joiner, waiter })
+        slot.fds.close_all();
+        slot.cwd_dir = None;
+        slot.state = ProcessState::Zombie;
+        slot.exit_status = Some(status);
+        slot.waiter
+    };
+    table.unbind_main_thread(pid);
+    Some(waiter)
 }
 
 struct ForkSnapshot {
     parent_pid: ProcessId,
     user_image: *const UserElfImage,
-    stack: FrameRange,
+    stack: *const OwnedUserStack,
     fds: FdTable,
     cwd_dir: usize,
 }
@@ -918,7 +891,7 @@ impl ForkSnapshot {
     fn user_image(&self) -> &UserElfImage {
         // SAFETY: the pointer targets the current process slot. genrt currently
         // has one user thread per process, so the current process cannot mutate
-        // or reclaim its own image while fork clones resources in task context.
+        // or reclaim its own image while fork clones resources in thread context.
         unsafe { &*self.user_image }
     }
 }
@@ -930,7 +903,7 @@ enum WaitChildPrepare {
 }
 
 fn fork_snapshot_current() -> Result<ForkSnapshot, errno::Errno> {
-    let parent_pid = sched::current_user_process_id().ok_or(errno::EINVAL)?;
+    let parent_pid = current_process_id().ok_or(errno::EINVAL)?;
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let table = table_mut();
     let slot = table.slot_mut(parent_pid).ok_or(errno::EINVAL)?;
@@ -940,7 +913,9 @@ fn fork_snapshot_current() -> Result<ForkSnapshot, errno::Errno> {
     Ok(ForkSnapshot {
         parent_pid,
         user_image,
-        stack: slot.stack,
+        // SAFETY: synchronous fork cannot reap its currently running parent
+        // thread before the clone consumes this pointer.
+        stack: unsafe { sched::current_user_stack_ptr() }.ok_or(errno::EINVAL)?,
         fds: slot.fds,
         cwd_dir,
     })
@@ -948,7 +923,7 @@ fn fork_snapshot_current() -> Result<ForkSnapshot, errno::Errno> {
 
 fn clone_user_image(
     src: &UserElfImage,
-    dst_aspace: UserAddressSpace,
+    dst_aspace: &OwnedUserAddressSpace,
 ) -> Result<UserElfImage, errno::Errno> {
     let mut segments = Vec::new();
     segments
@@ -971,7 +946,7 @@ fn clone_user_image(
 
 fn clone_user_segment(
     segment: UserElfSegment,
-    dst_aspace: UserAddressSpace,
+    dst_aspace: &OwnedUserAddressSpace,
 ) -> Result<UserElfSegment, errno::Errno> {
     let frames = memory::clone_frame_range(segment.frames).map_err(clone_frame_errno)?;
     if let Err(err) = vm::map_user_page_range(
@@ -988,18 +963,6 @@ fn clone_user_segment(
     Ok(UserElfSegment { frames, ..segment })
 }
 
-fn clone_user_stack(
-    src_stack: FrameRange,
-    dst_aspace: UserAddressSpace,
-) -> Result<FrameRange, errno::Errno> {
-    let stack = memory::clone_frame_range(src_stack).map_err(clone_frame_errno)?;
-    if let Err(err) = map_user_stack(dst_aspace, stack) {
-        memory::free_contiguous_frames(stack);
-        return Err(fork_errno(err));
-    }
-    Ok(stack)
-}
-
 fn stage_exec_image(
     path: &path::ResolvedPath,
     args: &ExecArgs,
@@ -1010,26 +973,24 @@ fn stage_exec_image(
     };
     let image = ramfs::data(file_index).ok_or(errno::ENOENT)?;
 
-    let address_space = vm::create_user_address_space().map_err(exec_vm_errno)?;
-    let mut stack = FrameRange::empty();
+    let mut address_space = Some(vm::create_user_address_space().map_err(exec_vm_errno)?);
+    let mut stack = None;
     let mut user_image = None;
 
     let result = (|| {
-        let mut aspace = address_space;
-        let loaded = elf::load_user_elf(image, &mut aspace).map_err(exec_elf_errno)?;
+        let aspace = address_space.as_mut().ok_or(errno::ENOMEM)?;
+        let loaded = elf::load_user_elf(image, aspace).map_err(exec_elf_errno)?;
         let entry = loaded.entry;
         user_image = Some(loaded);
 
-        stack =
-            memory::alloc_contiguous_frames(USER_STACK_SIZE / PAGE_SIZE).ok_or(errno::ENOMEM)?;
-        memory::zero_phys_range(stack);
-        map_user_stack(address_space, stack).map_err(fork_errno)?;
-        let initial_sp = build_initial_user_stack(stack, args).ok_or(errno::E2BIG)?;
+        stack = Some(OwnedUserStack::allocate(aspace, USER_STACK_SIZE).map_err(exec_vm_errno)?);
+        let initial_sp = build_initial_user_stack(stack.as_ref().ok_or(errno::ENOMEM)?, args)
+            .ok_or(errno::E2BIG)?;
 
         Ok(StagedProcessImage {
-            address_space,
+            address_space: address_space.take().ok_or(errno::ENOMEM)?,
             user_image: user_image.take().ok_or(errno::ENOMEM)?,
-            stack,
+            stack: stack.take().ok_or(errno::ENOMEM)?,
             entry,
             initial_sp,
         })
@@ -1039,12 +1000,12 @@ fn stage_exec_image(
         if let Some(image) = user_image {
             elf::free_loaded_segments(&image);
         }
-        if stack.start != 0 {
-            memory::free_contiguous_frames(stack);
-        }
+        drop(stack);
         // SAFETY: staged exec has not been published to the scheduler/process
-        // table yet, so no running task can reference this root.
-        let _ = unsafe { vm::destroy_user_address_space(address_space) };
+        // table yet, so no running thread can reference this root.
+        if let Some(address_space) = address_space {
+            let _ = unsafe { vm::destroy_user_address_space(address_space) };
+        }
     }
 
     result
@@ -1054,47 +1015,47 @@ fn commit_exec_image(
     pid: ProcessId,
     staged: StagedProcessImage,
     context: &mut ActiveContext<'_>,
-) -> Result<ProcessResources, errno::Errno> {
+) -> (ProcessResources, crate::sched::UserThreadResources) {
     let entry = staged.entry;
     let initial_sp = staged.initial_sp;
-    sched::replace_current_user_address_space(staged.address_space).map_err(|_| errno::EINVAL)?;
-
-    let old = replace_process_resources(pid, staged.address_space, staged.user_image, staged.stack)
-        .ok_or(errno::EINVAL)?;
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    if table_mut().slot_mut(pid).is_none() {
+        panic!("process: validated exec slot disappeared before commit");
+    }
+    let old_stack = sched::replace_current_user_resources(staged.address_space.id(), staged.stack)
+        .unwrap_or_else(|_| panic!("process: staged exec address-space activation failed"));
+    let old = replace_process_resources(pid, staged.address_space, staged.user_image);
 
     // The current thread now points at the new TTBR0 root and the stack was
     // populated through HVA before commit. The architecture facade preserves
     // the EL1 kernel stack while replacing all EL0-visible state.
     context.replace_user_context_after_exec(entry, initial_sp);
 
-    Ok(old)
+    (old, old_stack)
 }
 
 fn replace_process_resources(
     pid: ProcessId,
-    address_space: UserAddressSpace,
+    address_space: OwnedUserAddressSpace,
     user_image: UserElfImage,
-    stack: FrameRange,
-) -> Option<ProcessResources> {
+) -> ProcessResources {
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let table = table_mut();
-    let slot = table.slot_mut(pid)?;
+    let slot = table
+        .slot_mut(pid)
+        .unwrap_or_else(|| panic!("process: prevalidated exec slot disappeared during swap"));
     let old = ProcessResources {
         address_space: slot.address_space.replace(address_space),
         user_image: slot.user_image.replace(user_image),
-        stack: mem::replace(&mut slot.stack, stack),
     };
     slot.state = ProcessState::Running;
     slot.exit_status = None;
-    Some(old)
+    old
 }
 
 fn cleanup_process_resources(pid: ProcessId, resources: ProcessResources) {
     if let Some(image) = resources.user_image {
         elf::free_loaded_segments(&image);
-    }
-    if resources.stack.start != 0 {
-        memory::free_contiguous_frames(resources.stack);
     }
     if let Some(address_space) = resources.address_space {
         // SAFETY: resources were atomically removed from the process slot and
@@ -1105,8 +1066,8 @@ fn cleanup_process_resources(pid: ProcessId, resources: ProcessResources) {
     }
 }
 
-fn build_initial_user_stack(stack: FrameRange, args: &ExecArgs) -> Option<usize> {
-    let stack_base = USER_STACK_TOP.checked_sub(USER_STACK_SIZE)?;
+fn build_initial_user_stack(stack: &OwnedUserStack, args: &ExecArgs) -> Option<usize> {
+    let stack_base = stack.base();
     let argc = args.argv.len();
     let envc = args.envp.len();
     let mut sp = USER_STACK_TOP;
@@ -1153,7 +1114,7 @@ fn build_initial_user_stack(stack: FrameRange, args: &ExecArgs) -> Option<usize>
 }
 
 fn push_stack_cstr(
-    stack: FrameRange,
+    stack: &OwnedUserStack,
     stack_base: usize,
     sp: &mut usize,
     bytes: &[u8],
@@ -1168,7 +1129,7 @@ fn push_stack_cstr(
 }
 
 fn write_stack_bytes(
-    stack: FrameRange,
+    stack: &OwnedUserStack,
     stack_base: usize,
     user_va: usize,
     bytes: &[u8],
@@ -1180,20 +1141,30 @@ fn write_stack_bytes(
     if offset.checked_add(bytes.len())? > USER_STACK_SIZE {
         return None;
     }
-    memory::copy_bytes_to_phys(stack.start + offset, bytes);
+    memory::copy_bytes_to_phys(stack.frames().start + offset, bytes);
     Some(())
 }
 
-fn write_stack_byte(stack: FrameRange, stack_base: usize, user_va: usize, byte: u8) -> Option<()> {
+fn write_stack_byte(
+    stack: &OwnedUserStack,
+    stack_base: usize,
+    user_va: usize,
+    byte: u8,
+) -> Option<()> {
     let offset = user_va.checked_sub(stack_base)?;
     if offset >= USER_STACK_SIZE {
         return None;
     }
-    memory::copy_bytes_to_phys(stack.start + offset, &[byte]);
+    memory::copy_bytes_to_phys(stack.frames().start + offset, &[byte]);
     Some(())
 }
 
-fn write_stack_u64(stack: FrameRange, stack_base: usize, user_va: usize, value: u64) -> Option<()> {
+fn write_stack_u64(
+    stack: &OwnedUserStack,
+    stack_base: usize,
+    user_va: usize,
+    value: u64,
+) -> Option<()> {
     write_stack_bytes(stack, stack_base, user_va, &value.to_le_bytes())
 }
 
@@ -1209,6 +1180,11 @@ fn prepare_wait_child_locked(
     if slot.parent != Some(parent_pid) {
         return WaitChildPrepare::Err(errno::ECHILD);
     }
+    match slot.process_consumer {
+        Some(consumer) if consumer != caller => return WaitChildPrepare::Err(errno::ECHILD),
+        Some(_) => {}
+        None => slot.process_consumer = Some(caller),
+    }
     if let Some(waiter) = slot.waiter {
         if waiter.thread() != caller {
             return WaitChildPrepare::Err(errno::ECHILD);
@@ -1220,24 +1196,24 @@ fn prepare_wait_child_locked(
             panic!("waitpid: current caller already owns an unfinished child wait");
         }
         crate::sync::preempt::assert_preemption_enabled("process waiter publication");
-        let prepared = sched::prepare_wait(WaitKind::Process);
+        let prepared = sched::prepare_wait();
         slot.waiter = Some(prepared.token());
         return WaitChildPrepare::Prepared(prepared);
     };
 
+    let main_thread = slot
+        .main_thread
+        .unwrap_or_else(|| panic!("waitpid: terminal process has no main thread"));
     let waited = WaitedProcess {
         pid: child_pid,
         status,
         address_space: slot.address_space.take(),
         user_image: slot.user_image.take(),
-        stack: slot.stack,
+        main_thread,
         wait_token: slot.waiter.take(),
     };
     let next_generation = next_generation(slot.generation);
-    *slot = ProcessSlot {
-        generation: next_generation,
-        ..ProcessSlot::free()
-    };
+    table.release_slot(child_pid, next_generation);
     WaitChildPrepare::Consumed(waited)
 }
 
@@ -1247,7 +1223,6 @@ fn cleanup_waited_process(waited: WaitedProcess) {
         ProcessResources {
             address_space: waited.address_space,
             user_image: waited.user_image,
-            stack: waited.stack,
         },
     );
     crate::debug!(
@@ -1373,7 +1348,8 @@ fn clone_frame_errno(err: memory::FrameRangeCloneError) -> errno::Errno {
 fn spawn_errno(err: sched::SpawnError) -> errno::Errno {
     match err {
         sched::SpawnError::NoThreadSlots | sched::SpawnError::NoStackSlots => errno::EAGAIN,
-        sched::SpawnError::SchedulerNotInitialized => errno::EINVAL,
+        sched::SpawnError::SchedulerNotInitialized
+        | sched::SpawnError::UserThreadMustBeJoinable => errno::EINVAL,
     }
 }
 
@@ -1412,10 +1388,9 @@ fn wait_user_copy_errno(_err: user::UserCopyError) -> errno::Errno {
     errno::EFAULT
 }
 
-// Process terminal status is single-consumer. A terminal process may be
-// reclaimed only by the registered joiner, if one exists, or by the first
-// thread that atomically consumes an unclaimed terminal process. Reading status
-// and reclaiming resources must stay one process-table operation.
+// Process terminal status is single-consumer. `process_consumer` claims that
+// ownership before generic main-thread join, and consuming status/resources
+// stays one process-table operation.
 fn consume_process_for_join(
     pid: ProcessId,
     caller: ThreadId,
@@ -1426,10 +1401,8 @@ fn consume_process_for_join(
         .slot_mut(pid)
         .ok_or(ConsumeProcessError::Join(ProcessJoinError::InvalidProcess))?;
 
-    if let Some(joiner) = slot.joiner {
-        if joiner.thread() != caller {
-            return Err(ConsumeProcessError::Join(ProcessJoinError::JoinInProgress));
-        }
+    if slot.process_consumer != Some(caller) {
+        return Err(ConsumeProcessError::Join(ProcessJoinError::JoinInProgress));
     }
 
     let Some(status) = slot.exit_status.take() else {
@@ -1440,13 +1413,9 @@ fn consume_process_for_join(
         status,
         address_space: slot.address_space.take(),
         user_image: slot.user_image.take(),
-        stack: slot.stack,
     };
     let next_generation = next_generation(slot.generation);
-    *slot = ProcessSlot {
-        generation: next_generation,
-        ..ProcessSlot::free()
-    };
+    table.release_slot(pid, next_generation);
 
     Ok(reclaimed)
 }
@@ -1458,9 +1427,6 @@ fn cleanup_reclaimed_process(
     let status = reclaimed.status;
     if let Some(image) = reclaimed.user_image {
         elf::free_loaded_segments(&image);
-    }
-    if reclaimed.stack.start != 0 {
-        memory::free_contiguous_frames(reclaimed.stack);
     }
     if let Some(address_space) = reclaimed.address_space {
         // SAFETY: process join has observed terminal status, and the detached
@@ -1478,11 +1444,8 @@ fn cleanup_reclaimed_process(
 fn free_process_slot(pid: ProcessId) {
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let table = table_mut();
-    if let Some(slot) = table.slot_mut(pid) {
-        *slot = ProcessSlot {
-            generation: slot.generation,
-            ..ProcessSlot::free()
-        };
+    if let Some(generation) = table.slot(pid).map(|slot| slot.generation) {
+        table.release_slot(pid, generation);
     }
 }
 
@@ -1499,7 +1462,7 @@ fn free_process_slot(pid: ProcessId) {
 /// Returns `ProcessPathError::NoCurrentProcess` outside a user process, or
 /// `ProcessPathError::InvalidDirectory` if process state lacks a cwd.
 pub(crate) fn current_cwd_dir() -> Result<usize, ProcessPathError> {
-    let pid = sched::current_user_process_id().ok_or(ProcessPathError::NoCurrentProcess)?;
+    let pid = current_process_id().ok_or(ProcessPathError::NoCurrentProcess)?;
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let table = table_mut();
     let slot = table
@@ -1548,7 +1511,7 @@ pub(crate) fn set_current_cwd(dir_index: usize) -> Result<(), ProcessPathError> 
         return Err(ProcessPathError::InvalidDirectory);
     }
 
-    let pid = sched::current_user_process_id().ok_or(ProcessPathError::NoCurrentProcess)?;
+    let pid = current_process_id().ok_or(ProcessPathError::NoCurrentProcess)?;
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let table = table_mut();
     let slot = table
@@ -1719,7 +1682,7 @@ pub(crate) fn current_fd_is_open(fd: usize) -> Result<bool, FdError> {
 }
 
 fn with_current_fd_table<T>(f: impl FnOnce(&FdTable) -> Result<T, FdError>) -> Result<T, FdError> {
-    let pid = sched::current_user_process_id().ok_or(FdError::BadFd)?;
+    let pid = current_process_id().ok_or(FdError::BadFd)?;
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let table = table_mut();
     let slot = table.slot_mut(pid).ok_or(FdError::BadFd)?;
@@ -1733,7 +1696,7 @@ fn with_current_fd_table_mut<T>(
     // implemented yet. These short IRQ-disabled sections are sufficient for the
     // current single-threaded user process milestone; user memory copies happen
     // outside them in the syscall layer.
-    let pid = sched::current_user_process_id().ok_or(FdError::BadFd)?;
+    let pid = current_process_id().ok_or(FdError::BadFd)?;
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let table = table_mut();
     let slot = table.slot_mut(pid).ok_or(FdError::BadFd)?;
@@ -1747,49 +1710,103 @@ fn take_process_resources(pid: ProcessId) -> ProcessResources {
         return ProcessResources {
             address_space: None,
             user_image: None,
-            stack: FrameRange::empty(),
         };
     };
 
     let resources = ProcessResources {
         address_space: slot.address_space.take(),
         user_image: slot.user_image.take(),
-        stack: slot.stack,
     };
-    slot.stack = FrameRange::empty();
     resources
 }
 
-fn load_init_image(address_space: UserAddressSpace) -> Result<UserElfImage, ProcessError> {
+fn load_init_image(
+    address_space: &mut OwnedUserAddressSpace,
+) -> Result<UserElfImage, ProcessError> {
     let image = initramfs::init_file().map_err(ProcessError::Initramfs)?;
     crate::info!("init: loading /init from initramfs");
     crate::info!("init: /init size={}", image.len());
-    let mut address_space = address_space;
-    elf::load_user_elf(image, &mut address_space).map_err(ProcessError::Elf)
-}
-
-fn map_user_stack(address_space: UserAddressSpace, stack: FrameRange) -> Result<(), ProcessError> {
-    let stack_base = USER_STACK_TOP - USER_STACK_SIZE;
-    crate::debug!(
-        "process: map user stack pa={:?} va=0x{:x}..0x{:x}",
-        stack,
-        stack_base,
-        USER_STACK_TOP
-    );
-    vm::map_user_page_range(
-        address_space,
-        stack_base,
-        stack.start,
-        USER_STACK_SIZE,
-        UserMapFlags::WRITE,
-    )
-    .map_err(ProcessError::Vm)
+    elf::load_user_elf(image, address_space).map_err(ProcessError::Elf)
 }
 
 impl ProcessTable {
+    fn slot(&self, pid: ProcessId) -> Option<&ProcessSlot> {
+        let slot = self.slots.get(pid.index())?;
+        (slot.generation == pid.generation() && !slot.is_free()).then_some(slot)
+    }
+
     fn slot_mut(&mut self, pid: ProcessId) -> Option<&mut ProcessSlot> {
         let slot = self.slots.get_mut(pid.index())?;
         (slot.generation == pid.generation() && !slot.is_free()).then_some(slot)
+    }
+
+    fn process_for_thread(&self, thread: ThreadId) -> Option<ProcessId> {
+        let pid = *self.thread_owners.get(thread.index())?.as_ref()?;
+        let slot = self
+            .slot(pid)
+            .unwrap_or_else(|| panic!("process: stale reverse owner {pid} for thread {thread}"));
+        if slot.main_thread != Some(thread) {
+            panic!("process: reverse owner mismatch pid={pid} thread={thread}");
+        }
+        Some(pid)
+    }
+
+    fn bind_main_thread(&mut self, pid: ProcessId, thread: ThreadId) {
+        if thread.index() >= self.thread_owners.len() {
+            panic!("process: main thread index outside reverse owner table: {thread}");
+        }
+        if self.thread_owners[thread.index()].is_some() {
+            panic!("process: main thread already belongs to a process: {thread}");
+        }
+        let slot = self
+            .slot_mut(pid)
+            .unwrap_or_else(|| panic!("process: published thread lost slot {pid}"));
+        if slot.main_thread.is_some() {
+            panic!("process: pid={pid} already has a main thread");
+        }
+        slot.main_thread = Some(thread);
+        self.thread_owners[thread.index()] = Some(pid);
+    }
+
+    fn unbind_main_thread(&mut self, pid: ProcessId) {
+        let thread = self
+            .slot(pid)
+            .unwrap_or_else(|| panic!("process: unbind of invalid slot {pid}"))
+            .main_thread
+            .unwrap_or_else(|| panic!("process: pid={pid} has no main thread to unbind"));
+        let owner = self
+            .thread_owners
+            .get_mut(thread.index())
+            .unwrap_or_else(|| panic!("process: main thread index outside reverse owner table"));
+        if *owner != Some(pid) {
+            panic!("process: reverse owner missing during unbind pid={pid} thread={thread}");
+        }
+        *owner = None;
+    }
+
+    fn release_slot(&mut self, pid: ProcessId, generation: u32) {
+        let main_thread = self
+            .slot(pid)
+            .unwrap_or_else(|| panic!("process: release of invalid slot {pid}"))
+            .main_thread;
+        if let Some(thread) = main_thread {
+            let owner = self
+                .thread_owners
+                .get_mut(thread.index())
+                .unwrap_or_else(|| {
+                    panic!("process: main thread index outside reverse owner table")
+                });
+            // A terminal process unbinds before generic thread reap. Its slot
+            // may therefore have been reused and rebound before this later
+            // process reclaim; never erase the newer generation's owner.
+            if *owner == Some(pid) {
+                *owner = None;
+            }
+        }
+        self.slots[pid.index()] = ProcessSlot {
+            generation,
+            ..ProcessSlot::free()
+        };
     }
 }
 
@@ -1805,4 +1822,43 @@ fn next_generation(generation: u32) -> u32 {
 fn table_mut() -> &'static mut ProcessTable {
     // SAFETY: single-core access discipline is documented on `ProcessTableCell`.
     unsafe { &mut *PROCESS_TABLE.0.get() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn occupy_process_slot(table: &mut ProcessTable, index: usize, generation: u32) -> ProcessId {
+        let pid = ProcessId::new(index, generation);
+        table.slots[index] = ProcessSlot {
+            generation,
+            state: ProcessState::Running,
+            ..ProcessSlot::free()
+        };
+        pid
+    }
+
+    #[test]
+    fn reverse_thread_owner_survives_thread_slot_reuse_before_process_reclaim() {
+        let mut table = ProcessTable::new();
+        let old_pid = occupy_process_slot(&mut table, 0, INITIAL_PROCESS_GENERATION);
+        let old_thread = ThreadId::new(KERNEL_THREAD_CAPACITY - 1, 7);
+
+        table.bind_main_thread(old_pid, old_thread);
+        assert_eq!(table.process_for_thread(old_thread), Some(old_pid));
+        assert_eq!(
+            table.process_for_thread(ThreadId::new(old_thread.index() - 1, 7)),
+            None
+        );
+
+        table.unbind_main_thread(old_pid);
+        assert_eq!(table.process_for_thread(old_thread), None);
+
+        let new_pid = occupy_process_slot(&mut table, 1, INITIAL_PROCESS_GENERATION);
+        let new_thread = ThreadId::new(old_thread.index(), old_thread.generation() + 1);
+        table.bind_main_thread(new_pid, new_thread);
+
+        table.release_slot(old_pid, next_generation(old_pid.generation()));
+        assert_eq!(table.process_for_thread(new_thread), Some(new_pid));
+    }
 }

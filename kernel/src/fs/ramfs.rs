@@ -208,7 +208,7 @@ struct RamfsCell(UnsafeCell<Option<MountedRamfs>>);
 
 // SAFETY: the initramfs is mounted once during single-core boot before the
 // scheduler starts. After a successful mount the filesystem index is immutable;
-// task context only performs shared lookups.
+// thread context only performs shared lookups.
 unsafe impl Sync for RamfsCell {}
 
 static RAMFS: RamfsCell = RamfsCell(UnsafeCell::new(None));

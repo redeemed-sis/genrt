@@ -85,7 +85,7 @@ pub enum DispatchError {
 /// number.
 ///
 /// Individual handlers may allocate, copy userspace memory, or block only in
-/// synchronous task/syscall context. Dispatch itself adds no allocation, and
+/// synchronous thread/syscall context. Dispatch itself adds no allocation, and
 /// IRQ entry never calls this API.
 pub fn dispatch(
     context: &mut ActiveContext<'_>,

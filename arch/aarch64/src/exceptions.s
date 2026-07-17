@@ -304,9 +304,9 @@ trap_lower_el_aarch32_fiq:
 trap_lower_el_aarch32_serror:
     FATAL_LOWER_VECTOR 15
 
-.global arch_enter_task_frame
-.type arch_enter_task_frame, %function
-arch_enter_task_frame:
+.global arch_enter_saved_context
+.type arch_enter_saved_context, %function
+arch_enter_saved_context:
     mov sp, x0
 
 // Restore contract:

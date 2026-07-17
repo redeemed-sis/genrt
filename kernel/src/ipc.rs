@@ -3,9 +3,10 @@ use core::cell::UnsafeCell;
 
 use crate::{
     arch::ActiveContext,
-    sched::{self, CommitResult, CompletionResult, WaitCause, WaitKind, WaitToken},
+    sched::{
+        self, CommitResult, CompletionResult, WaitCause, WaitToken, call::SchedCallWaitOutput,
+    },
     sync::{LocalIrqGuard, LocalIrqLock},
-    task_call::TaskCallWaitOutput,
     time::TimedEvent,
 };
 
@@ -214,14 +215,17 @@ impl<T> Mailbox<T> {
     }
 
     fn wait(&self, kind: MailboxWaitKind) {
-        if let Some(completion) = crate::task_call::mailbox_wait(self.control_ptr(), kind.raw()) {
+        if let Some(completion) = crate::sched::call::mailbox_wait(self.control_ptr(), kind.raw()) {
             self.remove_waiter(kind, completion.token());
         }
     }
 
     fn wait_until_counter(&self, kind: MailboxWaitKind, deadline: u64) -> Option<WaitCause> {
-        let completion =
-            crate::task_call::mailbox_wait_until_counter(self.control_ptr(), kind.raw(), deadline)?;
+        let completion = crate::sched::call::mailbox_wait_until_counter(
+            self.control_ptr(),
+            kind.raw(),
+            deadline,
+        )?;
         self.remove_waiter(kind, completion.token());
         Some(completion.cause())
     }
@@ -327,7 +331,7 @@ impl MailboxControl {
     }
 }
 
-/// Publish and commit one mailbox wait from the private task-call path.
+/// Publish and commit one mailbox wait from the private sched-call path.
 ///
 /// The mailbox lock covers condition check, scheduler preparation, queue token,
 /// and optional deadline publication. It is dropped before commit, while the
@@ -337,19 +341,19 @@ impl MailboxControl {
 ///
 /// # Arguments
 ///
-/// * `context` - Exclusive live task-call context used if wait commit blocks.
+/// * `context` - Exclusive live sched-call context used if wait commit blocks.
 /// * `control` - Opaque pointer to the mailbox's stable control lock.
 /// * `raw_wait_kind` - Mailbox-private send/receive condition selector.
 /// * `timeout_deadline` - Optional absolute architecture counter deadline for
 ///   the exact registration.
-/// * `output` - Stack-owned task-call output retaining the exact token and an
+/// * `output` - Stack-owned sched-call output retaining the exact token and an
 ///   optional completion observed before commit.
 ///
 /// # Returns
 ///
 /// Returns without registration if the condition is already available or the
 /// deadline already expired. Otherwise returns after early completion or after
-/// the blocked task resumes. The operation is bounded and allocation-free.
+/// the blocked thread resumes. The operation is bounded and allocation-free.
 ///
 /// # Panics
 ///
@@ -359,13 +363,13 @@ impl MailboxControl {
 /// # Safety
 ///
 /// `control` must point to the live `LocalIrqLock<MailboxControl>` owned by the
-/// calling mailbox and remain valid across a blocked task-call interval.
+/// calling mailbox and remain valid across a blocked sched-call interval.
 pub(crate) fn on_mailbox_wait_sync(
     context: &mut ActiveContext<'_>,
     control: *mut core::ffi::c_void,
     raw_wait_kind: u64,
     timeout_deadline: Option<u64>,
-    output: &mut TaskCallWaitOutput,
+    output: &mut SchedCallWaitOutput,
 ) {
     if control.is_null() {
         panic!("ipc: mailbox wait with null control block");
@@ -373,7 +377,7 @@ pub(crate) fn on_mailbox_wait_sync(
     let kind = MailboxWaitKind::from_raw(raw_wait_kind)
         .unwrap_or_else(|| panic!("ipc: invalid mailbox wait kind {raw_wait_kind}"));
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    // SAFETY: task-call users pass the stable control lock of their mailbox.
+    // SAFETY: sched-call users pass the stable control lock of their mailbox.
     let owner = unsafe { &*(control.cast::<LocalIrqLock<MailboxControl>>()) };
     let prepared = {
         let mut state = owner.lock();
@@ -384,7 +388,7 @@ pub(crate) fn on_mailbox_wait_sync(
             return;
         }
         crate::sync::preempt::assert_preemption_enabled("mailbox waiter publication");
-        let prepared = sched::prepare_wait(WaitKind::Ipc);
+        let prepared = sched::prepare_wait();
         let token = prepared.token();
         output.record_token(token);
         state.enqueue_waiter(kind, token);

@@ -9,7 +9,7 @@ const SYSCALL_ARGUMENT_REGISTERS: core::ops::Range<usize> = 0..6;
 const SVC_INSTRUCTION_BYTES: u64 = 4;
 
 unsafe extern "C" {
-    fn arch_enter_task_frame(frame: *const TrapFrame) -> !;
+    fn arch_enter_saved_context(frame: *const TrapFrame) -> !;
 }
 
 /// Wrap the live AArch64 trap frame for generic kernel handling.
@@ -146,7 +146,7 @@ unsafe extern "C" fn arch_saved_context_enter(saved: *const SavedContext) -> ! {
     // SAFETY: the facade supplies stable initialized SavedContext storage. The
     // assembly routine reads the TrapFrame prefix and transfers control by eret.
     let frame = unsafe { saved_frame_from_raw(saved) };
-    unsafe { arch_enter_task_frame(frame) }
+    unsafe { arch_enter_saved_context(frame) }
 }
 
 unsafe fn active_frame_from_raw<'a>(frame: *mut c_void) -> &'a mut TrapFrame {

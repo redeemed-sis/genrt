@@ -4,7 +4,7 @@
 //! The transition layer consumes this module's inline state machine while it owns
 //! lifecycle state and ready-queue membership.
 
-use crate::{arch::ActiveContext, sync::LocalIrqGuard, task::ThreadId};
+use crate::{arch::ActiveContext, sched::ThreadId, sync::LocalIrqGuard};
 
 use super::{Scheduler, scheduler_mut, transition::SwitchOutcome};
 
@@ -49,24 +49,6 @@ impl WaitToken {
     }
 }
 
-/// Coarse diagnostic classification of an external wait owner.
-///
-/// This type is not a payload channel. In particular, it never contains a
-/// mailbox message, process status, target identity, or device-specific state.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum WaitKind {
-    /// Time owns an absolute deadline registration.
-    Deadline,
-    /// A bounded mailbox owns condition availability and its waiter queue.
-    Ipc,
-    /// Thread lifecycle owns a join relationship and exit result.
-    Thread,
-    /// Process lifecycle owns a terminal status and parent relationship.
-    Process,
-    /// Console or another I/O owner owns data availability.
-    Io,
-}
-
 /// The first external completion cause retained for a wait token.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum WaitCause {
@@ -101,9 +83,9 @@ impl PreparedWait {
 /// Controlled result of an external completion attempt.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CompletionResult {
-    /// The token completed while its task was still running and prepared.
+    /// The token completed while its thread was still running and prepared.
     CompletedPrepared,
-    /// The token completed a blocked task and made it ready exactly once.
+    /// The token completed a blocked thread and made it ready exactly once.
     WokeBlocked,
     /// The exact token had already completed; its first cause remains intact.
     AlreadyCompleted,
@@ -118,7 +100,7 @@ pub(crate) enum CompletionResult {
 /// publication but before blocking, so no handoff occurred.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CommitResult {
-    /// The current task was made blocked and the supplied handoff was applied.
+    /// The current thread was made blocked and the supplied handoff was applied.
     Blocked(SwitchOutcome),
     /// A published completion won before blocking and was consumed.
     Early(WaitCause),
@@ -146,7 +128,7 @@ pub(crate) enum FinishError {
     NotCompleted,
 }
 
-/// Inline scheduler metadata for one occupied slot.
+/// Active wait metadata owned by one occupied thread.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct WaitMetadata {
     next_sequence: u64,
@@ -156,19 +138,9 @@ pub(super) struct WaitMetadata {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum WaitState {
     None,
-    Prepared {
-        token: WaitToken,
-        kind: WaitKind,
-    },
-    Blocked {
-        token: WaitToken,
-        kind: WaitKind,
-    },
-    Completed {
-        token: WaitToken,
-        cause: WaitCause,
-        kind: WaitKind,
-    },
+    Prepared { token: WaitToken },
+    Blocked { token: WaitToken },
+    Completed { token: WaitToken, cause: WaitCause },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -179,14 +151,18 @@ pub(super) enum CommitState {
 }
 
 impl WaitMetadata {
-    pub(super) const fn empty() -> Self {
+    pub(super) const fn with_next_sequence(next_sequence: u64) -> Self {
         Self {
-            next_sequence: 0,
+            next_sequence,
             state: WaitState::None,
         }
     }
 
-    pub(super) fn prepare(&mut self, thread: ThreadId, kind: WaitKind) -> PreparedWait {
+    pub(super) const fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
+    pub(super) fn prepare(&mut self, thread: ThreadId) -> PreparedWait {
         if self.state != WaitState::None {
             panic!("sched: new wait before prior completion is consumed");
         }
@@ -198,14 +174,14 @@ impl WaitMetadata {
             thread,
             sequence: WaitSequence(self.next_sequence),
         };
-        self.state = WaitState::Prepared { token, kind };
+        self.state = WaitState::Prepared { token };
         PreparedWait { token }
     }
 
     pub(super) fn commit(&mut self, prepared: PreparedWait) -> CommitState {
         match self.state {
-            WaitState::Prepared { token, kind } if token == prepared.token => {
-                self.state = WaitState::Blocked { token, kind };
+            WaitState::Prepared { token } if token == prepared.token => {
+                self.state = WaitState::Blocked { token };
                 CommitState::Block(token)
             }
             WaitState::Completed { token, cause, .. } if token == prepared.token => {
@@ -218,18 +194,12 @@ impl WaitMetadata {
 
     pub(super) fn complete(&mut self, token: WaitToken, cause: WaitCause) -> CompletionResult {
         match self.state {
-            WaitState::Prepared {
-                token: active,
-                kind,
-            } if active == token => {
-                self.state = WaitState::Completed { token, cause, kind };
+            WaitState::Prepared { token: active } if active == token => {
+                self.state = WaitState::Completed { token, cause };
                 CompletionResult::CompletedPrepared
             }
-            WaitState::Blocked {
-                token: active,
-                kind,
-            } if active == token => {
-                self.state = WaitState::Completed { token, cause, kind };
+            WaitState::Blocked { token: active } if active == token => {
+                self.state = WaitState::Completed { token, cause };
                 CompletionResult::WokeBlocked
             }
             WaitState::Completed { token: active, .. } if active == token => {
@@ -273,6 +243,7 @@ impl WaitMetadata {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn clear_active(&mut self) {
         self.state = WaitState::None;
     }
@@ -299,16 +270,12 @@ impl WaitMetadata {
     }
 }
 
-/// Prepare the current running task for an externally owned wait condition.
+/// Prepare the current running thread for an externally owned wait condition.
 ///
 /// Callers publish [`PreparedWait::token`] while holding their owner lock, then
-/// drop that lock before calling [`commit_wait`]. The controlled task-call
+/// drop that lock before calling [`commit_wait`]. The controlled sched-call
 /// entry already masks IRQs; this function allocates nothing and does not
 /// block.
-///
-/// # Arguments
-///
-/// * `kind` - Coarse diagnostic owner classification with no condition payload.
 ///
 /// # Returns
 ///
@@ -317,10 +284,10 @@ impl WaitMetadata {
 ///
 /// # Panics
 ///
-/// Panics when no current task is running, a prior wait is unfinished, or the
+/// Panics when no current thread is running, a prior wait is unfinished, or the
 /// per-slot sequence would overflow before publication.
-pub(crate) fn prepare_wait(kind: WaitKind) -> PreparedWait {
-    scheduler_mut().transition_prepare_wait(kind)
+pub(crate) fn prepare_wait() -> PreparedWait {
+    scheduler_mut().transition_prepare_wait()
 }
 
 /// Commit a published wait registration and apply its mandatory handoff.
@@ -331,7 +298,7 @@ pub(crate) fn prepare_wait(kind: WaitKind) -> PreparedWait {
 ///
 /// # Arguments
 ///
-/// * `context` - Exclusive task-call context saved if the prepared task blocks.
+/// * `context` - Exclusive sched-call context saved if the prepared thread blocks.
 /// * `prepared` - Single-use registration returned by [`prepare_wait`].
 ///
 /// # Returns
@@ -368,15 +335,15 @@ pub(crate) fn complete_wait(token: WaitToken, cause: WaitCause) -> CompletionRes
     scheduler_mut().transition_complete_wait(token, cause)
 }
 
-/// Consume the completion retained for the current running task's exact token.
+/// Consume the completion retained for the current running thread's exact token.
 ///
-/// This is called by task-call wrappers after their saved context resumes. It
+/// This is called by sched-call wrappers after their saved context resumes. It
 /// takes local IRQ exclusion, allocates nothing, and cannot consume another
 /// wait's result.
 ///
 /// # Arguments
 ///
-/// * `token` - Exact token published by the operation before its task call.
+/// * `token` - Exact token published by the operation before its sched call.
 ///
 /// # Returns
 ///
@@ -384,14 +351,14 @@ pub(crate) fn complete_wait(token: WaitToken, cause: WaitCause) -> CompletionRes
 ///
 /// # Errors
 ///
-/// Returns [`FinishError::Stale`] for another generation/sequence/current task,
+/// Returns [`FinishError::Stale`] for another generation/sequence/current thread,
 /// or [`FinishError::NotCompleted`] when called before completion.
 pub(crate) fn finish_wait(token: WaitToken) -> Result<WaitCause, FinishError> {
     let _irq_guard = LocalIrqGuard::save_and_disable();
     scheduler_mut().transition_finish_wait(token)
 }
 
-/// Cancel a still-prepared current wait without directly waking a blocked task.
+/// Cancel a still-prepared current wait without directly waking a blocked thread.
 ///
 /// # Arguments
 ///
@@ -419,7 +386,7 @@ impl Scheduler {
             (CommitState::Block(_), Some(switch_outcome @ SwitchOutcome::Switch { from, to })) => {
                 self.saved_context_mut(from).save_from(context);
                 self.saved_context(to).restore_into(context);
-                self.activate_task_address_space(to);
+                self.activate_thread_address_space(to);
                 self.finish_block_current(from, to);
                 CommitResult::Blocked(switch_outcome)
             }
@@ -436,9 +403,9 @@ impl Scheduler {
 ///
 /// # Arguments
 ///
-/// * `context` - Exclusive private task-call context for a possible handoff.
+/// * `context` - Exclusive private sched-call context for a possible handoff.
 /// * `mode` - Fixture-selected bounded completion ordering.
-/// * `output` - Stack-owned task-call output that preserves the exact token.
+/// * `output` - Stack-owned sched-call output that preserves the exact token.
 ///
 /// # Returns
 ///
@@ -452,7 +419,7 @@ impl Scheduler {
 pub(crate) fn on_test_wait_sync(
     context: &mut ActiveContext<'_>,
     mode: u64,
-    output: &mut crate::task_call::TaskCallWaitOutput,
+    output: &mut crate::sched::call::SchedCallWaitOutput,
 ) {
     fn complete_prepared(token: WaitToken, first: WaitCause, second: Option<WaitCause>) {
         if complete_wait(token, first) != CompletionResult::CompletedPrepared {
@@ -465,7 +432,7 @@ pub(crate) fn on_test_wait_sync(
         }
     }
 
-    let prepared = prepare_wait(WaitKind::Io);
+    let prepared = prepare_wait();
     let token = prepared.token();
     output.record_token(token);
     match mode {
@@ -482,7 +449,7 @@ pub(crate) fn on_test_wait_sync(
             if cause != WaitCause::Notified {
                 panic!("sched test: wrong first cause");
             }
-            let next = prepare_wait(WaitKind::Io);
+            let next = prepare_wait();
             let next_token = next.token();
             output.record_token(next_token);
             if complete_wait(token, WaitCause::Timeout) != CompletionResult::Stale {
@@ -519,8 +486,8 @@ mod tests {
     const THREAD: ThreadId = ThreadId::new(1, 7);
 
     fn prepared() -> (WaitMetadata, PreparedWait) {
-        let mut wait = WaitMetadata::empty();
-        let prepared = wait.prepare(THREAD, WaitKind::Ipc);
+        let mut wait = WaitMetadata::with_next_sequence(0);
+        let prepared = wait.prepare(THREAD);
         (wait, prepared)
     }
 
@@ -556,7 +523,7 @@ mod tests {
     fn cancel_and_first_completion_win() {
         let (mut wait, prepared) = prepared();
         assert_eq!(wait.cancel(prepared), CancelResult::Cancelled);
-        let prepared = wait.prepare(THREAD, WaitKind::Ipc);
+        let prepared = wait.prepare(THREAD);
         let token = prepared.token();
         assert_eq!(
             wait.complete(token, WaitCause::Notified),
@@ -570,7 +537,7 @@ mod tests {
             wait.commit(prepared),
             CommitState::Early(WaitCause::Notified)
         );
-        let prepared = wait.prepare(THREAD, WaitKind::Ipc);
+        let prepared = wait.prepare(THREAD);
         let token = prepared.token();
         assert_eq!(
             wait.complete(token, WaitCause::Timeout),
@@ -600,11 +567,11 @@ mod tests {
             CompletionResult::AlreadyCompleted
         );
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = wait.prepare(THREAD, WaitKind::Ipc);
+            let _ = wait.prepare(THREAD);
         }));
         assert!(rejected.is_err());
         assert_eq!(wait.finish(token), Ok(WaitCause::Notified));
-        let _next = wait.prepare(THREAD, WaitKind::Ipc);
+        let _next = wait.prepare(THREAD);
     }
 
     #[test]
@@ -634,8 +601,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "wait sequence overflow")]
     fn sequence_overflow_panics_before_publication() {
-        let mut wait = WaitMetadata::empty();
+        let mut wait = WaitMetadata::with_next_sequence(0);
         wait.set_next_sequence_for_test(u64::MAX);
-        let _ = wait.prepare(THREAD, WaitKind::Deadline);
+        let _ = wait.prepare(THREAD);
     }
 }

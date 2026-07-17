@@ -153,7 +153,7 @@ impl SavedContext {
     ///
     /// # Returns
     ///
-    /// This associated constant is the exact size of `SavedContext` in a task
+    /// This associated constant is the exact size of `SavedContext` in a thread
     /// slot.
     pub const STORAGE_BYTES: usize = SAVED_CONTEXT_STORAGE_BYTES;
 
@@ -263,7 +263,7 @@ impl SavedContext {
     ///
     /// # Arguments
     ///
-    /// * `active` - Exclusively borrowed live context that will resume the task.
+    /// * `active` - Exclusively borrowed live context that will resume the thread.
     ///
     /// # Returns
     ///
@@ -275,7 +275,7 @@ impl SavedContext {
         unsafe { arch_saved_context_restore(self, active.frame.as_ptr()) }
     }
 
-    /// Enter this saved context as the scheduler's first running task.
+    /// Enter this saved context as the scheduler's first running thread.
     ///
     /// # Returns
     ///

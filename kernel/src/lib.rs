@@ -7,6 +7,8 @@
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
+#[cfg(test)]
+mod test_arch_stubs;
 
 pub mod arch;
 pub mod boot;
@@ -26,8 +28,6 @@ pub mod process;
 pub mod sched;
 pub(crate) mod sync;
 pub mod syscall;
-pub mod task;
-pub mod task_call;
 #[cfg(feature = "qemu-test")]
 mod test_support;
 pub mod time;
@@ -35,7 +35,7 @@ pub mod time;
 use bootinfo::BootInfo;
 
 #[cfg(not(any(feature = "qemu-test-kernel-runtime", feature = "qemu-test-user-fault")))]
-const PRODUCTION_TASKS: [sched::StaticTask; 1] = [sched::StaticTask::new(
+const PRODUCTION_THREADS: [sched::StaticThread; 1] = [sched::StaticThread::new(
     crate::init::kernel_init_thread,
     sched::ThreadArg::empty(),
 )];
@@ -75,9 +75,9 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
     test_support::kernel_runtime::init();
 
     if sched::bootstrap(
-        idle_task,
+        idle_thread,
         sched::ThreadArg::empty(),
-        static_tasks(),
+        static_threads(),
         config::SCHED_RR_QUANTUM_MS,
         config::KERNEL_THREAD_CAPACITY,
     )
@@ -86,28 +86,28 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
         panic!("sched: failed to bootstrap scheduler");
     }
 
-    log_bootstrap_stack_usage("before first task");
+    log_bootstrap_stack_usage("before first thread");
     crate::info!("sched: irq-return preemptive switching initialized");
-    // Enters the running task through architecture trap-frame restore and never returns.
-    sched::enter_running_task()
+    // Enters the running thread through architecture trap-frame restore and never returns.
+    sched::enter_running_thread()
 }
 
-fn static_tasks() -> &'static [sched::StaticTask] {
+fn static_threads() -> &'static [sched::StaticThread] {
     #[cfg(feature = "qemu-test-kernel-runtime")]
     {
-        &test_support::kernel_runtime::TASKS
+        &test_support::kernel_runtime::THREADS
     }
     #[cfg(feature = "qemu-test-user-fault")]
     {
-        &test_support::user_fault::TASKS
+        &test_support::user_fault::THREADS
     }
     #[cfg(not(any(feature = "qemu-test-kernel-runtime", feature = "qemu-test-user-fault")))]
     {
-        &PRODUCTION_TASKS
+        &PRODUCTION_THREADS
     }
 }
 
-fn idle_task(_arg: sched::ThreadArg) -> usize {
+fn idle_thread(_arg: sched::ThreadArg) -> usize {
     let mut last_log_ms = 0u64;
     loop {
         let now_ms = time::uptime_ms();

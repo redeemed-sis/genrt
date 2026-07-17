@@ -35,7 +35,7 @@ const MAILBOX_READY: u8 = 2;
 const CYCLE_WORKERS: usize = 3;
 const CYCLE_EXIT_BASE: usize = 0x80;
 const WAIT_TOKEN_STRESS_CYCLES: usize =
-    (crate::config::KERNEL_THREAD_CAPACITY * crate::time::TIMED_EVENT_CAPACITY_PER_TASK) + 1;
+    (crate::config::KERNEL_THREAD_CAPACITY * crate::time::TIMED_EVENT_CAPACITY_PER_THREAD) + 1;
 
 struct TestMailboxCell {
     value: UnsafeCell<MaybeUninit<Mailbox<usize>>>,
@@ -111,19 +111,19 @@ pub(crate) fn note_timer_irq() {
     TIMER_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Finite test-only scheduler tasks selected by the kernel runtime feature.
-pub(crate) const TASKS: [sched::StaticTask; 4] = [
-    sched::StaticTask::new(coordinator, ThreadArg::empty()),
-    sched::StaticTask::new(blocked_receiver, ThreadArg::empty()),
-    sched::StaticTask::new(progress_a, ThreadArg::empty()),
-    sched::StaticTask::new(progress_b, ThreadArg::empty()),
+/// Finite test-only scheduler threads selected by the kernel runtime feature.
+pub(crate) const THREADS: [sched::StaticThread; 4] = [
+    sched::StaticThread::new(coordinator, ThreadArg::empty()),
+    sched::StaticThread::new(blocked_receiver, ThreadArg::empty()),
+    sched::StaticThread::new(progress_a, ThreadArg::empty()),
+    sched::StaticThread::new(progress_b, ThreadArg::empty()),
 ];
 
 /// Initialize bounded fixtures before scheduler entry.
 ///
 /// # Returns
 ///
-/// Returns after publishing the mailbox used by the finite test tasks.
+/// Returns after publishing the mailbox used by the finite test threads.
 ///
 /// # Panics
 ///
@@ -141,9 +141,9 @@ pub(crate) fn init() {
     {
         panic!("qemu-test: runtime fixtures initialized twice");
     }
-    // SAFETY: this runs once before any static task can access the cell.
+    // SAFETY: this runs once before any static thread can access the cell.
     unsafe {
-        (*TEST_MAILBOX.value.get()).write(Mailbox::with_capacity(1, TASKS.len() + 1));
+        (*TEST_MAILBOX.value.get()).write(Mailbox::with_capacity(1, THREADS.len() + 1));
     }
     TEST_MAILBOX.state.store(MAILBOX_READY, Ordering::Release);
 }
@@ -405,7 +405,7 @@ fn ready_queue_worker(_arg: ThreadArg) -> usize {
 }
 
 fn check_test_wait(mode: u64, expected: sched::WaitCause, case: &str) {
-    if crate::task_call::test_wait(mode).cause() != expected {
+    if crate::sched::call::test_wait(mode).cause() != expected {
         protocol::fail(case, "WRONG_CAUSE");
     }
     sched::validate_invariants_for_test();
@@ -444,7 +444,7 @@ fn run_blocked_first_wins(case: &str, first: sched::WaitCause, second: sched::Wa
 }
 
 fn exact_wait_worker(_arg: ThreadArg) -> usize {
-    let completion = crate::task_call::test_wait(5);
+    let completion = crate::sched::call::test_wait(5);
     WAIT_CAUSE_A.store(encode_wait_cause(completion.cause()), Ordering::Release);
     WAIT_WORKER_RUNS.fetch_add(1, Ordering::AcqRel);
     0
@@ -483,10 +483,10 @@ fn run_late_timeout_against_next_wait() {
 }
 
 fn two_wait_worker(_arg: ThreadArg) -> usize {
-    let first = crate::task_call::test_wait(5);
+    let first = crate::sched::call::test_wait(5);
     WAIT_CAUSE_A.store(encode_wait_cause(first.cause()), Ordering::Release);
     WAIT_WORKER_STAGE.store(1, Ordering::Release);
-    let second = crate::task_call::test_wait(5);
+    let second = crate::sched::call::test_wait(5);
     WAIT_CAUSE_B.store(encode_wait_cause(second.cause()), Ordering::Release);
     WAIT_WORKER_STAGE.store(2, Ordering::Release);
     0
@@ -712,14 +712,14 @@ fn run_yield_inside_preempt_guard_case() {
     wait_for_guard_peer("yield-inside-preempt-guard", worker);
 }
 
-fn prepare_guard_peer(case: &str) -> crate::task::ThreadId {
+fn prepare_guard_peer(case: &str) -> crate::sched::ThreadId {
     GUARD_PEER_STAGE.store(0, Ordering::Release);
     GUARD_PEER_PROGRESS.store(0, Ordering::Release);
     sched::thread_spawn(guard_peer, ThreadArg::empty(), ThreadAttrs::joinable())
         .unwrap_or_else(|_| protocol::fail(case, "SPAWN"))
 }
 
-fn wait_for_guard_peer(case: &str, worker: crate::task::ThreadId) {
+fn wait_for_guard_peer(case: &str, worker: crate::sched::ThreadId) {
     if GUARD_PEER_PROGRESS.load(Ordering::Acquire) == 0
         || GUARD_PEER_STAGE.load(Ordering::Acquire) != 2
     {

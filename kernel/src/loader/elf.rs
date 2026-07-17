@@ -20,7 +20,7 @@ use crate::{
     memory::{
         self, FrameRange, PAGE_SIZE, VirtAddr,
         user::{USER_STACK_TOP, USER_TEXT_BASE},
-        vm::{self, UserAddressSpace, UserMapFlags, VmError},
+        vm::{self, OwnedUserAddressSpace, UserMapFlags, VmError},
     },
 };
 
@@ -85,7 +85,7 @@ pub enum ElfLoadError {
 
 pub fn load_user_elf(
     image: &[u8],
-    address_space: &mut UserAddressSpace,
+    address_space: &mut OwnedUserAddressSpace,
 ) -> Result<UserElfImage, ElfLoadError> {
     let file = ElfBytes::<AnyEndian>::minimal_parse(image).map_err(|_| ElfLoadError::Parse)?;
     validate_header(&file)?;
@@ -100,7 +100,7 @@ pub fn load_user_elf(
     );
 
     let mut loaded = UserElfImage::empty(entry);
-    let result = load_segments(image, &file, *address_space, &mut loaded);
+    let result = load_segments(image, &file, address_space, &mut loaded);
     if result.is_err() {
         free_loaded_segments(&loaded);
     }
@@ -118,7 +118,7 @@ pub fn free_loaded_segments(image: &UserElfImage) {
 fn load_segments(
     image: &[u8],
     file: &ElfBytes<'_, AnyEndian>,
-    address_space: UserAddressSpace,
+    address_space: &OwnedUserAddressSpace,
     loaded: &mut UserElfImage,
 ) -> Result<(), ElfLoadError> {
     let segments = file.segments().ok_or(ElfLoadError::InvalidProgramHeader)?;
@@ -145,7 +145,7 @@ fn load_segments(
 
 fn load_segment(
     image: &[u8],
-    address_space: UserAddressSpace,
+    address_space: &OwnedUserAddressSpace,
     ph: ProgramHeader,
     loaded: &mut UserElfImage,
 ) -> Result<(), ElfLoadError> {
@@ -193,9 +193,13 @@ fn load_segment(
         &image[offset..file_end],
     );
     let flags = map_flags_from_program_flags(ph.p_flags);
-    if let Err(err) =
-        vm::map_user_page_range(address_space, map_start, frame_range.start, map_size, flags)
-    {
+    if let Err(err) = vm::map_user_page_range(
+        &address_space,
+        map_start,
+        frame_range.start,
+        map_size,
+        flags,
+    ) {
         memory::free_contiguous_frames(frame_range);
         return Err(map_vm_error(err));
     }

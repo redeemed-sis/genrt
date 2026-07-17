@@ -3,7 +3,7 @@ use core::{cell::UnsafeCell, marker::PhantomData};
 use super::LocalIrqGuard;
 
 unsafe extern "C" {
-    fn arch_irq_state_allows_task_call(saved_irq_state: u64) -> bool;
+    fn arch_irq_state_allows_sched_call(saved_irq_state: u64) -> bool;
 }
 
 struct PreemptionState {
@@ -15,7 +15,7 @@ struct PreemptionState {
 struct PreemptionCell(UnsafeCell<PreemptionState>);
 
 // SAFETY: genrt's active target is single-core. Every access takes a short
-// LocalIrqGuard, so task and IRQ paths cannot concurrently mutate the state.
+// LocalIrqGuard, so thread and IRQ paths cannot concurrently mutate the state.
 unsafe impl Sync for PreemptionCell {}
 
 static PREEMPTION: PreemptionCell = PreemptionCell(UnsafeCell::new(PreemptionState {
@@ -31,18 +31,18 @@ fn state_mut() -> &'static mut PreemptionState {
     unsafe { &mut *PREEMPTION.0.get() }
 }
 
-/// Excludes task preemption until dropped while preserving local IRQ state.
+/// Excludes thread preemption until dropped while preserving local IRQ state.
 ///
-/// This primitive is for bootstrap or ordinary task context only and must not
+/// This primitive is for bootstrap or ordinary thread context only and must not
 /// be used from an interrupt handler. Entry and drop mutate the private
 /// single-core state under a short local-IRQ guard; neither operation allocates
-/// nor blocks. An outermost drop may enter the private task-call checkpoint.
+/// nor blocks. An outermost drop may enter the private sched-call checkpoint.
 pub(crate) struct PreemptGuard {
     _not_send: PhantomData<*mut ()>,
 }
 
 impl PreemptGuard {
-    /// Enter a task-context preemption-excluded section.
+    /// Enter a thread-context preemption-excluded section.
     ///
     /// # Returns
     ///
@@ -69,10 +69,10 @@ impl PreemptGuard {
 impl Drop for PreemptGuard {
     fn drop(&mut self) {
         let irq_guard = LocalIrqGuard::save_and_disable();
-        let prior_irq_allows_task_call = {
+        let prior_irq_allows_sched_call = {
             // SAFETY: the saved IRQ state belongs to this guard on the current
             // core. The architecture hook owns DAIF encoding details.
-            unsafe { arch_irq_state_allows_task_call(irq_guard.saved_state()) }
+            unsafe { arch_irq_state_allows_sched_call(irq_guard.saved_state()) }
         };
         let checkpoint = {
             let state = state_mut();
@@ -83,23 +83,23 @@ impl Drop for PreemptGuard {
             state.disable_depth == 0
                 && state.reschedule_pending
                 && state.scheduler_online
-                && prior_irq_allows_task_call
+                && prior_irq_allows_sched_call
         };
         drop(irq_guard);
 
         if checkpoint {
             // The checkpoint owns pending acknowledgement and can replace the
-            // active task context. Keep no live context or raw frame pointer in
+            // active thread context. Keep no live context or raw frame pointer in
             // the guard itself.
-            crate::task_call::preempt_checkpoint();
+            crate::sched::call::preempt_checkpoint();
         }
     }
 }
 
-/// Return whether task preemption is currently excluded.
+/// Return whether thread preemption is currently excluded.
 ///
 /// This reads private single-core state under a short local-IRQ guard. It is
-/// bounded, allocation-free, and safe in task or IRQ context.
+/// bounded, allocation-free, and safe in thread or IRQ context.
 ///
 /// # Returns
 ///
@@ -111,8 +111,8 @@ pub(crate) fn is_disabled() -> bool {
 
 /// Request one coalesced scheduler checkpoint.
 ///
-/// This operation is bounded, allocation-free, and safe in task or IRQ
-/// context. It does not itself switch tasks; pending work remains until a
+/// This operation is bounded, allocation-free, and safe in thread or IRQ
+/// context. It does not itself switch threads; pending work remains until a
 /// depth-zero scheduler checkpoint consumes it.
 ///
 /// # Returns
@@ -137,10 +137,10 @@ pub(crate) fn reschedule_pending() -> bool {
     state_mut().reschedule_pending
 }
 
-/// Return whether task entry has made scheduler checkpoints available.
+/// Return whether thread entry has made scheduler checkpoints available.
 ///
 /// The query takes a short local-IRQ guard, allocates nothing, and is safe in
-/// task or IRQ context.
+/// thread or IRQ context.
 ///
 /// # Returns
 ///
@@ -151,7 +151,7 @@ pub(crate) fn scheduler_online() -> bool {
     state_mut().scheduler_online
 }
 
-/// Mark the initialized scheduler available immediately before its first task entry.
+/// Mark the initialized scheduler available immediately before its first thread entry.
 ///
 /// This is a bounded, allocation-free bootstrap operation. It requires no
 /// active preemption exclusion and panics if called twice or while disabled.
@@ -201,7 +201,7 @@ pub(crate) fn checkpoint_consume() -> bool {
 ///
 /// # Arguments
 ///
-/// * `operation` - Static name of the operation that requires task preemption.
+/// * `operation` - Static name of the operation that requires thread preemption.
 ///
 /// # Panics
 ///

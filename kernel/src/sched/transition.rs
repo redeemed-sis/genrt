@@ -1,6 +1,6 @@
 //! Scheduler lifecycle transitions and bounded state validation.
 //!
-//! This module is the sole owner of task lifecycle state, current-task identity,
+//! This module is the sole owner of thread lifecycle state, current-thread identity,
 //! and ready-queue membership. Handoff code supplies architecture context save /
 //! restore and address-space activation after a transition selects its outcome.
 
@@ -8,35 +8,50 @@ use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 
 use crate::{
     arch::SavedContext,
-    memory::vm::UserAddressSpace,
-    process::ProcessId,
-    task::{TaskId, ThreadId},
+    memory::{user::OwnedUserStack, vm::AddressSpaceId},
 };
 
 use super::{
-    IDLE_TASK_ID, INITIAL_THREAD_GENERATION, Scheduler, THREAD_STACK_SIZE, thread,
+    IDLE_THREAD_INDEX, INITIAL_THREAD_GENERATION, Scheduler, THREAD_STACK_SIZE, ThreadId, thread,
     wait::{
         CancelResult, CommitState, CompletionResult, FinishError, PreparedWait, WaitCause,
-        WaitKind, WaitMetadata, WaitToken,
+        WaitMetadata, WaitToken,
     },
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum TaskState {
-    Free,
+pub(super) enum ThreadState {
     Ready,
     Running,
     Blocked,
-    Zombie,
+    Exited,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum ThreadKind {
-    Kernel,
-    User {
-        process_id: ProcessId,
-        address_space: UserAddressSpace,
-    },
+/// Resources that belong to a user thread rather than its process.
+///
+/// The address-space identifier is copyable scheduler metadata. The mapped
+/// user stack is uniquely owned by the thread and is extracted before a
+/// exited thread is released so its destructor never runs under an IRQ guard.
+pub(crate) struct UserThreadResources {
+    address_space: AddressSpaceId,
+    stack: OwnedUserStack,
+}
+
+impl UserThreadResources {
+    pub(super) fn new(address_space: AddressSpaceId, stack: OwnedUserStack) -> Self {
+        Self {
+            address_space,
+            stack,
+        }
+    }
+
+    pub(super) const fn address_space(&self) -> AddressSpaceId {
+        self.address_space
+    }
+
+    pub(super) fn stack(&self) -> &OwnedUserStack {
+        &self.stack
+    }
 }
 
 /// A context-free scheduling decision for architecture handoff code.
@@ -47,91 +62,127 @@ pub(crate) enum SwitchOutcome {
 }
 
 #[repr(C, align(16))]
-struct TaskStack {
+struct OwnedKernelStack {
     bytes: [u8; THREAD_STACK_SIZE],
 }
 
-impl TaskStack {
+impl OwnedKernelStack {
     fn top(&self) -> usize {
         self.bytes.as_ptr() as usize + THREAD_STACK_SIZE
     }
 }
 
-struct Task {
-    generation: u32,
-    state: TaskState,
+struct Thread {
+    state: ThreadState,
     joinable: bool,
     exit_code: Option<usize>,
     joiner: Option<WaitToken>,
     last_join_result: Option<core::result::Result<usize, thread::JoinError>>,
+    reaped_user: Option<UserThreadResources>,
+    user: Option<UserThreadResources>,
     wait: WaitMetadata,
-    kind: ThreadKind,
-    stack: Box<TaskStack>,
-    context: Option<SavedContext>,
+    stack: Box<OwnedKernelStack>,
+    context: SavedContext,
 }
 
-impl Task {
+struct ThreadSlot {
+    generation: u32,
+    next_wait_sequence: u64,
+    stack: Option<Box<OwnedKernelStack>>,
+    thread: Option<Thread>,
+}
+
+impl ThreadSlot {
     fn free() -> Self {
         Self {
             generation: 0,
-            state: TaskState::Free,
-            joinable: false,
-            exit_code: None,
-            joiner: None,
-            last_join_result: None,
-            wait: WaitMetadata::empty(),
-            kind: ThreadKind::Kernel,
-            stack: boxed_zeroed_stack(),
-            context: None,
+            next_wait_sequence: 0,
+            stack: Some(boxed_zeroed_stack()),
+            thread: None,
         }
-    }
-
-    fn stack_top(&self) -> usize {
-        self.stack.top()
     }
 }
 
-pub(super) struct TransitionState {
-    tasks: Vec<Task>,
+pub(super) struct ThreadTable {
+    slots: Vec<ThreadSlot>,
+    free_slots: Vec<usize>,
     ready_queue: VecDeque<ThreadId>,
     current: Option<ThreadId>,
 }
 
-impl TransitionState {
-    fn with_capacity(task_capacity: usize) -> Self {
-        let mut tasks = Vec::new();
-        tasks.reserve_exact(task_capacity);
+impl ThreadTable {
+    fn with_capacity(thread_capacity: usize) -> Self {
+        let mut slots = Vec::new();
+        slots.reserve_exact(thread_capacity);
+        let mut free_slots = Vec::new();
+        free_slots.reserve_exact(thread_capacity);
 
         let mut ready_queue = VecDeque::new();
-        ready_queue.reserve_exact(task_capacity.saturating_sub(1));
+        ready_queue.reserve_exact(thread_capacity.saturating_sub(1));
 
         Self {
-            tasks,
+            slots,
+            free_slots,
             ready_queue,
             current: None,
         }
     }
+
+    /// Look up a live thread directly by its generation-bearing ID.
+    fn get(&self, id: ThreadId) -> Option<&Thread> {
+        let slot = self.slots.get(id.index())?;
+        if slot.generation != id.generation() {
+            return None;
+        }
+        slot.thread.as_ref()
+    }
+
+    /// Mutably look up a live thread directly by its generation-bearing ID.
+    fn get_mut(&mut self, id: ThreadId) -> Option<&mut Thread> {
+        let slot = self.slots.get_mut(id.index())?;
+        if slot.generation != id.generation() {
+            return None;
+        }
+        slot.thread.as_mut()
+    }
+
+    /// Release a non-current exited thread and return its user resources for cleanup.
+    fn release(&mut self, id: ThreadId) -> Option<UserThreadResources> {
+        let slot = self.slots.get_mut(id.index())?;
+        if slot.generation != id.generation() {
+            return None;
+        }
+        let mut thread = slot.thread.take()?;
+        if !thread.wait.is_none() {
+            panic!("sched: release of {id} with active wait metadata");
+        }
+        let user = thread.user.take();
+        slot.next_wait_sequence = thread.wait.next_sequence();
+        slot.stack = Some(thread.stack);
+        self.free_slots.push(id.index());
+        user
+    }
 }
 
-fn boxed_zeroed_stack() -> Box<TaskStack> {
-    let mut boxed = Box::<TaskStack>::new_uninit();
-    // SAFETY: TaskStack is a byte array whose all-zero value is valid.
+fn boxed_zeroed_stack() -> Box<OwnedKernelStack> {
+    let mut boxed = Box::<OwnedKernelStack>::new_uninit();
+    // SAFETY: OwnedKernelStack is a byte array whose all-zero value is valid.
     unsafe {
         core::ptr::write_bytes(
             boxed.as_mut_ptr().cast::<u8>(),
             0,
-            core::mem::size_of::<TaskStack>(),
+            core::mem::size_of::<OwnedKernelStack>(),
         );
         boxed.assume_init()
     }
 }
 
 impl Scheduler {
-    pub(super) fn transition_new(task_capacity: usize, rr_quantum_ms: u64) -> Self {
+    pub(super) fn transition_new(thread_capacity: usize, rr_quantum_ms: u64) -> Self {
         Self {
-            lifecycle: TransitionState::with_capacity(task_capacity),
+            lifecycle: ThreadTable::with_capacity(thread_capacity),
             rr_quantum_ms: rr_quantum_ms.max(1),
-            entered_running_task: false,
+            entered_running_thread: false,
         }
     }
 
@@ -140,23 +191,24 @@ impl Scheduler {
         entry: thread::ThreadEntry,
         arg: thread::ThreadArg,
         idle: bool,
-    ) -> TaskId {
-        let id = TaskId::new(self.lifecycle.tasks.len());
-        self.lifecycle.tasks.push(Task::free());
+    ) -> usize {
+        let id = self.lifecycle.slots.len();
+        self.lifecycle.slots.push(ThreadSlot::free());
         self.transition_publish_bootstrap(id, entry, arg, idle);
         id
     }
 
-    pub(super) fn transition_fill_free_slots(&mut self, task_capacity: usize) {
-        while self.lifecycle.tasks.len() < task_capacity {
-            let id = TaskId::new(self.lifecycle.tasks.len());
-            self.lifecycle.tasks.push(Task::free());
+    pub(super) fn transition_fill_free_slots(&mut self, thread_capacity: usize) {
+        while self.lifecycle.slots.len() < thread_capacity {
+            let id = self.lifecycle.slots.len();
+            self.lifecycle.slots.push(ThreadSlot::free());
+            self.lifecycle.free_slots.push(id);
             crate::trace!("sched: prepared free thread slot {id}");
         }
     }
 
-    pub(super) fn transition_task_count(&self) -> usize {
-        self.lifecycle.tasks.len()
+    pub(super) fn transition_thread_count(&self) -> usize {
+        self.lifecycle.slots.len()
     }
 
     pub(super) fn transition_ready_capacity(&self) -> usize {
@@ -167,76 +219,76 @@ impl Scheduler {
         !self.lifecycle.ready_queue.is_empty()
     }
 
-    pub(super) fn find_free_slot(&self) -> Option<TaskId> {
-        self.lifecycle
-            .tasks
-            .iter()
-            .enumerate()
-            .skip(1)
-            .find_map(|(index, task)| (task.state == TaskState::Free).then_some(TaskId::new(index)))
+    pub(super) fn take_free_slot(&mut self) -> Option<usize> {
+        self.lifecycle.free_slots.pop()
     }
 
     pub(super) fn transition_publish_bootstrap(
         &mut self,
-        id: TaskId,
+        id: usize,
         entry: thread::ThreadEntry,
         arg: thread::ThreadArg,
         idle: bool,
     ) {
-        if idle != (id == IDLE_TASK_ID) {
+        if idle != (id == IDLE_THREAD_INDEX) {
             panic!("sched: bootstrap idle identity mismatch");
         }
         let context = SavedContext::kernel_entry(
-            self.lifecycle.tasks[id.index()].stack_top(),
+            self.lifecycle.slots[id]
+                .stack
+                .as_ref()
+                .unwrap_or_else(|| panic!("sched: bootstrap slot {id} has no stack"))
+                .top(),
             entry as *const () as usize,
             arg.as_usize(),
             thread::thread_entry_bootstrap as *const () as usize,
         );
-        self.publish(
-            id,
-            context,
-            ThreadKind::Kernel,
-            false,
-            INITIAL_THREAD_GENERATION,
-            true,
-        );
+        self.publish(id, context, None, false, INITIAL_THREAD_GENERATION, true);
     }
 
     pub(super) fn transition_publish_runtime(
         &mut self,
-        id: TaskId,
+        id: usize,
         context: SavedContext,
-        kind: ThreadKind,
+        user: Option<UserThreadResources>,
         joinable: bool,
     ) -> ThreadId {
-        let generation = next_generation(self.lifecycle.tasks[id.index()].generation);
-        self.publish(id, context, kind, joinable, generation, false);
+        let generation = next_generation(self.lifecycle.slots[id].generation);
+        self.publish(id, context, user, joinable, generation, false);
         self.thread_id(id)
     }
 
     fn publish(
         &mut self,
-        id: TaskId,
+        id: usize,
         context: SavedContext,
-        kind: ThreadKind,
+        user: Option<UserThreadResources>,
         joinable: bool,
         generation: u32,
         bootstrap: bool,
     ) {
-        let task = &mut self.lifecycle.tasks[id.index()];
-        if task.state != TaskState::Free || task.context.is_some() {
+        let slot = &mut self.lifecycle.slots[id];
+        if slot.thread.is_some() {
             panic!("sched: publish into occupied slot {id}");
         }
-        task.generation = generation;
-        task.joinable = joinable;
-        task.exit_code = None;
-        task.joiner = None;
-        task.last_join_result = None;
-        task.wait.clear_active();
-        task.kind = kind;
-        task.context = Some(context);
-        task.state = TaskState::Ready;
-        if id != IDLE_TASK_ID {
+        let stack = slot
+            .stack
+            .take()
+            .unwrap_or_else(|| panic!("sched: free slot {id} has no kernel stack"));
+        slot.generation = generation;
+        slot.thread = Some(Thread {
+            state: ThreadState::Ready,
+            joinable,
+            exit_code: None,
+            joiner: None,
+            last_join_result: None,
+            reaped_user: None,
+            user,
+            wait: WaitMetadata::with_next_sequence(slot.next_wait_sequence),
+            stack,
+            context,
+        });
+        if id != IDLE_THREAD_INDEX {
             let was_empty = self.lifecycle.ready_queue.is_empty();
             self.ready_push_back(self.thread_id(id));
             if !bootstrap && was_empty {
@@ -248,11 +300,11 @@ impl Scheduler {
 
     pub(super) fn transition_initial_dispatch(&mut self) -> super::Result<()> {
         if self.lifecycle.current.is_some() {
-            return Err(super::SchedError::InvalidTaskId);
+            return Err(super::SchedError::InvalidThreadId);
         }
         let next = self
             .ready_pop_front()
-            .unwrap_or_else(|| self.thread_id(IDLE_TASK_ID));
+            .unwrap_or_else(|| self.thread_id(IDLE_THREAD_INDEX));
         self.make_running(next);
         self.validate_after_transition();
         Ok(())
@@ -268,7 +320,7 @@ impl Scheduler {
             return SwitchOutcome::ContinueCurrent;
         };
         // The checkpoint already consumed the request that selected this
-        // switch. Requeueing the outgoing task must not create a second one.
+        // switch. Requeueing the outgoing thread must not create a second one.
         self.make_ready_and_queue(from, false);
         self.make_running(to);
         self.validate_after_transition();
@@ -283,39 +335,33 @@ impl Scheduler {
         let from = self
             .lifecycle
             .current
-            .unwrap_or_else(|| panic!("block requested without a running task"));
+            .unwrap_or_else(|| panic!("block requested without a running thread"));
         self.assert_current_running(from, "blocking transition");
-        if from.index() == IDLE_TASK_ID.index() {
-            panic!("sched: idle task cannot block");
+        if from.index() == IDLE_THREAD_INDEX {
+            panic!("sched: idle thread cannot block");
         }
-        let commit = self
-            .task_mut(TaskId::new(from.index()))
-            .wait
-            .commit(prepared);
+        let commit = self.thread_mut(from.index()).wait.commit(prepared);
         let CommitState::Block(_) = commit else {
             self.validate_after_transition();
             return (commit, None);
         };
         let to = self
             .ready_pop_front()
-            .unwrap_or_else(|| self.thread_id(IDLE_TASK_ID));
-        self.task_mut(TaskId::new(from.index())).state = TaskState::Blocked;
+            .unwrap_or_else(|| self.thread_id(IDLE_THREAD_INDEX));
+        self.thread_mut(from.index()).state = ThreadState::Blocked;
         self.make_running(to);
         self.validate_after_transition();
         (commit, Some(SwitchOutcome::Switch { from, to }))
     }
 
-    pub(super) fn transition_prepare_wait(&mut self, kind: WaitKind) -> PreparedWait {
+    pub(super) fn transition_prepare_wait(&mut self) -> PreparedWait {
         crate::sync::preempt::assert_preemption_enabled("scheduler wait preparation");
         let current = self
             .lifecycle
             .current
-            .unwrap_or_else(|| panic!("sched: wait preparation without a running task"));
+            .unwrap_or_else(|| panic!("sched: wait preparation without a running thread"));
         self.assert_current_running(current, "wait preparation");
-        let prepared = self
-            .task_mut(TaskId::new(current.index()))
-            .wait
-            .prepare(current, kind);
+        let prepared = self.thread_mut(current.index()).wait.prepare(current);
         self.validate_after_transition();
         prepared
     }
@@ -328,17 +374,17 @@ impl Scheduler {
         if !self.thread_matches(token.thread()) {
             return CompletionResult::Stale;
         }
-        let id = TaskId::new(token.thread().index());
-        let result = self.task_mut(id).wait.complete(token, cause);
+        let id = token.thread().index();
+        let result = self.thread_mut(id).wait.complete(token, cause);
         if result == CompletionResult::WokeBlocked {
-            if self.task_state(id) != TaskState::Blocked {
-                panic!("sched: blocked wait completion has non-blocked task state");
+            if self.thread_state(id) != ThreadState::Blocked {
+                panic!("sched: blocked wait completion has non-blocked thread state");
             }
             self.make_ready_and_queue(token.thread(), true);
         } else if result == CompletionResult::CompletedPrepared
-            && self.task_state(id) != TaskState::Running
+            && self.thread_state(id) != ThreadState::Running
         {
-            panic!("sched: prepared wait completion has non-running task state");
+            panic!("sched: prepared wait completion has non-running thread state");
         }
         self.validate_after_transition();
         result
@@ -352,10 +398,7 @@ impl Scheduler {
             return Err(FinishError::Stale);
         }
         self.assert_current_running(token.thread(), "wait finish");
-        let result = self
-            .task_mut(TaskId::new(token.thread().index()))
-            .wait
-            .finish(token);
+        let result = self.thread_mut(token.thread().index()).wait.finish(token);
         self.validate_after_transition();
         result
     }
@@ -367,7 +410,7 @@ impl Scheduler {
         }
         self.assert_current_running(token.thread(), "wait cancellation");
         let result = self
-            .task_mut(TaskId::new(token.thread().index()))
+            .thread_mut(token.thread().index())
             .wait
             .cancel(prepared);
         self.validate_after_transition();
@@ -380,42 +423,43 @@ impl Scheduler {
             .current
             .unwrap_or_else(|| panic!("thread: exit without running thread"));
         self.assert_current_running(from, "exit transition");
-        if from.index() == IDLE_TASK_ID.index() {
+        if from.index() == IDLE_THREAD_INDEX {
             panic!("thread: idle thread cannot exit");
         }
-        let joinable = self.task(TaskId::new(from.index())).joinable;
-        let joiner = self.task_mut(TaskId::new(from.index())).joiner.take();
-        self.task_mut(TaskId::new(from.index())).exit_code = Some(code);
+        let joinable = self.thread(from.index()).joinable;
+        let joiner = self.thread_mut(from.index()).joiner.take();
+        self.thread_mut(from.index()).exit_code = Some(code);
         if let Some(joiner) = joiner {
             // Publish the lifecycle result and complete the exact join wait
-            // while `from` is still the current Running task. Completion runs
+            // while `from` is still the current Running thread. Completion runs
             // the transition validator, so exposing an intermediate
-            // current-but-Zombie state here would violate the scheduler table
+            // current-but-Exited state here would violate the scheduler table
             // invariant before mandatory exit selection is committed.
             self.complete_joiner(from, joiner, code);
         }
-        self.task_mut(TaskId::new(from.index())).state = TaskState::Zombie;
-        if joiner.is_some() {
-            self.reap_zombie(from);
+        self.thread_mut(from.index()).state = ThreadState::Exited;
+        if let Some(joiner) = joiner {
+            let resources = self.reap_exited(from);
+            self.set_reaped_user(joiner.thread(), resources);
         } else if !joinable {
-            self.reap_zombie(from);
+            let _ = self.reap_exited(from);
         }
         let to = self
             .ready_pop_front()
-            .unwrap_or_else(|| self.thread_id(IDLE_TASK_ID));
+            .unwrap_or_else(|| self.thread_id(IDLE_THREAD_INDEX));
         self.make_running(to);
         self.validate_after_transition();
         SwitchOutcome::Switch { from, to }
     }
 
-    pub(super) fn transition_reap_zombie(&mut self, id: ThreadId) {
-        if id.index() >= self.lifecycle.tasks.len()
+    pub(super) fn transition_reap_exited(&mut self, id: ThreadId) -> Option<UserThreadResources> {
+        if id.index() >= self.lifecycle.slots.len()
             || !self.thread_matches(id)
-            || id.index() == IDLE_TASK_ID.index()
+            || id.index() == IDLE_THREAD_INDEX
             || self.lifecycle.current == Some(id)
-            || self.task(TaskId::new(id.index())).state != TaskState::Zombie
+            || self.thread(id.index()).state != ThreadState::Exited
         {
-            panic!("thread: reclaim requires a non-current zombie");
+            panic!("thread: reclaim requires a non-current exited thread");
         }
         if self
             .lifecycle
@@ -425,20 +469,13 @@ impl Scheduler {
         {
             panic!("thread: reclaim target still queued ready");
         }
-        self.reap_zombie(id);
+        let resources = self.reap_exited(id);
         self.validate_after_transition();
+        resources
     }
 
-    fn reap_zombie(&mut self, id: ThreadId) {
-        let task = self.task_mut(TaskId::new(id.index()));
-        task.joinable = false;
-        task.exit_code = None;
-        task.joiner = None;
-        task.last_join_result = None;
-        task.wait.clear_active();
-        task.kind = ThreadKind::Kernel;
-        task.context = None;
-        task.state = TaskState::Free;
+    fn reap_exited(&mut self, id: ThreadId) -> Option<UserThreadResources> {
+        self.lifecycle.release(id)
     }
 
     fn complete_joiner(&mut self, target: ThreadId, joiner: WaitToken, code: usize) {
@@ -449,12 +486,11 @@ impl Scheduler {
         }
         // Exact completion validates generation and wait sequence before the
         // lifecycle owner writes payload into the joiner's reusable slot.
-        self.task_mut(TaskId::new(joiner.thread().index()))
-            .last_join_result = Some(Ok(code));
+        self.thread_mut(joiner.thread().index()).last_join_result = Some(Ok(code));
     }
 
     fn ready_push_back(&mut self, id: ThreadId) {
-        if id.index() == IDLE_TASK_ID.index() {
+        if id.index() == IDLE_THREAD_INDEX {
             panic!("sched: idle must not enter ready queue");
         }
         if let Some(queued) = self
@@ -474,8 +510,8 @@ impl Scheduler {
     fn ready_pop_front(&mut self) -> Option<ThreadId> {
         let id = self.lifecycle.ready_queue.pop_front()?;
         if !self.thread_matches(id)
-            || self.task(TaskId::new(id.index())).state != TaskState::Ready
-            || id.index() == IDLE_TASK_ID.index()
+            || self.thread(id.index()).state != ThreadState::Ready
+            || id.index() == IDLE_THREAD_INDEX
         {
             panic!("sched: stale or invalid ready queue entry {id}");
         }
@@ -484,10 +520,10 @@ impl Scheduler {
 
     fn make_ready_and_queue(&mut self, id: ThreadId, notify_new_peer: bool) {
         if !self.thread_matches(id) {
-            panic!("sched: ready transition requires a current-generation task {id}");
+            panic!("sched: ready transition requires a current-generation thread {id}");
         }
-        self.task_mut(TaskId::new(id.index())).state = TaskState::Ready;
-        if id.index() != IDLE_TASK_ID.index() {
+        self.thread_mut(id.index()).state = ThreadState::Ready;
+        if id.index() != IDLE_THREAD_INDEX {
             let was_empty = self.lifecycle.ready_queue.is_empty();
             self.ready_push_back(id);
             if notify_new_peer && was_empty {
@@ -499,18 +535,17 @@ impl Scheduler {
     fn assert_current_running(&self, id: ThreadId, operation: &str) {
         if self.lifecycle.current != Some(id)
             || !self.thread_matches(id)
-            || self.task_state(TaskId::new(id.index())) != TaskState::Running
+            || self.thread_state(id.index()) != ThreadState::Running
         {
-            panic!("sched: {operation} requires the current running task {id}");
+            panic!("sched: {operation} requires the current running thread {id}");
         }
     }
 
     fn make_running(&mut self, id: ThreadId) {
-        if !self.thread_matches(id) || self.task(TaskId::new(id.index())).state != TaskState::Ready
-        {
-            panic!("sched: running transition requires a ready current-generation task");
+        if !self.thread_matches(id) || self.thread(id.index()).state != ThreadState::Ready {
+            panic!("sched: running transition requires a ready current-generation thread");
         }
-        self.task_mut(TaskId::new(id.index())).state = TaskState::Running;
+        self.thread_mut(id.index()).state = ThreadState::Running;
         self.lifecycle.current = Some(id);
     }
 
@@ -522,92 +557,123 @@ impl Scheduler {
         self.lifecycle.current
     }
 
-    pub(super) fn thread_id(&self, id: TaskId) -> ThreadId {
-        ThreadId::new(id.index(), self.task(id).generation)
+    pub(super) fn thread_id(&self, id: usize) -> ThreadId {
+        ThreadId::new(id, self.lifecycle.slots[id].generation)
     }
 
     pub(super) fn thread_matches(&self, id: ThreadId) -> bool {
-        self.is_valid_task(TaskId::new(id.index()))
-            && self.task(TaskId::new(id.index())).generation == id.generation()
-            && self.task(TaskId::new(id.index())).state != TaskState::Free
+        self.lifecycle.get(id).is_some()
     }
 
-    pub(super) fn is_valid_task(&self, id: TaskId) -> bool {
-        id.index() < self.lifecycle.tasks.len()
+    fn thread(&self, id: usize) -> &Thread {
+        self.lifecycle.slots[id]
+            .thread
+            .as_ref()
+            .unwrap_or_else(|| panic!("sched: free slot {id} has no thread"))
     }
 
-    fn task(&self, id: TaskId) -> &Task {
-        &self.lifecycle.tasks[id.index()]
+    fn thread_mut(&mut self, id: usize) -> &mut Thread {
+        self.lifecycle.slots[id]
+            .thread
+            .as_mut()
+            .unwrap_or_else(|| panic!("sched: free slot {id} has no thread"))
     }
 
-    fn task_mut(&mut self, id: TaskId) -> &mut Task {
-        &mut self.lifecycle.tasks[id.index()]
+    pub(super) fn thread_state(&self, id: usize) -> ThreadState {
+        self.thread(id).state
     }
 
-    pub(super) fn task_state(&self, id: TaskId) -> TaskState {
-        self.task(id).state
+    pub(super) fn thread_address_space(&self, id: usize) -> Option<AddressSpaceId> {
+        self.thread(id)
+            .user
+            .as_ref()
+            .map(UserThreadResources::address_space)
     }
-
-    pub(super) fn task_kind(&self, id: TaskId) -> ThreadKind {
-        self.task(id).kind
+    pub(super) fn thread_user_stack(&self, id: usize) -> Option<&OwnedUserStack> {
+        self.thread(id)
+            .user
+            .as_ref()
+            .map(UserThreadResources::stack)
     }
 
     pub(super) fn saved_context(&self, id: ThreadId) -> &SavedContext {
-        self.task(TaskId::new(id.index()))
-            .context
-            .as_ref()
-            .unwrap_or_else(|| panic!("sched: occupied task {} has no saved context", id.index()))
+        &self.thread(id.index()).context
     }
 
     pub(super) fn saved_context_mut(&mut self, id: ThreadId) -> &mut SavedContext {
-        self.task_mut(TaskId::new(id.index()))
-            .context
-            .as_mut()
-            .unwrap_or_else(|| panic!("sched: occupied task {} has no saved context", id.index()))
+        &mut self.thread_mut(id.index()).context
     }
 
-    pub(super) fn stack_top(&self, id: TaskId) -> usize {
-        self.task(id).stack_top()
+    pub(super) fn stack_top(&self, id: usize) -> usize {
+        self.lifecycle.slots[id]
+            .thread
+            .as_ref()
+            .map(|thread| thread.stack.top())
+            .or_else(|| {
+                self.lifecycle.slots[id]
+                    .stack
+                    .as_ref()
+                    .map(|stack| stack.top())
+            })
+            .unwrap_or_else(|| panic!("sched: slot {id} has no kernel stack"))
     }
 
-    pub(super) fn task_joinable(&self, id: TaskId) -> bool {
-        self.task(id).joinable
+    pub(super) fn thread_joinable(&self, id: usize) -> bool {
+        self.thread(id).joinable
     }
-    pub(super) fn task_joiner(&self, id: TaskId) -> Option<WaitToken> {
-        self.task(id).joiner
+    pub(super) fn thread_joiner(&self, id: usize) -> Option<WaitToken> {
+        self.thread(id).joiner
     }
-    pub(super) fn task_exit_code(&self, id: TaskId) -> Option<usize> {
-        self.task(id).exit_code
+    pub(super) fn thread_exit_code(&self, id: usize) -> Option<usize> {
+        self.thread(id).exit_code
     }
-    pub(super) fn task_set_joiner(&mut self, id: TaskId, joiner: WaitToken) {
-        self.task_mut(id).joiner = Some(joiner);
+    pub(super) fn thread_set_joiner(&mut self, id: usize, joiner: WaitToken) {
+        self.thread_mut(id).joiner = Some(joiner);
     }
     pub(super) fn set_join_result(
         &mut self,
-        id: TaskId,
+        id: usize,
         result: core::result::Result<usize, thread::JoinError>,
     ) {
-        self.task_mut(id).last_join_result = Some(result);
+        self.thread_mut(id).last_join_result = Some(result);
     }
     pub(super) fn take_join_result(
         &mut self,
-        id: TaskId,
+        id: usize,
     ) -> Option<core::result::Result<usize, thread::JoinError>> {
-        self.task_mut(id).last_join_result.take()
+        self.thread_mut(id).last_join_result.take()
     }
-    pub(super) fn replace_current_kind(
-        &mut self,
-        kind: ThreadKind,
-    ) -> core::result::Result<(), ()> {
-        let current = self.lifecycle.current.ok_or(())?;
-        if !matches!(
-            self.task_kind(TaskId::new(current.index())),
-            ThreadKind::User { .. }
-        ) {
-            return Err(());
+    pub(super) fn has_join_result(&self, id: usize) -> bool {
+        self.thread(id).last_join_result.is_some()
+    }
+    pub(super) fn take_reaped_user(&mut self, id: usize) -> Option<UserThreadResources> {
+        self.thread_mut(id).reaped_user.take()
+    }
+    pub(super) fn has_reaped_user(&self, id: usize) -> bool {
+        self.thread(id).reaped_user.is_some()
+    }
+    pub(super) fn set_reaped_user(&mut self, id: ThreadId, user: Option<UserThreadResources>) {
+        let joiner = self
+            .lifecycle
+            .get_mut(id)
+            .unwrap_or_else(|| panic!("sched: stale joiner while reaping {id}"));
+        if joiner.reaped_user.is_some() {
+            // An invariant failure must not unwind through `user`: its stack
+            // destructor frees frames and is forbidden while this transition
+            // still holds local IRQ exclusion. The halted kernel may leak the
+            // incoming resource, but it must never release it in this context.
+            core::mem::forget(user);
+            panic!("sched: joiner {id} retains unreaped user resources");
         }
-        self.task_mut(TaskId::new(current.index())).kind = kind;
-        Ok(())
+        joiner.reaped_user = user;
+    }
+    pub(super) fn replace_current_user_payload(
+        &mut self,
+        user: UserThreadResources,
+    ) -> core::result::Result<UserThreadResources, ()> {
+        let current = self.lifecycle.current.ok_or(())?;
+        let thread = self.thread_mut(current.index());
+        thread.user.replace(user).ok_or(())
     }
 
     fn validate_after_transition(&self) {
@@ -621,9 +687,9 @@ impl Scheduler {
             panic!("sched: ready queue exceeds capacity");
         }
         let mut running = 0usize;
-        for (index, task) in self.lifecycle.tasks.iter().enumerate() {
-            let id = TaskId::new(index);
-            let tid = ThreadId::new(index, task.generation);
+        for (index, slot) in self.lifecycle.slots.iter().enumerate() {
+            let id = index;
+            let tid = ThreadId::new(index, slot.generation);
             let queued = self
                 .lifecycle
                 .ready_queue
@@ -633,25 +699,18 @@ impl Scheduler {
             if queued > 1 {
                 panic!("sched: duplicate ready entry {tid}");
             }
-            match task.state {
-                TaskState::Free => {
-                    if task.context.is_some()
-                        || task.joiner.is_some()
-                        || task.joinable
-                        || task.exit_code.is_some()
-                        || task.last_join_result.is_some()
-                        || !task.wait.is_none()
-                        || task.kind != ThreadKind::Kernel
-                        || queued != 0
-                    {
-                        panic!("sched: free slot {id} retains lifecycle metadata");
-                    }
+            let Some(thread) = slot.thread.as_ref() else {
+                if slot.stack.is_none() || queued != 0 {
+                    panic!("sched: free slot {id} retains lifecycle metadata");
                 }
-                TaskState::Ready => {
-                    if task.context.is_none() {
-                        panic!("sched: ready slot {id} lacks context");
-                    }
-                    if id == IDLE_TASK_ID {
+                continue;
+            };
+            if slot.stack.is_some() {
+                panic!("sched: occupied thread {id} does not own its kernel stack");
+            }
+            match thread.state {
+                ThreadState::Ready => {
+                    if id == IDLE_THREAD_INDEX {
                         if queued != 0 {
                             panic!("sched: idle queued while ready");
                         }
@@ -659,50 +718,49 @@ impl Scheduler {
                         panic!("sched: ready slot {id} queue mismatch");
                     }
                 }
-                TaskState::Running => {
+                ThreadState::Running => {
                     running += 1;
-                    if task.context.is_none() || self.lifecycle.current != Some(tid) || queued != 0
-                    {
+                    if self.lifecycle.current != Some(tid) || queued != 0 {
                         panic!("sched: running slot {id} identity mismatch");
                     }
                 }
-                TaskState::Blocked => {
-                    if task.context.is_none() || queued != 0 || !task.wait.is_blocked() {
+                ThreadState::Blocked => {
+                    if queued != 0 || !thread.wait.is_blocked() {
                         panic!("sched: blocked slot {id} wait/queue/context mismatch");
                     }
                 }
-                TaskState::Zombie => {
-                    if task.context.is_none() || queued != 0 || !task.wait.is_none() {
-                        panic!("sched: zombie slot {id} wait/queue/context mismatch");
+                ThreadState::Exited => {
+                    if queued != 0 || !thread.wait.is_none() {
+                        panic!("sched: exited thread {id} wait/queue/context mismatch");
                     }
                 }
             }
-            if task.wait.is_prepared() && task.state != TaskState::Running {
-                panic!("sched: prepared wait is not current running task {id}");
+            if thread.wait.is_prepared() && thread.state != ThreadState::Running {
+                panic!("sched: prepared wait is not current running thread {id}");
             }
-            if task.wait.is_completed()
-                && !matches!(task.state, TaskState::Ready | TaskState::Running)
+            if thread.wait.is_completed()
+                && !matches!(thread.state, ThreadState::Ready | ThreadState::Running)
             {
-                panic!("sched: completed wait has invalid task state {id}");
+                panic!("sched: completed wait has invalid thread state {id}");
             }
-            if task.wait.is_blocked() && task.state != TaskState::Blocked {
-                panic!("sched: blocked wait has invalid task state {id}");
+            if thread.wait.is_blocked() && thread.state != ThreadState::Blocked {
+                panic!("sched: blocked wait has invalid thread state {id}");
             }
         }
         for queued in &self.lifecycle.ready_queue {
             if !self.thread_matches(*queued)
-                || self.task_state(TaskId::new(queued.index())) != TaskState::Ready
-                || queued.index() == IDLE_TASK_ID.index()
+                || self.thread_state(queued.index()) != ThreadState::Ready
+                || queued.index() == IDLE_THREAD_INDEX
             {
                 panic!("sched: stale ready queue entry {queued}");
             }
         }
         if self.lifecycle.current.is_none() {
             if running != 0 {
-                panic!("sched: running task exists before initial dispatch");
+                panic!("sched: running thread exists before initial dispatch");
             }
         } else if running != 1 {
-            panic!("sched: expected exactly one running task");
+            panic!("sched: expected exactly one running thread");
         }
     }
 }
@@ -710,4 +768,90 @@ impl Scheduler {
 fn next_generation(generation: u32) -> u32 {
     let next = generation.wrapping_add(1);
     if next == 0 { 1 } else { next }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn publish_joinable(scheduler: &mut Scheduler, slot: usize) -> ThreadId {
+        let context = SavedContext::kernel_entry(scheduler.stack_top(slot), 0, 0, 0);
+        scheduler.transition_publish_runtime(slot, context, None, true)
+    }
+
+    #[test]
+    fn thread_table_preallocates_bounded_free_slots() {
+        let mut scheduler = Scheduler::transition_new(2, 1);
+        scheduler.transition_fill_free_slots(2);
+        assert_eq!(scheduler.transition_thread_count(), 2);
+        assert_eq!(scheduler.lifecycle.free_slots.len(), 2);
+        assert!(
+            scheduler
+                .lifecycle
+                .slots
+                .iter()
+                .all(|slot| slot.thread.is_none() && slot.stack.is_some())
+        );
+        assert_eq!(scheduler.take_free_slot(), Some(1));
+        assert_eq!(scheduler.take_free_slot(), Some(0));
+        assert_eq!(scheduler.take_free_slot(), None);
+        assert!(scheduler.lifecycle.ready_queue.capacity() >= 1);
+    }
+
+    #[test]
+    fn free_slot_is_not_a_valid_thread_and_reuse_changes_generation() {
+        let mut scheduler = Scheduler::transition_new(2, 1);
+        scheduler.transition_fill_free_slots(2);
+        let slot = scheduler.take_free_slot().expect("bounded free slot");
+        let stale = ThreadId::new(slot, scheduler.lifecycle.slots[slot].generation);
+        assert!(!scheduler.thread_matches(stale));
+        assert!(scheduler.lifecycle.get(stale).is_none());
+        let first_id = publish_joinable(&mut scheduler, slot);
+        assert!(scheduler.thread_matches(first_id));
+        assert!(scheduler.lifecycle.get(first_id).is_some());
+        assert!(scheduler.lifecycle.get_mut(first_id).is_some());
+        assert!(scheduler.lifecycle.slots[slot].stack.is_none());
+        scheduler.thread_mut(slot).state = ThreadState::Exited;
+        scheduler.lifecycle.ready_queue.clear();
+        scheduler.transition_reap_exited(first_id);
+        assert!(!scheduler.thread_matches(first_id));
+        assert!(scheduler.lifecycle.get(first_id).is_none());
+        assert!(scheduler.lifecycle.slots[slot].stack.is_some());
+        assert_eq!(scheduler.lifecycle.slots[slot].next_wait_sequence, 0);
+        let reused_slot = scheduler.take_free_slot().expect("released slot");
+        assert_eq!(reused_slot, slot);
+        let reused = publish_joinable(&mut scheduler, reused_slot);
+        assert_eq!(reused.index(), first_id.index());
+        assert_ne!(reused.generation(), first_id.generation());
+    }
+
+    #[test]
+    fn wait_sequence_survives_thread_release_and_slot_reuse() {
+        let mut scheduler = Scheduler::transition_new(2, 1);
+        scheduler.transition_fill_free_slots(2);
+        let slot = scheduler.take_free_slot().expect("bounded free slot");
+        let first_id = publish_joinable(&mut scheduler, slot);
+        scheduler.thread_mut(slot).state = ThreadState::Running;
+        let first = scheduler
+            .thread_mut(slot)
+            .wait
+            .prepare(first_id)
+            .token()
+            .sequence();
+        scheduler.thread_mut(slot).wait.clear_active();
+        scheduler.thread_mut(slot).state = ThreadState::Exited;
+        scheduler.lifecycle.ready_queue.clear();
+        scheduler.transition_reap_exited(first_id);
+
+        let reused_slot = scheduler.take_free_slot().expect("released slot");
+        let reused_id = publish_joinable(&mut scheduler, reused_slot);
+        let second = scheduler
+            .thread_mut(reused_slot)
+            .wait
+            .prepare(reused_id)
+            .token()
+            .sequence();
+        assert_eq!(reused_slot, slot);
+        assert!(second > first);
+    }
 }

@@ -39,7 +39,7 @@ impl TrapFrame {
     pub const SPSR_MODE_EL0T: u64 = 0b0000;
     pub const SPSR_MODE_EL1H: u64 = 0b0101;
 
-    // Keep interrupts unmasked in resumed tasks for the current kernel stage.
+    // Keep interrupts unmasked in resumed threads for the current kernel stage.
     pub const SPSR_DAIF_UNMASKED: u64 = 0;
     pub const EL0T: u64 = Self::SPSR_MODE_EL0T | Self::SPSR_DAIF_UNMASKED;
     pub const EL1H: u64 = Self::SPSR_MODE_EL1H | Self::SPSR_DAIF_UNMASKED;

@@ -1,7 +1,10 @@
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
-use crate::{arch::ActiveContext, sched::WaitToken, task::ThreadId};
+use crate::{
+    arch::ActiveContext,
+    sched::{ThreadId, WaitToken},
+};
 
 unsafe extern "C" {
     fn arch_counter_now() -> u64;
@@ -11,14 +14,14 @@ unsafe extern "C" {
 }
 
 type FinishTimerInterruptHandler = fn(&mut ActiveContext<'_>, u64);
-type TimedTaskHandler = fn(ThreadId);
+type TimedThreadHandler = fn(ThreadId);
 
-/// Preallocated timed-event slots reserved for each scheduler task slot.
+/// Preallocated timed-event slots reserved for each scheduler thread slot.
 ///
-/// One task may concurrently own one exact wait deadline and one scheduler
+/// One thread may concurrently own one exact wait deadline and one scheduler
 /// quantum. The third slot preserves the configured bounded queue headroom;
-/// scheduler bootstrap multiplies this constant by task capacity.
-pub(crate) const TIMED_EVENT_CAPACITY_PER_TASK: usize = 3;
+/// scheduler bootstrap multiplies this constant by thread capacity.
+pub(crate) const TIMED_EVENT_CAPACITY_PER_THREAD: usize = 3;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TimedEvent {
@@ -47,8 +50,8 @@ pub(crate) struct TimeHandlers {
     pub finish_timer_interrupt: FinishTimerInterruptHandler,
     /// Complete one exact wait deadline without acquiring an owner lock.
     pub wait_deadline: TimedWaitHandler,
-    /// Mark one generation-aware task quantum as expired.
-    pub quantum_expired: TimedTaskHandler,
+    /// Mark one generation-aware thread quantum as expired.
+    pub quantum_expired: TimedThreadHandler,
 }
 
 /// Allocation-free time callback for one exact wait deadline.
@@ -366,7 +369,7 @@ pub fn on_timer_interrupt(context: &mut ActiveContext<'_>) {
     }
 
     // Timer IRQ fast-path policy: do not allocate here. The heap is protected
-    // against local IRQ reentrancy for ordinary task-context allocations, but
+    // against local IRQ reentrancy for ordinary thread-context allocations, but
     // timed-event dispatch itself must stay on preallocated, bounded state.
     let now = now_counter();
     let handlers = {
@@ -393,9 +396,9 @@ fn dispatch_expired_event(handlers: TimeHandlers, event: TimedEvent) {
             crate::trace!("time: dispatch WaitDeadline({token:?})");
             (handlers.wait_deadline)(token);
         }
-        TimedEvent::QuantumExpired(task_id) => {
-            crate::trace!("time: dispatch QuantumExpired({task_id})");
-            (handlers.quantum_expired)(task_id);
+        TimedEvent::QuantumExpired(thread_id) => {
+            crate::trace!("time: dispatch QuantumExpired({thread_id})");
+            (handlers.quantum_expired)(thread_id);
         }
     }
 }

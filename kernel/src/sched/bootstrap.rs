@@ -5,35 +5,65 @@ use super::{
 };
 
 #[derive(Copy, Clone)]
-/// Immutable entry descriptor for a kernel task created during bootstrap.
-pub(crate) struct StaticTask {
+/// Immutable entry descriptor for a kernel thread created during bootstrap.
+pub(crate) struct StaticThread {
     entry: thread::ThreadEntry,
     arg: thread::ThreadArg,
 }
 
-impl StaticTask {
-    /// Create a static bootstrap task descriptor.
+impl StaticThread {
+    /// Create a static bootstrap thread descriptor.
     ///
-    /// This constructor records task metadata only. Stack/frame allocation and
+    /// This constructor records thread metadata only. Stack/frame allocation and
     /// ready-queue insertion occur later during scheduler bootstrap.
     ///
     /// # Arguments
     ///
-    /// - `entry`: Kernel thread entry function invoked by the bootstrap frame.
-    /// - `arg`: Value passed to `entry` when the task first runs.
+    /// * `entry` - Kernel thread entry function invoked by the bootstrap frame.
+    /// * `arg` - Value passed to `entry` when the thread first runs.
     ///
     /// # Returns
     ///
-    /// Returns an immutable descriptor containing `entry` and `arg`.
+    /// Returns an immutable descriptor containing `entry` and `arg`. This is a
+    /// const metadata operation that does not allocate, block, or alter IRQ
+    /// state.
     pub(crate) const fn new(entry: thread::ThreadEntry, arg: thread::ThreadArg) -> Self {
         Self { entry, arg }
     }
 }
 
+/// Build and publish the bounded scheduler bootstrap set.
+///
+/// Kernel-stack and ready-queue storage are preallocated before scheduler
+/// entry. The function allocates only during bootstrap setup, before runtime
+/// IRQ scheduling begins; it must not be called from IRQ context or block.
+///
+/// # Arguments
+///
+/// * `idle_entry` - Entry function for the mandatory idle thread.
+/// * `idle_arg` - Argument supplied to `idle_entry`.
+/// * `threads` - Additional static kernel-thread descriptors.
+/// * `rr_quantum_ms` - Requested round-robin quantum in milliseconds.
+/// * `thread_capacity` - Total bounded slot and preallocated stack capacity.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after publishing the scheduler and initializing timer
+/// callbacks that reference it.
+///
+/// # Errors
+///
+/// Returns [`SchedError::AlreadyBootstrapped`] when scheduler state already
+/// exists or [`SchedError::ThreadCapacityTooSmall`] when capacity cannot hold
+/// idle plus every static thread.
+///
+/// # Panics
+///
+/// Panics if bootstrap-time allocator or scheduler transition invariants fail.
 pub(crate) fn bootstrap(
     idle_entry: thread::ThreadEntry,
     idle_arg: thread::ThreadArg,
-    tasks: &[StaticTask],
+    threads: &[StaticThread],
     rr_quantum_ms: u64,
     thread_capacity: usize,
 ) -> Result<()> {
@@ -46,23 +76,28 @@ pub(crate) fn bootstrap(
     //    have a concrete scheduler instance to reach.
     // 2. Only then initialize `kernel::time`, which is the first point where
     //    timer IRQ dispatch can invoke scheduler callbacks.
-    let scheduler =
-        Scheduler::bootstrap_new(idle_entry, idle_arg, tasks, rr_quantum_ms, thread_capacity)?;
-    let task_count = scheduler.transition_task_count();
+    let scheduler = Scheduler::bootstrap_new(
+        idle_entry,
+        idle_arg,
+        threads,
+        rr_quantum_ms,
+        thread_capacity,
+    )?;
+    let thread_count = scheduler.transition_thread_count();
     *scheduler_slot_mut() = Some(scheduler);
-    init_time_after_scheduler_publish(task_count);
+    init_time_after_scheduler_publish(thread_count);
     Ok(())
 }
 
 #[inline(always)]
-fn init_time_after_scheduler_publish(task_count: usize) {
+fn init_time_after_scheduler_publish(thread_count: usize) {
     crate::time::init(
         TimeHandlers {
             finish_timer_interrupt: preempt::finish_timer_interrupt,
             wait_deadline: preempt::on_wait_deadline,
             quantum_expired: preempt::on_quantum_expired,
         },
-        task_count.saturating_mul(crate::time::TIMED_EVENT_CAPACITY_PER_TASK),
+        thread_count.saturating_mul(crate::time::TIMED_EVENT_CAPACITY_PER_THREAD),
     );
 }
 
@@ -70,27 +105,27 @@ impl Scheduler {
     fn bootstrap_new(
         idle_entry: thread::ThreadEntry,
         idle_arg: thread::ThreadArg,
-        tasks: &[StaticTask],
+        threads: &[StaticThread],
         rr_quantum_ms: u64,
         thread_capacity: usize,
     ) -> Result<Self> {
-        let bootstrap_task_count = tasks.len() + 1;
-        if thread_capacity < bootstrap_task_count {
+        let bootstrap_thread_count = threads.len() + 1;
+        if thread_capacity < bootstrap_thread_count {
             return Err(SchedError::ThreadCapacityTooSmall);
         }
 
         let mut scheduler = Self::transition_new(thread_capacity, rr_quantum_ms);
         scheduler.transition_append_bootstrap(idle_entry, idle_arg, true);
-        for task in tasks {
-            let id = scheduler.transition_append_bootstrap(task.entry, task.arg, false);
-            crate::debug!("sched: bootstrap task {id}");
+        for thread in threads {
+            let id = scheduler.transition_append_bootstrap(thread.entry, thread.arg, false);
+            crate::debug!("sched: bootstrap thread {id}");
         }
         scheduler.transition_fill_free_slots(thread_capacity);
 
         scheduler.transition_initial_dispatch()?;
         crate::debug!(
             "sched: thread_capacity={} ready_queue_capacity={} stack_size={} quantum={}ms",
-            scheduler.transition_task_count(),
+            scheduler.transition_thread_count(),
             scheduler.transition_ready_capacity(),
             THREAD_STACK_SIZE,
             scheduler.rr_quantum_ms

@@ -154,7 +154,7 @@ static FRAME_ALLOCATOR: PreemptLock<RuntimeFrameAllocator> =
 /// Initialize immutable physical-memory metadata and the runtime allocators.
 ///
 /// This boot-only operation normalizes firmware ranges, reserves kernel-owned
-/// regions, initializes the task-only frame allocator, extracts the fixed heap
+/// regions, initializes the thread-only frame allocator, extracts the fixed heap
 /// range, and initializes the kernel heap. It runs before scheduler entry.
 ///
 /// # Arguments
@@ -310,7 +310,7 @@ pub(crate) fn init(boot: &'static BootInfo) -> Result<()> {
 /// # Returns
 ///
 /// Returns the physical address of one page-aligned frame, or `None` when the
-/// allocator is not initialized or no frame remains. The task-only allocator
+/// allocator is not initialized or no frame remains. The thread-only allocator
 /// lock is held for free-list mutation; the operation does not allocate from
 /// the kernel heap or block.
 pub fn alloc_frame() -> Option<PhysAddr> {
@@ -331,7 +331,7 @@ pub fn alloc_frame() -> Option<PhysAddr> {
 /// # Returns
 ///
 /// Returns the allocated page-aligned range, or `None` for zero frames, an
-/// uninitialized allocator, or insufficient contiguous space. The task-only
+/// uninitialized allocator, or insufficient contiguous space. The thread-only
 /// allocator lock is held during free-list traversal; the operation does not
 /// allocate from the kernel heap or block.
 pub fn alloc_contiguous_frames(frames: usize) -> Option<FrameRange> {
@@ -352,7 +352,7 @@ pub fn alloc_contiguous_frames(frames: usize) -> Option<FrameRange> {
 ///
 /// # Returns
 ///
-/// Returns after reinserting the frame under the task-only allocator lock. The
+/// Returns after reinserting the frame under the thread-only allocator lock. The
 /// operation does not allocate from the kernel heap or block.
 ///
 /// # Panics
@@ -380,7 +380,7 @@ pub fn free_frame(frame_pa: PhysAddr) {
 ///
 /// # Returns
 ///
-/// Returns after reinserting the complete range under the task-only allocator
+/// Returns after reinserting the complete range under the thread-only allocator
 /// lock. The operation does not allocate from the kernel heap or block.
 ///
 /// # Panics
@@ -404,7 +404,7 @@ pub fn free_contiguous_frames(range: FrameRange) {
 /// # Returns
 ///
 /// Returns `Some(count)` after runtime allocator initialization, or `None`
-/// before initialization. The count is copied while holding the task-only
+/// before initialization. The count is copied while holding the thread-only
 /// allocator lock; no protected reference escapes, and the operation does not
 /// allocate or block.
 pub(crate) fn free_frame_count() -> Option<usize> {
@@ -575,7 +575,7 @@ fn phys_to_kernel_ptr<T>(pa: PhysAddr) -> *mut T {
 #[inline(always)]
 fn metadata_mut() -> &'static mut MemoryMetadata {
     // SAFETY: boot initialization is the sole writer and completes before any
-    // runtime task can observe immutable memory metadata.
+    // runtime thread can observe immutable memory metadata.
     unsafe { &mut *MEMORY_METADATA.0.get() }
 }
 

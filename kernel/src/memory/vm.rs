@@ -73,19 +73,49 @@ impl UserMapFlags {
     }
 }
 
+/// Copyable identity for an owned TTBR0 address space.
+///
+/// This value may be stored in scheduler state and used for activation or
+/// mapping queries. It cannot destroy page tables; only
+/// [`OwnedUserAddressSpace`] owns that capability. Copying this identity does
+/// not allocate, block, alter IRQ state, or extend the lifetime of the root.
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct UserAddressSpace {
+pub struct AddressSpaceId {
     root_pa: PhysAddr,
 }
 
-impl UserAddressSpace {
-    pub const fn root_pa(self) -> PhysAddr {
+impl AddressSpaceId {
+    const fn root_pa(self) -> PhysAddr {
         self.root_pa
+    }
+}
+
+/// Exclusive owner of allocator-backed TTBR0 page tables.
+///
+/// Mapping and loading borrow this value; activation and query APIs accept its
+/// copyable [`AddressSpaceId`]. The root physical address remains encapsulated.
+/// Ownership must be consumed by [`destroy_user_address_space`] after every
+/// failed staging path; this type has no implicit `Drop` cleanup.
+pub struct OwnedUserAddressSpace {
+    id: AddressSpaceId,
+}
+
+impl OwnedUserAddressSpace {
+    /// Return the non-owning ID used by scheduler and query paths.
+    ///
+    /// # Returns
+    ///
+    /// Returns a copyable identifier without transferring ownership. This is
+    /// bounded and does not allocate, block, or alter IRQ state.
+    pub const fn id(&self) -> AddressSpaceId {
+        self.id
     }
 
     const fn from_root_pa(root_pa: PhysAddr) -> Self {
-        Self { root_pa }
+        Self {
+            id: AddressSpaceId { root_pa },
+        }
     }
 }
 
@@ -169,29 +199,115 @@ pub fn initramfs_load_range() -> PhysRange {
     }
 }
 
-pub fn create_user_address_space() -> Result<UserAddressSpace, VmError> {
+/// Create an owned, empty TTBR0 user address space.
+///
+/// This delegates page-table-root allocation to the architecture VM backend.
+/// It may allocate frames and must not run in an IRQ or scheduler fast path.
+///
+/// # Returns
+///
+/// Returns the unique root owner. The caller must either transfer it to a
+/// process lifecycle path or consume it with [`destroy_user_address_space`].
+///
+/// # Errors
+///
+/// Returns backend initialization, frame-allocation, or unsupported-operation
+/// errors as [`VmError`].
+pub fn create_user_address_space() -> Result<OwnedUserAddressSpace, VmError> {
     let mut root_pa = 0usize;
     match unsafe { arch_create_user_address_space(&mut root_pa as *mut usize) } {
-        0 => Ok(UserAddressSpace::from_root_pa(root_pa)),
+        0 => Ok(OwnedUserAddressSpace::from_root_pa(root_pa)),
         code => Err(vm_error_from_code(code)),
     }
 }
 
-pub unsafe fn destroy_user_address_space(aspace: UserAddressSpace) -> Result<(), VmError> {
-    vm_result(unsafe { arch_destroy_user_address_space(aspace.root_pa()) })
+/// Destroy an owned TTBR0 root and its page-table frames.
+///
+/// The operation consumes `aspace`, may return frames to the allocator, and
+/// must not run in an IRQ or scheduler fast path.
+///
+/// # Arguments
+///
+/// * `aspace` - Unique root owner being permanently destroyed.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after the architecture backend released the root.
+///
+/// # Errors
+///
+/// Returns backend teardown failures as [`VmError`]. On error, ownership has
+/// still been consumed and callers must not reuse the ID as a live root.
+///
+/// # Safety
+///
+/// The caller must ensure no active CPU, scheduler thread, mapping operation,
+/// or retained architecture context can still reference this address space.
+pub unsafe fn destroy_user_address_space(aspace: OwnedUserAddressSpace) -> Result<(), VmError> {
+    vm_result(unsafe { arch_destroy_user_address_space(aspace.id.root_pa()) })
 }
 
+/// Map one user page into an owned TTBR0 root.
+///
+/// The architecture backend may allocate intermediate page tables; this path
+/// does not block and must stay outside IRQ and scheduler fast paths.
+///
+/// # Arguments
+///
+/// * `aspace` - Borrowed owner of the destination TTBR0 root.
+/// * `va` - Page-aligned user virtual address.
+/// * `pa` - Page-aligned physical frame address.
+/// * `flags` - User mapping permissions.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after publishing the mapping.
+///
+/// # Errors
+///
+/// Returns invalid-range, alignment, existing-mapping, or frame-allocation
+/// errors reported by the architecture backend.
+///
+/// # Safety
+///
+/// The caller must own the physical frame's lifetime, provide a valid user
+/// page range, and ensure that publishing this mapping cannot violate an
+/// active address-space or aliasing invariant.
 pub unsafe fn map_user_page(
-    aspace: UserAddressSpace,
+    aspace: &OwnedUserAddressSpace,
     va: VirtAddr,
     pa: PhysAddr,
     flags: UserMapFlags,
 ) -> Result<(), VmError> {
-    vm_result(unsafe { arch_map_user_page(aspace.root_pa(), va, pa, flags.bits()) })
+    vm_result(unsafe { arch_map_user_page(aspace.id.root_pa(), va, pa, flags.bits()) })
 }
 
+/// Map a contiguous range of user pages into an owned TTBR0 root.
+///
+/// This validates alignment and arithmetic before mapping each page. The
+/// backend may allocate intermediate page tables; it does not block and must
+/// not run in IRQ or scheduler fast paths.
+///
+/// # Arguments
+///
+/// * `aspace` - Borrowed owner of the destination TTBR0 root.
+/// * `va` - Page-aligned first user virtual address.
+/// * `pa` - Page-aligned first physical frame address.
+/// * `size` - Page-aligned byte count; zero is a no-op.
+/// * `flags` - Permissions applied to every mapped page.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after all pages are mapped; a zero `size` succeeds without
+/// touching the backend.
+///
+/// # Errors
+///
+/// Returns [`VmError::NotAligned`] for unaligned inputs,
+/// [`VmError::InvalidRange`] for overflow, or backend mapping errors. Earlier
+/// pages remain mapped if a later backend call fails.
 pub fn map_user_page_range(
-    aspace: UserAddressSpace,
+    aspace: &OwnedUserAddressSpace,
     va: VirtAddr,
     pa: PhysAddr,
     size: usize,
@@ -219,7 +335,21 @@ pub fn map_user_page_range(
     Ok(())
 }
 
-pub fn translate_user_va(aspace: UserAddressSpace, va: VirtAddr) -> Option<PhysAddr> {
+/// Translate a virtual address through a user address-space identity.
+///
+/// This is a bounded query that neither allocates nor blocks and may be used
+/// with scheduler-held copyable IDs. It does not alter IRQ state.
+///
+/// # Arguments
+///
+/// * `aspace` - Copyable identity for the queried TTBR0 root.
+/// * `va` - User virtual address to translate.
+///
+/// # Returns
+///
+/// Returns `Some` with the physical address when mapped, or `None` when the
+/// backend reports no translation.
+pub fn translate_user_va(aspace: AddressSpaceId, va: VirtAddr) -> Option<PhysAddr> {
     let mut pa = 0usize;
     match unsafe { arch_translate_user_va(aspace.root_pa(), va, &mut pa as *mut usize) } {
         0 => Some(pa),
@@ -227,7 +357,20 @@ pub fn translate_user_va(aspace: UserAddressSpace, va: VirtAddr) -> Option<PhysA
     }
 }
 
-pub fn query_user_mapping(aspace: UserAddressSpace, va: VirtAddr) -> Option<UserMappingInfo> {
+/// Query permissions and physical backing for one user virtual address.
+///
+/// This bounded query neither allocates nor blocks and does not alter IRQ
+/// state.
+///
+/// # Arguments
+///
+/// * `aspace` - Copyable identity for the queried TTBR0 root.
+/// * `va` - User virtual address whose mapping is queried.
+///
+/// # Returns
+///
+/// Returns `Some` with mapping metadata, or `None` when no mapping exists.
+pub fn query_user_mapping(aspace: AddressSpaceId, va: VirtAddr) -> Option<UserMappingInfo> {
     let mut info = UserMappingInfo {
         pa: 0,
         user: false,
@@ -241,10 +384,48 @@ pub fn query_user_mapping(aspace: UserAddressSpace, va: VirtAddr) -> Option<User
     }
 }
 
-pub unsafe fn activate_user_address_space(aspace: UserAddressSpace) -> Result<(), VmError> {
+/// Activate a user TTBR0 root for the current execution context.
+///
+/// This is bounded and allocation-free. Scheduler handoff calls it with local
+/// IRQ exclusion; it must not block.
+///
+/// # Arguments
+///
+/// * `aspace` - Live root identity selected for the current user thread.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after the architecture installed the root.
+///
+/// # Errors
+///
+/// Returns backend activation failures as [`VmError`].
+///
+/// # Safety
+///
+/// The caller must ensure `aspace` names a live owner and that replacing the
+/// current TTBR0 is valid for the active saved/live context.
+pub unsafe fn activate_user_address_space(aspace: AddressSpaceId) -> Result<(), VmError> {
     vm_result(unsafe { arch_activate_user_address_space(aspace.root_pa()) })
 }
 
+/// Clear the current user TTBR0 root for kernel-thread execution.
+///
+/// This is bounded and allocation-free. Scheduler handoff calls it with local
+/// IRQ exclusion; it must not block.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after the architecture cleared the root.
+///
+/// # Errors
+///
+/// Returns backend clearing failures as [`VmError`].
+///
+/// # Safety
+///
+/// The caller must ensure the active context will not resume userspace until a
+/// valid user address space is activated again.
 pub unsafe fn clear_user_address_space() -> Result<(), VmError> {
     vm_result(unsafe { arch_clear_user_address_space() })
 }

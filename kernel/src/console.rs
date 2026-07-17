@@ -2,13 +2,46 @@ use core::cell::UnsafeCell;
 
 use crate::{
     arch::ActiveContext,
-    sched::{self, CommitResult, WaitCause, WaitKind, WaitToken},
+    sched::{self, CommitResult, WaitCause, WaitToken},
     sync::LocalIrqGuard,
 };
 
+#[cfg(not(test))]
 unsafe extern "C" {
     fn arch_console_init_once();
     fn arch_console_putc_raw(c: u8);
+}
+
+// Host-only scheduler/unit tests link the generic kernel without the AArch64
+// console object. These no-op ABI stubs keep diagnostics side-effect free.
+#[cfg(test)]
+#[unsafe(no_mangle)]
+extern "C" fn arch_console_init_once() {}
+
+#[cfg(test)]
+#[unsafe(no_mangle)]
+extern "C" fn arch_console_putc_raw(_c: u8) {}
+
+#[inline]
+fn console_init_once() {
+    #[cfg(not(test))]
+    // SAFETY: the selected architecture provides the console backend.
+    unsafe {
+        arch_console_init_once();
+    }
+    #[cfg(test)]
+    arch_console_init_once();
+}
+
+#[inline]
+fn console_putc_raw(c: u8) {
+    #[cfg(not(test))]
+    // SAFETY: the selected architecture provides the console backend.
+    unsafe {
+        arch_console_putc_raw(c);
+    }
+    #[cfg(test)]
+    arch_console_putc_raw(c);
 }
 
 const STDIN_RX_CAPACITY: usize = 256;
@@ -83,7 +116,7 @@ impl StdinRx {
         }
     }
 
-    fn take_completed(&mut self, current: crate::task::ThreadId) -> Option<WaitToken> {
+    fn take_completed(&mut self, current: crate::sched::ThreadId) -> Option<WaitToken> {
         match self.completed {
             Some(token) if token.thread() == current => self.completed.take(),
             _ => None,
@@ -102,22 +135,13 @@ static STDIN_RX: StdinCell = StdinCell(UnsafeCell::new(StdinRx::new()));
 
 #[inline]
 pub fn putc(c: u8) {
-    // SAFETY: arch layer provides console backend for the selected target.
-    unsafe {
-        arch_console_init_once();
-    }
+    console_init_once();
 
     if c == b'\n' {
-        // SAFETY: same as above.
-        unsafe {
-            arch_console_putc_raw(b'\r');
-        }
+        console_putc_raw(b'\r');
     }
 
-    // SAFETY: same as above.
-    unsafe {
-        arch_console_putc_raw(c);
-    }
+    console_putc_raw(c);
 }
 
 pub fn puts(s: &str) {
@@ -199,7 +223,7 @@ pub(crate) fn block_current_stdin_read_if_empty(
         }
 
         crate::sync::preempt::assert_preemption_enabled("stdin waiter registration");
-        let prepared = sched::prepare_wait(WaitKind::Io);
+        let prepared = sched::prepare_wait();
         let token = prepared.token();
         if !stdin_mut().register_waiter(token) {
             let _ = sched::cancel_wait(prepared);

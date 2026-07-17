@@ -90,7 +90,7 @@ pub extern "C" fn arch_local_irq_restore(saved_daif: u64) {
 }
 
 #[unsafe(no_mangle)]
-/// Classify whether restoring an opaque saved IRQ state permits an EL1 task call.
+/// Classify whether restoring an opaque saved IRQ state permits an EL1 sched call.
 ///
 /// # Arguments
 ///
@@ -100,9 +100,9 @@ pub extern "C" fn arch_local_irq_restore(saved_daif: u64) {
 ///
 /// Returns `true` when IRQ delivery would be enabled after restoration. This
 /// is a register-only, allocation-free architecture classification.
-pub extern "C" fn arch_irq_state_allows_task_call(saved_daif: u64) -> bool {
+pub extern "C" fn arch_irq_state_allows_sched_call(saved_daif: u64) -> bool {
     // DAIF.I is bit 7. The generic kernel asks only whether restoring the saved
-    // state permits a controlled EL1 task call; it never interprets DAIF.
+    // state permits a controlled EL1 sched call; it never interprets DAIF.
     (saved_daif & (1 << 7)) == 0
 }
 
@@ -129,11 +129,11 @@ pub extern "C" fn arch_timer_disarm() {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn arch_task_call(request: *const core::ffi::c_void) {
+pub extern "C" fn arch_sched_call(request: *const core::ffi::c_void) {
     // SAFETY: `svc #0` raises a synchronous exception at the current EL. The
     // EL1 vector path saves the current TrapFrame and routes the request pointer
     // through `sync_entry()`. If the request blocks, execution resumes after this
-    // instruction when the task is later woken.
+    // instruction when the thread is later woken.
     unsafe {
         asm!(
             "svc #0",

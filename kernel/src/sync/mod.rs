@@ -157,7 +157,7 @@ impl<T> Drop for LocalIrqLockGuard<'_, T> {
     }
 }
 
-/// Task-preemption exclusion lock for bootstrap and task-only mutable state.
+/// Thread-preemption exclusion lock for bootstrap and thread-only mutable state.
 ///
 /// This lock must not be acquired from interrupt context. Recursive or
 /// contended entry is a bug. It keeps local IRQs enabled while the value is
@@ -171,7 +171,7 @@ pub(crate) struct PreemptLock<T> {
 
 /// Exclusive borrow returned by [`PreemptLock::lock`].
 ///
-/// Dropping the guard releases the value and ends task preemption exclusion.
+/// Dropping the guard releases the value and ends thread preemption exclusion.
 /// An outermost drop may suspend at the private scheduler checkpoint after the
 /// lock has been published as free. The guard is intentionally neither `Copy`
 /// nor `Clone`.
@@ -180,17 +180,17 @@ pub(crate) struct PreemptLockGuard<'a, T> {
     preempt_guard: ManuallyDrop<PreemptGuard>,
 }
 
-// SAFETY: task-context access to `value` is serialized by preemption exclusion
+// SAFETY: thread-context access to `value` is serialized by preemption exclusion
 // and the recursive-entry flag on the active single core. IRQ callers are
 // forbidden by the type's contract.
 unsafe impl<T: Send> Sync for PreemptLock<T> {}
 
 impl<T> PreemptLock<T> {
-    /// Construct a task-preemption exclusion lock.
+    /// Construct a thread-preemption exclusion lock.
     ///
     /// # Arguments
     ///
-    /// * `value` - Initial task-only value owned by the lock.
+    /// * `value` - Initial thread-only value owned by the lock.
     ///
     /// # Returns
     ///
@@ -203,12 +203,12 @@ impl<T> PreemptLock<T> {
         }
     }
 
-    /// Exclude task preemption and exclusively borrow the protected value.
+    /// Exclude thread preemption and exclusively borrow the protected value.
     ///
     /// # Returns
     ///
     /// Returns a guard that ends preemption exclusion when dropped. Local IRQs
-    /// remain enabled; an outermost drop can enter the bounded task-call
+    /// remain enabled; an outermost drop can enter the bounded thread-call
     /// scheduler checkpoint. The operation is bounded and allocation-free.
     ///
     /// # Panics
@@ -236,7 +236,7 @@ impl<T> Deref for PreemptLockGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: the guard owns exclusive task-context access while the lock
+        // SAFETY: the guard owns exclusive thread-context access while the lock
         // is held.
         unsafe { &*self.owner.value.get() }
     }
@@ -244,7 +244,7 @@ impl<T> Deref for PreemptLockGuard<'_, T> {
 
 impl<T> DerefMut for PreemptLockGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: the guard owns exclusive task-context access while the lock
+        // SAFETY: the guard owns exclusive thread-context access while the lock
         // is held.
         unsafe { &mut *self.owner.value.get() }
     }
@@ -253,7 +253,7 @@ impl<T> DerefMut for PreemptLockGuard<'_, T> {
 impl<T> Drop for PreemptLockGuard<'_, T> {
     fn drop(&mut self) {
         // Release the protected access before ending preemption exclusion: the
-        // guard drop may synchronously hand off to another task.
+        // guard drop may synchronously hand off to another thread.
         self.owner.locked.store(false, Ordering::Release);
         // SAFETY: this is the sole owner of the manually dropped guard. The
         // Release store above makes a deferred checkpoint unable to observe the

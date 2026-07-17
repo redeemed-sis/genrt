@@ -3,7 +3,7 @@ use core::arch::asm;
 use crate::{console, context, esr, gic, platform, timer, trap_frame::TrapFrame};
 
 const VECTOR_CURRENT_EL_SPX_SYNC: u64 = 4;
-const ISS_SVC_TASK_CALL: u32 = 0;
+const ISS_SVC_SCHED_CALL: u32 = 0;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn irq_entry(frame: *mut TrapFrame) {
@@ -43,22 +43,24 @@ pub extern "C" fn sync_entry(vector: u64, frame: *mut TrapFrame) {
     let iss = esr::iss(raw_esr);
 
     // `sync_entry` is the narrow Rust-side dispatcher for controlled synchronous
-    // traps that originate from kernel task code. We currently accept
-    // scheduler-controlled `svc` calls from the current EL1 task path;
+    // traps that originate from kernel thread code. We currently accept
+    // scheduler-controlled `svc` calls from the current EL1 thread path;
     // any other synchronous exception remains fatal and goes through
     // `exception_entry()` for diagnostics + halt.
-    if vector == VECTOR_CURRENT_EL_SPX_SYNC && ec == esr::EC_SVC_AARCH64 && iss == ISS_SVC_TASK_CALL
+    if vector == VECTOR_CURRENT_EL_SPX_SYNC
+        && ec == esr::EC_SVC_AARCH64
+        && iss == ISS_SVC_SCHED_CALL
     {
         // SAFETY: exception assembly supplies the live frame for this entry.
         let frame = unsafe { live_trap_frame(frame) };
-        // SAFETY: `exceptions.s` saved a live trap frame for the current EL1 task before
-        // calling into Rust. `x0` carries a pointer to the typed task-call request
-        // from `arch_task_call()`.
+        // SAFETY: `exceptions.s` saved a live trap frame for the current EL1 thread before
+        // calling into Rust. `x0` carries a pointer to the typed sched-call request
+        // from `arch_sched_call()`.
         let request = frame.x[0] as *const core::ffi::c_void;
         // SAFETY: this controlled current-EL SVC owns one live frame until the
-        // task-call dispatcher returns or replaces it through the scheduler.
+        // sched-call dispatcher returns or replaces it through the scheduler.
         let mut active = unsafe { context::active_context(frame) };
-        kernel::task_call::on_arch_task_call(&mut active, request);
+        kernel::sched::call::on_arch_sched_call(&mut active, request);
         return;
     }
 
@@ -72,7 +74,7 @@ pub extern "C" fn lower_el_sync_entry(vector: u64, frame: *mut TrapFrame) {
     let iss = esr::iss(raw_esr);
 
     // This is the userspace syscall/fault boundary. It is deliberately separate
-    // from `sync_entry()`, whose SVC #0 ABI is reserved for controlled EL1 task
+    // from `sync_entry()`, whose SVC #0 ABI is reserved for controlled EL1 thread
     // calls such as sleep, mailbox wait, exit, and join.
     let far = read_far_el1();
     // SAFETY: exception assembly supplies the live frame for this entry.
