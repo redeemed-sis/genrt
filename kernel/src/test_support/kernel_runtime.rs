@@ -34,7 +34,7 @@ const MAILBOX_INITIALIZING: u8 = 1;
 const MAILBOX_READY: u8 = 2;
 const CYCLE_WORKERS: usize = 3;
 const CYCLE_EXIT_BASE: usize = 0x80;
-const EARLY_WAKE_CYCLES: usize =
+const WAIT_TOKEN_STRESS_CYCLES: usize =
     (crate::config::KERNEL_THREAD_CAPACITY * crate::time::TIMED_EVENT_CAPACITY_PER_TASK) + 1;
 
 struct TestMailboxCell {
@@ -62,11 +62,42 @@ static GUARD_PEER_PROGRESS: AtomicUsize = AtomicUsize::new(0);
 static WAKEUP_STAGE: AtomicUsize = AtomicUsize::new(0);
 static WAKEUP_DEADLINE: AtomicU64 = AtomicU64::new(0);
 static READY_QUEUE_RUNS: AtomicUsize = AtomicUsize::new(0);
-static WAKE_ONCE_STAGE: AtomicUsize = AtomicUsize::new(0);
-static WAKE_ONCE_RUNS: AtomicUsize = AtomicUsize::new(0);
-static WAKE_ONCE_DEADLINE: AtomicU64 = AtomicU64::new(0);
-static SLOT_REUSE_STAGE: AtomicUsize = AtomicUsize::new(0);
+static WAIT_TOKEN_PUBLISH_COUNT: AtomicUsize = AtomicUsize::new(0);
+static WAIT_WORKER_RUNS: AtomicUsize = AtomicUsize::new(0);
+static WAIT_WORKER_STAGE: AtomicUsize = AtomicUsize::new(0);
+static WAIT_CAUSE_A: AtomicUsize = AtomicUsize::new(0);
+static WAIT_CAUSE_B: AtomicUsize = AtomicUsize::new(0);
+static MAILBOX_WAIT_RESULT: AtomicUsize = AtomicUsize::new(0);
 static TEST_PREEMPT_LOCK: PreemptLock<usize> = PreemptLock::new(0);
+
+struct PublishedWaitToken(UnsafeCell<MaybeUninit<sched::WaitToken>>);
+
+// SAFETY: the worker writes one Copy token before publishing the release
+// counter; the coordinator reads only after the matching acquire observation.
+// Test cases serialize publications and never overwrite a token while read.
+unsafe impl Sync for PublishedWaitToken {}
+
+static PUBLISHED_WAIT_TOKEN: PublishedWaitToken =
+    PublishedWaitToken(UnsafeCell::new(MaybeUninit::uninit()));
+
+/// Publish one exact token from the test-only scheduler wait seam.
+///
+/// The write is paired with a release counter increment so the coordinator can
+/// observe it without allocation or production scheduler hooks.
+///
+/// # Arguments
+///
+/// * `token` - Exact wait registration prepared by the current worker.
+///
+/// # Returns
+///
+/// Returns after publishing the token for one bounded contract step.
+pub(crate) fn publish_wait_token(token: sched::WaitToken) {
+    // SAFETY: contract cases serialize one writer and wait for each publication
+    // before allowing the worker to publish another token.
+    unsafe { (*PUBLISHED_WAIT_TOKEN.0.get()).write(token) };
+    WAIT_TOKEN_PUBLISH_COUNT.fetch_add(1, Ordering::Release);
+}
 
 /// Record one timer IRQ for bounded kernel-runtime contract coordination.
 ///
@@ -170,13 +201,42 @@ fn coordinator(_arg: ThreadArg) -> usize {
     run_ready_queue_no_duplicates();
     protocol::pass("ready-queue-no-duplicates");
 
-    protocol::case_start("blocked-wake-once");
-    run_blocked_wake_once();
-    protocol::pass("blocked-wake-once");
+    protocol::case_start("wake-before-block");
+    check_test_wait(0, crate::sched::WaitCause::Notified, "wake-before-block");
+    protocol::pass("wake-before-block");
 
-    protocol::case_start("thread-slot-reuse");
-    run_thread_slot_reuse();
-    protocol::pass("thread-slot-reuse");
+    protocol::case_start("duplicate-wake");
+    run_blocked_first_wins(
+        "duplicate-wake",
+        sched::WaitCause::Notified,
+        sched::WaitCause::Notified,
+    );
+    protocol::pass("duplicate-wake");
+
+    protocol::case_start("event-timeout-race");
+    run_blocked_first_wins(
+        "event-timeout-race",
+        sched::WaitCause::Notified,
+        sched::WaitCause::Timeout,
+    );
+    run_blocked_first_wins(
+        "event-timeout-race",
+        sched::WaitCause::Timeout,
+        sched::WaitCause::Notified,
+    );
+    protocol::pass("event-timeout-race");
+
+    protocol::case_start("late-timeout-does-not-wake-next-wait");
+    run_late_timeout_against_next_wait();
+    protocol::pass("late-timeout-does-not-wake-next-wait");
+
+    protocol::case_start("wait-token-slot-reuse");
+    run_wait_token_slot_reuse();
+    protocol::pass("wait-token-slot-reuse");
+
+    protocol::case_start("mailbox-timed-receive");
+    run_mailbox_timed_receive();
+    protocol::pass("mailbox-timed-receive");
 
     protocol::case_start("timer-preemption");
     PREEMPT_STAGE.store(1, Ordering::Release);
@@ -344,131 +404,201 @@ fn ready_queue_worker(_arg: ThreadArg) -> usize {
     0
 }
 
-fn run_blocked_wake_once() {
-    WAKE_ONCE_STAGE.store(0, Ordering::Release);
-    WAKE_ONCE_RUNS.store(0, Ordering::Release);
-    WAKE_ONCE_DEADLINE.store(0, Ordering::Release);
+fn check_test_wait(mode: u64, expected: sched::WaitCause, case: &str) {
+    if crate::task_call::test_wait(mode).cause() != expected {
+        protocol::fail(case, "WRONG_CAUSE");
+    }
+    sched::validate_invariants_for_test();
+}
+
+fn run_blocked_first_wins(case: &str, first: sched::WaitCause, second: sched::WaitCause) {
+    WAIT_WORKER_RUNS.store(0, Ordering::Release);
+    WAIT_CAUSE_A.store(0, Ordering::Release);
+    let published = WAIT_TOKEN_PUBLISH_COUNT.load(Ordering::Acquire);
     let worker = sched::thread_spawn(
-        wake_once_worker,
+        exact_wait_worker,
         ThreadArg::empty(),
         ThreadAttrs::joinable(),
     )
-    .unwrap_or_else(|_| protocol::fail("blocked-wake-once", "SPAWN"));
-    while WAKE_ONCE_STAGE.load(Ordering::Acquire) != 1 {
-        sched::yield_now();
+    .unwrap_or_else(|_| protocol::fail(case, "SPAWN"));
+    let (_, token) = wait_for_published_wait(published, case);
+
+    // Keep the completed worker from consuming its token between the two
+    // completion attempts. IRQs still run, but the guard defers the optional
+    // handoff until the duplicate result has been observed deterministically.
+    let guard = PreemptGuard::enter();
+    if sched::complete_wait(token, first) != sched::CompletionResult::WokeBlocked {
+        protocol::fail(case, "FIRST_DID_NOT_WAKE");
     }
-    let deadline = WAKE_ONCE_DEADLINE.load(Ordering::Acquire);
-    if deadline == 0 {
-        protocol::fail("blocked-wake-once", "NO_DEADLINE");
+    if sched::complete_wait(token, second) != sched::CompletionResult::AlreadyCompleted {
+        protocol::fail(case, "SECOND_CHANGED_STATE");
     }
-    {
-        let _guard = PreemptGuard::enter();
-        while crate::time::now_counter() < deadline {
-            core::hint::spin_loop();
-        }
-        let baseline = TIMER_IRQ_COUNT.load(Ordering::Acquire);
-        wait_for_timer_irqs_after(baseline, 1);
-        if sched::wake_thread_for_test(worker) || sched::wake_thread_for_test(worker) {
-            protocol::fail("blocked-wake-once", "DUPLICATE_WAKE_CHANGED_STATE");
-        }
-        sched::validate_invariants_for_test();
-        if WAKE_ONCE_STAGE.load(Ordering::Acquire) != 1
-            || WAKE_ONCE_RUNS.load(Ordering::Acquire) != 0
-        {
-            protocol::fail("blocked-wake-once", "WAKE_NOT_DEFERRED");
-        }
-    }
+    drop(guard);
     if sched::thread_join(worker) != Ok(0)
-        || WAKE_ONCE_STAGE.load(Ordering::Acquire) != 2
-        || WAKE_ONCE_RUNS.load(Ordering::Acquire) != 1
+        || WAIT_WORKER_RUNS.load(Ordering::Acquire) != 1
+        || WAIT_CAUSE_A.load(Ordering::Acquire) != encode_wait_cause(first)
     {
-        protocol::fail("blocked-wake-once", "DUPLICATE_OR_MISSING_RUN");
-    }
-    // A late duplicate wake for the reclaimed generation is externally stale
-    // input and must remain a no-op.
-    if sched::wake_thread_for_test(worker) {
-        protocol::fail("blocked-wake-once", "LATE_WAKE_CHANGED_STATE");
+        protocol::fail(case, "WRONG_WINNER_OR_RUN_COUNT");
     }
     sched::validate_invariants_for_test();
-    run_early_wake_cleanup_stress();
 }
 
-fn wake_once_worker(_arg: ThreadArg) -> usize {
-    let deadline = crate::time::now_counter().wrapping_add(crate::time::ms_to_counts(10));
-    WAKE_ONCE_DEADLINE.store(deadline, Ordering::Release);
-    WAKE_ONCE_STAGE.store(1, Ordering::Release);
-    sched::sleep_until_counter(deadline);
-    WAKE_ONCE_RUNS.fetch_add(1, Ordering::AcqRel);
-    WAKE_ONCE_STAGE.store(2, Ordering::Release);
+fn exact_wait_worker(_arg: ThreadArg) -> usize {
+    let completion = crate::task_call::test_wait(5);
+    WAIT_CAUSE_A.store(encode_wait_cause(completion.cause()), Ordering::Release);
+    WAIT_WORKER_RUNS.fetch_add(1, Ordering::AcqRel);
     0
 }
 
-fn run_early_wake_cleanup_stress() {
-    for _ in 0..EARLY_WAKE_CYCLES {
-        WAKE_ONCE_STAGE.store(0, Ordering::Release);
+fn run_late_timeout_against_next_wait() {
+    const CASE: &str = "late-timeout-does-not-wake-next-wait";
+    WAIT_WORKER_STAGE.store(0, Ordering::Release);
+    WAIT_CAUSE_A.store(0, Ordering::Release);
+    WAIT_CAUSE_B.store(0, Ordering::Release);
+    let published = WAIT_TOKEN_PUBLISH_COUNT.load(Ordering::Acquire);
+    let worker = sched::thread_spawn(two_wait_worker, ThreadArg::empty(), ThreadAttrs::joinable())
+        .unwrap_or_else(|_| protocol::fail(CASE, "SPAWN"));
+    let (first_publication, first) = wait_for_published_wait(published, CASE);
+    if sched::complete_wait(first, sched::WaitCause::Notified)
+        != sched::CompletionResult::WokeBlocked
+    {
+        protocol::fail(CASE, "FIRST_DID_NOT_WAKE");
+    }
+    let (_, second) = wait_for_published_wait(first_publication, CASE);
+    if sched::complete_wait(first, sched::WaitCause::Timeout) != sched::CompletionResult::Stale
+        || WAIT_WORKER_STAGE.load(Ordering::Acquire) != 1
+    {
+        protocol::fail(CASE, "STALE_TIMEOUT_WOKE_NEXT");
+    }
+    if sched::complete_wait(second, sched::WaitCause::Notified)
+        != sched::CompletionResult::WokeBlocked
+        || sched::thread_join(worker) != Ok(0)
+        || WAIT_WORKER_STAGE.load(Ordering::Acquire) != 2
+        || WAIT_CAUSE_A.load(Ordering::Acquire) != encode_wait_cause(sched::WaitCause::Notified)
+        || WAIT_CAUSE_B.load(Ordering::Acquire) != encode_wait_cause(sched::WaitCause::Notified)
+    {
+        protocol::fail(CASE, "NEXT_WAIT_BAD_RESULT");
+    }
+    sched::validate_invariants_for_test();
+}
+
+fn two_wait_worker(_arg: ThreadArg) -> usize {
+    let first = crate::task_call::test_wait(5);
+    WAIT_CAUSE_A.store(encode_wait_cause(first.cause()), Ordering::Release);
+    WAIT_WORKER_STAGE.store(1, Ordering::Release);
+    let second = crate::task_call::test_wait(5);
+    WAIT_CAUSE_B.store(encode_wait_cause(second.cause()), Ordering::Release);
+    WAIT_WORKER_STAGE.store(2, Ordering::Release);
+    0
+}
+
+fn run_wait_token_slot_reuse() {
+    const CASE: &str = "wait-token-slot-reuse";
+    let published = WAIT_TOKEN_PUBLISH_COUNT.load(Ordering::Acquire);
+    let first_thread = sched::thread_spawn(
+        exact_wait_worker,
+        ThreadArg::empty(),
+        ThreadAttrs::joinable(),
+    )
+    .unwrap_or_else(|_| protocol::fail(CASE, "SPAWN_A"));
+    let (first_publication, first_token) = wait_for_published_wait(published, CASE);
+    if sched::complete_wait(first_token, sched::WaitCause::Notified)
+        != sched::CompletionResult::WokeBlocked
+        || sched::thread_join(first_thread) != Ok(0)
+    {
+        protocol::fail(CASE, "COMPLETE_A");
+    }
+
+    WAIT_WORKER_RUNS.store(0, Ordering::Release);
+    let second_thread = sched::thread_spawn(
+        exact_wait_worker,
+        ThreadArg::empty(),
+        ThreadAttrs::joinable(),
+    )
+    .unwrap_or_else(|_| protocol::fail(CASE, "SPAWN_B"));
+    let (_, second_token) = wait_for_published_wait(first_publication, CASE);
+    if first_thread.index() != second_thread.index()
+        || first_thread.generation() == second_thread.generation()
+        || sched::complete_wait(first_token, sched::WaitCause::Timeout)
+            != sched::CompletionResult::Stale
+        || WAIT_WORKER_RUNS.load(Ordering::Acquire) != 0
+    {
+        protocol::fail(CASE, "STALE_TOKEN_WOKE_REUSED_SLOT");
+    }
+    if sched::complete_wait(second_token, sched::WaitCause::Notified)
+        != sched::CompletionResult::WokeBlocked
+        || sched::thread_join(second_thread) != Ok(0)
+        || WAIT_WORKER_RUNS.load(Ordering::Acquire) != 1
+    {
+        protocol::fail(CASE, "COMPLETE_B");
+    }
+    sched::validate_invariants_for_test();
+}
+
+fn wait_for_published_wait(previous: usize, case: &str) -> (usize, sched::WaitToken) {
+    let deadline = crate::time::now_counter().wrapping_add(crate::time::ms_to_counts(250));
+    loop {
+        let observed = WAIT_TOKEN_PUBLISH_COUNT.load(Ordering::Acquire);
+        if observed > previous {
+            // SAFETY: the release/acquire counter pair publishes the initialized
+            // Copy token, and cases serialize one publication at a time.
+            let token = unsafe { (*PUBLISHED_WAIT_TOKEN.0.get()).assume_init_read() };
+            return (observed, token);
+        }
+        if crate::time::now_counter() >= deadline {
+            protocol::fail(case, "TOKEN_PUBLICATION_TIMEOUT");
+        }
+        sched::yield_now();
+    }
+}
+
+const fn encode_wait_cause(cause: sched::WaitCause) -> usize {
+    match cause {
+        sched::WaitCause::Notified => 1,
+        sched::WaitCause::Timeout => 2,
+    }
+}
+
+fn run_mailbox_timed_receive() {
+    const CASE: &str = "mailbox-timed-receive";
+    for _ in 0..WAIT_TOKEN_STRESS_CYCLES {
+        MAILBOX_WAIT_RESULT.store(0, Ordering::Release);
         let worker = sched::thread_spawn(
-            distant_sleep_worker,
+            mailbox_timed_worker,
             ThreadArg::empty(),
             ThreadAttrs::joinable(),
         )
-        .unwrap_or_else(|_| protocol::fail("blocked-wake-once", "EARLY_SPAWN"));
-        while WAKE_ONCE_STAGE.load(Ordering::Acquire) != 1 {
+        .unwrap_or_else(|_| protocol::fail(CASE, "SPAWN"));
+        let deadline = crate::time::now_counter().wrapping_add(crate::time::ms_to_counts(250));
+        while test_mailbox().waiter_count_for_test() == 0 {
+            if crate::time::now_counter() >= deadline {
+                protocol::fail(CASE, "WAITER_PUBLICATION_TIMEOUT");
+            }
             sched::yield_now();
         }
-        let task = crate::task::TaskId::new(worker.index());
-        while !sched::wake_task_for_test(task) {
-            sched::yield_now();
+        if test_mailbox().waiter_count_for_test() != 1 {
+            protocol::fail(CASE, "DUPLICATE_OWNER_REGISTRATION");
         }
-        if sched::thread_join(worker) != Ok(0) {
-            protocol::fail("blocked-wake-once", "EARLY_JOIN");
+        test_mailbox().send(DELIVERY_VALUE);
+        if sched::thread_join(worker) != Ok(0)
+            || MAILBOX_WAIT_RESULT.load(Ordering::Acquire) != DELIVERY_VALUE
+            || test_mailbox().waiter_count_for_test() != 0
+        {
+            protocol::fail(CASE, "EVENT_COMPLETION_OR_CLEANUP");
         }
     }
-    sched::validate_invariants_for_test();
-}
 
-fn distant_sleep_worker(_arg: ThreadArg) -> usize {
-    WAKE_ONCE_STAGE.store(1, Ordering::Release);
-    sched::msleep(60_000);
-    0
-}
-
-fn run_thread_slot_reuse() {
-    let first = sched::thread_spawn(worker, ThreadArg::empty(), ThreadAttrs::joinable())
-        .unwrap_or_else(|_| protocol::fail("thread-slot-reuse", "SPAWN_A"));
-    if sched::thread_join(first) != Ok(WORKER_EXIT) {
-        protocol::fail("thread-slot-reuse", "JOIN_A");
-    }
-    SLOT_REUSE_STAGE.store(0, Ordering::Release);
-    let second = sched::thread_spawn(
-        slot_reuse_worker,
-        ThreadArg::empty(),
-        ThreadAttrs::joinable(),
-    )
-    .unwrap_or_else(|_| protocol::fail("thread-slot-reuse", "SPAWN_B"));
-    while SLOT_REUSE_STAGE.load(Ordering::Acquire) != 1 {
-        sched::yield_now();
-    }
-    let stale_woke_reused_slot = {
-        let _guard = PreemptGuard::enter();
-        let woke = sched::wake_thread_for_test(first);
-        sched::validate_invariants_for_test();
-        woke
-    };
-    if first.index() != second.index()
-        || first.generation() == second.generation()
-        || stale_woke_reused_slot
-        || sched::thread_join(first) != Err(sched::JoinError::InvalidThread)
-        || sched::thread_join(second) != Ok(WORKER_EXIT)
+    if test_mailbox().recv_timeout_ms(5) != Err(RecvTimeoutError::Timeout)
+        || test_mailbox().waiter_count_for_test() != 0
     {
-        protocol::fail("thread-slot-reuse", "STALE_HANDLE");
+        protocol::fail(CASE, "TIMEOUT_COMPLETION_OR_CLEANUP");
     }
-    sched::validate_invariants_for_test();
 }
 
-fn slot_reuse_worker(_arg: ThreadArg) -> usize {
-    SLOT_REUSE_STAGE.store(1, Ordering::Release);
-    sched::msleep(25);
-    WORKER_EXIT
+fn mailbox_timed_worker(_arg: ThreadArg) -> usize {
+    let value = test_mailbox().recv_timeout_ms(5_000).unwrap_or(0);
+    MAILBOX_WAIT_RESULT.store(value, Ordering::Release);
+    0
 }
 
 fn run_preempt_lock_case() {

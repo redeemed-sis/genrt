@@ -41,12 +41,32 @@ subject = "ready-queue-no-duplicates"
 [[steps]]
 action = "expect_case"
 producer = "kernel"
-subject = "blocked-wake-once"
+subject = "wake-before-block"
 
 [[steps]]
 action = "expect_case"
 producer = "kernel"
-subject = "thread-slot-reuse"
+subject = "duplicate-wake"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "event-timeout-race"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "late-timeout-does-not-wake-next-wait"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "wait-token-slot-reuse"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "mailbox-timed-receive"
 
 [[steps]]
 action = "expect_case"
