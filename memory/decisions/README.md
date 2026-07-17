@@ -36,5 +36,6 @@ growth.
 | [0028](ADR-0028-typed-saved-context-and-scheduler-ownership.md) | Typed saved context and scheduler ownership | Accepted | Scheduler/AArch64 context ownership | [0011](ADR-0011-dynamic-preallocated-scheduler-and-time-structures.md) (saved-frame backing), [0027](ADR-0027-typed-active-context-and-syscall-boundary.md) (saved-frame bridge) | - |
 | [0029](ADR-0029-local-irq-and-task-preemption-exclusion.md) | Local IRQ and task preemption exclusion | Accepted | Synchronization/memory/RT | [0010](ADR-0010-irq-safe-kernel-heap-lock-and-allocation-policy.md) (heap lock ownership), [0012](ADR-0012-bounded-mailbox-ipc.md) (lock naming) | [0030](ADR-0030-nested-preemption-control-and-deferred-rescheduling.md) (transitional preemption backend only) |
 | [0030](ADR-0030-nested-preemption-control-and-deferred-rescheduling.md) | Nested preemption control and deferred rescheduling | Accepted | Synchronization/scheduler/RT | [0029](ADR-0029-local-irq-and-task-preemption-exclusion.md) (transitional preemption backend only) | - |
+| [0031](ADR-0031-centralized-scheduler-state-transitions.md) | Centralized scheduler state transitions | Accepted | Scheduler/lifecycle/RT | - | - |
 
 Use [`TEMPLATE.md`](TEMPLATE.md) for new decisions.

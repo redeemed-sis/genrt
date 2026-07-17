@@ -9,8 +9,6 @@ explicit acceptance criteria.
 1. **Scheduler and frame lifecycle**
    - consolidate duplicated block/wake entry points and clarify Task/Thread
      ownership without erasing the user/kernel distinction;
-   - centralize scheduler state transitions and eliminate direct thread-slot
-     state mutation outside that transition layer;
    - measure bounded queue behavior and critical-section length.
 2. **Process decomposition**
    - separate process table/lifecycle, image loading, wait/join, FD access, and

@@ -63,6 +63,15 @@ Changes that invalidate one require architecture review and an ADR.
   lock and must not be documented as one.
 - Task, thread, and process handles use generations; stale handles never name a
   reused slot.
+- Scheduler lifecycle state, slot generation, current identity, and ready-queue
+  membership change only through the scheduler transition layer. A non-idle
+  `Ready` task has exactly one current-generation queue entry, and the sole
+  `Running` task is exactly `current`.
+- Scheduler-owned timed wake, quantum, and timeout events carry generation
+  identity; an event for a reclaimed thread cannot affect a reused slot.
+- Scheduler transition selection is separate from context handoff: transition
+  code does not inspect architecture frame layout, and handoff code does not
+  reopen task lifecycle state.
 - Terminal thread and process status is single-consumer where a join/wait API
   promises one waiter.
 - Wake paths make runnable work visible to the ready queue and rearm scheduling

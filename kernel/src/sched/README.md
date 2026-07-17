@@ -18,6 +18,30 @@ Block reasons cover sleep, IPC, thread join, process wait, and stdin. The
 scheduler stores enough typed identity to validate a wake but does not own the
 external wait condition.
 
+All lifecycle mutations pass through the private `sched::transition` layer.
+That layer changes task state, generation, `current`, and ready-queue membership
+as one scheduler operation. Other scheduler modules own policy and context
+handoff, but cannot write those fields directly.
+
+The accepted transition table is:
+
+| Source | Destination | Operation |
+| --- | --- | --- |
+| `Free` | `Ready` | bootstrap or runtime publication |
+| `Ready` | `Running` | initial dispatch or task selection |
+| `Running` | `Ready` | optional round-robin switch |
+| `Running` | `Blocked(reason)` | mandatory blocking handoff |
+| `Blocked(reason)` | `Ready` | validated wake by the owning subsystem |
+| `Running` | `Zombie` | joinable exit |
+| `Zombie` | `Free` | status consumption and slot reclaim |
+
+Detached exit may perform `Running -> Zombie -> Free` inside one mandatory
+handoff. Internal impossible transitions panic. Duplicate or stale
+generation-bearing wake notifications remain no-ops. Ready-queue identities
+are complete `ThreadId` values, so a reused slot cannot inherit stale queue
+ownership. Sleep, quantum, and IPC-timeout events also carry `ThreadId`; an
+expired event from an older generation cannot affect a reused slot.
+
 ## Preemption and time
 
 The architected timer is programmed to the nearest deadline. `kernel::time`
@@ -28,7 +52,9 @@ in the interrupt path.
 
 Ready-queue insertion notifies the scheduler when a runnable peer appears so
 idle cannot remain selected indefinitely. A quantum switch is committed only at
-the frame-handoff boundary.
+the frame-handoff boundary. The transition layer returns a context-free switch
+outcome; `preempt` and `thread` code then save or restore `SavedContext` values
+and activate TTBR0 without reopening lifecycle state.
 
 Task-only preemption exclusion is nested and IRQ-enabled. Quantum expiration
 and deadline wakeups continue their bounded IRQ bookkeeping while a guard is
@@ -40,9 +66,10 @@ yield uses the same checkpoint and therefore cannot bypass a guard.
 ## Block and wake
 
 A blocking operation joins waiter registration with scheduler blocking under a
-short local IRQ critical section, closing lost-wakeup windows. The current frame
-is saved before another task or idle is selected. Wake paths validate the
-expected block identity, transition the task to ready, enqueue it, and request
+short local IRQ critical section, closing lost-wakeup windows. The transition
+commits the outgoing block and incoming selection before handoff code saves the
+outgoing frame and restores the selected task. Wake paths validate the expected
+block identity, transition the task to ready, enqueue it, and request
 rescheduling when needed.
 
 Sleep, blocking IPC/stdin/join/process waits, and thread/process exit fail fast
@@ -77,8 +104,10 @@ their own finite static-task arrays without changing round-robin behavior.
   progress.
 - No heap allocation or unbounded work in scheduling/timer fast paths.
 - Idle is the permanent fallback and is never joinable or reclaimed.
+- Debug and QEMU-test builds validate state/context/queue/current consistency
+  after transitions using a bounded, allocation-free table walk.
 - `SavedContext` layout is opaque to scheduler policy; Rust and architecture
   trap-frame handoff contracts change together inside the architecture facade.
 
 Related decisions: ADR-0003, ADR-0005, ADR-0006, ADR-0011 through ADR-0014,
-ADR-0020, and ADR-0027 through ADR-0030.
+ADR-0020, and ADR-0027 through ADR-0031.

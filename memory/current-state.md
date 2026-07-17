@@ -73,6 +73,14 @@ accepted ADRs remain authoritative when details differ.
   waits and terminal task/process transitions fail fast under a guard.
 - Kernel thread slots, stacks, ready queues, and handles are bounded and
   generation-checked.
+- The private scheduler transition layer exclusively mutates task state, slot
+  generation, current identity, and ready-queue membership. Ready entries carry
+  complete `ThreadId` generations; debug and QEMU-test builds run a bounded
+  invariant validator after lifecycle transitions.
+- Sleep, scheduler-quantum, and IPC-timeout events carry `ThreadId` generation
+  identity, so stale timed events cannot target a reused slot.
+- Transition selection returns a context-free switch outcome. Context
+  save/restore, TTBR0 activation, and switch logging remain in handoff code.
 - Sleep, thread join, process wait, mailbox waits, and stdin waits block through
   scheduler-owned state transitions rather than polling.
 

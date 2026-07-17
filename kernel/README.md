@@ -44,6 +44,11 @@ Blocking syscall/task-call paths record a reason, commit scheduler state, and
 resume another task. Wakeup owners remain in time, IPC, process, or console
 layers; the scheduler owns runnable state and queue visibility.
 
+The private scheduler transition layer is the sole writer of lifecycle state,
+slot generation, current-task identity, and ready-queue membership. It returns
+context-free switch outcomes; architecture-neutral handoff code separately
+saves and restores typed contexts and activates the selected address space.
+
 Architecture entry code wraps each live exception frame in one non-null,
 exclusive `ActiveContext`. Generic syscall handlers receive a decoded
 `SyscallRequest` and mutate return state only through that context. Each
