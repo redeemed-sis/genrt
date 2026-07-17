@@ -30,9 +30,9 @@ accepted ADRs remain authoritative when details differ.
   frame ranges.
 - A fixed 16 MiB bootstrap heap is allocated from physical frames and exposed
   through the high direct map.
-- Heap allocation is permitted during bootstrap and task context. The heap and
-  runtime physical frame allocator use task-only `PreemptLock`. Its nested
-  disable depth permits IRQ progress, forbids task handoff until unlock, and is
+- Heap allocation is permitted during bootstrap and thread context. The heap and
+  runtime physical frame allocator use thread-context-only `PreemptLock`. Its nested
+  disable depth permits IRQ progress, forbids thread handoff until unlock, and is
   forbidden in IRQ paths.
 - Boot-discovered physical regions and the heap range are immutable after
   initialization. Runtime free-list state is separately locked and does not
@@ -41,8 +41,9 @@ accepted ADRs remain authoritative when details differ.
   entering IRQ-sensitive operation.
 - Runtime TTBR1 APIs map, unmap, protect, and translate kernel regions after
   the boot tables have been replaced.
-- Each user process owns an allocator-backed TTBR0 root. ELF segments and the
-  user stack use 4 KiB mappings with user-specific permissions.
+- Each user process owns an allocator-backed `OwnedUserAddressSpace`. ELF
+  segments and thread-owned user stacks use 4 KiB mappings with user-specific
+  permissions.
 - `copy_from_user` and `copy_to_user` validate the active user address space;
   fault recovery during the actual copy is not implemented yet.
 
@@ -66,14 +67,19 @@ accepted ADRs remain authoritative when details differ.
 - `kernel::time` owns the preallocated deadline queue for exact wait deadlines
   and scheduler quantum expiration.
 - Reschedule requests coalesce in `kernel::sync::preempt`. Timer IRQ return and
-  a private typed task-call checkpoint may consume them only at disable depth
+  a private typed sched-call checkpoint may consume them only at disable depth
   zero; outermost guard release invokes that checkpoint automatically when the
   saved IRQ state is safe.
-- Kernel yield under preemption exclusion returns to the same task. Blocking
-  waits and terminal task/process transitions fail fast under a guard.
+- Kernel yield under preemption exclusion returns to the same thread. Blocking
+  waits and terminal thread/process transitions fail fast under a guard.
 - Kernel thread slots, stacks, ready queues, and handles are bounded and
   generation-checked.
-- The private scheduler transition layer exclusively mutates task state, slot
+- `ThreadId { index, generation }` directly indexes an occupied bounded slot;
+  free and stale generations are rejected without a second scheduler identity.
+- A free slot parks its preallocated kernel stack and next wait sequence. An
+  occupied `Thread` owns that stack, `SavedContext`, lifecycle/join state,
+  active wait metadata, and optional userspace resources.
+- The private scheduler transition layer exclusively mutates thread state, slot
   generation, current identity, and ready-queue membership. Ready entries carry
   complete `ThreadId` generations; debug and QEMU-test builds run a bounded
   invariant validator after lifecycle transitions.
@@ -93,11 +99,19 @@ accepted ADRs remain authoritative when details differ.
 ## Processes and userspace
 
 - The bounded process table owns process state, TTBR0 address spaces, loaded
-  ELF segments, user stacks, cwd, file descriptors, and exit/fault status.
+  ELF segments, cwd, file descriptors, relationships, exit/fault status, and
+  `main_thread: ThreadId`.
+- A user thread owns its `OwnedUserStack` and retains only a non-owning
+  `AddressSpaceId`. Scheduler code stores no `ProcessId` or process metadata;
+  the process table resolves the current process in O(1) through a fixed
+  thread-slot reverse index that validates `ThreadId`, `ProcessId`, and
+  `main_thread` generations.
 - `fork` eagerly clones the user address space and process resources.
 - `execve` loads a static AArch64 ELF from ramfs, replaces the current user
-  image, and builds bounded `argc`, `argv`, and `envp` data on the new stack.
-- `waitpid` supports a specific positive child PID with options `0`.
+  image and thread-owned stack, and builds bounded `argc`, `argv`, and `envp`.
+- `process_join` and `waitpid` consume process-owned status, then use ordinary
+  thread join/reap before releasing stack, ELF, and address-space resources.
+  `waitpid` supports a specific positive child PID with options `0`.
 - Lower-EL faults terminate the attributed user process and remain joinable;
   current-EL kernel faults stay fatal.
 - The syscall ABI supports `open`, `read`, `write`, `close`, `getdents64`,

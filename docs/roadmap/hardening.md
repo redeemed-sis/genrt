@@ -7,11 +7,15 @@ explicit acceptance criteria.
 ## High-value architecture work
 
 1. **Scheduler and frame lifecycle**
-   - measure bounded queue behavior and critical-section length.
+   - measure bounded queue behavior and critical-section length;
+   - define thread-group/address-space lifetime before adding multiple user
+     threads to one process.
 2. **Process decomposition**
    - separate process table/lifecycle, image loading, wait/join, FD access, and
-     user-stack construction currently concentrated in `process.rs`;
-   - preserve atomic consume/reclaim and rollback invariants during extraction.
+     user-stack staging currently concentrated in `process.rs`;
+   - preserve the current ownership transfer from process staging into
+     `Thread`, plus atomic consume/reclaim and rollback invariants, during
+     extraction.
 3. **Interrupt API boundaries**
    - replace ad hoc architecture dispatch wiring with explicit IRQ ownership
      interfaces while keeping GIC/ESR details in AArch64 code;

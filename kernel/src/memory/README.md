@@ -13,9 +13,9 @@ frames and stores free-list metadata through explicit high direct-map aliases.
 
 The bootstrap heap is one contiguous 16 MiB frame range. Once allocated, it is
 removed from the frame free list and initialized through its HVA. Allocation is
-allowed during bootstrap and task context. The heap and runtime frame free list
-use task-only `PreemptLock` ownership. IRQs remain enabled when permitted by the
-caller, while nested preemption exclusion prevents another task from observing
+allowed during bootstrap and thread context. The heap and runtime frame free list
+use thread-context-only `PreemptLock` ownership. IRQs remain enabled when permitted by the
+caller, while nested preemption exclusion prevents another thread from observing
 allocator mutation; a requested switch is deferred until the outermost lock is
 released. Boot-discovered regions and the heap range become immutable metadata
 after initialization and can be read without holding the allocator lock.
@@ -34,14 +34,27 @@ to its documented alignment and granularity.
 
 ## User address spaces
 
-Each process owns an allocator-backed TTBR0 root. User ELF segments and stacks
-use 4 KiB page mappings with descriptor-derived user, write, and execute
-permissions. Scheduler handoff activates the selected user root or clears TTBR0
-for a kernel thread.
+Each process owns a non-copyable `OwnedUserAddressSpace` backed by an
+allocator-owned TTBR0 root. Mapping code borrows that owner. Scheduler handoff
+stores only a copyable, non-owning `AddressSpaceId`, which can activate the
+selected root but cannot destroy it.
 
-Address-space destruction walks allocator-owned tables only. ELF segment and
-stack frames have separate ownership and are released by process lifecycle
-cleanup; QEMU/initramfs source bytes are not process-owned frames.
+User ELF segments and stacks use 4 KiB mappings with descriptor-derived user,
+write, and execute permissions. ELF frames remain process-owned. Each user
+thread owns one non-copyable `OwnedUserStack` containing its virtual range and
+physical frames. Generic thread join/reap releases that stack before process
+cleanup frees ELF frames and destroys the address-space owner. QEMU/initramfs
+source bytes are not process-owned frames.
+
+The current one-thread-per-process lifetime is:
+
+```text
+Process owns OwnedUserAddressSpace
+  -> Thread borrows identity as AddressSpaceId and owns OwnedUserStack
+  -> Thread exits and is reaped
+  -> OwnedUserStack frames are released
+  -> ELF frames and OwnedUserAddressSpace are released
+```
 
 ## User copies
 
@@ -65,4 +78,4 @@ belongs inside this module, not in individual syscalls.
 - No reference into mutable frame allocator state may escape its guard.
 
 Related decisions: ADR-0007, ADR-0009 through ADR-0011, ADR-0015, ADR-0016, and
-ADR-0029 and ADR-0030.
+ADR-0029, ADR-0030, and ADR-0033.

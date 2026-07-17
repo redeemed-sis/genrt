@@ -9,7 +9,7 @@ hooks.
 | Module | Responsibility |
 | --- | --- |
 | `memory` | Physical map, frame allocator, heap, kernel/user VM, user copies |
-| `sched`, `task`, `task_call` | Task states, preemption, typed waits, thread lifecycle |
+| `sched` | Thread states, controlled scheduler calls, preemption, typed waits, and lifecycle |
 | `time` | Monotonic counter conversion and one-shot timed events |
 | `ipc` | Bounded mailbox buffers, wait queues, and timeout integration |
 | `process` | Process table, address-space/image ownership, fork/exec/wait, cwd/FD access |
@@ -29,15 +29,18 @@ runtime TTBR1 tables, mounts initramfs, bootstraps scheduler storage, and enters
 the first selected trap frame. The init kernel thread spawns `/init` as a normal
 user process and joins it.
 
-The production scheduler starts with exactly two kernel tasks: the permanent
+The production scheduler starts with exactly two kernel threads: the permanent
 idle thread and one non-idle `kernel_init_thread`. QEMU scenario features replace
-the non-idle static-task set with their bounded test coordinators; production
+the non-idle static-thread set with their bounded test coordinators; production
 does not carry unrelated background workloads.
 
-Tasks are schedulable contexts. Kernel threads have only kernel state; user
-threads reference their owning process and TTBR0 address space. A process owns
-the userspace resources shared across its current single main thread: loaded
-ELF, stack, cwd, FDs, and terminal status.
+`Thread` is the only schedulable entity. `ThreadId { index, generation }`
+directly addresses one bounded slot. Kernel threads own kernel execution state;
+user threads additionally own one `OwnedUserStack` and retain only an opaque,
+non-owning `AddressSpaceId` for TTBR0 activation. A process owns the TTBR0 root,
+loaded ELF, cwd, FDs, relationships, and terminal status, and records its
+joinable `main_thread`. A fixed process-owned reverse index resolves the current
+thread to that process in O(1) without adding process metadata to the scheduler.
 
 Timer IRQs collect expired typed events and may choose a different return frame.
 Each blocking episode has an exact `WaitToken` containing a generation-aware
@@ -46,7 +49,7 @@ or console code publish and later complete that token; the scheduler owns only
 wait lifecycle, runnable state, and ready-queue visibility.
 
 The private scheduler transition layer is the sole writer of lifecycle state,
-slot generation, current-task identity, and ready-queue membership. It returns
+slot generation, current-thread identity, and ready-queue membership. It returns
 context-free switch outcomes; architecture-neutral handoff code separately
 saves and restores typed contexts and activates the selected address space.
 
@@ -61,17 +64,17 @@ frame.
 ## Allocation and synchronization
 
 The active system is single-core. `LocalIrqLock`/`LocalIrqGuard` protect state
-shared with interrupt handlers. `PreemptLock` identifies task-only state such
+shared with interrupt handlers. `PreemptLock` identifies thread-context-only state such
 as the fixed heap and runtime frame allocator. Its nested `PreemptGuard` leaves
 IRQs in their caller-selected state, coalesces scheduler requests, and performs
-a deferred handoff only at a typed timer-return or private task-call checkpoint.
-Neither domain is an SMP lock. Heap use is allowed in bootstrap and normal task
+a deferred handoff only at a typed timer-return or private sched-call checkpoint.
+Neither domain is an SMP lock. Heap use is allowed in bootstrap and normal thread
 context. IRQ, scheduler, timed-event, and frame-handoff paths operate on bounded
 preallocated storage.
 
-Blocking and terminal task transitions are forbidden under `PreemptGuard`.
+Blocking and terminal thread transitions are forbidden under `PreemptGuard`.
 Kernel yield under a guard records a pending reschedule and returns to the same
-task; release of the outermost guard triggers the controlled checkpoint when
+thread; release of the outermost guard triggers the controlled checkpoint when
 the saved IRQ state permits it.
 
 Resource cleanup occurs after ownership has been atomically removed under a
@@ -80,10 +83,12 @@ destruction do not run with IRQs disabled.
 
 ## Userspace lifecycle
 
-The process layer creates TTBR0 roots, loads static ELF segments, maps user
-stacks, and initializes EL0 frames through architecture helpers. `fork` performs
-bounded eager copying; `execve` stages a replacement before commit; process
-exit/fault wakes one registered waiter and leaves resources reclaimable.
+The process layer creates TTBR0 roots, loads static ELF segments, prepares user
+stacks, and transfers each stack into a normal joinable user thread. `fork`
+performs bounded eager copying; `execve` stages a replacement before atomically
+swapping process and current-thread resources; process exit/fault wakes its
+registered waiter and then uses ordinary thread exit/join/reap. Reap releases
+the user stack before the process destroys its ELF frames and address space.
 
 Lower-EL faults become `ProcessExitStatus::Faulted` when ownership is known.
 Kernel/current-EL faults remain fatal. User pointers are accessed only through
