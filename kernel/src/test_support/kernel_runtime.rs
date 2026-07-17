@@ -32,6 +32,10 @@ const ALLOCATOR_HEAP_FAILED: usize = 3;
 const MAILBOX_UNINITIALIZED: u8 = 0;
 const MAILBOX_INITIALIZING: u8 = 1;
 const MAILBOX_READY: u8 = 2;
+const CYCLE_WORKERS: usize = 3;
+const CYCLE_EXIT_BASE: usize = 0x80;
+const EARLY_WAKE_CYCLES: usize =
+    (crate::config::KERNEL_THREAD_CAPACITY * crate::time::TIMED_EVENT_CAPACITY_PER_TASK) + 1;
 
 struct TestMailboxCell {
     value: UnsafeCell<MaybeUninit<Mailbox<usize>>>,
@@ -57,6 +61,11 @@ static GUARD_PEER_STAGE: AtomicUsize = AtomicUsize::new(0);
 static GUARD_PEER_PROGRESS: AtomicUsize = AtomicUsize::new(0);
 static WAKEUP_STAGE: AtomicUsize = AtomicUsize::new(0);
 static WAKEUP_DEADLINE: AtomicU64 = AtomicU64::new(0);
+static READY_QUEUE_RUNS: AtomicUsize = AtomicUsize::new(0);
+static WAKE_ONCE_STAGE: AtomicUsize = AtomicUsize::new(0);
+static WAKE_ONCE_RUNS: AtomicUsize = AtomicUsize::new(0);
+static WAKE_ONCE_DEADLINE: AtomicU64 = AtomicU64::new(0);
+static SLOT_REUSE_STAGE: AtomicUsize = AtomicUsize::new(0);
 static TEST_PREEMPT_LOCK: PreemptLock<usize> = PreemptLock::new(0);
 
 /// Record one timer IRQ for bounded kernel-runtime contract coordination.
@@ -152,6 +161,22 @@ fn coordinator(_arg: ThreadArg) -> usize {
         protocol::fail("thread-join", "BAD_STATUS");
     }
     protocol::pass("thread-join");
+
+    protocol::case_start("scheduler-transition-cycle");
+    run_scheduler_transition_cycle();
+    protocol::pass("scheduler-transition-cycle");
+
+    protocol::case_start("ready-queue-no-duplicates");
+    run_ready_queue_no_duplicates();
+    protocol::pass("ready-queue-no-duplicates");
+
+    protocol::case_start("blocked-wake-once");
+    run_blocked_wake_once();
+    protocol::pass("blocked-wake-once");
+
+    protocol::case_start("thread-slot-reuse");
+    run_thread_slot_reuse();
+    protocol::pass("thread-slot-reuse");
 
     protocol::case_start("timer-preemption");
     PREEMPT_STAGE.store(1, Ordering::Release);
@@ -261,6 +286,191 @@ fn worker(_arg: ThreadArg) -> usize {
     WORKER_EXIT
 }
 
+fn run_scheduler_transition_cycle() {
+    let mut workers = [None; CYCLE_WORKERS];
+    for (index, worker) in workers.iter_mut().enumerate() {
+        *worker = Some(
+            sched::thread_spawn(
+                transition_cycle_worker,
+                ThreadArg::from_usize(index),
+                ThreadAttrs::joinable(),
+            )
+            .unwrap_or_else(|_| protocol::fail("scheduler-transition-cycle", "SPAWN")),
+        );
+    }
+    for (index, worker) in workers.into_iter().enumerate() {
+        if sched::thread_join(
+            worker.unwrap_or_else(|| protocol::fail("scheduler-transition-cycle", "MISSING")),
+        ) != Ok(CYCLE_EXIT_BASE + index)
+        {
+            protocol::fail("scheduler-transition-cycle", "JOIN");
+        }
+        sched::validate_invariants_for_test();
+    }
+}
+
+fn transition_cycle_worker(arg: ThreadArg) -> usize {
+    sched::yield_now();
+    sched::msleep(1);
+    CYCLE_EXIT_BASE + arg.as_usize()
+}
+
+fn run_ready_queue_no_duplicates() {
+    READY_QUEUE_RUNS.store(0, Ordering::Release);
+    let guard = PreemptGuard::enter();
+    let worker = sched::thread_spawn(
+        ready_queue_worker,
+        ThreadArg::empty(),
+        ThreadAttrs::joinable(),
+    )
+    .unwrap_or_else(|_| protocol::fail("ready-queue-no-duplicates", "SPAWN"));
+    for _ in 0..8 {
+        crate::sync::preempt::request_reschedule();
+        sched::yield_now();
+        sched::validate_invariants_for_test();
+    }
+    if READY_QUEUE_RUNS.load(Ordering::Acquire) != 0 {
+        protocol::fail("ready-queue-no-duplicates", "RAN_INSIDE_GUARD");
+    }
+    drop(guard);
+    if sched::thread_join(worker) != Ok(0) || READY_QUEUE_RUNS.load(Ordering::Acquire) != 1 {
+        protocol::fail("ready-queue-no-duplicates", "DUPLICATE_OR_MISSING_RUN");
+    }
+    sched::validate_invariants_for_test();
+}
+
+fn ready_queue_worker(_arg: ThreadArg) -> usize {
+    READY_QUEUE_RUNS.fetch_add(1, Ordering::AcqRel);
+    0
+}
+
+fn run_blocked_wake_once() {
+    WAKE_ONCE_STAGE.store(0, Ordering::Release);
+    WAKE_ONCE_RUNS.store(0, Ordering::Release);
+    WAKE_ONCE_DEADLINE.store(0, Ordering::Release);
+    let worker = sched::thread_spawn(
+        wake_once_worker,
+        ThreadArg::empty(),
+        ThreadAttrs::joinable(),
+    )
+    .unwrap_or_else(|_| protocol::fail("blocked-wake-once", "SPAWN"));
+    while WAKE_ONCE_STAGE.load(Ordering::Acquire) != 1 {
+        sched::yield_now();
+    }
+    let deadline = WAKE_ONCE_DEADLINE.load(Ordering::Acquire);
+    if deadline == 0 {
+        protocol::fail("blocked-wake-once", "NO_DEADLINE");
+    }
+    {
+        let _guard = PreemptGuard::enter();
+        while crate::time::now_counter() < deadline {
+            core::hint::spin_loop();
+        }
+        let baseline = TIMER_IRQ_COUNT.load(Ordering::Acquire);
+        wait_for_timer_irqs_after(baseline, 1);
+        if sched::wake_thread_for_test(worker) || sched::wake_thread_for_test(worker) {
+            protocol::fail("blocked-wake-once", "DUPLICATE_WAKE_CHANGED_STATE");
+        }
+        sched::validate_invariants_for_test();
+        if WAKE_ONCE_STAGE.load(Ordering::Acquire) != 1
+            || WAKE_ONCE_RUNS.load(Ordering::Acquire) != 0
+        {
+            protocol::fail("blocked-wake-once", "WAKE_NOT_DEFERRED");
+        }
+    }
+    if sched::thread_join(worker) != Ok(0)
+        || WAKE_ONCE_STAGE.load(Ordering::Acquire) != 2
+        || WAKE_ONCE_RUNS.load(Ordering::Acquire) != 1
+    {
+        protocol::fail("blocked-wake-once", "DUPLICATE_OR_MISSING_RUN");
+    }
+    // A late duplicate wake for the reclaimed generation is externally stale
+    // input and must remain a no-op.
+    if sched::wake_thread_for_test(worker) {
+        protocol::fail("blocked-wake-once", "LATE_WAKE_CHANGED_STATE");
+    }
+    sched::validate_invariants_for_test();
+    run_early_wake_cleanup_stress();
+}
+
+fn wake_once_worker(_arg: ThreadArg) -> usize {
+    let deadline = crate::time::now_counter().wrapping_add(crate::time::ms_to_counts(10));
+    WAKE_ONCE_DEADLINE.store(deadline, Ordering::Release);
+    WAKE_ONCE_STAGE.store(1, Ordering::Release);
+    sched::sleep_until_counter(deadline);
+    WAKE_ONCE_RUNS.fetch_add(1, Ordering::AcqRel);
+    WAKE_ONCE_STAGE.store(2, Ordering::Release);
+    0
+}
+
+fn run_early_wake_cleanup_stress() {
+    for _ in 0..EARLY_WAKE_CYCLES {
+        WAKE_ONCE_STAGE.store(0, Ordering::Release);
+        let worker = sched::thread_spawn(
+            distant_sleep_worker,
+            ThreadArg::empty(),
+            ThreadAttrs::joinable(),
+        )
+        .unwrap_or_else(|_| protocol::fail("blocked-wake-once", "EARLY_SPAWN"));
+        while WAKE_ONCE_STAGE.load(Ordering::Acquire) != 1 {
+            sched::yield_now();
+        }
+        let task = crate::task::TaskId::new(worker.index());
+        while !sched::wake_task_for_test(task) {
+            sched::yield_now();
+        }
+        if sched::thread_join(worker) != Ok(0) {
+            protocol::fail("blocked-wake-once", "EARLY_JOIN");
+        }
+    }
+    sched::validate_invariants_for_test();
+}
+
+fn distant_sleep_worker(_arg: ThreadArg) -> usize {
+    WAKE_ONCE_STAGE.store(1, Ordering::Release);
+    sched::msleep(60_000);
+    0
+}
+
+fn run_thread_slot_reuse() {
+    let first = sched::thread_spawn(worker, ThreadArg::empty(), ThreadAttrs::joinable())
+        .unwrap_or_else(|_| protocol::fail("thread-slot-reuse", "SPAWN_A"));
+    if sched::thread_join(first) != Ok(WORKER_EXIT) {
+        protocol::fail("thread-slot-reuse", "JOIN_A");
+    }
+    SLOT_REUSE_STAGE.store(0, Ordering::Release);
+    let second = sched::thread_spawn(
+        slot_reuse_worker,
+        ThreadArg::empty(),
+        ThreadAttrs::joinable(),
+    )
+    .unwrap_or_else(|_| protocol::fail("thread-slot-reuse", "SPAWN_B"));
+    while SLOT_REUSE_STAGE.load(Ordering::Acquire) != 1 {
+        sched::yield_now();
+    }
+    let stale_woke_reused_slot = {
+        let _guard = PreemptGuard::enter();
+        let woke = sched::wake_thread_for_test(first);
+        sched::validate_invariants_for_test();
+        woke
+    };
+    if first.index() != second.index()
+        || first.generation() == second.generation()
+        || stale_woke_reused_slot
+        || sched::thread_join(first) != Err(sched::JoinError::InvalidThread)
+        || sched::thread_join(second) != Ok(WORKER_EXIT)
+    {
+        protocol::fail("thread-slot-reuse", "STALE_HANDLE");
+    }
+    sched::validate_invariants_for_test();
+}
+
+fn slot_reuse_worker(_arg: ThreadArg) -> usize {
+    SLOT_REUSE_STAGE.store(1, Ordering::Release);
+    sched::msleep(25);
+    WORKER_EXIT
+}
+
 fn run_preempt_lock_case() {
     let mut lock = TEST_PREEMPT_LOCK.lock();
     let worker = prepare_guard_peer("preempt-lock-keeps-irqs-enabled");
@@ -274,6 +484,7 @@ fn run_preempt_lock_case() {
     if GUARD_PEER_PROGRESS.load(Ordering::Acquire) != 0 || !reschedule_pending() {
         protocol::fail("preempt-lock-keeps-irqs-enabled", "BAD_DEFERRED_STATE");
     }
+    sched::validate_invariants_for_test();
     drop(lock);
     wait_for_guard_peer("preempt-lock-keeps-irqs-enabled", worker);
 }
@@ -286,6 +497,7 @@ fn run_deferred_reschedule_case() {
     if GUARD_PEER_PROGRESS.load(Ordering::Acquire) != 0 || !reschedule_pending() {
         protocol::fail("deferred-reschedule-after-unlock", "BAD_DEFERRED_STATE");
     }
+    sched::validate_invariants_for_test();
     drop(guard);
     // No explicit yield or timer wait occurs between outermost drop and proof.
     wait_for_guard_peer("deferred-reschedule-after-unlock", worker);
@@ -301,6 +513,7 @@ fn run_nested_preempt_guard_case() {
     if GUARD_PEER_PROGRESS.load(Ordering::Acquire) != 0 || !reschedule_pending() {
         protocol::fail("nested-preempt-guard", "INNER_DROP_CONSUMED_REQUEST");
     }
+    sched::validate_invariants_for_test();
     drop(outer);
     wait_for_guard_peer("nested-preempt-guard", worker);
 }
@@ -318,6 +531,7 @@ fn run_irq_masked_unlock_case() {
             "MASKED_DROP_SERVICED_REQUEST",
         );
     }
+    sched::validate_invariants_for_test();
     drop(irq_guard);
     sched::yield_now();
     wait_for_guard_peer("irq-masked-unlock-preserves-pending", worker);
@@ -345,6 +559,7 @@ fn run_deferred_wakeup_case() {
         if WAKEUP_STAGE.load(Ordering::Acquire) != 1 || !reschedule_pending() {
             protocol::fail("deferred-wakeup", "WAKE_NOT_DEFERRED");
         }
+        sched::validate_invariants_for_test();
     }
     if WAKEUP_STAGE.load(Ordering::Acquire) != 2 {
         protocol::fail("deferred-wakeup", "NO_UNLOCK_CHECKPOINT");
@@ -362,6 +577,7 @@ fn run_yield_inside_preempt_guard_case() {
     if GUARD_PEER_PROGRESS.load(Ordering::Acquire) != 0 || !reschedule_pending() {
         protocol::fail("yield-inside-preempt-guard", "YIELD_ESCAPED_GUARD");
     }
+    sched::validate_invariants_for_test();
     drop(guard);
     wait_for_guard_peer("yield-inside-preempt-guard", worker);
 }
@@ -385,6 +601,7 @@ fn wait_for_guard_peer(case: &str, worker: crate::task::ThreadId) {
     if sched::thread_join(worker) != Ok(0) {
         protocol::fail(case, "JOIN");
     }
+    sched::validate_invariants_for_test();
 }
 
 fn wait_for_timer_irqs_after(baseline: usize, count: usize) {

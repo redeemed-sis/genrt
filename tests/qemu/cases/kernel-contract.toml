@@ -31,6 +31,26 @@ subject = "thread-join"
 [[steps]]
 action = "expect_case"
 producer = "kernel"
+subject = "scheduler-transition-cycle"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "ready-queue-no-duplicates"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "blocked-wake-once"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "thread-slot-reuse"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
 subject = "timer-preemption"
 
 [[steps]]
