@@ -9,7 +9,7 @@ hooks.
 | Module | Responsibility |
 | --- | --- |
 | `memory` | Physical map, frame allocator, heap, kernel/user VM, user copies |
-| `sched`, `task`, `task_call` | Task states, preemption, block/wake, thread lifecycle |
+| `sched`, `task`, `task_call` | Task states, preemption, typed waits, thread lifecycle |
 | `time` | Monotonic counter conversion and one-shot timed events |
 | `ipc` | Bounded mailbox buffers, wait queues, and timeout integration |
 | `process` | Process table, address-space/image ownership, fork/exec/wait, cwd/FD access |
@@ -40,9 +40,10 @@ the userspace resources shared across its current single main thread: loaded
 ELF, stack, cwd, FDs, and terminal status.
 
 Timer IRQs collect expired typed events and may choose a different return frame.
-Blocking syscall/task-call paths record a reason, commit scheduler state, and
-resume another task. Wakeup owners remain in time, IPC, process, or console
-layers; the scheduler owns runnable state and queue visibility.
+Each blocking episode has an exact `WaitToken` containing a generation-aware
+thread identity and per-slot sequence. Condition owners in time, IPC, process,
+or console code publish and later complete that token; the scheduler owns only
+wait lifecycle, runnable state, and ready-queue visibility.
 
 The private scheduler transition layer is the sole writer of lifecycle state,
 slot generation, current-task identity, and ready-queue membership. It returns

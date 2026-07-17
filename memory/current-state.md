@@ -63,8 +63,8 @@ accepted ADRs remain authoritative when details differ.
   and assembly entry boundary. Context switching remains bounded and
   allocation-free.
 - The architected timer runs in one-shot nearest-deadline mode.
-- `kernel::time` owns the preallocated deadline queue for wakeups, mailbox
-  timeouts, and scheduler quantum expiration.
+- `kernel::time` owns the preallocated deadline queue for exact wait deadlines
+  and scheduler quantum expiration.
 - Reschedule requests coalesce in `kernel::sync::preempt`. Timer IRQ return and
   a private typed task-call checkpoint may consume them only at disable depth
   zero; outermost guard release invokes that checkpoint automatically when the
@@ -77,12 +77,18 @@ accepted ADRs remain authoritative when details differ.
   generation, current identity, and ready-queue membership. Ready entries carry
   complete `ThreadId` generations; debug and QEMU-test builds run a bounded
   invariant validator after lifecycle transitions.
-- Sleep, scheduler-quantum, and IPC-timeout events carry `ThreadId` generation
-  identity, so stale timed events cannot target a reused slot.
+- Each blocking episode has a scheduler-owned `WaitToken` containing a complete
+  `ThreadId` and a checked per-slot sequence. Inline wait metadata moves through
+  `Prepared`, `Blocked`, and `Completed`; the sequence survives slot reuse.
+- Wait-deadline events carry the exact `WaitToken`, while scheduler-quantum
+  events carry `ThreadId`. Stale generations and earlier waits by the same live
+  thread cannot complete a later wait.
 - Transition selection returns a context-free switch outcome. Context
   save/restore, TTBR0 activation, and switch logging remain in handoff code.
-- Sleep, thread join, process wait, mailbox waits, and stdin waits block through
-  scheduler-owned state transitions rather than polling.
+- Sleep, thread join, process wait, mailbox, and stdin condition owners publish
+  and complete exact tokens through one prepare/publish/commit protocol. They
+  retain condition payload and cleanup ownership; the scheduler owns only wait
+  lifecycle and runnable visibility.
 
 ## Processes and userspace
 

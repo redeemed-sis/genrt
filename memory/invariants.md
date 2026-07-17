@@ -67,8 +67,19 @@ Changes that invalidate one require architecture review and an ADR.
   membership change only through the scheduler transition layer. A non-idle
   `Ready` task has exactly one current-generation queue entry, and the sole
   `Running` task is exactly `current`.
-- Scheduler-owned timed wake, quantum, and timeout events carry generation
-  identity; an event for a reclaimed thread cannot affect a reused slot.
+- Every blocking episode has one exact `WaitToken` containing a generation-aware
+  `ThreadId` and checked per-slot sequence. The sequence allocator survives slot
+  reuse; stale generation or sequence completions cannot affect a later wait.
+- A task is scheduler-blocked exactly when its inline wait metadata is
+  `Blocked`. `Prepared` belongs only to the current running task; `Completed`
+  retains one first-wins cause until exact consumption.
+- Condition owners publish tokens before scheduler commit and claim them before
+  completion. No mailbox, process, thread, console, or time-owner lock crosses
+  scheduler commit/completion, and the scheduler never calls back into those
+  owners while mutating lifecycle state.
+- Condition payload and loser cleanup remain owner-specific. Scheduler wait
+  metadata contains no mailbox message, exit status, process result, or UART
+  byte.
 - Scheduler transition selection is separate from context handoff: transition
   code does not inspect architecture frame layout, and handoff code does not
   reopen task lifecycle state.

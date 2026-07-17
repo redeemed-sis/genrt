@@ -7,8 +7,6 @@ explicit acceptance criteria.
 ## High-value architecture work
 
 1. **Scheduler and frame lifecycle**
-   - consolidate duplicated block/wake entry points and clarify Task/Thread
-     ownership without erasing the user/kernel distinction;
    - measure bounded queue behavior and critical-section length.
 2. **Process decomposition**
    - separate process table/lifecycle, image loading, wait/join, FD access, and
@@ -23,8 +21,9 @@ explicit acceptance criteria.
 
 ## Boundary cleanup
 
-4. Evolve stdin waiting into a console/TTY ownership model rather than a
-   scheduler-special case, without changing fd semantics prematurely.
+4. Evolve the current console-owned stdin ring and wait registration into TTY
+   semantics without moving line discipline into the scheduler or changing fd
+   semantics prematurely.
 5. Consolidate trap-frame initialization and remove interfaces no longer used by
    the established EL1/EL0 restore model.
 

@@ -10,13 +10,15 @@ committed by saving a borrowed `ActiveContext` into the current slot's owned
   ownership.
 - `Ready`: runnable with one valid `SavedContext` and queued unless it is idle.
 - `Running`: the sole committed resume target.
-- `Blocked(reason)`: excluded from selection until the owning subsystem wakes
-  it.
+- `Blocked`: excluded from selection while one exact wait registration is
+  active.
 - `Zombie`: exited joinable thread retaining status until consumption.
 
-Block reasons cover sleep, IPC, thread join, process wait, and stdin. The
-scheduler stores enough typed identity to validate a wake but does not own the
-external wait condition.
+Each task slot stores bounded inline wait metadata in one of `None`, `Prepared`,
+`Blocked`, or `Completed`. A `WaitToken` combines the complete `ThreadId` with a
+per-slot sequence, so a completion identifies one blocking episode rather than
+only one thread generation. `WaitKind` is diagnostic; external conditions and
+payload remain owned by time, IPC, thread/process lifecycle, or console code.
 
 All lifecycle mutations pass through the private `sched::transition` layer.
 That layer changes task state, generation, `current`, and ready-queue membership
@@ -30,25 +32,25 @@ The accepted transition table is:
 | `Free` | `Ready` | bootstrap or runtime publication |
 | `Ready` | `Running` | initial dispatch or task selection |
 | `Running` | `Ready` | optional round-robin switch |
-| `Running` | `Blocked(reason)` | mandatory blocking handoff |
-| `Blocked(reason)` | `Ready` | validated wake by the owning subsystem |
+| `Running` | `Blocked` | commit one prepared wait and hand off |
+| `Blocked` | `Ready` | complete the exact active wait token |
 | `Running` | `Zombie` | joinable exit |
 | `Zombie` | `Free` | status consumption and slot reclaim |
 
 Detached exit may perform `Running -> Zombie -> Free` inside one mandatory
-handoff. Internal impossible transitions panic. Duplicate or stale
-generation-bearing wake notifications remain no-ops. Ready-queue identities
-are complete `ThreadId` values, so a reused slot cannot inherit stale queue
-ownership. Sleep, quantum, and IPC-timeout events also carry `ThreadId`; an
-expired event from an older generation cannot affect a reused slot.
+handoff. Internal impossible transitions panic. Duplicate exact completions are
+reported without changing the retained cause; stale generations or sequences
+are ignored. Ready-queue identities are complete `ThreadId` values, so a reused
+slot cannot inherit stale queue ownership. Wait deadlines carry `WaitToken`;
+quantum events carry `ThreadId`.
 
 ## Preemption and time
 
 The architected timer is programmed to the nearest deadline. `kernel::time`
-owns a preallocated event queue containing wakeups, IPC timeouts, and quantum
-expiration. IRQ dispatch collects all expired events, updates scheduler state,
-and programs the next deadline. No callback allocation or queue growth occurs
-in the interrupt path.
+owns a preallocated event queue containing exact wait deadlines and quantum
+expiration. IRQ dispatch collects all expired events, completes deadline tokens,
+updates scheduler state, and programs the next deadline. No callback allocation
+or queue growth occurs in the interrupt path.
 
 Ready-queue insertion notifies the scheduler when a runnable peer appears so
 idle cannot remain selected indefinitely. A quantum switch is committed only at
@@ -63,21 +65,30 @@ coalesced pending request. Timer IRQ return and the private EL1
 `PreemptCheckpoint` task call consume that request only at depth zero. Kernel
 yield uses the same checkpoint and therefore cannot bypass a guard.
 
-## Block and wake
+## Wait registration and completion
 
-A blocking operation joins waiter registration with scheduler blocking under a
-short local IRQ critical section, closing lost-wakeup windows. The transition
-commits the outgoing block and incoming selection before handoff code saves the
-outgoing frame and restores the selected task. Wake paths validate the expected
-block identity, transition the task to ready, enqueue it, and request
-rescheduling when needed.
+A blocking operation prepares scheduler-owned wait metadata, publishes the
+exact token with its condition owner, releases that owner, and then commits the
+prepared wait. Completion before commit records the cause and keeps the caller
+running; completion after commit performs the centralized `Blocked -> Ready`
+transition. This prepare/publish/commit protocol closes the lost-wakeup window
+without carrying an owner lock across context selection.
+
+Completion first claims the token under the condition owner's short critical
+section, releases that owner, and then calls the scheduler. The first exact
+completion wins. A repeated exact token is `AlreadyCompleted`; a different
+generation, sequence, or active token is `Stale`. Completion does not switch
+directly and may only request the existing deferred scheduler checkpoint.
 
 Sleep, blocking IPC/stdin/join/process waits, and thread/process exit fail fast
 if task preemption is disabled. They do not defer ownership publication across
 an active guard.
 
-IPC queues and time own timeout removal; process lifecycle owns process wait;
-console owns stdin availability. The scheduler owns task state and queue order.
+Mailbox queues, thread/process lifecycle, and console retain their own payloads
+and store only the registration token. Time owns deadline storage. Timeout loser
+cleanup remains with the condition owner after the resumed task consumes the
+completion cause. The scheduler owns token lifecycle, task state, and queue
+order.
 
 ## Thread lifecycle
 
@@ -98,7 +109,7 @@ their own finite static-task arrays without changing round-robin behavior.
 ## Constraints
 
 - Single core; local IRQ exclusion is not SMP synchronization.
-- Scheduler, ready-queue, deadline, mailbox timeout, and console wake
+- Scheduler, ready-queue, deadline, mailbox, and console wait
   transitions retain local IRQ exclusion. Task-only `PreemptLock` state uses a
   nested disable depth and deferred scheduler checkpoint while allowing IRQ
   progress.
@@ -110,4 +121,4 @@ their own finite static-task arrays without changing round-robin behavior.
   trap-frame handoff contracts change together inside the architecture facade.
 
 Related decisions: ADR-0003, ADR-0005, ADR-0006, ADR-0011 through ADR-0014,
-ADR-0020, and ADR-0027 through ADR-0031.
+ADR-0020, and ADR-0027 through ADR-0032.
