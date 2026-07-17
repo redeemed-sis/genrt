@@ -6,11 +6,12 @@ use crate::{
     process::ProcessId,
     sync::LocalIrqGuard,
     task::{TaskId, ThreadId},
+    task_call::TaskCallWaitOutput,
 };
 
 use super::{
-    IDLE_TASK_ID, Scheduler, scheduler_mut,
-    transition::{BlockReason, SwitchOutcome, TaskState, ThreadKind},
+    CommitResult, IDLE_TASK_ID, Scheduler, WaitKind, scheduler_mut,
+    transition::{SwitchOutcome, TaskState, ThreadKind},
     try_scheduler_mut,
 };
 
@@ -261,6 +262,8 @@ pub(crate) fn on_thread_exit_sync(context: &mut ActiveContext<'_>, code: usize) 
 ///
 /// * `context` - Exclusive live task-call context used only if the join blocks.
 /// * `target` - Generation-checked thread identity to join.
+/// * `output` - Stack-owned task-call output that retains the exact join token
+///   across a blocked resume.
 ///
 /// # Returns
 ///
@@ -270,46 +273,12 @@ pub(crate) fn on_thread_exit_sync(context: &mut ActiveContext<'_>, code: usize) 
 /// # Panics
 ///
 /// Panics when scheduler running-state invariants are absent.
-pub(crate) fn on_thread_join_sync(context: &mut ActiveContext<'_>, target: ThreadId) {
-    scheduler_mut().join_thread(context, target);
-}
-
-/// Block the current task on one process identity.
-///
-/// # Arguments
-///
-/// * `context` - Exclusive live context saved and replaced by the scheduler.
-/// * `pid` - Generation-checked process associated with the wait reason.
-///
-/// # Returns
-///
-/// Returns after the task is later resumed. The handoff is bounded and does not
-/// allocate.
-pub(crate) fn block_current_on_process_wait(context: &mut ActiveContext<'_>, pid: ProcessId) {
-    scheduler_mut().block_current_on_process_wait(context, pid);
-}
-
-pub(crate) fn complete_process_wait(waiter: ThreadId, pid: ProcessId) {
-    scheduler_mut().complete_process_wait(waiter, pid);
-}
-
-/// Block the current task on the singleton stdin wait reason.
-///
-/// # Arguments
-///
-/// * `context` - Exclusive live syscall context saved and replaced by the
-///   scheduler.
-///
-/// # Returns
-///
-/// Returns after UART input wakes and the scheduler resumes the task. The
-/// handoff is bounded and does not allocate.
-pub(crate) fn block_current_on_stdin_read(context: &mut ActiveContext<'_>) {
-    scheduler_mut().block_current_on_stdin_read(context);
-}
-
-pub(crate) fn complete_stdin_read(waiter: ThreadId) {
-    scheduler_mut().complete_stdin_read(waiter);
+pub(crate) fn on_thread_join_sync(
+    context: &mut ActiveContext<'_>,
+    target: ThreadId,
+    output: &mut TaskCallWaitOutput,
+) {
+    scheduler_mut().join_thread(context, target, output);
 }
 
 impl Scheduler {
@@ -414,7 +383,12 @@ impl Scheduler {
         crate::debug!("thread: exited id={exited} code={code}");
     }
 
-    fn join_thread(&mut self, context: &mut ActiveContext<'_>, target: ThreadId) {
+    fn join_thread(
+        &mut self,
+        context: &mut ActiveContext<'_>,
+        target: ThreadId,
+        output: &mut TaskCallWaitOutput,
+    ) {
         let current = self
             .running_task()
             .unwrap_or_else(|| panic!("thread: join without running thread"));
@@ -463,8 +437,15 @@ impl Scheduler {
         }
 
         crate::sync::preempt::assert_preemption_enabled("thread joiner publication");
-        self.task_set_joiner(target_task, current_thread);
-        self.block_with_reason(context, BlockReason::Join(target));
+        let prepared = self.transition_prepare_wait(WaitKind::Thread);
+        let token = prepared.token();
+        output.record_token(token);
+        self.task_set_joiner(target_task, token);
+        match self.commit_prepared_wait(context, prepared) {
+            CommitResult::Blocked(_) => {}
+            CommitResult::Early(cause) => output.record_early(cause),
+            CommitResult::Stale => panic!("thread: join wait became stale before commit"),
+        }
         crate::debug!("thread: join blocking current={current_thread} target={target}");
     }
 
@@ -521,36 +502,6 @@ impl Scheduler {
             process_id,
             address_space,
         })
-    }
-
-    fn block_current_on_process_wait(&mut self, context: &mut ActiveContext<'_>, pid: ProcessId) {
-        self.block_with_reason(context, BlockReason::Process(pid));
-    }
-
-    fn block_current_on_stdin_read(&mut self, context: &mut ActiveContext<'_>) {
-        self.block_with_reason(context, BlockReason::StdinRead);
-    }
-
-    fn complete_process_wait(&mut self, waiter: ThreadId, pid: ProcessId) {
-        if self.transition_wake_thread(waiter, BlockReason::Process(pid)) {
-            crate::debug!("process: wake pid={pid} waiter={waiter}");
-        }
-    }
-
-    fn complete_stdin_read(&mut self, waiter: ThreadId) {
-        if self.transition_wake_thread(waiter, BlockReason::StdinRead) {
-            crate::trace!("stdin: wake waiter={waiter}");
-        }
-    }
-
-    fn block_with_reason(&mut self, context: &mut ActiveContext<'_>, reason: BlockReason) {
-        let SwitchOutcome::Switch { from, to } = self.transition_block_current(reason) else {
-            panic!("sched: block transition continued current task")
-        };
-        self.saved_context_mut(from).save_from(context);
-        self.saved_context(to).restore_into(context);
-        self.activate_task_address_space(to);
-        self.finish_block_current(from, to);
     }
 }
 

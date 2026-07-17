@@ -1,6 +1,6 @@
-use crate::{arch::ActiveContext, time::TimedEvent};
+use crate::{arch::ActiveContext, task_call::TaskCallWaitOutput, time::TimedEvent};
 
-use super::{Scheduler, scheduler_mut, transition::BlockReason};
+use super::{CommitResult, WaitKind, commit_wait, prepare_wait};
 
 pub fn usleep(us: u64) {
     if us == 0 {
@@ -40,20 +40,26 @@ pub fn sleep_until(deadline: u64) {
 /// * `context` - Exclusive live task-call context saved and replaced by the
 ///   scheduler.
 /// * `deadline` - Absolute architecture counter value for the wake event.
+/// * `output` - Stack-owned task-call output that retains the exact token and
+///   an optional completion observed before commit.
 ///
 /// # Returns
 ///
 /// Returns after the task is later resumed. Event insertion uses preallocated
 /// storage and this scheduler handoff does not allocate.
-pub(crate) fn on_sleep_sync(context: &mut ActiveContext<'_>, deadline: u64) {
-    scheduler_mut().block_current_until(context, deadline);
-}
-
-impl Scheduler {
-    fn block_current_until(&mut self, context: &mut ActiveContext<'_>, deadline: u64) {
-        let (current, next) = self.begin_block_current(context, BlockReason::Sleep);
-        crate::time::schedule_event(deadline, TimedEvent::WakeTask(current));
-        self.finish_block_current(current, next);
-        crate::trace!("sched: task {current} sleeping until counter {deadline}");
+pub(crate) fn on_sleep_sync(
+    context: &mut ActiveContext<'_>,
+    deadline: u64,
+    output: &mut TaskCallWaitOutput,
+) {
+    let prepared = prepare_wait(WaitKind::Deadline);
+    let token = prepared.token();
+    output.record_token(token);
+    crate::time::schedule_event(deadline, TimedEvent::WaitDeadline(token));
+    match commit_wait(context, prepared) {
+        CommitResult::Blocked(_) => {}
+        CommitResult::Early(cause) => output.record_early(cause),
+        CommitResult::Stale => panic!("sched: sleep wait became stale before commit"),
     }
+    crate::trace!("sched: task wait {token:?} sleeping until counter {deadline}");
 }

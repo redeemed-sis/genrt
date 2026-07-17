@@ -4,8 +4,15 @@ const TASK_CALL_THREAD_EXIT: u64 = 3;
 const TASK_CALL_THREAD_JOIN: u64 = 4;
 const TASK_CALL_PROCESS_JOIN: u64 = 5;
 const TASK_CALL_PREEMPT_CHECKPOINT: u64 = 6;
+#[cfg(feature = "qemu-test-kernel-runtime")]
+const TASK_CALL_TEST_WAIT: u64 = 7;
 
-use crate::{arch::ActiveContext, process::ProcessId, task::ThreadId};
+use crate::{
+    arch::ActiveContext,
+    process::ProcessId,
+    sched::{WaitCause, WaitToken},
+    task::ThreadId,
+};
 
 unsafe extern "C" {
     fn arch_task_call(request: *const core::ffi::c_void);
@@ -25,12 +32,15 @@ union TaskCallArgs {
     thread_join: TaskCallThreadJoin,
     process_join: TaskCallProcessJoin,
     preempt_checkpoint: TaskCallPreemptCheckpoint,
+    #[cfg(feature = "qemu-test-kernel-runtime")]
+    test_wait: TaskCallTestWait,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct TaskCallSleepUntil {
     deadline: u64,
+    output: *mut TaskCallWaitOutput,
 }
 
 #[repr(C)]
@@ -40,6 +50,7 @@ struct TaskCallMailboxWait {
     wait_kind: u64,
     timeout_enabled: u64,
     deadline: u64,
+    output: *mut TaskCallWaitOutput,
 }
 
 #[repr(C)]
@@ -53,6 +64,7 @@ struct TaskCallThreadExit {
 struct TaskCallThreadJoin {
     index: usize,
     generation: u32,
+    output: *mut TaskCallWaitOutput,
 }
 
 #[repr(C)]
@@ -60,18 +72,27 @@ struct TaskCallThreadJoin {
 struct TaskCallProcessJoin {
     index: usize,
     generation: u32,
+    output: *mut TaskCallWaitOutput,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct TaskCallPreemptCheckpoint;
 
+#[cfg(feature = "qemu-test-kernel-runtime")]
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct TaskCallTestWait {
+    mode: u64,
+    output: *mut TaskCallWaitOutput,
+}
+
 impl TaskCallRequest {
-    fn sleep_until(deadline: u64) -> Self {
+    fn sleep_until(deadline: u64, output: &mut TaskCallWaitOutput) -> Self {
         Self {
             op: TASK_CALL_SLEEP_UNTIL,
             args: TaskCallArgs {
-                sleep_until: TaskCallSleepUntil { deadline },
+                sleep_until: TaskCallSleepUntil { deadline, output },
             },
         }
     }
@@ -80,6 +101,7 @@ impl TaskCallRequest {
         mailbox: *const core::ffi::c_void,
         wait_kind: u64,
         timeout_deadline: Option<u64>,
+        output: &mut TaskCallWaitOutput,
     ) -> Self {
         let (timeout_enabled, deadline) = match timeout_deadline {
             Some(deadline) => (1, deadline),
@@ -94,6 +116,7 @@ impl TaskCallRequest {
                     wait_kind,
                     timeout_enabled,
                     deadline,
+                    output,
                 },
             },
         }
@@ -108,25 +131,27 @@ impl TaskCallRequest {
         }
     }
 
-    fn thread_join(id: ThreadId) -> Self {
+    fn thread_join(id: ThreadId, output: &mut TaskCallWaitOutput) -> Self {
         Self {
             op: TASK_CALL_THREAD_JOIN,
             args: TaskCallArgs {
                 thread_join: TaskCallThreadJoin {
                     index: id.index(),
                     generation: id.generation(),
+                    output,
                 },
             },
         }
     }
 
-    fn process_join(id: ProcessId) -> Self {
+    fn process_join(id: ProcessId, output: &mut TaskCallWaitOutput) -> Self {
         Self {
             op: TASK_CALL_PROCESS_JOIN,
             args: TaskCallArgs {
                 process_join: TaskCallProcessJoin {
                     index: id.index(),
                     generation: id.generation(),
+                    output,
                 },
             },
         }
@@ -139,6 +164,120 @@ impl TaskCallRequest {
                 preempt_checkpoint: TaskCallPreemptCheckpoint,
             },
         }
+    }
+
+    #[cfg(feature = "qemu-test-kernel-runtime")]
+    fn test_wait(mode: u64, output: &mut TaskCallWaitOutput) -> Self {
+        Self {
+            op: TASK_CALL_TEST_WAIT,
+            args: TaskCallArgs {
+                test_wait: TaskCallTestWait { mode, output },
+            },
+        }
+    }
+}
+
+/// Exact completion returned by a private blocking task call.
+///
+/// A completion carries the original token only for owner-side loser cleanup;
+/// the scheduler metadata has already been consumed by the time this value is
+/// returned.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WaitCallCompletion {
+    token: WaitToken,
+    cause: WaitCause,
+}
+
+impl WaitCallCompletion {
+    /// Return the exact registration token published by the operation.
+    ///
+    /// # Returns
+    ///
+    /// Returns a copy without changing scheduler state, allocating, blocking,
+    /// or touching IRQ state.
+    pub(crate) const fn token(self) -> WaitToken {
+        self.token
+    }
+
+    /// Return the first-wins completion cause.
+    ///
+    /// # Returns
+    ///
+    /// Returns the cause without changing scheduler state, allocating,
+    /// blocking, or touching IRQ state.
+    pub(crate) const fn cause(self) -> WaitCause {
+        self.cause
+    }
+}
+
+/// Mutable private task-call output retaining one exact wait token.
+///
+/// The request owner creates this on its stack, the controlled EL1 exception
+/// writes it before any handoff, and the wrapper consumes it after resume.
+/// It is private to the EL1 task-call ABI and does not change the EL0 syscall
+/// ABI.
+pub(crate) struct TaskCallWaitOutput {
+    token: Option<WaitToken>,
+    early: Option<WaitCause>,
+}
+
+impl TaskCallWaitOutput {
+    /// Construct empty output for one private task-call request.
+    ///
+    /// # Returns
+    ///
+    /// Returns stack-owned empty output without allocation or IRQ changes.
+    pub(crate) const fn new() -> Self {
+        Self {
+            token: None,
+            early: None,
+        }
+    }
+
+    /// Record the token before the external owner publishes it.
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - Exact prepared token stored by the owner and scheduler.
+    ///
+    /// # Returns
+    ///
+    /// Returns after retaining `token`; this is bounded and allocation-free.
+    pub(crate) fn record_token(&mut self, token: WaitToken) {
+        self.token = Some(token);
+    }
+
+    /// Record an early completion consumed by commit without a handoff.
+    ///
+    /// # Arguments
+    ///
+    /// * `cause` - First-wins completion cause observed during commit.
+    ///
+    /// # Returns
+    ///
+    /// Returns after retaining `cause`; this is bounded and allocation-free.
+    pub(crate) fn record_early(&mut self, cause: WaitCause) {
+        self.early = Some(cause);
+    }
+
+    /// Consume the exact completion after the task-call path returns.
+    ///
+    /// # Returns
+    ///
+    /// Returns `None` when the owner skipped registration. Otherwise returns
+    /// the early cause or calls exact scheduler finish; neither path allocates.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a resumed task-call token is not completed by its owner.
+    pub(crate) fn take_completion(&mut self) -> Option<WaitCallCompletion> {
+        let token = self.token.take()?;
+        let cause = match self.early.take() {
+            Some(cause) => cause,
+            None => crate::sched::finish_wait(token)
+                .unwrap_or_else(|error| panic!("task-call: exact wait finish failed: {error:?}")),
+        };
+        Some(WaitCallCompletion { token, cause })
     }
 }
 
@@ -160,30 +299,87 @@ pub(crate) fn preempt_checkpoint() {
 }
 
 pub(crate) fn sleep_until_counter(deadline: u64) {
-    let request = TaskCallRequest::sleep_until(deadline);
+    let mut output = TaskCallWaitOutput::new();
+    let request = TaskCallRequest::sleep_until(deadline, &mut output);
     // SAFETY: `arch_task_call()` enters a controlled synchronous exception path.
     // The architecture saves the current task frame and routes the typed request
     // back into `on_arch_task_call()`. The request lives on the current task's
     // stack and is consumed synchronously before this function can return.
     unsafe { arch_task_call(&request as *const TaskCallRequest as *const core::ffi::c_void) }
+    let _ = output.take_completion();
 }
 
-pub(crate) fn mailbox_wait(mailbox: *const core::ffi::c_void, wait_kind: u64) {
-    let request = TaskCallRequest::mailbox_wait(mailbox, wait_kind, None);
+/// Enter a private task call that waits on one mailbox condition.
+///
+/// The mailbox owner publishes an exact wait token while the controlled
+/// exception keeps local IRQs masked. The task call may block, but performs no
+/// allocation in the scheduler path.
+///
+/// # Arguments
+///
+/// * `mailbox` - Opaque pointer to the live mailbox control lock that owns the
+///   condition and waiter queue.
+/// * `wait_kind` - Mailbox-private numeric selector for send or receive
+///   availability.
+///
+/// # Returns
+///
+/// Returns `Some` with the exact token and first-wins cause after a published
+/// wait completes. Returns `None` when the mailbox condition no longer requires
+/// registration at exception time.
+///
+/// # Safety
+///
+/// `mailbox` must remain valid for the entire synchronous task-call operation,
+/// including any blocked interval, and must point to the mailbox control type
+/// expected by [`crate::ipc::on_mailbox_wait_sync`].
+pub(crate) fn mailbox_wait(
+    mailbox: *const core::ffi::c_void,
+    wait_kind: u64,
+) -> Option<WaitCallCompletion> {
+    let mut output = TaskCallWaitOutput::new();
+    let request = TaskCallRequest::mailbox_wait(mailbox, wait_kind, None, &mut output);
     // SAFETY: same controlled synchronous exception path as sleep. The caller
     // passes an opaque pointer whose lifetime is validated by the mailbox owner.
     unsafe { arch_task_call(&request as *const TaskCallRequest as *const core::ffi::c_void) }
+    output.take_completion()
 }
 
+/// Enter a private timed task call waiting on one mailbox condition.
+///
+/// This has the same owner and allocation contract as [`mailbox_wait`], and
+/// additionally publishes one exact time-owned deadline for the wait token.
+///
+/// # Arguments
+///
+/// * `mailbox` - Opaque pointer to the live mailbox control lock that owns the
+///   condition and waiter queue.
+/// * `wait_kind` - Mailbox-private numeric selector for send or receive
+///   availability.
+/// * `deadline` - Absolute architecture counter at which timeout may complete
+///   the exact wait.
+///
+/// # Returns
+///
+/// Returns `Some` with the exact token and either notified or timeout cause
+/// after registration. Returns `None` when no wait is required at exception
+/// time.
+///
+/// # Safety
+///
+/// `mailbox` must satisfy the validity and lifetime contract documented by
+/// [`mailbox_wait`].
 pub(crate) fn mailbox_wait_until_counter(
     mailbox: *const core::ffi::c_void,
     wait_kind: u64,
     deadline: u64,
-) {
-    let request = TaskCallRequest::mailbox_wait(mailbox, wait_kind, Some(deadline));
+) -> Option<WaitCallCompletion> {
+    let mut output = TaskCallWaitOutput::new();
+    let request = TaskCallRequest::mailbox_wait(mailbox, wait_kind, Some(deadline), &mut output);
     // SAFETY: same controlled synchronous exception path as sleep. The timeout
     // deadline is an absolute architecture counter value consumed synchronously.
     unsafe { arch_task_call(&request as *const TaskCallRequest as *const core::ffi::c_void) }
+    output.take_completion()
 }
 
 pub(crate) fn thread_exit(code: usize) -> ! {
@@ -196,18 +392,50 @@ pub(crate) fn thread_exit(code: usize) -> ! {
 }
 
 pub(crate) fn thread_join(id: ThreadId) {
-    let request = TaskCallRequest::thread_join(id);
+    let mut output = TaskCallWaitOutput::new();
+    let request = TaskCallRequest::thread_join(id, &mut output);
     // SAFETY: the join request is consumed synchronously by the controlled SVC
     // path before this stack frame can go away or the caller blocks.
     unsafe { arch_task_call(&request as *const TaskCallRequest as *const core::ffi::c_void) }
+    let _ = output.take_completion();
 }
 
 pub(crate) fn process_join(id: ProcessId) {
-    let request = TaskCallRequest::process_join(id);
+    let mut output = TaskCallWaitOutput::new();
+    let request = TaskCallRequest::process_join(id, &mut output);
     // SAFETY: process join is consumed synchronously by the controlled SVC path.
     // If the process is still running, the current kernel thread may block and
     // resume after the process stores a terminal exit status.
     unsafe { arch_task_call(&request as *const TaskCallRequest as *const core::ffi::c_void) }
+    let _ = output.take_completion();
+}
+
+/// Run one QEMU-test-only exact-token wait scenario.
+///
+/// This private EL1 test seam is compiled only into the finite kernel-runtime
+/// fixture. It neither changes the EL0 syscall ABI nor appears in production
+/// artifacts.
+///
+/// # Arguments
+///
+/// * `mode` - Bounded coordinator-selected event/timeout ordering.
+///
+/// # Returns
+///
+/// Returns the exact first-wins completion from the test scenario.
+///
+/// # Panics
+///
+/// Panics when the controlled test registration does not complete.
+#[cfg(feature = "qemu-test-kernel-runtime")]
+pub(crate) fn test_wait(mode: u64) -> WaitCallCompletion {
+    let mut output = TaskCallWaitOutput::new();
+    let request = TaskCallRequest::test_wait(mode, &mut output);
+    // SAFETY: same synchronous controlled task-call lifetime as other waits.
+    unsafe { arch_task_call(&request as *const TaskCallRequest as *const core::ffi::c_void) }
+    output
+        .take_completion()
+        .unwrap_or_else(|| panic!("task-call: test wait skipped registration"))
 }
 
 /// Dispatch one controlled EL1 task call against the live exception context.
@@ -247,7 +475,11 @@ pub fn on_arch_task_call(context: &mut ActiveContext<'_>, request: *const core::
         TASK_CALL_SLEEP_UNTIL => {
             // SAFETY: the `op` tag selects this payload variant.
             let args = unsafe { request.args.sleep_until };
-            crate::sched::on_sleep_sync(context, args.deadline);
+            // SAFETY: the wrapper stores stack-owned output in this private
+            // synchronous request until the task call returns after any resume.
+            let output = unsafe { args.output.as_mut() }
+                .unwrap_or_else(|| panic!("task-call: null sleep wait output"));
+            crate::sched::on_sleep_sync(context, args.deadline, output);
         }
         TASK_CALL_MAILBOX_WAIT => {
             // SAFETY: the `op` tag selects this payload variant.
@@ -261,6 +493,9 @@ pub fn on_arch_task_call(context: &mut ActiveContext<'_>, request: *const core::
                 } else {
                     None
                 },
+                // SAFETY: see the sleep output contract above.
+                unsafe { args.output.as_mut() }
+                    .unwrap_or_else(|| panic!("task-call: null mailbox wait output")),
             );
         }
         TASK_CALL_THREAD_EXIT => {
@@ -271,7 +506,14 @@ pub fn on_arch_task_call(context: &mut ActiveContext<'_>, request: *const core::
         TASK_CALL_THREAD_JOIN => {
             // SAFETY: the `op` tag selects this payload variant.
             let args = unsafe { request.args.thread_join };
-            crate::sched::on_thread_join_sync(context, ThreadId::new(args.index, args.generation));
+            // SAFETY: see the sleep output contract above.
+            let output = unsafe { args.output.as_mut() }
+                .unwrap_or_else(|| panic!("task-call: null thread wait output"));
+            crate::sched::on_thread_join_sync(
+                context,
+                ThreadId::new(args.index, args.generation),
+                output,
+            );
         }
         TASK_CALL_PROCESS_JOIN => {
             // SAFETY: the `op` tag selects this payload variant.
@@ -279,6 +521,9 @@ pub fn on_arch_task_call(context: &mut ActiveContext<'_>, request: *const core::
             crate::process::on_process_join_sync(
                 context,
                 ProcessId::new(args.index, args.generation),
+                // SAFETY: see the sleep output contract above.
+                unsafe { args.output.as_mut() }
+                    .unwrap_or_else(|| panic!("task-call: null process wait output")),
             );
         }
         TASK_CALL_PREEMPT_CHECKPOINT => {
@@ -286,6 +531,15 @@ pub fn on_arch_task_call(context: &mut ActiveContext<'_>, request: *const core::
             // representation has no data to inspect.
             let _ = unsafe { request.args.preempt_checkpoint };
             crate::sched::on_preempt_checkpoint(context);
+        }
+        #[cfg(feature = "qemu-test-kernel-runtime")]
+        TASK_CALL_TEST_WAIT => {
+            // SAFETY: the `op` tag selects this payload variant.
+            let args = unsafe { request.args.test_wait };
+            // SAFETY: see the stack-owned output contract above.
+            let output = unsafe { args.output.as_mut() }
+                .unwrap_or_else(|| panic!("task-call: null test wait output"));
+            crate::sched::on_test_wait_sync(context, args.mode, output);
         }
         op => panic!("task-call: unknown operation {op}"),
     }

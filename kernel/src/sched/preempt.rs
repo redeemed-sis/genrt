@@ -5,8 +5,8 @@ use crate::{
 };
 
 use super::{
-    IDLE_TASK_ID, Scheduler, log_switch, scheduler_mut,
-    transition::{BlockReason, SwitchOutcome, TaskState, ThreadKind},
+    IDLE_TASK_ID, Scheduler, WaitCause, WaitToken, complete_wait, log_switch, scheduler_mut,
+    transition::{SwitchOutcome, TaskState, ThreadKind},
 };
 
 /// Finish one bounded timer IRQ and optionally replace its return context.
@@ -14,8 +14,18 @@ pub(super) fn finish_timer_interrupt(context: &mut ActiveContext<'_>, now: u64) 
     scheduler_mut().finish_timer_interrupt(context, now);
 }
 
-pub(super) fn on_wake_thread(thread: ThreadId) {
-    scheduler_mut().wake_sleeping_thread(thread);
+/// Complete one time-owned exact wait deadline.
+///
+/// # Arguments
+///
+/// * `token` - Exact wait registration stored in the expired timed event.
+///
+/// # Returns
+///
+/// Returns after a bounded completion attempt. Stale or already-completed
+/// deadlines are controlled no-ops.
+pub(super) fn on_wait_deadline(token: WaitToken) {
+    let _ = complete_wait(token, WaitCause::Timeout);
 }
 
 pub(super) fn on_quantum_expired(thread: ThreadId) {
@@ -26,77 +36,6 @@ pub fn current_task_id() -> Option<TaskId> {
     scheduler_mut()
         .running_task()
         .map(|id| TaskId::new(id.index()))
-}
-
-/// Wake the current occupant of a scheduler slot if it is sleeping.
-///
-/// This compatibility API identifies a slot rather than a thread generation.
-/// Wait owners with a `ThreadId` use generation-aware internal wake paths. The
-/// operation masks local IRQs, cancels the exact pending sleep event, allocates
-/// nothing, and treats a non-sleeping or invalid slot as a no-op. Other block
-/// reasons retain cleanup ownership in their subsystem and are not woken.
-///
-/// # Arguments
-///
-/// * `task_id` - Scheduler slot whose current occupant may be sleeping.
-///
-/// # Returns
-///
-/// Returns after the occupant is made ready or the request is ignored.
-///
-/// # Panics
-///
-/// Panics if the scheduler or time subsystem is not initialized, or if an
-/// internal scheduler transition invariant is violated.
-pub fn wake_task(task_id: TaskId) {
-    let _irq_guard = crate::sync::LocalIrqGuard::save_and_disable();
-    let _ = scheduler_mut().wake_task(task_id);
-}
-
-/// Attempt the slot-compatible sleep wake used by the bounded QEMU stress.
-///
-/// This is the result-bearing form of [`wake_task`]. It masks local IRQs,
-/// cancels the exact generation's sleep event, and allocates nothing.
-///
-/// # Arguments
-///
-/// * `task_id` - Scheduler slot whose current occupant is expected to sleep.
-///
-/// # Returns
-///
-/// Returns `true` only when this call performs `Blocked(Sleep) -> Ready`.
-///
-/// # Panics
-///
-/// Panics if the test scheduler or time subsystem is not initialized, or if an
-/// internal scheduler transition invariant is violated.
-#[cfg(feature = "qemu-test-kernel-runtime")]
-pub(crate) fn wake_task_for_test(task_id: TaskId) -> bool {
-    let _irq_guard = crate::sync::LocalIrqGuard::save_and_disable();
-    scheduler_mut().wake_task(task_id)
-}
-
-/// Attempt a generation-aware sleep wake for a QEMU contract.
-///
-/// The operation masks local IRQs and mutates no state when `thread` is stale
-/// or is no longer blocked on sleep.
-///
-/// # Arguments
-///
-/// * `thread` - Exact scheduler slot generation expected to be sleeping.
-///
-/// # Returns
-///
-/// Returns `true` only when this call performs `Blocked(Sleep) -> Ready`.
-///
-/// # Panics
-///
-/// Panics if the test scheduler is not initialized or an internal transition
-/// invariant is violated.
-#[cfg(feature = "qemu-test-kernel-runtime")]
-pub(crate) fn wake_thread_for_test(thread: ThreadId) -> bool {
-    let _irq_guard = crate::sync::LocalIrqGuard::save_and_disable();
-    scheduler_mut().wake_sleeping_thread(thread)
 }
 
 /// Validate bounded scheduler ownership after a test-controlled transition.
@@ -207,25 +146,6 @@ impl Scheduler {
         self.replace_quantum_event(crate::time::now_counter(), current);
     }
 
-    pub(super) fn begin_block_current(
-        &mut self,
-        context: &mut ActiveContext<'_>,
-        reason: BlockReason,
-    ) -> (ThreadId, ThreadId) {
-        let SwitchOutcome::Switch {
-            from: current,
-            to: next,
-        } = self.transition_block_current(reason)
-        else {
-            panic!("sched: blocking transition continued current task")
-        };
-        // Save the current task's post-SVC resume frame before making it unrunnable.
-        self.saved_context_mut(current).save_from(context);
-        self.saved_context(next).restore_into(context);
-        self.activate_task_address_space(next);
-        (current, next)
-    }
-
     pub(super) fn finish_block_current(&mut self, current: ThreadId, next: ThreadId) {
         // A mandatory handoff also acknowledges any stale request at its
         // depth-zero checkpoint; it never needs to select a second task.
@@ -257,28 +177,6 @@ impl Scheduler {
 
     pub(super) fn running_task(&self) -> Option<super::ThreadId> {
         self.current_thread()
-    }
-
-    pub(super) fn wake_task(&mut self, task_id: TaskId) -> bool {
-        if !self.is_valid_task(task_id)
-            || self.task_state(task_id) != TaskState::Blocked(BlockReason::Sleep)
-        {
-            return false;
-        }
-        let thread = self.thread_id(task_id);
-        self.wake_sleeping_thread(thread)
-    }
-
-    fn wake_sleeping_thread(&mut self, thread: ThreadId) -> bool {
-        if !self.matches_blocked(thread, BlockReason::Sleep) {
-            return false;
-        }
-        crate::time::cancel_event(TimedEvent::WakeTask(thread));
-        let woke = self.transition_wake_thread(thread, BlockReason::Sleep);
-        if woke {
-            crate::trace!("sched: sleeping thread {thread} moved to Ready");
-        }
-        woke
     }
 
     pub(super) fn note_quantum_expired(&mut self, thread: ThreadId) {

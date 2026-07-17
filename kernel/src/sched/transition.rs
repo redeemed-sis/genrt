@@ -14,24 +14,19 @@ use crate::{
 };
 
 use super::{
-    IDLE_TASK_ID, INITIAL_THREAD_GENERATION, Scheduler, THREAD_STACK_SIZE, ipc as sched_ipc, thread,
+    IDLE_TASK_ID, INITIAL_THREAD_GENERATION, Scheduler, THREAD_STACK_SIZE, thread,
+    wait::{
+        CancelResult, CommitState, CompletionResult, FinishError, PreparedWait, WaitCause,
+        WaitKind, WaitMetadata, WaitToken,
+    },
 };
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum BlockReason {
-    Sleep,
-    Ipc(sched_ipc::IpcBlock),
-    Join(ThreadId),
-    Process(ProcessId),
-    StdinRead,
-}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) enum TaskState {
     Free,
     Ready,
     Running,
-    Blocked(BlockReason),
+    Blocked,
     Zombie,
 }
 
@@ -46,7 +41,7 @@ pub(super) enum ThreadKind {
 
 /// A context-free scheduling decision for architecture handoff code.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum SwitchOutcome {
+pub(crate) enum SwitchOutcome {
     ContinueCurrent,
     Switch { from: ThreadId, to: ThreadId },
 }
@@ -67,9 +62,9 @@ struct Task {
     state: TaskState,
     joinable: bool,
     exit_code: Option<usize>,
-    joiner: Option<ThreadId>,
-    ipc: sched_ipc::TaskIpcState,
+    joiner: Option<WaitToken>,
     last_join_result: Option<core::result::Result<usize, thread::JoinError>>,
+    wait: WaitMetadata,
     kind: ThreadKind,
     stack: Box<TaskStack>,
     context: Option<SavedContext>,
@@ -83,8 +78,8 @@ impl Task {
             joinable: false,
             exit_code: None,
             joiner: None,
-            ipc: sched_ipc::TaskIpcState::empty(),
             last_join_result: None,
+            wait: WaitMetadata::empty(),
             kind: ThreadKind::Kernel,
             stack: boxed_zeroed_stack(),
             context: None,
@@ -236,8 +231,8 @@ impl Scheduler {
         task.joinable = joinable;
         task.exit_code = None;
         task.joiner = None;
-        task.ipc.reset();
         task.last_join_result = None;
+        task.wait.clear_active();
         task.kind = kind;
         task.context = Some(context);
         task.state = TaskState::Ready;
@@ -280,7 +275,10 @@ impl Scheduler {
         SwitchOutcome::Switch { from, to }
     }
 
-    pub(super) fn transition_block_current(&mut self, reason: BlockReason) -> SwitchOutcome {
+    pub(super) fn transition_commit_wait(
+        &mut self,
+        prepared: PreparedWait,
+    ) -> (CommitState, Option<SwitchOutcome>) {
         crate::sync::preempt::assert_preemption_enabled("scheduler blocking transition");
         let from = self
             .lifecycle
@@ -290,24 +288,90 @@ impl Scheduler {
         if from.index() == IDLE_TASK_ID.index() {
             panic!("sched: idle task cannot block");
         }
+        let commit = self
+            .task_mut(TaskId::new(from.index()))
+            .wait
+            .commit(prepared);
+        let CommitState::Block(_) = commit else {
+            self.validate_after_transition();
+            return (commit, None);
+        };
         let to = self
             .ready_pop_front()
             .unwrap_or_else(|| self.thread_id(IDLE_TASK_ID));
-        self.task_mut(TaskId::new(from.index())).state = TaskState::Blocked(reason);
+        self.task_mut(TaskId::new(from.index())).state = TaskState::Blocked;
         self.make_running(to);
         self.validate_after_transition();
-        SwitchOutcome::Switch { from, to }
+        (commit, Some(SwitchOutcome::Switch { from, to }))
     }
 
-    pub(super) fn transition_wake_thread(&mut self, id: ThreadId, expected: BlockReason) -> bool {
-        if !self.thread_matches(id)
-            || self.task_state(TaskId::new(id.index())) != TaskState::Blocked(expected)
-        {
-            return false;
-        }
-        self.make_ready_and_queue(id, true);
+    pub(super) fn transition_prepare_wait(&mut self, kind: WaitKind) -> PreparedWait {
+        crate::sync::preempt::assert_preemption_enabled("scheduler wait preparation");
+        let current = self
+            .lifecycle
+            .current
+            .unwrap_or_else(|| panic!("sched: wait preparation without a running task"));
+        self.assert_current_running(current, "wait preparation");
+        let prepared = self
+            .task_mut(TaskId::new(current.index()))
+            .wait
+            .prepare(current, kind);
         self.validate_after_transition();
-        true
+        prepared
+    }
+
+    pub(super) fn transition_complete_wait(
+        &mut self,
+        token: WaitToken,
+        cause: WaitCause,
+    ) -> CompletionResult {
+        if !self.thread_matches(token.thread()) {
+            return CompletionResult::Stale;
+        }
+        let id = TaskId::new(token.thread().index());
+        let result = self.task_mut(id).wait.complete(token, cause);
+        if result == CompletionResult::WokeBlocked {
+            if self.task_state(id) != TaskState::Blocked {
+                panic!("sched: blocked wait completion has non-blocked task state");
+            }
+            self.make_ready_and_queue(token.thread(), true);
+        } else if result == CompletionResult::CompletedPrepared
+            && self.task_state(id) != TaskState::Running
+        {
+            panic!("sched: prepared wait completion has non-running task state");
+        }
+        self.validate_after_transition();
+        result
+    }
+
+    pub(super) fn transition_finish_wait(
+        &mut self,
+        token: WaitToken,
+    ) -> Result<WaitCause, FinishError> {
+        if !self.thread_matches(token.thread()) || self.lifecycle.current != Some(token.thread()) {
+            return Err(FinishError::Stale);
+        }
+        self.assert_current_running(token.thread(), "wait finish");
+        let result = self
+            .task_mut(TaskId::new(token.thread().index()))
+            .wait
+            .finish(token);
+        self.validate_after_transition();
+        result
+    }
+
+    pub(super) fn transition_cancel_wait(&mut self, prepared: PreparedWait) -> CancelResult {
+        let token = prepared.token();
+        if !self.thread_matches(token.thread()) || self.lifecycle.current != Some(token.thread()) {
+            return CancelResult::Stale;
+        }
+        self.assert_current_running(token.thread(), "wait cancellation");
+        let result = self
+            .task_mut(TaskId::new(token.thread().index()))
+            .wait
+            .cancel(prepared);
+        self.validate_after_transition();
+        result
     }
 
     pub(super) fn transition_exit_current(&mut self, code: usize) -> SwitchOutcome {
@@ -320,11 +384,18 @@ impl Scheduler {
             panic!("thread: idle thread cannot exit");
         }
         let joinable = self.task(TaskId::new(from.index())).joinable;
-        let joiner = self.task(TaskId::new(from.index())).joiner;
+        let joiner = self.task_mut(TaskId::new(from.index())).joiner.take();
         self.task_mut(TaskId::new(from.index())).exit_code = Some(code);
-        self.task_mut(TaskId::new(from.index())).state = TaskState::Zombie;
         if let Some(joiner) = joiner {
+            // Publish the lifecycle result and complete the exact join wait
+            // while `from` is still the current Running task. Completion runs
+            // the transition validator, so exposing an intermediate
+            // current-but-Zombie state here would violate the scheduler table
+            // invariant before mandatory exit selection is committed.
             self.complete_joiner(from, joiner, code);
+        }
+        self.task_mut(TaskId::new(from.index())).state = TaskState::Zombie;
+        if joiner.is_some() {
             self.reap_zombie(from);
         } else if !joinable {
             self.reap_zombie(from);
@@ -363,19 +434,23 @@ impl Scheduler {
         task.joinable = false;
         task.exit_code = None;
         task.joiner = None;
-        task.ipc.reset();
         task.last_join_result = None;
+        task.wait.clear_active();
         task.kind = ThreadKind::Kernel;
         task.context = None;
         task.state = TaskState::Free;
     }
 
-    fn complete_joiner(&mut self, target: ThreadId, joiner: ThreadId, code: usize) {
-        if !self.matches_blocked(joiner, BlockReason::Join(target)) {
-            panic!("thread: joiner {joiner} has invalid state while target {target} exited");
+    fn complete_joiner(&mut self, target: ThreadId, joiner: WaitToken, code: usize) {
+        if self.transition_complete_wait(joiner, WaitCause::Notified)
+            != CompletionResult::WokeBlocked
+        {
+            panic!("thread: joiner {joiner:?} has invalid state while target {target} exited");
         }
-        self.task_mut(TaskId::new(joiner.index())).last_join_result = Some(Ok(code));
-        self.make_ready_and_queue(joiner, true);
+        // Exact completion validates generation and wait sequence before the
+        // lifecycle owner writes payload into the joiner's reusable slot.
+        self.task_mut(TaskId::new(joiner.thread().index()))
+            .last_join_result = Some(Ok(code));
     }
 
     fn ready_push_back(&mut self, id: ThreadId) {
@@ -498,13 +573,13 @@ impl Scheduler {
     pub(super) fn task_joinable(&self, id: TaskId) -> bool {
         self.task(id).joinable
     }
-    pub(super) fn task_joiner(&self, id: TaskId) -> Option<ThreadId> {
+    pub(super) fn task_joiner(&self, id: TaskId) -> Option<WaitToken> {
         self.task(id).joiner
     }
     pub(super) fn task_exit_code(&self, id: TaskId) -> Option<usize> {
         self.task(id).exit_code
     }
-    pub(super) fn task_set_joiner(&mut self, id: TaskId, joiner: ThreadId) {
+    pub(super) fn task_set_joiner(&mut self, id: TaskId, joiner: WaitToken) {
         self.task_mut(id).joiner = Some(joiner);
     }
     pub(super) fn set_join_result(
@@ -519,13 +594,6 @@ impl Scheduler {
         id: TaskId,
     ) -> Option<core::result::Result<usize, thread::JoinError>> {
         self.task_mut(id).last_join_result.take()
-    }
-    pub(super) fn ipc_mut(&mut self, id: TaskId) -> &mut sched_ipc::TaskIpcState {
-        &mut self.task_mut(id).ipc
-    }
-    pub(super) fn matches_blocked(&self, id: ThreadId, expected: BlockReason) -> bool {
-        self.thread_matches(id)
-            && self.task_state(TaskId::new(id.index())) == TaskState::Blocked(expected)
     }
     pub(super) fn replace_current_kind(
         &mut self,
@@ -572,7 +640,7 @@ impl Scheduler {
                         || task.joinable
                         || task.exit_code.is_some()
                         || task.last_join_result.is_some()
-                        || !task.ipc.is_empty()
+                        || !task.wait.is_none()
                         || task.kind != ThreadKind::Kernel
                         || queued != 0
                     {
@@ -598,11 +666,27 @@ impl Scheduler {
                         panic!("sched: running slot {id} identity mismatch");
                     }
                 }
-                TaskState::Blocked(_) | TaskState::Zombie => {
-                    if task.context.is_none() || queued != 0 {
-                        panic!("sched: non-runnable slot {id} queue/context mismatch");
+                TaskState::Blocked => {
+                    if task.context.is_none() || queued != 0 || !task.wait.is_blocked() {
+                        panic!("sched: blocked slot {id} wait/queue/context mismatch");
                     }
                 }
+                TaskState::Zombie => {
+                    if task.context.is_none() || queued != 0 || !task.wait.is_none() {
+                        panic!("sched: zombie slot {id} wait/queue/context mismatch");
+                    }
+                }
+            }
+            if task.wait.is_prepared() && task.state != TaskState::Running {
+                panic!("sched: prepared wait is not current running task {id}");
+            }
+            if task.wait.is_completed()
+                && !matches!(task.state, TaskState::Ready | TaskState::Running)
+            {
+                panic!("sched: completed wait has invalid task state {id}");
+            }
+            if task.wait.is_blocked() && task.state != TaskState::Blocked {
+                panic!("sched: blocked wait has invalid task state {id}");
             }
         }
         for queued in &self.lifecycle.ready_queue {

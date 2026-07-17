@@ -46,7 +46,7 @@ struct KernelHeap {
 // the task-only preemption lock. Allocation from IRQ context remains forbidden.
 unsafe impl Sync for KernelHeap {}
 
-#[global_allocator]
+#[cfg_attr(not(test), global_allocator)]
 static KERNEL_HEAP: KernelHeap = KernelHeap::empty();
 
 // OOM currently follows the default alloc panic path, which then converges

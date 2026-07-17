@@ -1,8 +1,7 @@
 use crate::time::TimeHandlers;
 
 use super::{
-    Result, SchedError, Scheduler, THREAD_STACK_SIZE, ipc as sched_ipc, preempt,
-    scheduler_slot_mut, thread,
+    Result, SchedError, Scheduler, THREAD_STACK_SIZE, preempt, scheduler_slot_mut, thread,
 };
 
 #[derive(Copy, Clone)]
@@ -60,9 +59,8 @@ fn init_time_after_scheduler_publish(task_count: usize) {
     crate::time::init(
         TimeHandlers {
             finish_timer_interrupt: preempt::finish_timer_interrupt,
-            wake_task: preempt::on_wake_thread,
+            wait_deadline: preempt::on_wait_deadline,
             quantum_expired: preempt::on_quantum_expired,
-            ipc_timeout: sched_ipc::on_ipc_timeout,
         },
         task_count.saturating_mul(crate::time::TIMED_EVENT_CAPACITY_PER_TASK),
     );

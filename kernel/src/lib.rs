@@ -5,6 +5,8 @@
 #![cfg_attr(feature = "qemu-test", allow(dead_code))]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub mod arch;
 pub mod boot;

@@ -3,33 +3,32 @@ use core::cell::UnsafeCell;
 use crate::task::{TaskId, ThreadId};
 
 mod bootstrap;
-mod ipc;
 mod preempt;
 mod sleep;
 mod thread;
 mod transition;
+mod wait;
 
 #[cfg(feature = "qemu-test-kernel-runtime")]
-pub(crate) use self::preempt::{
-    validate_invariants_for_test, wake_task_for_test, wake_thread_for_test,
-};
+pub(crate) use self::preempt::validate_invariants_for_test;
+#[cfg(feature = "qemu-test-kernel-runtime")]
+pub(crate) use self::wait::on_test_wait_sync;
 pub(crate) use self::{
     bootstrap::{StaticTask, bootstrap},
-    ipc::{
-        WaitResult, block_current_on_ipc, clear_current_wait_result, complete_ipc_wait,
-        set_current_wait_result, take_current_wait_result,
-    },
     preempt::{enter_running_task, on_preempt_checkpoint},
     sleep::on_sleep_sync,
     thread::{
-        block_current_on_process_wait, block_current_on_stdin_read, complete_process_wait,
-        complete_stdin_read, current_user_address_space, current_user_process_id,
-        on_thread_exit_sync, on_thread_join_sync, replace_current_user_address_space,
-        thread_spawn_user, thread_spawn_user_from_context,
+        current_user_address_space, current_user_process_id, on_thread_exit_sync,
+        on_thread_join_sync, replace_current_user_address_space, thread_spawn_user,
+        thread_spawn_user_from_context,
+    },
+    wait::{
+        CommitResult, CompletionResult, FinishError, PreparedWait, WaitCause, WaitKind, WaitToken,
+        cancel_wait, commit_wait, complete_wait, finish_wait, prepare_wait,
     },
 };
 pub use self::{
-    preempt::{current_task_id, wake_task, yield_now},
+    preempt::{current_task_id, yield_now},
     sleep::{msleep, sleep_until, sleep_until_counter, usleep},
     thread::{
         JoinError, SpawnError, ThreadArg, ThreadAttrs, ThreadEntry, current_thread_id, thread_exit,

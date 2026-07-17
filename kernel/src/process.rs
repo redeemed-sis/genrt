@@ -13,9 +13,10 @@ use crate::{
         user::{self, USER_STACK_TOP},
         vm::{self, UserAddressSpace, UserMapFlags, VmError},
     },
-    sched::{self, ThreadAttrs},
+    sched::{self, CommitResult, ThreadAttrs, WaitCause, WaitKind, WaitToken},
     sync::LocalIrqGuard,
     task::ThreadId,
+    task_call::TaskCallWaitOutput,
 };
 
 pub(crate) const USER_STACK_SIZE: usize = 64 * 1024;
@@ -190,8 +191,8 @@ struct ProcessSlot {
     main_thread: Option<ThreadId>,
     stack: FrameRange,
     exit_status: Option<ProcessExitStatus>,
-    joiner: Option<ThreadId>,
-    waiter: Option<ThreadId>,
+    joiner: Option<WaitToken>,
+    waiter: Option<WaitToken>,
 }
 
 impl ProcessSlot {
@@ -308,6 +309,7 @@ struct WaitedProcess {
     address_space: Option<UserAddressSpace>,
     user_image: Option<UserElfImage>,
     stack: FrameRange,
+    wait_token: Option<WaitToken>,
 }
 
 pub(crate) enum WaitPidAction {
@@ -437,6 +439,8 @@ pub(crate) fn process_join(pid: ProcessId) -> Result<ProcessExitStatus, ProcessJ
 ///
 /// * `context` - Exclusive live task-call context for scheduler handoff.
 /// * `pid` - Generation-checked process whose terminal state is awaited.
+/// * `output` - Stack-owned private task-call output that retains the exact
+///   wait token across a blocked resume.
 ///
 /// # Returns
 ///
@@ -446,14 +450,19 @@ pub(crate) fn process_join(pid: ProcessId) -> Result<ProcessExitStatus, ProcessJ
 ///
 /// # Panics
 ///
-/// Panics when a [`crate::sync::preempt::PreemptGuard`] is active before publishing the
-/// process joiner.
-pub(crate) fn on_process_join_sync(context: &mut ActiveContext<'_>, pid: ProcessId) {
+/// Panics when a [`crate::sync::preempt::PreemptGuard`] is active before
+/// publishing the process joiner.
+pub(crate) fn on_process_join_sync(
+    context: &mut ActiveContext<'_>,
+    pid: ProcessId,
+    output: &mut TaskCallWaitOutput,
+) {
     let Some(joiner) = sched::current_thread_id() else {
         return;
     };
 
-    {
+    let prepared = {
+        let _irq_guard = LocalIrqGuard::save_and_disable();
         let table = table_mut();
         let Some(slot) = table.slot_mut(pid) else {
             return;
@@ -467,10 +476,18 @@ pub(crate) fn on_process_join_sync(context: &mut ActiveContext<'_>, pid: Process
         }
 
         crate::sync::preempt::assert_preemption_enabled("process joiner publication");
-        slot.joiner = Some(joiner);
-    }
+        let prepared = sched::prepare_wait(WaitKind::Process);
+        let token = prepared.token();
+        output.record_token(token);
+        slot.joiner = Some(token);
+        prepared
+    };
 
-    sched::block_current_on_process_wait(context, pid);
+    match sched::commit_wait(context, prepared) {
+        CommitResult::Blocked(_) => {}
+        CommitResult::Early(cause) => output.record_early(cause),
+        CommitResult::Stale => panic!("process: join wait became stale before commit"),
+    }
     crate::debug!("process: join blocking current={joiner} pid={pid}");
 }
 
@@ -723,18 +740,19 @@ pub(crate) fn waitpid_current(
 
     let prepare = {
         let _irq_guard = LocalIrqGuard::save_and_disable();
-        let prepare = prepare_wait_child_locked(parent_pid, child_pid, caller);
-        if matches!(prepare, WaitChildPrepare::WouldBlock) {
-            // waitpid blocks before producing userspace-visible side effects.
-            // The architecture facade restarts the syscall after wake.
-            context.restart_current_syscall();
-            sched::block_current_on_process_wait(context, child_pid);
-        }
-        prepare
+        prepare_wait_child_locked(parent_pid, child_pid, caller)
     };
 
     match prepare {
         WaitChildPrepare::Consumed(waited) => {
+            if let Some(token) = waited.wait_token {
+                match sched::finish_wait(token) {
+                    Ok(_) | Err(sched::FinishError::Stale) => {}
+                    Err(sched::FinishError::NotCompleted) => {
+                        panic!("waitpid: child wait not completed")
+                    }
+                }
+            }
             let encoded = encode_wait_status(waited.status);
             cleanup_waited_process(waited);
             if status_ptr != 0 {
@@ -748,7 +766,13 @@ pub(crate) fn waitpid_current(
             }
             WaitPidAction::Return(Ok(child_pid.as_raw()))
         }
-        WaitChildPrepare::WouldBlock => WaitPidAction::Blocked,
+        WaitChildPrepare::Prepared(prepared) => {
+            context.restart_current_syscall();
+            match sched::commit_wait(context, prepared) {
+                CommitResult::Blocked(_) | CommitResult::Early(_) => WaitPidAction::Blocked,
+                CommitResult::Stale => panic!("waitpid: prepared wait became stale before commit"),
+            }
+        }
         WaitChildPrepare::Err(errno) => WaitPidAction::Return(Err(errno)),
     }
 }
@@ -761,7 +785,10 @@ fn finish_current_process(
     crate::sync::preempt::assert_preemption_enabled("process terminal state change");
     let pid = sched::current_user_process_id().ok_or(ProcessFaultError::NoCurrentProcess)?;
     let thread = sched::current_thread_id();
-    let wake = finish_process(pid, status).ok_or(ProcessFaultError::InvalidProcess)?;
+    let wake = {
+        let _irq_guard = LocalIrqGuard::save_and_disable();
+        finish_process(pid, status).ok_or(ProcessFaultError::InvalidProcess)?
+    };
 
     match status {
         ProcessExitStatus::Exited(code) => {
@@ -776,10 +803,10 @@ fn finish_current_process(
     }
 
     if let Some(joiner) = wake.joiner {
-        sched::complete_process_wait(joiner, pid);
+        let _ = sched::complete_wait(joiner, WaitCause::Notified);
     }
     if let Some(waiter) = wake.waiter {
-        sched::complete_process_wait(waiter, pid);
+        let _ = sched::complete_wait(waiter, WaitCause::Notified);
     }
     sched::on_thread_exit_sync(context, thread_code);
     Ok(())
@@ -856,8 +883,8 @@ fn attach_process_main_thread(pid: ProcessId, main_thread: ThreadId) -> Result<(
 
 #[derive(Copy, Clone)]
 struct ProcessWake {
-    joiner: Option<ThreadId>,
-    waiter: Option<ThreadId>,
+    joiner: Option<WaitToken>,
+    waiter: Option<WaitToken>,
 }
 
 fn finish_process(pid: ProcessId, status: ProcessExitStatus) -> Option<ProcessWake> {
@@ -898,7 +925,7 @@ impl ForkSnapshot {
 
 enum WaitChildPrepare {
     Consumed(WaitedProcess),
-    WouldBlock,
+    Prepared(sched::PreparedWait),
     Err(errno::Errno),
 }
 
@@ -1183,15 +1210,19 @@ fn prepare_wait_child_locked(
         return WaitChildPrepare::Err(errno::ECHILD);
     }
     if let Some(waiter) = slot.waiter {
-        if waiter != caller {
+        if waiter.thread() != caller {
             return WaitChildPrepare::Err(errno::ECHILD);
         }
     }
 
     let Some(status) = slot.exit_status.take() else {
+        if slot.waiter.is_some() {
+            panic!("waitpid: current caller already owns an unfinished child wait");
+        }
         crate::sync::preempt::assert_preemption_enabled("process waiter publication");
-        slot.waiter = Some(caller);
-        return WaitChildPrepare::WouldBlock;
+        let prepared = sched::prepare_wait(WaitKind::Process);
+        slot.waiter = Some(prepared.token());
+        return WaitChildPrepare::Prepared(prepared);
     };
 
     let waited = WaitedProcess {
@@ -1200,6 +1231,7 @@ fn prepare_wait_child_locked(
         address_space: slot.address_space.take(),
         user_image: slot.user_image.take(),
         stack: slot.stack,
+        wait_token: slot.waiter.take(),
     };
     let next_generation = next_generation(slot.generation);
     *slot = ProcessSlot {
@@ -1395,7 +1427,7 @@ fn consume_process_for_join(
         .ok_or(ConsumeProcessError::Join(ProcessJoinError::InvalidProcess))?;
 
     if let Some(joiner) = slot.joiner {
-        if joiner != caller {
+        if joiner.thread() != caller {
             return Err(ConsumeProcessError::Join(ProcessJoinError::JoinInProgress));
         }
     }

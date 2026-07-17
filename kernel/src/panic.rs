@@ -1,9 +1,12 @@
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 
+#[cfg(not(test))]
 unsafe extern "C" {
     fn arch_hard_fault() -> !;
 }
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     #[cfg(feature = "qemu-test")]

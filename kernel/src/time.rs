@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
-use crate::{arch::ActiveContext, task::ThreadId};
+use crate::{arch::ActiveContext, sched::WaitToken, task::ThreadId};
 
 unsafe extern "C" {
     fn arch_counter_now() -> u64;
@@ -15,38 +15,44 @@ type TimedTaskHandler = fn(ThreadId);
 
 /// Preallocated timed-event slots reserved for each scheduler task slot.
 ///
-/// One task may concurrently own a sleep wake, a scheduler quantum, and an IPC
-/// timeout. Scheduler bootstrap multiplies this constant by task capacity.
+/// One task may concurrently own one exact wait deadline and one scheduler
+/// quantum. The third slot preserves the configured bounded queue headroom;
+/// scheduler bootstrap multiplies this constant by task capacity.
 pub(crate) const TIMED_EVENT_CAPACITY_PER_TASK: usize = 3;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TimedEvent {
-    WakeTask(ThreadId),
+    /// Time-owned deadline for one exact externally published wait.
+    WaitDeadline(WaitToken),
     QuantumExpired(ThreadId),
-    // IPC timeouts are typed task events, not callbacks. Scheduler owns the
-    // task wait state and asks IPC to remove the mailbox waiter during dispatch.
-    IpcTimeout(ThreadId),
 }
 
 impl TimedEvent {
-    fn sort_key(self) -> (u8, usize, u32) {
+    fn sort_key(self) -> (u8, usize, u32, u64) {
         match self {
-            Self::WakeTask(thread) => (0, thread.index(), thread.generation()),
-            Self::QuantumExpired(thread) => (1, thread.index(), thread.generation()),
-            Self::IpcTimeout(thread) => (2, thread.index(), thread.generation()),
+            Self::WaitDeadline(token) => (
+                0,
+                token.thread().index(),
+                token.thread().generation(),
+                token.sequence(),
+            ),
+            Self::QuantumExpired(thread) => (1, thread.index(), thread.generation(), 0),
         }
     }
 }
 
 #[derive(Copy, Clone)]
 pub(crate) struct TimeHandlers {
-    // Scheduler-owned reactions injected during bootstrap so `kernel::time`
-    // stays agnostic of the scheduler module itself.
+    /// Finish one timer interrupt after all expired events are dispatched.
     pub finish_timer_interrupt: FinishTimerInterruptHandler,
-    pub wake_task: TimedTaskHandler,
+    /// Complete one exact wait deadline without acquiring an owner lock.
+    pub wait_deadline: TimedWaitHandler,
+    /// Mark one generation-aware task quantum as expired.
     pub quantum_expired: TimedTaskHandler,
-    pub ipc_timeout: TimedTaskHandler,
 }
+
+/// Allocation-free time callback for one exact wait deadline.
+pub(crate) type TimedWaitHandler = fn(WaitToken);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct DeadlineEntry {
@@ -383,17 +389,13 @@ pub fn on_timer_interrupt(context: &mut ActiveContext<'_>) {
 #[inline(always)]
 fn dispatch_expired_event(handlers: TimeHandlers, event: TimedEvent) {
     match event {
-        TimedEvent::WakeTask(task_id) => {
-            crate::trace!("time: dispatch WakeTask({task_id})");
-            (handlers.wake_task)(task_id);
+        TimedEvent::WaitDeadline(token) => {
+            crate::trace!("time: dispatch WaitDeadline({token:?})");
+            (handlers.wait_deadline)(token);
         }
         TimedEvent::QuantumExpired(task_id) => {
             crate::trace!("time: dispatch QuantumExpired({task_id})");
             (handlers.quantum_expired)(task_id);
-        }
-        TimedEvent::IpcTimeout(task_id) => {
-            crate::debug!("time: timeout fired IpcTimeout({task_id})");
-            (handlers.ipc_timeout)(task_id);
         }
     }
 }

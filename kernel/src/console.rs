@@ -1,6 +1,10 @@
 use core::cell::UnsafeCell;
 
-use crate::{arch::ActiveContext, sched, sync::LocalIrqGuard, task::ThreadId};
+use crate::{
+    arch::ActiveContext,
+    sched::{self, CommitResult, WaitCause, WaitKind, WaitToken},
+    sync::LocalIrqGuard,
+};
 
 unsafe extern "C" {
     fn arch_console_init_once();
@@ -15,7 +19,8 @@ struct StdinRx {
     tail: usize,
     len: usize,
     overflow_count: usize,
-    waiter: Option<ThreadId>,
+    waiter: Option<WaitToken>,
+    completed: Option<WaitToken>,
 }
 
 impl StdinRx {
@@ -27,10 +32,11 @@ impl StdinRx {
             len: 0,
             overflow_count: 0,
             waiter: None,
+            completed: None,
         }
     }
 
-    fn push(&mut self, byte: u8) -> Option<ThreadId> {
+    fn push(&mut self, byte: u8) -> Option<WaitToken> {
         if self.len == STDIN_RX_CAPACITY {
             // Drop-newest policy: keep already buffered input stable for the
             // blocked reader and count the overflow for diagnostics.
@@ -41,7 +47,11 @@ impl StdinRx {
         self.ring[self.tail] = byte;
         self.tail = (self.tail + 1) % STDIN_RX_CAPACITY;
         self.len += 1;
-        self.waiter.take()
+        let token = self.waiter.take();
+        if token.is_some() {
+            self.completed = token;
+        }
+        token
     }
 
     fn pop_into(&mut self, out: &mut [u8]) -> usize {
@@ -59,7 +69,10 @@ impl StdinRx {
         self.len == 0
     }
 
-    fn register_waiter(&mut self, waiter: ThreadId) -> bool {
+    fn register_waiter(&mut self, waiter: WaitToken) -> bool {
+        if self.completed.is_some() {
+            return false;
+        }
         match self.waiter {
             Some(existing) if existing == waiter => true,
             Some(_) => false,
@@ -67,6 +80,13 @@ impl StdinRx {
                 self.waiter = Some(waiter);
                 true
             }
+        }
+    }
+
+    fn take_completed(&mut self, current: crate::task::ThreadId) -> Option<WaitToken> {
+        match self.completed {
+            Some(token) if token.thread() == current => self.completed.take(),
+            _ => None,
         }
     }
 }
@@ -108,12 +128,13 @@ pub fn puts(s: &str) {
 
 pub fn on_stdin_byte(byte: u8) {
     let waiter = {
+        let _irq_guard = LocalIrqGuard::save_and_disable();
         let stdin = stdin_mut();
         stdin.push(byte)
     };
 
     if let Some(waiter) = waiter {
-        sched::complete_stdin_read(waiter);
+        let _ = sched::complete_wait(waiter, WaitCause::Notified);
     }
 }
 
@@ -122,8 +143,23 @@ pub fn read_stdin(buffer: &mut [u8]) -> usize {
         return 0;
     }
 
-    let _irq_guard = LocalIrqGuard::save_and_disable();
-    stdin_mut().pop_into(buffer)
+    let current = sched::current_thread_id();
+    let (len, completed) = {
+        let _irq_guard = LocalIrqGuard::save_and_disable();
+        let stdin = stdin_mut();
+        let len = stdin.pop_into(buffer);
+        let completed = current.and_then(|thread| stdin.take_completed(thread));
+        (len, completed)
+    };
+    if let Some(token) = completed {
+        match sched::finish_wait(token) {
+            Ok(_) | Err(sched::FinishError::Stale) => {}
+            Err(sched::FinishError::NotCompleted) => {
+                panic!("stdin: consumed before wait completion")
+            }
+        }
+    }
+    len
 }
 
 /// Register and block the current stdin reader if the RX ring is still empty.
@@ -156,21 +192,29 @@ pub fn read_stdin(buffer: &mut [u8]) -> usize {
 pub(crate) fn block_current_stdin_read_if_empty(
     context: &mut ActiveContext<'_>,
 ) -> Result<bool, ()> {
-    let _irq_guard = LocalIrqGuard::save_and_disable();
-    if !stdin_ref().is_empty() {
-        return Ok(false);
-    }
+    let prepared = {
+        let _irq_guard = LocalIrqGuard::save_and_disable();
+        if !stdin_ref().is_empty() {
+            return Ok(false);
+        }
 
-    let current = sched::current_thread_id().ok_or(())?;
-    crate::sync::preempt::assert_preemption_enabled("stdin waiter registration");
-    if !stdin_mut().register_waiter(current) {
-        return Err(());
-    }
+        crate::sync::preempt::assert_preemption_enabled("stdin waiter registration");
+        let prepared = sched::prepare_wait(WaitKind::Io);
+        let token = prepared.token();
+        if !stdin_mut().register_waiter(token) {
+            let _ = sched::cancel_wait(prepared);
+            return Err(());
+        }
+        prepared
+    };
 
     // The architecture facade owns the instruction-width and resume-PC detail.
     // This call occurs before any bytes are copied, so retry is transparent.
     context.restart_current_syscall();
-    sched::block_current_on_stdin_read(context);
+    match sched::commit_wait(context, prepared) {
+        CommitResult::Blocked(_) | CommitResult::Early(_) => {}
+        CommitResult::Stale => panic!("stdin: wait became stale before commit"),
+    }
     Ok(true)
 }
 
