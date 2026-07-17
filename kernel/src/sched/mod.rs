@@ -1,14 +1,18 @@
-use alloc::{collections::VecDeque, vec::Vec};
 use core::cell::UnsafeCell;
 
-use crate::task::TaskId;
+use crate::task::{TaskId, ThreadId};
 
 mod bootstrap;
 mod ipc;
 mod preempt;
 mod sleep;
 mod thread;
+mod transition;
 
+#[cfg(feature = "qemu-test-kernel-runtime")]
+pub(crate) use self::preempt::{
+    validate_invariants_for_test, wake_task_for_test, wake_thread_for_test,
+};
 pub(crate) use self::{
     bootstrap::{StaticTask, bootstrap},
     ipc::{
@@ -60,9 +64,7 @@ pub(crate) struct Scheduler {
     //   stable while scheduling is active,
     // - `ready_queue` owns round-robin order for non-idle runnable tasks,
     // - no allocation or queue growth is allowed in IRQ fast paths.
-    tasks: Vec<preempt::Task>,
-    ready_queue: VecDeque<TaskId>,
-    current: Option<TaskId>,
+    lifecycle: transition::TransitionState,
     rr_quantum_ms: u64,
     entered_running_task: bool,
 }

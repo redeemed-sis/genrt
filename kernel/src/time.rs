@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
-use crate::{arch::ActiveContext, task::TaskId};
+use crate::{arch::ActiveContext, task::ThreadId};
 
 unsafe extern "C" {
     fn arch_counter_now() -> u64;
@@ -11,23 +11,29 @@ unsafe extern "C" {
 }
 
 type FinishTimerInterruptHandler = fn(&mut ActiveContext<'_>, u64);
-type TimedTaskHandler = fn(TaskId);
+type TimedTaskHandler = fn(ThreadId);
+
+/// Preallocated timed-event slots reserved for each scheduler task slot.
+///
+/// One task may concurrently own a sleep wake, a scheduler quantum, and an IPC
+/// timeout. Scheduler bootstrap multiplies this constant by task capacity.
+pub(crate) const TIMED_EVENT_CAPACITY_PER_TASK: usize = 3;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TimedEvent {
-    WakeTask(TaskId),
-    QuantumExpired(TaskId),
+    WakeTask(ThreadId),
+    QuantumExpired(ThreadId),
     // IPC timeouts are typed task events, not callbacks. Scheduler owns the
     // task wait state and asks IPC to remove the mailbox waiter during dispatch.
-    IpcTimeout(TaskId),
+    IpcTimeout(ThreadId),
 }
 
 impl TimedEvent {
-    fn sort_key(self) -> (u8, usize) {
+    fn sort_key(self) -> (u8, usize, u32) {
         match self {
-            Self::WakeTask(task_id) => (0, task_id.index()),
-            Self::QuantumExpired(task_id) => (1, task_id.index()),
-            Self::IpcTimeout(task_id) => (2, task_id.index()),
+            Self::WakeTask(thread) => (0, thread.index(), thread.generation()),
+            Self::QuantumExpired(thread) => (1, thread.index(), thread.generation()),
+            Self::IpcTimeout(thread) => (2, thread.index(), thread.generation()),
         }
     }
 }

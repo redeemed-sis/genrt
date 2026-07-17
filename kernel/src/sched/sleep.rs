@@ -1,6 +1,6 @@
 use crate::{arch::ActiveContext, time::TimedEvent};
 
-use super::{Scheduler, preempt::BlockReason, scheduler_mut};
+use super::{Scheduler, scheduler_mut, transition::BlockReason};
 
 pub fn usleep(us: u64) {
     if us == 0 {

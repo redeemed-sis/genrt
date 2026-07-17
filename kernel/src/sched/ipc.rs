@@ -2,11 +2,14 @@ use crate::{
     arch::ActiveContext,
     ipc::{IpcWaitRegistration, IpcWaitToken},
     sync::LocalIrqGuard,
-    task::TaskId,
+    task::{TaskId, ThreadId},
     time::TimedEvent,
 };
 
-use super::{Scheduler, preempt::BlockReason, preempt::TaskState, scheduler_mut};
+use super::{
+    Scheduler, scheduler_mut,
+    transition::{BlockReason, TaskState},
+};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum WaitResult {
@@ -36,17 +39,21 @@ impl TaskIpcState {
         self.last_wait_result = None;
     }
 
-    fn set_wait_result(&mut self, result: WaitResult) {
+    pub(super) fn is_empty(&self) -> bool {
+        self.last_wait_result.is_none()
+    }
+
+    pub(super) fn set_wait_result(&mut self, result: WaitResult) {
         self.last_wait_result = Some(result);
     }
 
-    fn take_wait_result(&mut self) -> Option<WaitResult> {
+    pub(super) fn take_wait_result(&mut self) -> Option<WaitResult> {
         self.last_wait_result.take()
     }
 }
 
-pub(super) fn on_ipc_timeout(task_id: TaskId) {
-    scheduler_mut().handle_ipc_timeout(task_id);
+pub(super) fn on_ipc_timeout(thread: ThreadId) {
+    scheduler_mut().handle_ipc_timeout(thread);
 }
 
 pub(crate) fn complete_ipc_wait(task_id: TaskId) {
@@ -88,7 +95,9 @@ pub(crate) fn block_current_on_ipc(context: &mut ActiveContext<'_>, wait: IpcWai
 
 impl Scheduler {
     fn block_current_on_ipc(&mut self, context: &mut ActiveContext<'_>, wait: IpcWaitRegistration) {
-        let current = self.blocking_current();
+        let current = self
+            .running_task()
+            .unwrap_or_else(|| panic!("sched: IPC wait without running task"));
         let timeout_event = wait.timeout_deadline().map(|deadline| {
             let event = TimedEvent::IpcTimeout(current);
             crate::time::schedule_event(deadline, event);
@@ -100,8 +109,9 @@ impl Scheduler {
             timeout_event,
         });
 
-        let next = self.block_current_with_reason(context, current, reason);
-        self.finish_block_current(current, next);
+        let (from, next) = self.begin_block_current(context, reason);
+        debug_assert_eq!(from, current);
+        self.finish_block_current(from, next);
         crate::trace!(
             "sched: task {current} blocked on IPC token={:?} timeout_event={:?}",
             wait.token(),
@@ -114,8 +124,8 @@ impl Scheduler {
             return;
         }
 
-        let timeout_event = match self.task(task_id).state {
-            TaskState::Blocked(BlockReason::Ipc(wait)) => wait.timeout_event,
+        let wait = match self.task_state(task_id) {
+            TaskState::Blocked(BlockReason::Ipc(wait)) => wait,
             TaskState::Blocked(reason) => {
                 crate::trace!(
                     "sched: ignoring IPC completion for task {task_id}; blocked on {reason:?}"
@@ -128,25 +138,27 @@ impl Scheduler {
             }
         };
 
-        if let Some(event) = timeout_event {
+        if let Some(event) = wait.timeout_event {
             crate::time::cancel_event(event);
             crate::debug!("sched: normal IPC wake canceled timeout {event:?}");
         }
 
-        self.task_mut(task_id)
-            .ipc
-            .set_wait_result(WaitResult::Completed);
-        self.wake_task(task_id);
+        self.ipc_mut(task_id).set_wait_result(WaitResult::Completed);
+        let thread = self.thread_id(task_id);
+        if !self.transition_wake_thread(thread, BlockReason::Ipc(wait)) {
+            panic!("sched: IPC completion failed to wake {thread}");
+        }
     }
 
-    fn handle_ipc_timeout(&mut self, task_id: TaskId) {
-        if !self.is_valid_task(task_id) {
+    fn handle_ipc_timeout(&mut self, thread: ThreadId) {
+        if !self.thread_matches(thread) {
             return;
         }
+        let task_id = TaskId::new(thread.index());
 
-        let wait = match self.task(task_id).state {
+        let wait = match self.task_state(task_id) {
             TaskState::Blocked(BlockReason::Ipc(wait))
-                if wait.timeout_event == Some(TimedEvent::IpcTimeout(task_id)) =>
+                if wait.timeout_event == Some(TimedEvent::IpcTimeout(thread)) =>
             {
                 wait
             }
@@ -165,10 +177,10 @@ impl Scheduler {
             panic!("sched: IPC timeout task {task_id} missing from IPC wait queue");
         }
 
-        self.task_mut(task_id)
-            .ipc
-            .set_wait_result(WaitResult::TimedOut);
-        self.wake_task(task_id);
+        self.ipc_mut(task_id).set_wait_result(WaitResult::TimedOut);
+        if !self.transition_wake_thread(thread, BlockReason::Ipc(wait)) {
+            panic!("sched: IPC timeout failed to wake {thread}");
+        }
         crate::debug!(
             "sched: IPC timeout completed task {task_id} token={:?}",
             wait.token
@@ -176,8 +188,8 @@ impl Scheduler {
     }
 
     fn clear_current_wait_result(&mut self) {
-        if let Some(current) = self.current {
-            self.task_mut(current).ipc.reset();
+        if let Some(current) = self.running_task() {
+            self.ipc_mut(TaskId::new(current.index())).reset();
         }
     }
 
@@ -185,13 +197,15 @@ impl Scheduler {
         let current = self
             .running_task()
             .unwrap_or_else(|| panic!("sched: wait result without running task"));
-        self.task_mut(current).ipc.set_wait_result(result);
+        self.ipc_mut(TaskId::new(current.index()))
+            .set_wait_result(result);
     }
 
     fn take_current_wait_result(&mut self) -> Option<WaitResult> {
         let current = self
             .running_task()
             .unwrap_or_else(|| panic!("sched: wait result without running task"));
-        self.task_mut(current).ipc.take_wait_result()
+        self.ipc_mut(TaskId::new(current.index()))
+            .take_wait_result()
     }
 }

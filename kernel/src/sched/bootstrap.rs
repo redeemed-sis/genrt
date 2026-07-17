@@ -1,9 +1,7 @@
-use alloc::{collections::VecDeque, vec::Vec};
-
-use crate::{task::TaskId, time::TimeHandlers};
+use crate::time::TimeHandlers;
 
 use super::{
-    IDLE_TASK_ID, Result, SchedError, Scheduler, THREAD_STACK_SIZE, ipc as sched_ipc, preempt,
+    Result, SchedError, Scheduler, THREAD_STACK_SIZE, ipc as sched_ipc, preempt,
     scheduler_slot_mut, thread,
 };
 
@@ -51,7 +49,7 @@ pub(crate) fn bootstrap(
     //    timer IRQ dispatch can invoke scheduler callbacks.
     let scheduler =
         Scheduler::bootstrap_new(idle_entry, idle_arg, tasks, rr_quantum_ms, thread_capacity)?;
-    let task_count = scheduler.tasks.len();
+    let task_count = scheduler.transition_task_count();
     *scheduler_slot_mut() = Some(scheduler);
     init_time_after_scheduler_publish(task_count);
     Ok(())
@@ -62,11 +60,11 @@ fn init_time_after_scheduler_publish(task_count: usize) {
     crate::time::init(
         TimeHandlers {
             finish_timer_interrupt: preempt::finish_timer_interrupt,
-            wake_task: preempt::on_wake_task,
+            wake_task: preempt::on_wake_thread,
             quantum_expired: preempt::on_quantum_expired,
             ipc_timeout: sched_ipc::on_ipc_timeout,
         },
-        task_count.saturating_mul(3),
+        task_count.saturating_mul(crate::time::TIMED_EVENT_CAPACITY_PER_TASK),
     );
 }
 
@@ -83,69 +81,22 @@ impl Scheduler {
             return Err(SchedError::ThreadCapacityTooSmall);
         }
 
-        let mut scheduler = Self::new(thread_capacity, rr_quantum_ms);
-        scheduler.push_idle_task(idle_entry, idle_arg);
+        let mut scheduler = Self::transition_new(thread_capacity, rr_quantum_ms);
+        scheduler.transition_append_bootstrap(idle_entry, idle_arg, true);
         for task in tasks {
-            scheduler.push_bootstrap_task(task.entry, task.arg);
+            let id = scheduler.transition_append_bootstrap(task.entry, task.arg, false);
+            crate::debug!("sched: bootstrap task {id}");
         }
-        scheduler.fill_free_slots(thread_capacity);
+        scheduler.transition_fill_free_slots(thread_capacity);
 
-        let first = scheduler.dequeue_next_ready().unwrap_or(IDLE_TASK_ID);
-        scheduler.mark_initial_running(first)?;
+        scheduler.transition_initial_dispatch()?;
         crate::debug!(
             "sched: thread_capacity={} ready_queue_capacity={} stack_size={} quantum={}ms",
-            scheduler.tasks.len(),
-            scheduler.ready_queue.capacity(),
+            scheduler.transition_task_count(),
+            scheduler.transition_ready_capacity(),
             THREAD_STACK_SIZE,
             scheduler.rr_quantum_ms
         );
         Ok(scheduler)
-    }
-
-    fn new(task_capacity: usize, rr_quantum_ms: u64) -> Self {
-        let mut task_table = Vec::new();
-        task_table.reserve_exact(task_capacity);
-
-        let mut ready_queue = VecDeque::new();
-        ready_queue.reserve_exact(task_capacity.saturating_sub(1));
-
-        Self {
-            tasks: task_table,
-            ready_queue,
-            current: None,
-            rr_quantum_ms: rr_quantum_ms.max(1),
-            entered_running_task: false,
-        }
-    }
-
-    fn push_idle_task(&mut self, entry: thread::ThreadEntry, arg: thread::ThreadArg) {
-        let id = TaskId::new(self.tasks.len());
-        debug_assert_eq!(id, IDLE_TASK_ID);
-        self.tasks.push(preempt::Task::bootstrap(
-            entry,
-            arg,
-            preempt::TaskState::Ready,
-            false,
-        ));
-    }
-
-    fn push_bootstrap_task(&mut self, entry: thread::ThreadEntry, arg: thread::ThreadArg) {
-        let id = TaskId::new(self.tasks.len());
-        self.tasks.push(preempt::Task::bootstrap(
-            entry,
-            arg,
-            preempt::TaskState::Ready,
-            false,
-        ));
-        self.ready_push_back(id);
-        crate::debug!("sched: bootstrap task {id}");
-    }
-
-    fn fill_free_slots(&mut self, thread_capacity: usize) {
-        while self.tasks.len() < thread_capacity {
-            let id = TaskId::new(self.tasks.len());
-            self.tasks.push(preempt::Task::free());
-            crate::trace!("sched: prepared free thread slot {id}");
-        }
     }
 }

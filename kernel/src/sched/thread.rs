@@ -8,7 +8,11 @@ use crate::{
     task::{TaskId, ThreadId},
 };
 
-use super::{IDLE_TASK_ID, Scheduler, preempt, scheduler_mut, try_scheduler_mut};
+use super::{
+    IDLE_TASK_ID, Scheduler, scheduler_mut,
+    transition::{BlockReason, SwitchOutcome, TaskState, ThreadKind},
+    try_scheduler_mut,
+};
 
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -308,11 +312,6 @@ pub(crate) fn complete_stdin_read(waiter: ThreadId) {
     scheduler_mut().complete_stdin_read(waiter);
 }
 
-enum BlockedWaiterState {
-    Missing,
-    WrongState(preempt::TaskState),
-}
-
 impl Scheduler {
     fn spawn_thread(
         &mut self,
@@ -324,34 +323,14 @@ impl Scheduler {
             return Err(SpawnError::NoThreadSlots);
         };
         let context = SavedContext::kernel_entry(
-            self.task(id).stack_top(),
+            self.stack_top(id),
             entry as *const () as usize,
             arg.as_usize(),
             thread_entry_bootstrap as *const () as usize,
         );
 
-        let thread_id = {
-            let task = self.task_mut(id);
-            task.generation = next_generation(task.generation);
-            task.joinable = attrs.joinable;
-            task.exit_code = None;
-            task.joiner = None;
-            task.ipc.reset();
-            task.last_join_result = None;
-            task.entry = free_task_entry;
-            task.arg = ThreadArg::empty();
-            task.kind = preempt::ThreadKind::Kernel;
-            task.install_context(context);
-            task.state = preempt::TaskState::Ready;
-            ThreadId::new(id.index(), task.generation)
-        };
-        if id != IDLE_TASK_ID {
-            let was_empty = self.ready_queue.is_empty();
-            self.ready_push_back(id);
-            if was_empty {
-                self.note_runnable_peer_available();
-            }
-        }
+        let thread_id =
+            self.transition_publish_runtime(id, context, ThreadKind::Kernel, attrs.joinable);
 
         crate::debug!(
             "thread: spawned id={thread_id} joinable={} arg={}",
@@ -373,34 +352,17 @@ impl Scheduler {
         let Some(id) = self.find_free_slot() else {
             return Err(SpawnError::NoThreadSlots);
         };
-        let context =
-            SavedContext::user_entry(user_entry, user_sp, self.task(id).stack_top(), arg0);
+        let context = SavedContext::user_entry(user_entry, user_sp, self.stack_top(id), arg0);
 
-        let thread_id = {
-            let task = self.task_mut(id);
-            task.generation = next_generation(task.generation);
-            task.joinable = attrs.joinable;
-            task.exit_code = None;
-            task.joiner = None;
-            task.ipc.reset();
-            task.last_join_result = None;
-            task.entry = free_task_entry;
-            task.arg = ThreadArg::empty();
-            task.kind = preempt::ThreadKind::User {
+        let thread_id = self.transition_publish_runtime(
+            id,
+            context,
+            ThreadKind::User {
                 process_id,
                 address_space,
-            };
-            task.install_context(context);
-            task.state = preempt::TaskState::Ready;
-            ThreadId::new(id.index(), task.generation)
-        };
-        if id != IDLE_TASK_ID {
-            let was_empty = self.ready_queue.is_empty();
-            self.ready_push_back(id);
-            if was_empty {
-                self.note_runnable_peer_available();
-            }
-        }
+            },
+            attrs.joinable,
+        );
 
         crate::debug!(
             "thread: spawned user id={thread_id} pid={process_id} entry=0x{user_entry:x} sp=0x{user_sp:x} ttbr0=0x{:x}",
@@ -419,34 +381,17 @@ impl Scheduler {
         let Some(id) = self.find_free_slot() else {
             return Err(SpawnError::NoThreadSlots);
         };
-        let child_context = SavedContext::fork_child(context, self.task(id).stack_top());
+        let child_context = SavedContext::fork_child(context, self.stack_top(id));
 
-        let thread_id = {
-            let task = self.task_mut(id);
-            task.generation = next_generation(task.generation);
-            task.joinable = attrs.joinable;
-            task.exit_code = None;
-            task.joiner = None;
-            task.ipc.reset();
-            task.last_join_result = None;
-            task.entry = free_task_entry;
-            task.arg = ThreadArg::empty();
-            task.kind = preempt::ThreadKind::User {
+        let thread_id = self.transition_publish_runtime(
+            id,
+            child_context,
+            ThreadKind::User {
                 process_id,
                 address_space,
-            };
-            task.install_context(child_context);
-            task.state = preempt::TaskState::Ready;
-            ThreadId::new(id.index(), task.generation)
-        };
-
-        if id != IDLE_TASK_ID {
-            let was_empty = self.ready_queue.is_empty();
-            self.ready_push_back(id);
-            if was_empty {
-                self.note_runnable_peer_available();
-            }
-        }
+            },
+            attrs.joinable,
+        );
 
         crate::debug!(
             "thread: forked user id={thread_id} pid={process_id} ttbr0=0x{:x}",
@@ -455,29 +400,17 @@ impl Scheduler {
         Ok(thread_id)
     }
 
-    fn find_free_slot(&self) -> Option<TaskId> {
-        self.tasks
-            .iter()
-            .enumerate()
-            .skip(1)
-            .find_map(|(index, task)| task.is_free().then_some(TaskId::new(index)))
-    }
-
     fn exit_current(&mut self, context: &mut ActiveContext<'_>, code: usize) {
-        let current = self
-            .running_task()
-            .unwrap_or_else(|| panic!("thread: exit without running thread"));
-        if current == IDLE_TASK_ID {
-            panic!("thread: idle thread cannot exit");
-        }
-
-        let exited = self.thread_id(current);
-        self.finish_current_exit(current, exited, code);
-
-        let next = self.dequeue_next_ready().unwrap_or(IDLE_TASK_ID);
+        let SwitchOutcome::Switch {
+            from: exited,
+            to: next,
+        } = self.transition_exit_current(code)
+        else {
+            panic!("thread: exit transition continued current task")
+        };
         self.saved_context(next).restore_into(context);
-        self.make_running(next);
-        self.finish_block_current(current, next);
+        self.activate_task_address_space(next);
+        self.finish_block_current(exited, next);
         crate::debug!("thread: exited id={exited} code={code}");
     }
 
@@ -485,65 +418,58 @@ impl Scheduler {
         let current = self
             .running_task()
             .unwrap_or_else(|| panic!("thread: join without running thread"));
-        let current_thread = self.thread_id(current);
-        self.task_mut(current).last_join_result = None;
+        let current_thread = current;
+        let _ = self.take_join_result(TaskId::new(current.index()));
 
-        if current == IDLE_TASK_ID {
-            self.finish_join_immediate(current, Err(JoinError::NotJoinable));
+        if current.index() == IDLE_TASK_ID.index() {
+            self.set_join_result(TaskId::new(current.index()), Err(JoinError::NotJoinable));
             return;
         }
 
         let Some(target_task) = self.task_id_from_thread_id(target) else {
-            self.finish_join_immediate(current, Err(JoinError::InvalidThread));
+            self.set_join_result(TaskId::new(current.index()), Err(JoinError::InvalidThread));
             crate::debug!("thread: invalid/stale join target {target}");
             return;
         };
 
         if target_task == IDLE_TASK_ID {
-            self.finish_join_immediate(current, Err(JoinError::NotJoinable));
+            self.set_join_result(TaskId::new(current.index()), Err(JoinError::NotJoinable));
             return;
         }
 
-        if target_task == current {
-            self.finish_join_immediate(current, Err(JoinError::SelfJoin));
+        if target_task.index() == current.index() {
+            self.set_join_result(TaskId::new(current.index()), Err(JoinError::SelfJoin));
             return;
         }
 
-        if !self.task(target_task).joinable {
-            self.finish_join_immediate(current, Err(JoinError::NotJoinable));
+        if !self.task_joinable(target_task) {
+            self.set_join_result(TaskId::new(current.index()), Err(JoinError::NotJoinable));
             return;
         }
 
-        if self.task(target_task).joiner.is_some() {
-            self.finish_join_immediate(current, Err(JoinError::JoinInProgress));
+        if self.task_joiner(target_task).is_some() {
+            self.set_join_result(TaskId::new(current.index()), Err(JoinError::JoinInProgress));
             return;
         }
 
-        if self.task(target_task).state == preempt::TaskState::Zombie {
+        if self.task_state(target_task) == TaskState::Zombie {
             let code = self
-                .task(target_task)
-                .exit_code
+                .task_exit_code(target_task)
                 .unwrap_or_else(|| panic!("thread: zombie without exit code"));
-            self.reclaim_thread(target_task);
-            self.finish_join_immediate(current, Ok(code));
+            self.transition_reap_zombie(target);
+            self.set_join_result(TaskId::new(current.index()), Ok(code));
             crate::debug!("thread: join completed target={target} code={code}");
             return;
         }
 
         crate::sync::preempt::assert_preemption_enabled("thread joiner publication");
-        self.task_mut(target_task).joiner = Some(current_thread);
-        let next =
-            self.block_current_with_reason(context, current, preempt::BlockReason::Join(target));
-        self.finish_block_current(current, next);
+        self.task_set_joiner(target_task, current_thread);
+        self.block_with_reason(context, BlockReason::Join(target));
         crate::debug!("thread: join blocking current={current_thread} target={target}");
     }
 
     fn running_thread_id(&self) -> Option<ThreadId> {
-        self.current.map(|id| self.thread_id(id))
-    }
-
-    fn thread_id(&self, id: TaskId) -> ThreadId {
-        ThreadId::new(id.index(), self.task(id).generation)
+        self.current_thread()
     }
 
     fn task_id_from_thread_id(&self, id: ThreadId) -> Option<TaskId> {
@@ -552,101 +478,29 @@ impl Scheduler {
             return None;
         }
 
-        let task = self.task(task_id);
-        (task.generation == id.generation() && !task.is_free()).then_some(task_id)
-    }
-
-    fn finish_current_exit(&mut self, current: TaskId, exited: ThreadId, code: usize) {
-        let joinable = self.task(current).joinable;
-        let joiner = self.task(current).joiner;
-
-        self.task_mut(current).exit_code = Some(code);
-
-        if let Some(joiner) = joiner {
-            self.task_mut(current).state = preempt::TaskState::Zombie;
-            self.complete_joiner(exited, joiner, code);
-            self.reclaim_thread(current);
-            return;
-        }
-
-        if joinable {
-            self.task_mut(current).state = preempt::TaskState::Zombie;
-        } else {
-            self.reclaim_thread(current);
-        }
-    }
-
-    fn complete_joiner(&mut self, target: ThreadId, joiner: ThreadId, code: usize) {
-        let joiner_task = match self.blocked_waiter(joiner, preempt::BlockReason::Join(target)) {
-            Ok(task_id) => task_id,
-            Err(BlockedWaiterState::Missing) => {
-                panic!("thread: joiner {joiner} disappeared while target {target} exited")
-            }
-            Err(BlockedWaiterState::WrongState(state)) => {
-                panic!("thread: joiner {joiner} has invalid state {state:?}")
-            }
-        };
-        self.task_mut(joiner_task).last_join_result = Some(Ok(code));
-        self.make_ready_and_queue(joiner_task);
-        crate::debug!("thread: join wake target={target} joiner={joiner} code={code}");
-    }
-
-    fn finish_join_immediate(
-        &mut self,
-        current: TaskId,
-        result: core::result::Result<usize, JoinError>,
-    ) {
-        self.task_mut(current).last_join_result = Some(result);
-    }
-
-    fn reclaim_thread(&mut self, id: TaskId) {
-        if id == IDLE_TASK_ID {
-            panic!("thread: idle thread cannot be reclaimed");
-        }
-
-        debug_assert!(
-            !self.ready_queue.iter().any(|queued| *queued == id),
-            "thread: reclaim target still queued ready"
-        );
-
-        let generation = self.task(id).generation;
-        let task = self.task_mut(id);
-        task.joinable = false;
-        task.exit_code = None;
-        task.joiner = None;
-        task.ipc.reset();
-        task.last_join_result = None;
-        task.entry = free_task_entry;
-        task.arg = ThreadArg::empty();
-        task.kind = preempt::ThreadKind::Kernel;
-        task.release_context();
-        task.state = preempt::TaskState::Free;
-        crate::debug!(
-            "thread: reclaimed slot={} generation={generation}",
-            id.index()
-        );
+        self.thread_matches(id).then_some(task_id)
     }
 
     fn take_current_join_result(&mut self) -> Option<core::result::Result<usize, JoinError>> {
         let current = self
             .running_task()
             .unwrap_or_else(|| panic!("thread: join result without running thread"));
-        self.task_mut(current).last_join_result.take()
+        self.take_join_result(TaskId::new(current.index()))
     }
 
     fn running_user_address_space(&self) -> Option<UserAddressSpace> {
         let current = self.running_task()?;
-        match self.task(current).kind {
-            preempt::ThreadKind::User { address_space, .. } => Some(address_space),
-            preempt::ThreadKind::Kernel => None,
+        match self.task_kind(TaskId::new(current.index())) {
+            ThreadKind::User { address_space, .. } => Some(address_space),
+            ThreadKind::Kernel => None,
         }
     }
 
     fn running_user_process_id(&self) -> Option<ProcessId> {
         let current = self.running_task()?;
-        match self.task(current).kind {
-            preempt::ThreadKind::User { process_id, .. } => Some(process_id),
-            preempt::ThreadKind::Kernel => None,
+        match self.task_kind(TaskId::new(current.index())) {
+            ThreadKind::User { process_id, .. } => Some(process_id),
+            ThreadKind::Kernel => None,
         }
     }
 
@@ -655,78 +509,48 @@ impl Scheduler {
         address_space: UserAddressSpace,
     ) -> core::result::Result<(), ()> {
         let current = self.running_task().ok_or(())?;
-        let process_id = match self.task(current).kind {
-            preempt::ThreadKind::User { process_id, .. } => process_id,
-            preempt::ThreadKind::Kernel => return Err(()),
+        let process_id = match self.task_kind(TaskId::new(current.index())) {
+            ThreadKind::User { process_id, .. } => process_id,
+            ThreadKind::Kernel => return Err(()),
         };
 
         // SAFETY: execve commits a fully built TTBR0 root for the current user
         // process before replacing the trap frame that will resume to EL0.
         unsafe { crate::memory::vm::activate_user_address_space(address_space).map_err(|_| ())? };
-        self.task_mut(current).kind = preempt::ThreadKind::User {
+        self.replace_current_kind(ThreadKind::User {
             process_id,
             address_space,
-        };
-        Ok(())
+        })
     }
 
     fn block_current_on_process_wait(&mut self, context: &mut ActiveContext<'_>, pid: ProcessId) {
-        let current = self.blocking_current();
-        let next =
-            self.block_current_with_reason(context, current, preempt::BlockReason::Process(pid));
-        self.finish_block_current(current, next);
+        self.block_with_reason(context, BlockReason::Process(pid));
     }
 
     fn block_current_on_stdin_read(&mut self, context: &mut ActiveContext<'_>) {
-        let current = self.blocking_current();
-        let next =
-            self.block_current_with_reason(context, current, preempt::BlockReason::StdinRead);
-        self.finish_block_current(current, next);
+        self.block_with_reason(context, BlockReason::StdinRead);
     }
 
     fn complete_process_wait(&mut self, waiter: ThreadId, pid: ProcessId) {
-        match self.blocked_waiter(waiter, preempt::BlockReason::Process(pid)) {
-            Ok(task_id) => {
-                self.make_ready_and_queue(task_id);
-                crate::debug!("process: wake pid={pid} waiter={waiter}");
-            }
-            Err(BlockedWaiterState::Missing) => {
-                crate::trace!("process: waiter {waiter} disappeared while pid {pid} exited");
-            }
-            Err(BlockedWaiterState::WrongState(state)) => {
-                crate::trace!("process: ignoring wake for waiter {waiter}; state={state:?}");
-            }
+        if self.transition_wake_thread(waiter, BlockReason::Process(pid)) {
+            crate::debug!("process: wake pid={pid} waiter={waiter}");
         }
     }
 
     fn complete_stdin_read(&mut self, waiter: ThreadId) {
-        match self.blocked_waiter(waiter, preempt::BlockReason::StdinRead) {
-            Ok(task_id) => {
-                self.make_ready_and_queue(task_id);
-                crate::trace!("stdin: wake waiter={waiter}");
-            }
-            Err(BlockedWaiterState::Missing) => {
-                crate::trace!("stdin: waiter {waiter} disappeared before UART wake");
-            }
-            Err(BlockedWaiterState::WrongState(state)) => {
-                crate::trace!("stdin: ignoring wake for waiter {waiter}; state={state:?}");
-            }
+        if self.transition_wake_thread(waiter, BlockReason::StdinRead) {
+            crate::trace!("stdin: wake waiter={waiter}");
         }
     }
 
-    fn blocked_waiter(
-        &self,
-        waiter: ThreadId,
-        expected: preempt::BlockReason,
-    ) -> core::result::Result<TaskId, BlockedWaiterState> {
-        let Some(task_id) = self.task_id_from_thread_id(waiter) else {
-            return Err(BlockedWaiterState::Missing);
+    fn block_with_reason(&mut self, context: &mut ActiveContext<'_>, reason: BlockReason) {
+        let SwitchOutcome::Switch { from, to } = self.transition_block_current(reason) else {
+            panic!("sched: block transition continued current task")
         };
-
-        match self.task(task_id).state {
-            preempt::TaskState::Blocked(reason) if reason == expected => Ok(task_id),
-            state => Err(BlockedWaiterState::WrongState(state)),
-        }
+        self.saved_context_mut(from).save_from(context);
+        self.saved_context(to).restore_into(context);
+        self.activate_task_address_space(to);
+        self.finish_block_current(from, to);
     }
 }
 
@@ -743,13 +567,4 @@ pub(super) extern "C" fn thread_entry_bootstrap(entry_addr: usize, arg: usize) -
     let entry_fn: ThreadEntry = unsafe { mem::transmute(entry_addr) };
     let code = entry_fn(ThreadArg::from_usize(arg));
     thread_exit(code)
-}
-
-pub(super) fn free_task_entry(_arg: ThreadArg) -> usize {
-    panic!("thread: free thread slot entered");
-}
-
-fn next_generation(generation: u32) -> u32 {
-    let next = generation.wrapping_add(1);
-    if next == 0 { 1 } else { next }
 }

@@ -1,195 +1,123 @@
-use alloc::boxed::Box;
-
 use crate::{
-    arch::{ActiveContext, SavedContext},
-    memory::vm::UserAddressSpace,
-    process::ProcessId,
+    arch::ActiveContext,
     task::{TaskId, ThreadId},
     time::TimedEvent,
 };
 
 use super::{
-    IDLE_TASK_ID, INITIAL_THREAD_GENERATION, Scheduler, THREAD_STACK_SIZE, ipc as sched_ipc,
-    log_switch, scheduler_mut, thread,
+    IDLE_TASK_ID, Scheduler, log_switch, scheduler_mut,
+    transition::{BlockReason, SwitchOutcome, TaskState, ThreadKind},
 };
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum BlockReason {
-    Sleep,
-    Ipc(sched_ipc::IpcBlock),
-    Join(ThreadId),
-    Process(ProcessId),
-    StdinRead,
-}
-
-// Task-state semantics:
-// - Free: preallocated slot and stack are available for spawn; no SavedContext is owned.
-// - Running: the sole task whose SavedContext matches the committed resume target.
-// - Ready: runnable, owns a valid SavedContext, and sits in the ready queue unless it is idle.
-// - Blocked(reason): not runnable and not considered during round-robin
-//   selection. Wakeup ownership still lives outside the scheduler: deadlines in
-//   `kernel::time` and wait queues in `kernel::ipc`. The scheduler keeps an
-//   opaque IPC wait token so timeout dispatch can ask IPC to remove the waiter
-//   before restoring the task to `Ready`, without knowing the concrete IPC type.
-// - Zombie: joinable thread has exited and keeps its slot until a successful
-//   join observes the exit code and reclaims it.
-//
-// The idle thread is never joinable, never reclaimed, and must not enter
-// `thread_exit`; it remains the fallback runnable thread when no ordinary thread
-// is ready.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum TaskState {
-    Free,
-    Ready,
-    Running,
-    Blocked(BlockReason),
-    Zombie,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum ThreadKind {
-    Kernel,
-    User {
-        process_id: ProcessId,
-        address_space: UserAddressSpace,
-    },
-}
-
-#[repr(C, align(16))]
-struct TaskStack {
-    bytes: [u8; THREAD_STACK_SIZE],
-}
-
-impl TaskStack {
-    fn top(&self) -> usize {
-        self.bytes.as_ptr() as usize + THREAD_STACK_SIZE
-    }
-}
-
-pub(super) struct Task {
-    pub(super) generation: u32,
-    pub(super) state: TaskState,
-    pub(super) joinable: bool,
-    pub(super) exit_code: Option<usize>,
-    pub(super) joiner: Option<ThreadId>,
-    pub(super) ipc: sched_ipc::TaskIpcState,
-    pub(super) last_join_result: Option<core::result::Result<usize, thread::JoinError>>,
-    pub(super) entry: thread::ThreadEntry,
-    pub(super) arg: thread::ThreadArg,
-    pub(super) kind: ThreadKind,
-    stack: Box<TaskStack>,
-    context: Option<SavedContext>,
-}
-
-impl Task {
-    pub(super) fn bootstrap(
-        entry: thread::ThreadEntry,
-        arg: thread::ThreadArg,
-        state: TaskState,
-        joinable: bool,
-    ) -> Self {
-        let stack = boxed_zeroed_stack();
-        let context = SavedContext::kernel_entry(
-            stack.top(),
-            entry as *const () as usize,
-            arg.as_usize(),
-            thread::thread_entry_bootstrap as *const () as usize,
-        );
-        Self {
-            generation: INITIAL_THREAD_GENERATION,
-            state,
-            joinable,
-            exit_code: None,
-            joiner: None,
-            ipc: sched_ipc::TaskIpcState::empty(),
-            last_join_result: None,
-            entry,
-            arg,
-            kind: ThreadKind::Kernel,
-            stack,
-            context: Some(context),
-        }
-    }
-
-    pub(super) fn free() -> Self {
-        Self {
-            generation: 0,
-            state: TaskState::Free,
-            joinable: false,
-            exit_code: None,
-            joiner: None,
-            ipc: sched_ipc::TaskIpcState::empty(),
-            last_join_result: None,
-            entry: thread::free_task_entry,
-            arg: thread::ThreadArg::empty(),
-            kind: ThreadKind::Kernel,
-            stack: boxed_zeroed_stack(),
-            context: None,
-        }
-    }
-
-    pub(super) fn stack_top(&self) -> usize {
-        self.stack.top()
-    }
-
-    pub(super) fn is_blocked(&self) -> bool {
-        matches!(self.state, TaskState::Blocked(_))
-    }
-
-    pub(super) fn is_free(&self) -> bool {
-        self.state == TaskState::Free
-    }
-
-    pub(super) fn is_runnable(&self) -> bool {
-        matches!(self.state, TaskState::Ready | TaskState::Running)
-    }
-
-    pub(super) fn install_context(&mut self, context: SavedContext) {
-        debug_assert!(self.is_free());
-        debug_assert!(self.context.is_none());
-        self.context = Some(context);
-    }
-
-    pub(super) fn release_context(&mut self) {
-        debug_assert!(!self.is_free());
-        debug_assert!(self.context.is_some());
-        self.context = None;
-    }
-}
-
-fn boxed_zeroed_stack() -> Box<TaskStack> {
-    let mut boxed = Box::<TaskStack>::new_uninit();
-    // SAFETY: TaskStack is a byte array whose all-zero value is valid. Initialize
-    // it in place to avoid materializing 32 KiB on the boot/kernel stack.
-    unsafe {
-        core::ptr::write_bytes(
-            boxed.as_mut_ptr().cast::<u8>(),
-            0,
-            core::mem::size_of::<TaskStack>(),
-        );
-        boxed.assume_init()
-    }
-}
 
 /// Finish one bounded timer IRQ and optionally replace its return context.
 pub(super) fn finish_timer_interrupt(context: &mut ActiveContext<'_>, now: u64) {
     scheduler_mut().finish_timer_interrupt(context, now);
 }
 
-pub(super) fn on_wake_task(task_id: TaskId) {
-    wake_task(task_id);
+pub(super) fn on_wake_thread(thread: ThreadId) {
+    scheduler_mut().wake_sleeping_thread(thread);
 }
 
-pub(super) fn on_quantum_expired(task_id: TaskId) {
-    scheduler_mut().note_quantum_expired(task_id);
+pub(super) fn on_quantum_expired(thread: ThreadId) {
+    scheduler_mut().note_quantum_expired(thread);
 }
 
 pub fn current_task_id() -> Option<TaskId> {
-    scheduler_mut().running_task()
+    scheduler_mut()
+        .running_task()
+        .map(|id| TaskId::new(id.index()))
 }
 
+/// Wake the current occupant of a scheduler slot if it is sleeping.
+///
+/// This compatibility API identifies a slot rather than a thread generation.
+/// Wait owners with a `ThreadId` use generation-aware internal wake paths. The
+/// operation masks local IRQs, cancels the exact pending sleep event, allocates
+/// nothing, and treats a non-sleeping or invalid slot as a no-op. Other block
+/// reasons retain cleanup ownership in their subsystem and are not woken.
+///
+/// # Arguments
+///
+/// * `task_id` - Scheduler slot whose current occupant may be sleeping.
+///
+/// # Returns
+///
+/// Returns after the occupant is made ready or the request is ignored.
+///
+/// # Panics
+///
+/// Panics if the scheduler or time subsystem is not initialized, or if an
+/// internal scheduler transition invariant is violated.
 pub fn wake_task(task_id: TaskId) {
-    scheduler_mut().wake_task(task_id);
+    let _irq_guard = crate::sync::LocalIrqGuard::save_and_disable();
+    let _ = scheduler_mut().wake_task(task_id);
+}
+
+/// Attempt the slot-compatible sleep wake used by the bounded QEMU stress.
+///
+/// This is the result-bearing form of [`wake_task`]. It masks local IRQs,
+/// cancels the exact generation's sleep event, and allocates nothing.
+///
+/// # Arguments
+///
+/// * `task_id` - Scheduler slot whose current occupant is expected to sleep.
+///
+/// # Returns
+///
+/// Returns `true` only when this call performs `Blocked(Sleep) -> Ready`.
+///
+/// # Panics
+///
+/// Panics if the test scheduler or time subsystem is not initialized, or if an
+/// internal scheduler transition invariant is violated.
+#[cfg(feature = "qemu-test-kernel-runtime")]
+pub(crate) fn wake_task_for_test(task_id: TaskId) -> bool {
+    let _irq_guard = crate::sync::LocalIrqGuard::save_and_disable();
+    scheduler_mut().wake_task(task_id)
+}
+
+/// Attempt a generation-aware sleep wake for a QEMU contract.
+///
+/// The operation masks local IRQs and mutates no state when `thread` is stale
+/// or is no longer blocked on sleep.
+///
+/// # Arguments
+///
+/// * `thread` - Exact scheduler slot generation expected to be sleeping.
+///
+/// # Returns
+///
+/// Returns `true` only when this call performs `Blocked(Sleep) -> Ready`.
+///
+/// # Panics
+///
+/// Panics if the test scheduler is not initialized or an internal transition
+/// invariant is violated.
+#[cfg(feature = "qemu-test-kernel-runtime")]
+pub(crate) fn wake_thread_for_test(thread: ThreadId) -> bool {
+    let _irq_guard = crate::sync::LocalIrqGuard::save_and_disable();
+    scheduler_mut().wake_sleeping_thread(thread)
+}
+
+/// Validate bounded scheduler ownership after a test-controlled transition.
+///
+/// This test-only seam performs no allocation or scheduler mutation. It masks
+/// local IRQs while walking the table so timer dispatch cannot interleave with
+/// validation; task preemption state is otherwise unchanged.
+///
+/// # Returns
+///
+/// Returns after checking current identity, lifecycle/context ownership, and
+/// ready-queue membership.
+///
+/// # Panics
+///
+/// Panics if scheduler lifecycle, context ownership, current identity, or
+/// ready-queue membership violates an invariant.
+#[cfg(feature = "qemu-test-kernel-runtime")]
+pub(crate) fn validate_invariants_for_test() {
+    let _irq_guard = crate::sync::LocalIrqGuard::save_and_disable();
+    scheduler_mut().validate_invariants();
 }
 
 /// Request one cooperative scheduler checkpoint.
@@ -243,7 +171,7 @@ impl Scheduler {
             Some(id) => id,
             None => return,
         };
-        let must_leave_idle = current == IDLE_TASK_ID && !self.ready_queue.is_empty();
+        let must_leave_idle = current.index() == IDLE_TASK_ID.index() && self.has_runnable_peer();
         let mut refreshed_quantum_event = false;
 
         if must_leave_idle {
@@ -254,13 +182,7 @@ impl Scheduler {
         // after the deferred-preemption state confirms depth zero. Timed-event
         // dispatch and timer rearm continue even while a task holds a guard.
         if crate::sync::preempt::checkpoint_consume() {
-            let next = self.dequeue_next_ready().unwrap_or(current);
-            if next != current {
-                self.saved_context_mut(current).save_from(context);
-                self.saved_context(next).restore_into(context);
-                self.commit_switch(current, next);
-                log_switch(current, next);
-            }
+            self.handoff_optional(context);
 
             self.replace_quantum_event(now, current);
             refreshed_quantum_event = true;
@@ -281,13 +203,7 @@ impl Scheduler {
         let Some(current) = self.running_task() else {
             return;
         };
-        let next = self.dequeue_next_ready().unwrap_or(current);
-        if next != current {
-            self.saved_context_mut(current).save_from(context);
-            self.saved_context(next).restore_into(context);
-            self.commit_switch(current, next);
-            log_switch(current, next);
-        }
+        self.handoff_optional(context);
         self.replace_quantum_event(crate::time::now_counter(), current);
     }
 
@@ -295,48 +211,29 @@ impl Scheduler {
         &mut self,
         context: &mut ActiveContext<'_>,
         reason: BlockReason,
-    ) -> (TaskId, TaskId) {
-        let current = self.blocking_current();
-        let next = self.block_current_with_reason(context, current, reason);
-        (current, next)
-    }
-
-    pub(super) fn blocking_current(&self) -> TaskId {
-        // Safe point: mandatory blocking handoffs require enabled preemption
-        // before they mutate scheduler state or replace the active context.
-        crate::sync::preempt::assert_preemption_enabled("scheduler blocking_current");
-        let current = self
-            .running_task()
-            .unwrap_or_else(|| panic!("block requested without a running task"));
-        if current == IDLE_TASK_ID {
-            panic!("sched: idle task cannot block");
-        }
-
-        current
-    }
-
-    pub(super) fn block_current_with_reason(
-        &mut self,
-        context: &mut ActiveContext<'_>,
-        current: TaskId,
-        reason: BlockReason,
-    ) -> TaskId {
-        let next = self.dequeue_next_ready().unwrap_or(IDLE_TASK_ID);
+    ) -> (ThreadId, ThreadId) {
+        let SwitchOutcome::Switch {
+            from: current,
+            to: next,
+        } = self.transition_block_current(reason)
+        else {
+            panic!("sched: blocking transition continued current task")
+        };
         // Save the current task's post-SVC resume frame before making it unrunnable.
         self.saved_context_mut(current).save_from(context);
         self.saved_context(next).restore_into(context);
-        self.commit_block(current, next, reason);
-        next
+        self.activate_task_address_space(next);
+        (current, next)
     }
 
-    pub(super) fn finish_block_current(&mut self, current: TaskId, next: TaskId) {
+    pub(super) fn finish_block_current(&mut self, current: ThreadId, next: ThreadId) {
         // A mandatory handoff also acknowledges any stale request at its
         // depth-zero checkpoint; it never needs to select a second task.
         let _ = crate::sync::preempt::checkpoint_consume();
         let now = crate::time::now_counter();
         self.replace_quantum_event(now, current);
         if next != current {
-            log_switch(current, next);
+            log_switch(TaskId::new(current.index()), TaskId::new(next.index()));
         }
     }
 
@@ -348,126 +245,51 @@ impl Scheduler {
 
         self.entered_running_task = true;
         self.ensure_quantum_event(now);
-        debug_assert_eq!(self.current, Some(running));
-        debug_assert_eq!(self.task(running).state, TaskState::Running);
+        debug_assert_eq!(self.current_thread(), Some(running));
+        debug_assert_eq!(
+            self.task_state(TaskId::new(running.index())),
+            TaskState::Running
+        );
         crate::sync::preempt::mark_scheduler_online();
+        self.activate_task_address_space(running);
         self.saved_context(running).enter()
     }
 
-    pub(super) fn running_task(&self) -> Option<TaskId> {
-        self.current
+    pub(super) fn running_task(&self) -> Option<super::ThreadId> {
+        self.current_thread()
     }
 
-    pub(super) fn mark_initial_running(&mut self, id: TaskId) -> super::Result<()> {
-        if !self.is_valid_task(id) {
-            return Err(super::SchedError::InvalidTaskId);
+    pub(super) fn wake_task(&mut self, task_id: TaskId) -> bool {
+        if !self.is_valid_task(task_id)
+            || self.task_state(task_id) != TaskState::Blocked(BlockReason::Sleep)
+        {
+            return false;
         }
-
-        if !self.task(id).is_runnable() {
-            return Err(super::SchedError::InvalidTaskId);
-        }
-
-        self.make_running(id);
-        debug_assert_eq!(self.task(id).state, TaskState::Running);
-        debug_assert_eq!(self.current, Some(id));
-        Ok(())
+        let thread = self.thread_id(task_id);
+        self.wake_sleeping_thread(thread)
     }
 
-    fn commit_switch(&mut self, prev: TaskId, next: TaskId) {
-        if prev == next {
-            return;
+    fn wake_sleeping_thread(&mut self, thread: ThreadId) -> bool {
+        if !self.matches_blocked(thread, BlockReason::Sleep) {
+            return false;
         }
-
-        debug_assert_eq!(self.current, Some(prev));
-        debug_assert_eq!(self.task(prev).state, TaskState::Running);
-        debug_assert_eq!(self.task(next).state, TaskState::Ready);
-
-        self.make_ready(prev);
-        if prev != IDLE_TASK_ID {
-            self.ready_push_back(prev);
+        crate::time::cancel_event(TimedEvent::WakeTask(thread));
+        let woke = self.transition_wake_thread(thread, BlockReason::Sleep);
+        if woke {
+            crate::trace!("sched: sleeping thread {thread} moved to Ready");
         }
-        self.make_running(next);
-        debug_assert_eq!(self.current, Some(next));
-        debug_assert_eq!(self.task(next).state, TaskState::Running);
-        debug_assert_eq!(self.task(prev).state, TaskState::Ready);
+        woke
     }
 
-    fn commit_block(&mut self, blocked: TaskId, next: TaskId, reason: BlockReason) {
-        debug_assert_eq!(self.current, Some(blocked));
-        debug_assert_eq!(self.task(blocked).state, TaskState::Running);
-        debug_assert_eq!(self.task(next).state, TaskState::Ready);
-
-        self.make_blocked(blocked, reason);
-        self.make_running(next);
-
-        debug_assert_eq!(self.current, Some(next));
-        debug_assert!(self.task(blocked).is_blocked());
-        debug_assert_eq!(self.task(next).state, TaskState::Running);
-    }
-
-    pub(super) fn wake_task(&mut self, task_id: TaskId) {
-        if !self.is_valid_task(task_id) {
-            return;
-        }
-
-        if self.task(task_id).is_blocked() {
-            self.make_ready_and_queue(task_id);
-            crate::trace!("sched: task {task_id} moved to Ready");
-        }
-    }
-
-    pub(super) fn note_quantum_expired(&mut self, task_id: TaskId) {
-        if self.current == Some(task_id) {
+    pub(super) fn note_quantum_expired(&mut self, thread: ThreadId) {
+        if self.running_task() == Some(thread) {
             crate::sync::preempt::request_reschedule();
-            crate::trace!("sched: quantum expired task {task_id}");
+            crate::trace!("sched: quantum expired task {thread}");
         }
     }
 
-    pub(super) fn ready_push_back(&mut self, id: TaskId) {
-        debug_assert_ne!(id, IDLE_TASK_ID);
-        debug_assert!(
-            !self.ready_queue.iter().any(|queued| *queued == id),
-            "sched: task already present in ready queue"
-        );
-
-        if self.ready_queue.len() == self.ready_queue.capacity() {
-            panic!("sched: ready queue capacity exhausted");
-        }
-
-        self.ready_queue.push_back(id);
-    }
-
-    pub(super) fn dequeue_next_ready(&mut self) -> Option<TaskId> {
-        self.ready_queue.pop_front()
-    }
-
-    pub(super) fn make_ready(&mut self, id: TaskId) {
-        self.task_mut(id).state = TaskState::Ready;
-    }
-
-    pub(super) fn make_ready_and_queue(&mut self, id: TaskId) {
-        self.make_ready(id);
-        if id != IDLE_TASK_ID {
-            let was_empty = self.ready_queue.is_empty();
-            self.ready_push_back(id);
-            if was_empty {
-                self.note_runnable_peer_available();
-            }
-        }
-    }
-
-    pub(super) fn make_running(&mut self, id: TaskId) {
-        self.activate_task_address_space(id);
-        self.task_mut(id).state = TaskState::Running;
-        self.current = Some(id);
-    }
-
-    fn make_blocked(&mut self, id: TaskId, reason: BlockReason) {
-        self.task_mut(id).state = TaskState::Blocked(reason);
-    }
-
-    fn activate_task_address_space(&self, id: TaskId) {
-        let result = match self.task(id).kind {
+    pub(super) fn activate_task_address_space(&self, id: super::ThreadId) {
+        let result = match self.task_kind(TaskId::new(id.index())) {
             ThreadKind::Kernel => unsafe { crate::memory::vm::clear_user_address_space() },
             ThreadKind::User { address_space, .. } => unsafe {
                 crate::memory::vm::activate_user_address_space(address_space)
@@ -475,23 +297,26 @@ impl Scheduler {
         };
 
         if let Err(err) = result {
-            panic!("sched: failed to activate address space for task {id}: {err:?}");
+            panic!(
+                "sched: failed to activate address space for task {}: {err:?}",
+                id.index()
+            );
         }
     }
 
-    fn has_runnable_peer(&self) -> bool {
-        !self.ready_queue.is_empty()
+    pub(super) fn has_runnable_peer(&self) -> bool {
+        self.transition_has_ready()
     }
 
     pub(super) fn note_runnable_peer_available(&mut self) {
-        if self.current.is_some() && self.has_runnable_peer() {
+        if self.current_thread().is_some() && self.has_runnable_peer() {
             crate::sync::preempt::request_reschedule();
             self.ensure_quantum_event(crate::time::now_counter());
         }
     }
 
     fn ensure_quantum_event(&mut self, now: u64) {
-        let Some(current) = self.current else {
+        let Some(current) = self.running_task() else {
             return;
         };
 
@@ -513,34 +338,18 @@ impl Scheduler {
         );
     }
 
-    pub(super) fn replace_quantum_event(&mut self, now: u64, obsolete_task: TaskId) {
-        crate::time::cancel_event(TimedEvent::QuantumExpired(obsolete_task));
+    pub(super) fn replace_quantum_event(&mut self, now: u64, obsolete_thread: ThreadId) {
+        crate::time::cancel_event(TimedEvent::QuantumExpired(obsolete_thread));
         self.ensure_quantum_event(now);
     }
 
-    pub(super) fn is_valid_task(&self, id: TaskId) -> bool {
-        id.index() < self.tasks.len()
-    }
-
-    pub(super) fn task(&self, id: TaskId) -> &Task {
-        &self.tasks[id.index()]
-    }
-
-    pub(super) fn task_mut(&mut self, id: TaskId) -> &mut Task {
-        &mut self.tasks[id.index()]
-    }
-
-    pub(super) fn saved_context(&self, id: TaskId) -> &SavedContext {
-        self.task(id)
-            .context
-            .as_ref()
-            .unwrap_or_else(|| panic!("sched: occupied task {id} has no saved context"))
-    }
-
-    pub(super) fn saved_context_mut(&mut self, id: TaskId) -> &mut SavedContext {
-        self.task_mut(id)
-            .context
-            .as_mut()
-            .unwrap_or_else(|| panic!("sched: occupied task {id} has no saved context"))
+    fn handoff_optional(&mut self, context: &mut ActiveContext<'_>) {
+        let SwitchOutcome::Switch { from, to } = self.transition_optional_switch() else {
+            return;
+        };
+        self.saved_context_mut(from).save_from(context);
+        self.saved_context(to).restore_into(context);
+        self.activate_task_address_space(to);
+        log_switch(TaskId::new(from.index()), TaskId::new(to.index()));
     }
 }
