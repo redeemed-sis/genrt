@@ -28,17 +28,27 @@ details and [cross-cutting invariants](memory/invariants.md) for constraints.
 
 ## Quick start
 
-Host dependencies for Ubuntu are documented by the CI bootstrap script. The
-Rust toolchain and AArch64 target are pinned by `rust-toolchain.toml`.
+On Arch Linux x86_64 or Ubuntu 24.04/26.04, clone the repository and run:
 
 ```bash
-just doctor
-just run-aarch64
+git clone https://github.com/redeemed-sis/genrt.git
+cd genrt
+./scripts/setup/install-deps.sh
+cargo xtask run-aarch64
 ```
 
 The default image boots the production kernel and initramfs shell. QEMU uses
 the terminal as PL011 UART input; enter `ls`, `pwd`, `cat /etc/banner`,
 `echo hello`, or `exit`. Use `Ctrl-c` to stop QEMU.
+
+For the full local verification gate, run separately:
+
+```bash
+cargo xtask ci
+```
+
+See [host dependency setup](docs/development/setup.md) for supported platforms,
+manual installation, non-interactive use, and Rust migration guidance.
 
 Useful debugging commands:
 

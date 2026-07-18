@@ -17,6 +17,7 @@ Use the narrowest document that owns the question:
 | Build and artifact workflows | [`tools/xtask/README.md`](../tools/xtask/README.md) |
 | QEMU contracts | [`testing.md`](testing.md), [`tests/qemu/README.md`](../tests/qemu/README.md) |
 | Tagged releases | [`releases.md`](releases.md) |
+| Host dependency setup | [`development/setup.md`](development/setup.md) |
 | Agent workflow | [`development/agent-workflow.md`](development/agent-workflow.md) |
 | Debugging | [`development/debugging.md`](development/debugging.md) |
 | Active hardening backlog | [`roadmap/hardening.md`](roadmap/hardening.md) |

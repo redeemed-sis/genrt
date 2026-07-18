@@ -2,17 +2,20 @@
 
 ## Gates
 
-The bootstrap script installs the Ubuntu host packages, including `rustup` when
-it is not already available. Rust version and components remain sourced from
-`rust-toolchain.toml`. Run the same workflow locally from the repository root:
+The common setup dispatcher installs the supported host packages and `rustup`
+when it is not already available. Rust version and components remain sourced
+from `rust-toolchain.toml`. Run the same workflow locally from the repository
+root:
 
 ```bash
-scripts/ci/install-ubuntu-deps.sh
-cargo xtask doctor
+./scripts/setup/install-deps.sh
 cargo xtask check
 cargo xtask test-aarch64
 cargo xtask ci
 ```
+
+Supported host platforms, package lists, and manual setup are documented in
+[`development/setup.md`](development/setup.md).
 
 `check` covers formatting, xtask tests and clippy, userspace compilation,
 initramfs verification, AArch64 linking, and the `.boot.text` post-link
