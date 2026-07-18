@@ -268,6 +268,7 @@ fn package(
         ("qemu-virt.dtb", prepared.artifacts.dtb()),
         ("initramfs.cpio", prepared.initramfs.clone()),
         ("initramfs.manifest.json", initramfs_manifest),
+        ("LICENSE", PathBuf::from("LICENSE")),
     ];
     for (name, source) in &files {
         fs::copy(source, staging.join(name))
@@ -345,6 +346,7 @@ fn write_deterministic_archive(
         "qemu-virt.dtb",
         "initramfs.cpio",
         "initramfs.manifest.json",
+        "LICENSE",
         "manifest.json",
         "RUN.md",
     ] {
@@ -429,12 +431,13 @@ mod tests {
             clang_version: "clang".to_owned(),
             lld_version: "lld".to_owned(),
             files: vec![ManifestFile {
-                path: "kernel".to_owned(),
+                path: "LICENSE".to_owned(),
                 sha256: "00".to_owned(),
             }],
         };
         let json = serde_json::to_string(&manifest).unwrap();
         assert!(json.contains("\"tag\":\"v1.0.0\""));
+        assert!(json.contains("\"path\":\"LICENSE\""));
         assert_eq!(
             format!("{}  {}\n", "00", "archive.tar.gz"),
             "00  archive.tar.gz\n"
