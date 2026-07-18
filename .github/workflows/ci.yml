@@ -34,7 +34,7 @@ jobs:
           ./scripts/setup/install-deps.sh --help >/dev/null
           bash scripts/setup/test-install-deps.sh
           if command -v shellcheck >/dev/null 2>&1; then
-            shellcheck scripts/setup/*.sh
+            shellcheck -x scripts/setup/*.sh
           else
             echo 'ShellCheck is not installed; skipping optional lint.'
           fi

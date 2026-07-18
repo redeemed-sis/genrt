@@ -14,9 +14,13 @@ setup_parse_args() {
     for argument in "$@"; do
         case "$argument" in
             --yes)
+                # Public result consumed by the sourcing installer.
+                # shellcheck disable=SC2034
                 SETUP_YES=1
                 ;;
             --help|-h)
+                # Public result consumed by the sourcing installer.
+                # shellcheck disable=SC2034
                 SETUP_HELP=1
                 ;;
             *)
@@ -46,7 +50,10 @@ setup_load_os_release() {
         return 1
     }
 
+    # Public results consumed by the sourcing installer.
+    # shellcheck disable=SC2034
     SETUP_OS_ID=$ID
+    # shellcheck disable=SC2034
     SETUP_OS_VERSION_ID=${VERSION_ID:-}
 }
 
@@ -237,7 +244,7 @@ setup_activate_toolchain() {
     repository_root=$(setup_repo_root)
 
     (
-        cd -- "$repository_root"
+        cd -- "$repository_root" || exit 1
         rustup show
         cargo --version
         rustc --version

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-# shellcheck source=lib.sh
+# shellcheck source=scripts/setup/lib.sh
 source "$script_dir/lib.sh"
 
 usage() {

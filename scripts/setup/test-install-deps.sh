@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-# shellcheck source=lib.sh
+# shellcheck source=scripts/setup/lib.sh
 source "$script_dir/lib.sh"
 
 fail() {
@@ -62,6 +62,8 @@ assert_equal "$SETUP_OS_VERSION_ID" 24.04 'os-release VERSION_ID is loaded'
 assert_fails 'missing os-release is rejected' \
     setup_load_os_release "$temporary_directory/missing-os-release"
 
+# These arrays are read indirectly through nameref-based assertion helpers.
+# shellcheck disable=SC2034
 declare -a pacman_default pacman_yes apt_default apt_yes
 setup_arch_pacman_args pacman_default 0
 setup_arch_pacman_args pacman_yes 1

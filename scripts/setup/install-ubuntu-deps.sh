@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-# shellcheck source=lib.sh
+# shellcheck source=scripts/setup/lib.sh
 source "$script_dir/lib.sh"
 
 usage() {
@@ -37,6 +37,8 @@ enable_universe() {
 }
 
 ubuntu_has_universe() {
+    # `$(COMPONENT)` is apt's format placeholder, not a shell expression.
+    # shellcheck disable=SC2016
     apt-cache indextargets --format '$(COMPONENT)' 2>/dev/null | grep -Fxq universe
 }
 
