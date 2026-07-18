@@ -129,6 +129,10 @@ Active hardening topics are tracked in
 [docs/roadmap/hardening.md](docs/roadmap/hardening.md), without assigning them
 calendar-based milestones.
 
+## License
+
+genrt is distributed under the [MIT License](LICENSE).
+
 ## Contributing
 
 Read [AGENTS.md](AGENTS.md), the nearest nested instructions, and the relevant
