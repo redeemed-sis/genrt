@@ -22,17 +22,31 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - name: Install dependencies
-        run: scripts/ci/install-ubuntu-deps.sh
+      - name: Validate dependency setup scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/setup/lib.sh \
+            scripts/setup/install-deps.sh \
+            scripts/setup/install-arch-deps.sh \
+            scripts/setup/install-ubuntu-deps.sh \
+            scripts/setup/test-install-deps.sh
+          ./scripts/setup/install-deps.sh --help >/dev/null
+          bash scripts/setup/test-install-deps.sh
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck scripts/setup/*.sh
+          else
+            echo 'ShellCheck is not installed; skipping optional lint.'
+          fi
       - name: Cache Cargo downloads
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-${{ runner.os }}-rust-1.95.0-${{ hashFiles('Cargo.lock') }}
-      - name: Doctor
-        run: cargo xtask doctor
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Install dependencies
+        run: ./scripts/setup/install-deps.sh --yes
       - name: Run canonical merge gate
         run: cargo xtask ci
       - name: Add test summary
