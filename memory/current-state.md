@@ -101,6 +101,10 @@ accepted ADRs remain authoritative when details differ.
 - The bounded process table owns process state, TTBR0 address spaces, loaded
   ELF segments, cwd, file descriptors, relationships, exit/fault status, and
   `main_thread: ThreadId`.
+- Each process-table slot contains a generation and one identity-independent
+  `Process` aggregate. `ProcessResources` groups its address-space/image bundle
+  with `ProcessFileState`; operation modules remain separate without changing
+  ownership or synchronization semantics.
 - A user thread owns its `OwnedUserStack` and retains only a non-owning
   `AddressSpaceId`. Scheduler code stores no `ProcessId` or process metadata;
   the process table resolves the current process in O(1) through a fixed

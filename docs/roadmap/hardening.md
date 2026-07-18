@@ -10,12 +10,11 @@ explicit acceptance criteria.
    - measure bounded queue behavior and critical-section length;
    - define thread-group/address-space lifetime before adding multiple user
      threads to one process.
-2. **Process decomposition**
-   - separate process table/lifecycle, image loading, wait/join, FD access, and
-     user-stack staging currently concentrated in `process.rs`;
-   - preserve the current ownership transfer from process staging into
-     `Thread`, plus atomic consume/reclaim and rollback invariants, during
-     extraction.
+2. **Transactional process resource ownership**
+   - build explicit staging, commit, and rollback ownership for spawn, fork,
+     and exec now that process module boundaries are separated;
+   - preserve the current ownership transfer into `Thread`, plus atomic
+     consume/reclaim and rollback invariants.
 3. **Interrupt API boundaries**
    - replace ad hoc architecture dispatch wiring with explicit IRQ ownership
      interfaces while keeping GIC/ESR details in AArch64 code;

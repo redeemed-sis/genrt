@@ -12,7 +12,7 @@ hooks.
 | `sched` | Thread states, controlled scheduler calls, preemption, typed waits, and lifecycle |
 | `time` | Monotonic counter conversion and one-shot timed events |
 | `ipc` | Bounded mailbox buffers, wait queues, and timeout integration |
-| `process` | Process table, address-space/image ownership, fork/exec/wait, cwd/FD access |
+| `process` | [Bounded process table and lifecycle](src/process/README.md), address-space/image ownership, fork/exec/wait, cwd/FD access |
 | `fs` | Initramfs mount, readonly ramfs index, paths, and descriptor tables |
 | `loader` | Static userspace ELF validation and segment loading |
 | `syscall` | Architecture-neutral syscall behavior and errno mapping |

@@ -100,6 +100,10 @@ Changes that invalidate one require architecture review and an ADR.
   process-slot reclaim cannot clear an entry already reused by another thread
   generation. Lookup validates both handle generations; scheduler state does
   not own or inspect the index.
+- Process callers use the `process` facade. The process table exclusively owns
+  slots, generations, global table access, and the reverse index; scheduler
+  code does not import process policy. Process address spaces/images remain
+  process-owned, while user stacks remain thread-owned.
 - Terminal thread and process status is single-consumer where a join/wait API
   promises one waiter.
 - Wake paths make runnable work visible to the ready queue and rearm scheduling
