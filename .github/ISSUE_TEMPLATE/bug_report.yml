@@ -1,0 +1,93 @@
+name: Bug report
+description: Report a reproducible problem in genrt
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. genrt is experimental and currently targets
+        single-core AArch64 QEMU `virt`. For vulnerabilities, use the private
+        process described in SECURITY.md instead of this form.
+
+  - type: input
+    id: revision
+    attributes:
+      label: Commit or release
+      description: Provide a full commit SHA or release tag.
+      placeholder: v0.1.0-alpha.2 or 1368824...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host environment
+      options:
+        - Ubuntu 24.04 x86_64
+        - Ubuntu 26.04 x86_64
+        - Arch Linux x86_64
+        - Unsupported or other host
+    validations:
+      required: true
+
+  - type: input
+    id: qemu
+    attributes:
+      label: QEMU version
+      description: Paste the output of `qemu-system-aarch64 --version`.
+    validations:
+      required: true
+
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      description: Provide the exact command that exposes the problem.
+      placeholder: cargo xtask test-aarch64 --case shell-contract
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Include the smallest deterministic sequence that reproduces the problem.
+      placeholder: |
+        1. Clone the repository at the revision above.
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs and artifacts
+      description: Paste focused serial output, result.json content, or links to relevant artifacts. Remove secrets.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and pull requests.
+          required: true
+        - label: I removed secrets and unrelated machine-specific data from logs.
+          required: true
+        - label: This report does not disclose an exploitable vulnerability publicly.
+          required: true
