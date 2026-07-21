@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/redeemed-sis/genrt/security/policy
+    about: Read the private vulnerability reporting policy before disclosing details.

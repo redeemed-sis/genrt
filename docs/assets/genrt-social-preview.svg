@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title description">
+  <title id="title">genrt social preview</title>
+  <desc id="description">genrt, an experimental hard real-time operating system for AArch64 QEMU virt.</desc>
+  <rect width="1280" height="640" fill="#ffffff"/>
+  <rect x="0" y="0" width="22" height="640" fill="#111111"/>
+  <text x="86" y="190" fill="#111111" font-family="DejaVu Sans, sans-serif" font-size="112" font-weight="700" letter-spacing="-5">genrt</text>
+  <text x="92" y="255" fill="#333333" font-family="DejaVu Sans, sans-serif" font-size="31">experimental hard real-time OS</text>
+  <line x1="92" y1="302" x2="575" y2="302" stroke="#111111" stroke-width="4"/>
+  <text x="92" y="356" fill="#111111" font-family="DejaVu Sans Mono, monospace" font-size="25">Rust · AArch64 · QEMU virt</text>
+  <text x="92" y="414" fill="#555555" font-family="DejaVu Sans, sans-serif" font-size="23">bounded mechanisms · explicit ownership</text>
+  <text x="92" y="450" fill="#555555" font-family="DejaVu Sans, sans-serif" font-size="23">machine-checked contracts · reproducible releases</text>
+  <rect x="695" y="92" width="493" height="408" rx="16" fill="#111111"/>
+  <rect x="695" y="92" width="493" height="46" rx="16" fill="#292929"/>
+  <rect x="695" y="122" width="493" height="16" fill="#292929"/>
+  <circle cx="722" cy="115" r="6" fill="#777777"/>
+  <circle cx="744" cy="115" r="6" fill="#999999"/>
+  <circle cx="766" cy="115" r="6" fill="#bbbbbb"/>
+  <g font-family="DejaVu Sans Mono, monospace" font-size="21" fill="#f4f4f4">
+    <text x="728" y="185">genrt shell</text>
+    <text x="728" y="228"><tspan fill="#a8a8a8">&gt;</tspan><tspan dx="10">pwd</tspan></text>
+    <text x="728" y="264">/</text>
+    <text x="728" y="307"><tspan fill="#a8a8a8">&gt;</tspan><tspan dx="10">cat /etc/banner</tspan></text>
+    <text x="728" y="343">genrt initramfs</text>
+    <text x="728" y="386"><tspan fill="#a8a8a8">&gt;</tspan><tspan dx="10">echo hello from EL0</tspan></text>
+    <text x="728" y="422">hello from EL0</text>
+    <text x="728" y="465"><tspan fill="#a8a8a8">&gt;</tspan><tspan dx="10" fill="#f4f4f4">█</tspan></text>
+  </g>
+  <text x="92" y="570" fill="#111111" font-family="DejaVu Sans Mono, monospace" font-size="24">github.com/redeemed-sis/genrt</text>
+</svg>

@@ -1,0 +1,63 @@
+name: Feature request
+description: Propose a focused capability or improvement
+title: "feat: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Explain the problem before the implementation. Large subsystem, ABI,
+        ownership, or architecture changes usually require an ADR.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What limitation or developer need should be addressed?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed outcome
+      description: Describe observable behavior and acceptance criteria, not only an implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Which kernel, architecture, userspace, test, documentation, or tooling areas are involved?
+    validations:
+      required: true
+
+  - type: textarea
+    id: realtime
+    attributes:
+      label: Determinism and ownership impact
+      description: Note bounds, allocation, IRQ/preemption behavior, resource ownership, ABI, and artifact impact. Write "none" where appropriate.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What smaller solution, workaround, or different design did you consider?
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Additional context
+      description: Link relevant code, accepted ADRs, specifications, traces, or prior discussion.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues, pull requests, and the active roadmap.
+          required: true
+        - label: I described the problem and acceptance criteria separately from implementation details.
+          required: true

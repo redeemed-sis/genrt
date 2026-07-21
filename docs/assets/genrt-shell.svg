@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="500" viewBox="0 0 920 500" role="img" aria-labelledby="title description">
+  <title id="title">Representative genrt shell session</title>
+  <desc id="description">A terminal showing pwd, ls, cat, and echo commands in genrt running on AArch64 QEMU virt.</desc>
+  <rect width="920" height="500" rx="18" fill="#111111"/>
+  <rect width="920" height="48" rx="18" fill="#252525"/>
+  <rect y="30" width="920" height="18" fill="#252525"/>
+  <circle cx="28" cy="24" r="6" fill="#777777"/>
+  <circle cx="50" cy="24" r="6" fill="#999999"/>
+  <circle cx="72" cy="24" r="6" fill="#bbbbbb"/>
+  <text x="460" y="30" fill="#d0d0d0" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="14">genrt · AArch64 QEMU virt</text>
+  <g font-family="DejaVu Sans Mono, monospace" font-size="20" fill="#f4f4f4">
+    <text x="32" y="88">genrt shell</text>
+    <text x="32" y="126"><tspan fill="#a8a8a8">&gt;</tspan><tspan dx="10">pwd</tspan></text>
+    <text x="32" y="158">/</text>
+    <text x="32" y="196"><tspan fill="#a8a8a8">&gt;</tspan><tspan dx="10">ls /bin</tspan></text>
+    <text x="32" y="228">cat</text>
+    <text x="32" y="260">echo</text>
+    <text x="32" y="292">ls</text>
+    <text x="32" y="324">pwd</text>
+    <text x="32" y="362"><tspan fill="#a8a8a8">&gt;</tspan><tspan dx="10">cat /etc/banner</tspan></text>
+    <text x="32" y="394">genrt initramfs</text>
+    <text x="32" y="432"><tspan fill="#a8a8a8">&gt;</tspan><tspan dx="10">echo hello from EL0</tspan></text>
+    <text x="32" y="464">hello from EL0</text>
+  </g>
+</svg>

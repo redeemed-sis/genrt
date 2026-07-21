@@ -1,9 +1,19 @@
 # genrt
 
+[![CI](https://github.com/redeemed-sis/genrt/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/redeemed-sis/genrt/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/redeemed-sis/genrt?include_prereleases&label=release)](https://github.com/redeemed-sis/genrt/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-black.svg)](LICENSE)
+
 genrt is an experimental hard real-time operating system written primarily in
 Rust. The active platform is single-core AArch64 QEMU `virt`; the project uses
 that controlled environment to make boot, scheduling, userspace, testing, and
 release invariants explicit before expanding hardware scope.
+
+genrt is aimed at operating-system and embedded developers who want a compact,
+inspectable codebase for studying deterministic kernel mechanisms. Its focus is
+explicit ownership, bounded runtime structures, machine-checked QEMU contracts,
+and reproducible release artifacts. It is a research and learning project, not
+a production-ready or latency-certified operating system.
 
 ## Status
 
@@ -40,6 +50,12 @@ cargo xtask run-aarch64
 The default image boots the production kernel and initramfs shell. QEMU uses
 the terminal as PL011 UART input; enter `ls`, `pwd`, `cat /etc/banner`,
 `echo hello`, or `exit`. Use `Ctrl-c` to stop QEMU.
+
+![Representative genrt shell session](docs/assets/genrt-shell.svg)
+
+The image shows the current production shell after boot; the preceding kernel
+diagnostic log is cropped. Commands and output are derived from the production
+userspace and initramfs shipped by this repository.
 
 For the full local verification gate, run separately:
 
@@ -82,18 +98,19 @@ cargo xtask dist --tag v0.0.0-local.1 --output-dir /tmp/genrt-dist
 
 The release gate tests exact production executables in controlled contract
 images, verifies production composition and hashes, and emits a deterministic
-bundle. See [docs/releases.md](docs/releases.md).
+bundle. See [the published releases](https://github.com/redeemed-sis/genrt/releases)
+and [docs/releases.md](docs/releases.md).
 
 ## Repository layout
 
 | Path | Responsibility |
 | --- | --- |
-| `arch/aarch64/` | AArch64 boot, MMU, exception, IRQ, timer, GIC, and UART code |
-| `kernel/` | Architecture-neutral memory, scheduling, process, syscall, IPC, and filesystem policy |
+| `arch/aarch64/` | AArch64 boot, MMU, exceptions, IRQ, timer, GIC, and UART |
+| `kernel/` | Architecture-neutral kernel policy and mechanisms |
 | `crates/bootinfo/` | Early boot handoff types |
 | `user/` | Freestanding userspace and initramfs product data |
 | `tools/xtask/` | Canonical build, QEMU, test, and release workflows |
-| `tests/qemu/` | Declarative system contracts, fixtures, and test-only supervisors |
+| `tests/qemu/` | QEMU system contracts and test-only fixtures |
 | `memory/` | Current state, durable invariants, and ADRs |
 | `docs/` | Development, testing, release, and roadmap guides |
 | `.codex/` | Project custom-agent configuration |
@@ -135,7 +152,7 @@ genrt is distributed under the [MIT License](LICENSE).
 
 ## Contributing
 
-Read [AGENTS.md](AGENTS.md), the nearest nested instructions, and the relevant
-module documentation before changing the repository. Commits follow
-[Conventional Commits](.agents/standards/commits.md). New or changed public and
+Start with [CONTRIBUTING.md](CONTRIBUTING.md). Repository engineering rules live
+in [AGENTS.md](AGENTS.md) and the nearest nested instructions. Commits follow
+[Conventional Commits](.agents/standards/commits.md); new or changed public and
 crate-visible Rust APIs follow the [rustdoc standard](.agents/standards/rustdoc.md).
