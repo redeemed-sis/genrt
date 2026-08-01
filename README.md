@@ -156,3 +156,12 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md). Repository engineering rules live
 in [AGENTS.md](AGENTS.md) and the nearest nested instructions. Commits follow
 [Conventional Commits](.agents/standards/commits.md); new or changed public and
 crate-visible Rust APIs follow the [rustdoc standard](.agents/standards/rustdoc.md).
+
+Looking for a first task? The repository has several scoped issues suitable for
+new contributors:
+
+- [Validate the Quick Start on your Linux distribution](https://github.com/redeemed-sis/genrt/issues/11)
+- [Add the `wc` userspace utility](https://github.com/redeemed-sis/genrt/issues/12)
+- [Add the `uname` syscall and userspace utility](https://github.com/redeemed-sis/genrt/issues/13)
+
+Questions and draft pull requests are welcome.
