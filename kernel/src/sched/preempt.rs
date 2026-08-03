@@ -1,14 +1,17 @@
 use crate::{arch::ActiveContext, time::TimedEvent};
 
 use super::{
-    IDLE_THREAD_INDEX, Scheduler, ThreadId, WaitCause, WaitToken, complete_wait, log_switch,
+    CpuScheduler, ThreadId, WaitCause, WaitToken, complete_wait, current_cpu, log_switch,
     scheduler_mut,
     transition::{SwitchOutcome, ThreadState},
 };
 
 /// Finish one bounded timer IRQ and optionally replace its return context.
 pub(super) fn finish_timer_interrupt(context: &mut ActiveContext<'_>, now: u64) {
-    scheduler_mut().finish_timer_interrupt(context, now);
+    let cpu = current_cpu();
+    scheduler_mut()
+        .on_cpu(cpu)
+        .finish_timer_interrupt(context, now);
 }
 
 /// Complete one time-owned exact wait deadline.
@@ -26,7 +29,8 @@ pub(super) fn on_wait_deadline(token: WaitToken) {
 }
 
 pub(super) fn on_quantum_expired(thread: ThreadId) {
-    scheduler_mut().note_quantum_expired(thread);
+    let cpu = current_cpu();
+    scheduler_mut().on_cpu(cpu).note_quantum_expired(thread);
 }
 
 /// Validate bounded scheduler ownership after a test-controlled transition.
@@ -81,7 +85,8 @@ pub fn yield_now() {
 /// Panics when bootstrap did not select a running thread or architecture
 /// address-space activation fails.
 pub(crate) fn enter_running_thread() -> ! {
-    scheduler_mut().enter_running_thread()
+    let cpu = current_cpu();
+    scheduler_mut().on_cpu(cpu).enter_running_thread()
 }
 
 /// Service one private EL1 preemption checkpoint against the active context.
@@ -99,12 +104,13 @@ pub(crate) fn enter_running_thread() -> ! {
 /// Returns after retaining the current context or replacing it with the next
 /// ready thread. It does not create a new reschedule request.
 pub(crate) fn on_preempt_checkpoint(context: &mut ActiveContext<'_>) {
-    scheduler_mut().preempt_checkpoint(context);
+    let cpu = current_cpu();
+    scheduler_mut().on_cpu(cpu).preempt_checkpoint(context);
 }
 
-impl Scheduler {
+impl CpuScheduler<'_> {
     pub(super) fn finish_timer_interrupt(&mut self, context: &mut ActiveContext<'_>, now: u64) {
-        if !self.entered_running_thread {
+        if !self.state().online {
             return;
         }
 
@@ -115,17 +121,18 @@ impl Scheduler {
             Some(id) => id,
             None => return,
         };
-        let must_leave_idle = current.index() == IDLE_THREAD_INDEX && self.has_runnable_peer();
+        let must_leave_idle = self.state().idle == Some(current) && self.has_runnable_peer();
         let mut refreshed_quantum_event = false;
 
         if must_leave_idle {
-            crate::sync::preempt::request_reschedule();
+            self.state_mut().preemption.request();
         }
 
         // Safe point: timer IRQ return may replace the active frame, but only
         // after the deferred-preemption state confirms depth zero. Timed-event
         // dispatch and timer rearm continue even while a thread holds a guard.
-        if crate::sync::preempt::checkpoint_consume() {
+        let online = self.state().online;
+        if self.state_mut().preemption.consume_checkpoint(online) {
             self.handoff_optional(context);
 
             self.replace_quantum_event(now, current);
@@ -140,7 +147,8 @@ impl Scheduler {
     fn preempt_checkpoint(&mut self, context: &mut ActiveContext<'_>) {
         // Safe point: the private EL1 sched-call checkpoint owns the optional
         // thread-context handoff. It acknowledges only an existing request.
-        if !crate::sync::preempt::checkpoint_consume() {
+        let online = self.state().online;
+        if !self.state_mut().preemption.consume_checkpoint(online) {
             return;
         }
 
@@ -154,11 +162,12 @@ impl Scheduler {
     pub(super) fn finish_block_current(&mut self, current: ThreadId, next: ThreadId) {
         // A mandatory handoff also acknowledges any stale request at its
         // depth-zero checkpoint; it never needs to select a second thread.
-        let _ = crate::sync::preempt::checkpoint_consume();
+        let online = self.state().online;
+        let _ = self.state_mut().preemption.consume_checkpoint(online);
         let now = crate::time::now_counter();
         self.replace_quantum_event(now, current);
         if next != current {
-            log_switch(current, next);
+            log_switch(self.cpu(), current, next);
         }
     }
 
@@ -168,12 +177,14 @@ impl Scheduler {
             .unwrap_or_else(|| panic!("scheduler has no running thread"));
         let now = crate::time::now_counter();
 
-        self.entered_running_thread = true;
+        if self.state().online {
+            panic!("sched: CPU{} entered twice", self.cpu().index());
+        }
         self.ensure_quantum_event(now);
         debug_assert_eq!(self.current_thread(), Some(running));
         debug_assert_eq!(self.thread_state(running.index()), ThreadState::Running);
-        crate::sync::preempt::mark_scheduler_online();
         self.activate_thread_address_space(running);
+        self.state_mut().online = true;
         self.saved_context(running).enter()
     }
 
@@ -183,7 +194,7 @@ impl Scheduler {
 
     pub(super) fn note_quantum_expired(&mut self, thread: ThreadId) {
         if self.running_thread() == Some(thread) {
-            crate::sync::preempt::request_reschedule();
+            self.state_mut().preemption.request();
             crate::trace!("sched: quantum expired thread {thread}");
         }
     }
@@ -210,7 +221,7 @@ impl Scheduler {
 
     pub(super) fn note_runnable_peer_available(&mut self) {
         if self.current_thread().is_some() && self.has_runnable_peer() {
-            crate::sync::preempt::request_reschedule();
+            self.state_mut().preemption.request();
             self.ensure_quantum_event(crate::time::now_counter());
         }
     }
@@ -250,6 +261,6 @@ impl Scheduler {
         self.saved_context_mut(from).save_from(context);
         self.saved_context(to).restore_into(context);
         self.activate_thread_address_space(to);
-        log_switch(from, to);
+        log_switch(self.cpu(), from, to);
     }
 }

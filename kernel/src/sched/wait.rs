@@ -6,7 +6,7 @@
 
 use crate::{arch::ActiveContext, sched::ThreadId, sync::LocalIrqGuard};
 
-use super::{Scheduler, scheduler_mut, transition::SwitchOutcome};
+use super::{scheduler_mut, transition::SwitchOutcome};
 
 /// Monotonic per-slot identity for one wait registration.
 ///
@@ -287,7 +287,8 @@ impl WaitMetadata {
 /// Panics when no current thread is running, a prior wait is unfinished, or the
 /// per-slot sequence would overflow before publication.
 pub(crate) fn prepare_wait() -> PreparedWait {
-    scheduler_mut().transition_prepare_wait()
+    let cpu = super::current_cpu();
+    scheduler_mut().on_cpu(cpu).transition_prepare_wait()
 }
 
 /// Commit a published wait registration and apply its mandatory handoff.
@@ -312,7 +313,10 @@ pub(crate) fn prepare_wait() -> PreparedWait {
 /// Panics when blocking is attempted under a preemption guard or a required
 /// scheduler handoff invariant is absent.
 pub(crate) fn commit_wait(context: &mut ActiveContext<'_>, prepared: PreparedWait) -> CommitResult {
-    scheduler_mut().commit_prepared_wait(context, prepared)
+    let cpu = super::current_cpu();
+    scheduler_mut()
+        .on_cpu(cpu)
+        .commit_prepared_wait(context, prepared)
 }
 
 /// Attempt first-wins completion of one exact external wait token.
@@ -373,7 +377,7 @@ pub(crate) fn cancel_wait(prepared: PreparedWait) -> CancelResult {
     scheduler_mut().transition_cancel_wait(prepared)
 }
 
-impl Scheduler {
+impl super::CpuScheduler<'_> {
     pub(super) fn commit_prepared_wait(
         &mut self,
         context: &mut ActiveContext<'_>,

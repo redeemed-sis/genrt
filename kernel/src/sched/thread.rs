@@ -2,14 +2,15 @@ use core::mem;
 
 use crate::{
     arch::{ActiveContext, SavedContext},
+    cpu::{self, CpuId},
     memory::{user::OwnedUserStack, vm::AddressSpaceId},
     sync::LocalIrqGuard,
 };
 
 use super::{
-    CommitResult, IDLE_THREAD_INDEX, Scheduler, ThreadId,
+    CommitResult, CpuScheduler, ThreadId,
     call::SchedCallWaitOutput,
-    scheduler_mut,
+    current_cpu, scheduler_mut,
     transition::{SwitchOutcome, ThreadState, UserThreadResources},
     try_scheduler_mut,
 };
@@ -88,17 +89,66 @@ impl<T> From<*mut T> for ThreadArg {
 pub type ThreadEntry = fn(ThreadArg) -> usize;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+/// Immutable thread publication attributes.
+///
+/// Attributes are consumed before a thread becomes visible. Changing this
+/// value later cannot migrate or otherwise modify a published thread.
 pub struct ThreadAttrs {
+    /// Whether one waiter may later consume this thread's exit status.
     pub joinable: bool,
+    /// CPU placement resolved once before scheduler publication.
+    pub affinity: ThreadAffinity,
+}
+
+/// Immutable placement selected before a thread is published.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ThreadAffinity {
+    /// Place the thread on the CPU that performs publication.
+    Current,
+    /// Place the thread on one already registered and online logical CPU.
+    Cpu(CpuId),
 }
 
 impl ThreadAttrs {
+    /// Construct joinable attributes with current-CPU affinity.
+    ///
+    /// # Returns
+    ///
+    /// Returns immutable publication metadata without allocation, blocking,
+    /// or IRQ-state changes.
     pub const fn joinable() -> Self {
-        Self { joinable: true }
+        Self {
+            joinable: true,
+            affinity: ThreadAffinity::Current,
+        }
     }
 
+    /// Construct detached attributes with current-CPU affinity.
+    ///
+    /// # Returns
+    ///
+    /// Returns immutable publication metadata without allocation, blocking,
+    /// or IRQ-state changes.
     pub const fn detached() -> Self {
-        Self { joinable: false }
+        Self {
+            joinable: false,
+            affinity: ThreadAffinity::Current,
+        }
+    }
+
+    /// Select an immutable logical CPU affinity before publication.
+    ///
+    /// # Arguments
+    ///
+    /// * `cpu` - Registered logical CPU that must be online when spawning.
+    ///
+    /// # Returns
+    ///
+    /// Returns modified attributes without allocation, blocking, or IRQ-state
+    /// changes. The selected CPU becomes the thread's permanent home.
+    pub const fn with_affinity(mut self, cpu: CpuId) -> Self {
+        self.affinity = ThreadAffinity::Cpu(cpu);
+        self
     }
 }
 
@@ -109,10 +159,18 @@ impl Default for ThreadAttrs {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+/// Controlled failures while publishing a thread into bounded scheduler state.
 pub enum SpawnError {
+    /// No preallocated thread slot remains free.
     NoThreadSlots,
+    /// A preallocated slot unexpectedly has no parked kernel stack.
     NoStackSlots,
+    /// Scheduler bootstrap has not published runtime state.
     SchedulerNotInitialized,
+    /// The requested logical CPU is not registered or outside scheduler storage.
+    InvalidCpuAffinity,
+    /// The requested registered logical CPU is not online.
+    CpuOffline,
     /// User threads retain non-Copy resources and therefore must have a
     /// generic reaper; detached operation is reserved for kernel threads.
     UserThreadMustBeJoinable,
@@ -127,17 +185,40 @@ pub enum JoinError {
     SchedulerNotInitialized,
 }
 
+/// Publish a kernel thread into bounded scheduler storage.
+///
+/// The current logical CPU is resolved once before short local IRQ exclusion.
+/// Publication uses a preallocated slot and stack and does not allocate or
+/// block. The thread's resolved home CPU is immutable.
+///
+/// # Arguments
+///
+/// * `entry` - Function invoked when the new thread first runs.
+/// * `arg` - Opaque argument passed to `entry`.
+/// * `attrs` - Joinability and CPU affinity fixed before publication.
+///
+/// # Returns
+///
+/// Returns the generation-bearing thread identity after ready publication.
+///
+/// # Errors
+///
+/// Returns [`SpawnError::SchedulerNotInitialized`] before bootstrap,
+/// [`SpawnError::NoThreadSlots`] when bounded capacity is exhausted,
+/// [`SpawnError::InvalidCpuAffinity`] for an unregistered CPU, or
+/// [`SpawnError::CpuOffline`] for a registered context not yet online.
 pub fn thread_spawn(
     entry: ThreadEntry,
     arg: ThreadArg,
     attrs: ThreadAttrs,
 ) -> core::result::Result<ThreadId, SpawnError> {
+    let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let Some(scheduler) = try_scheduler_mut() else {
         return Err(SpawnError::SchedulerNotInitialized);
     };
 
-    scheduler.spawn_thread(entry, arg, attrs)
+    scheduler.on_cpu(cpu).spawn_thread(entry, arg, attrs)
 }
 
 pub fn thread_exit(code: usize) -> ! {
@@ -158,9 +239,19 @@ pub fn thread_join(id: ThreadId) -> core::result::Result<usize, JoinError> {
     result
 }
 
+/// Return the running thread on the executing logical CPU.
+///
+/// The function resolves the CPU once, performs a bounded lookup under short
+/// local IRQ exclusion, and neither allocates nor blocks.
+///
+/// # Returns
+///
+/// Returns the current generation-bearing thread identity, or `None` before
+/// scheduler publication or initial dispatch.
 pub fn current_thread_id() -> Option<ThreadId> {
+    let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    try_scheduler_mut().and_then(|scheduler| scheduler.running_thread_id())
+    try_scheduler_mut().and_then(|scheduler| scheduler.on_cpu(cpu).running_thread_id())
 }
 
 /// Return the active user thread's copyable address-space identifier.
@@ -173,8 +264,9 @@ pub fn current_thread_id() -> Option<ThreadId> {
 /// Returns `Some` only while the current schedulable thread owns userspace
 /// resources; kernel threads return `None`.
 pub(crate) fn current_user_address_space() -> Option<AddressSpaceId> {
+    let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    try_scheduler_mut().and_then(|scheduler| scheduler.running_user_address_space())
+    try_scheduler_mut().and_then(|scheduler| scheduler.on_cpu(cpu).running_user_address_space())
 }
 
 /// Return a raw pointer to the current user thread's owned stack.
@@ -193,9 +285,10 @@ pub(crate) fn current_user_address_space() -> Option<AddressSpaceId> {
 /// Returns `Some` for a current user thread and `None` for a kernel thread or
 /// before scheduler initialization.
 pub(crate) unsafe fn current_user_stack_ptr() -> Option<*const OwnedUserStack> {
+    let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
     try_scheduler_mut().and_then(|scheduler| {
-        let current = scheduler.running_thread_id()?;
+        let current = scheduler.on_cpu(cpu).running_thread_id()?;
         scheduler
             .thread_user_stack(current.index())
             .map(|stack| stack as *const OwnedUserStack)
@@ -235,12 +328,15 @@ pub(crate) fn thread_spawn_user(
     arg0: usize,
     attrs: ThreadAttrs,
 ) -> core::result::Result<ThreadId, (SpawnError, OwnedUserStack)> {
+    let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let Some(scheduler) = try_scheduler_mut() else {
         return Err((SpawnError::SchedulerNotInitialized, stack));
     };
 
-    scheduler.spawn_user_thread(address_space, stack, user_entry, user_sp, arg0, attrs)
+    scheduler
+        .on_cpu(cpu)
+        .spawn_user_thread(address_space, stack, user_entry, user_sp, arg0, attrs)
 }
 
 /// Spawn a user thread by cloning a live userspace context.
@@ -273,12 +369,15 @@ pub(crate) fn thread_spawn_user_from_context(
     context: &mut ActiveContext<'_>,
     attrs: ThreadAttrs,
 ) -> core::result::Result<ThreadId, (SpawnError, OwnedUserStack)> {
+    let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let Some(scheduler) = try_scheduler_mut() else {
         return Err((SpawnError::SchedulerNotInitialized, stack));
     };
 
-    scheduler.spawn_user_thread_from_context(address_space, stack, context, attrs)
+    scheduler
+        .on_cpu(cpu)
+        .spawn_user_thread_from_context(address_space, stack, context, attrs)
 }
 
 /// Activate and replace the current user thread's owned userspace resources.
@@ -305,12 +404,15 @@ pub(crate) fn replace_current_user_resources(
     address_space: AddressSpaceId,
     stack: OwnedUserStack,
 ) -> core::result::Result<UserThreadResources, ((), OwnedUserStack)> {
+    let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let Some(scheduler) = try_scheduler_mut() else {
         return Err(((), stack));
     };
 
-    scheduler.replace_current_user_resources(address_space, stack)
+    scheduler
+        .on_cpu(cpu)
+        .replace_current_user_resources(address_space, stack)
 }
 
 /// Terminate the current thread and replace its live return context.
@@ -331,10 +433,11 @@ pub(crate) fn replace_current_user_resources(
 /// Panics when no non-idle thread is currently running or a
 /// [`crate::sync::preempt::PreemptGuard`] is active before terminal state changes.
 pub(crate) fn on_thread_exit_sync(context: &mut ActiveContext<'_>, code: usize) {
+    let cpu = current_cpu();
     // Safe point: terminal handoff is permitted only after this enabled-state
     // assertion, before the exiting thread's scheduler state is changed.
-    crate::sync::preempt::assert_preemption_enabled("thread exit state change");
-    scheduler_mut().exit_current(context, code);
+    crate::sync::preempt::assert_preemption_enabled_on(cpu, "thread exit state change");
+    scheduler_mut().on_cpu(cpu).exit_current(context, code);
 }
 
 /// Complete immediately or block the current thread joining `target`.
@@ -359,16 +462,37 @@ pub(crate) fn on_thread_join_sync(
     target: ThreadId,
     output: &mut SchedCallWaitOutput,
 ) {
-    scheduler_mut().join_thread(context, target, output);
+    let cpu = current_cpu();
+    scheduler_mut()
+        .on_cpu(cpu)
+        .join_thread(context, target, output);
 }
 
-impl Scheduler {
+impl CpuScheduler<'_> {
+    fn resolve_affinity(
+        &self,
+        affinity: ThreadAffinity,
+    ) -> core::result::Result<CpuId, SpawnError> {
+        let target = match affinity {
+            ThreadAffinity::Current => self.cpu(),
+            ThreadAffinity::Cpu(cpu) => cpu,
+        };
+        if target.index() >= self.cpus.len() || !cpu::is_registered(target) {
+            return Err(SpawnError::InvalidCpuAffinity);
+        }
+        if !self.cpu_state_for(target).online {
+            return Err(SpawnError::CpuOffline);
+        }
+        Ok(target)
+    }
+
     fn spawn_thread(
         &mut self,
         entry: ThreadEntry,
         arg: ThreadArg,
         attrs: ThreadAttrs,
     ) -> core::result::Result<ThreadId, SpawnError> {
+        let target_cpu = self.resolve_affinity(attrs.affinity)?;
         let Some(id) = self.take_free_slot() else {
             return Err(SpawnError::NoThreadSlots);
         };
@@ -379,7 +503,9 @@ impl Scheduler {
             thread_entry_bootstrap as *const () as usize,
         );
 
-        let thread_id = self.transition_publish_runtime(id, context, None, attrs.joinable);
+        let thread_id =
+            self.for_cpu(target_cpu)
+                .transition_publish_runtime(id, context, None, attrs.joinable);
 
         crate::debug!(
             "thread: spawned id={thread_id} joinable={} arg={}",
@@ -398,6 +524,10 @@ impl Scheduler {
         arg0: usize,
         attrs: ThreadAttrs,
     ) -> core::result::Result<ThreadId, (SpawnError, OwnedUserStack)> {
+        let target_cpu = match self.resolve_affinity(attrs.affinity) {
+            Ok(cpu) => cpu,
+            Err(error) => return Err((error, stack)),
+        };
         if !attrs.joinable {
             return Err((SpawnError::UserThreadMustBeJoinable, stack));
         }
@@ -406,7 +536,7 @@ impl Scheduler {
         };
         let context = SavedContext::user_entry(user_entry, user_sp, self.stack_top(id), arg0);
 
-        let thread_id = self.transition_publish_runtime(
+        let thread_id = self.for_cpu(target_cpu).transition_publish_runtime(
             id,
             context,
             Some(UserThreadResources::new(address_space, stack)),
@@ -426,6 +556,10 @@ impl Scheduler {
         context: &mut ActiveContext<'_>,
         attrs: ThreadAttrs,
     ) -> core::result::Result<ThreadId, (SpawnError, OwnedUserStack)> {
+        let target_cpu = match self.resolve_affinity(attrs.affinity) {
+            Ok(cpu) => cpu,
+            Err(error) => return Err((error, stack)),
+        };
         if !attrs.joinable {
             return Err((SpawnError::UserThreadMustBeJoinable, stack));
         }
@@ -434,7 +568,7 @@ impl Scheduler {
         };
         let child_context = SavedContext::fork_child(context, self.stack_top(id));
 
-        let thread_id = self.transition_publish_runtime(
+        let thread_id = self.for_cpu(target_cpu).transition_publish_runtime(
             id,
             child_context,
             Some(UserThreadResources::new(address_space, stack)),
@@ -473,7 +607,7 @@ impl Scheduler {
             panic!("thread: join entered with an unconsumed prior join handoff");
         }
 
-        if current.index() == IDLE_THREAD_INDEX {
+        if self.state().idle == Some(current) {
             self.set_join_result(current.index(), Err(JoinError::NotJoinable));
             return;
         }
@@ -485,7 +619,7 @@ impl Scheduler {
         }
         let target_slot = target.index();
 
-        if target_slot == IDLE_THREAD_INDEX {
+        if self.cpu_state_for(self.thread_home_cpu(target_slot)).idle == Some(target) {
             self.set_join_result(current.index(), Err(JoinError::NotJoinable));
             return;
         }
@@ -516,7 +650,9 @@ impl Scheduler {
             return;
         }
 
-        crate::sync::preempt::assert_preemption_enabled("thread joiner publication");
+        self.state()
+            .preemption
+            .assert_enabled("thread joiner publication");
         let prepared = self.transition_prepare_wait();
         let token = prepared.token();
         output.record_token(token);
@@ -577,8 +713,10 @@ fn take_current_join_result_irqsave() -> (
     core::result::Result<usize, JoinError>,
     Option<UserThreadResources>,
 ) {
+    let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
     scheduler_mut()
+        .on_cpu(cpu)
         .take_current_join_result()
         .unwrap_or((Err(JoinError::InvalidThread), None))
 }

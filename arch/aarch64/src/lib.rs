@@ -107,6 +107,79 @@ pub extern "C" fn arch_irq_state_allows_sched_call(saved_daif: u64) -> bool {
 }
 
 #[unsafe(no_mangle)]
+/// Return the normalized hardware identity of the executing AArch64 CPU.
+///
+/// # Returns
+///
+/// Returns MPIDR affinity levels Aff3:Aff0 packed without the architecture
+/// control bits.  The read is register-only, allocation-free, non-blocking,
+/// and leaves IRQ state unchanged.  Generic kernel code treats this as opaque.
+pub extern "C" fn arch_current_cpu_hardware_id() -> u64 {
+    let mpidr: u64;
+    // SAFETY: MPIDR_EL1 is a read-only architected system register at EL1.
+    unsafe {
+        asm!(
+            "mrs {mpidr}, MPIDR_EL1",
+            mpidr = out(reg) mpidr,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    // Aff0 is bits 7:0; Aff1..3 are bits 15:8, 23:16, and 39:32.  The
+    // resulting compact value is a hardware key, never a scheduler index.
+    (mpidr & 0x00ff_ffff) | ((mpidr >> 8) & 0xff00_0000)
+}
+
+#[unsafe(no_mangle)]
+/// Bind a registered logical CPU index to the executing AArch64 CPU.
+///
+/// # Arguments
+///
+/// * `logical_index` - Checked zero-based logical CPU storage index assigned by
+///   the generic boot registry.
+///
+/// # Returns
+///
+/// Returns nothing. The index is stored in `TPIDR_EL1` as `logical_index + 1`,
+/// reserving zero for an unbound CPU. The operation is register-only,
+/// allocation-free, non-blocking, and leaves IRQ state unchanged.
+pub extern "C" fn arch_bind_current_cpu_logical_id(logical_index: usize) {
+    let encoded = logical_index
+        .checked_add(1)
+        .expect("cpu: logical ID encoding overflow");
+    // SAFETY: TPIDR_EL1 is software-owned at EL1. Boot clears it on every CPU,
+    // and the generic registry calls this hook only with a checked logical ID.
+    unsafe {
+        asm!(
+            "msr TPIDR_EL1, {encoded}",
+            encoded = in(reg) encoded,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Return the encoded logical identity bound to the executing AArch64 CPU.
+///
+/// # Returns
+///
+/// Returns zero when the CPU is unbound, or the registered logical index plus
+/// one after binding. The operation is register-only, allocation-free,
+/// non-blocking, and leaves IRQ state unchanged.
+pub extern "C" fn arch_current_cpu_logical_id() -> usize {
+    let encoded: usize;
+    // SAFETY: TPIDR_EL1 is software-owned and initialized by the boot
+    // trampoline before generic kernel code can read it.
+    unsafe {
+        asm!(
+            "mrs {encoded}, TPIDR_EL1",
+            encoded = out(reg) encoded,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    encoded
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn arch_counter_now() -> u64 {
     timer::counter()
 }

@@ -5,7 +5,12 @@
 //! exception frame or touching hardware, so these stubs deliberately provide
 //! only inert linkage semantics.
 
-use core::ffi::c_void;
+use core::{
+    ffi::c_void,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+static CURRENT_CPU_LOGICAL_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[unsafe(no_mangle)]
 extern "C" fn arch_local_irq_save_and_disable() -> u64 {
@@ -16,6 +21,18 @@ extern "C" fn arch_local_irq_restore(_saved: u64) {}
 #[unsafe(no_mangle)]
 extern "C" fn arch_irq_state_allows_sched_call(_saved: u64) -> bool {
     true
+}
+#[unsafe(no_mangle)]
+extern "C" fn arch_current_cpu_hardware_id() -> u64 {
+    0
+}
+#[unsafe(no_mangle)]
+extern "C" fn arch_bind_current_cpu_logical_id(logical_index: usize) {
+    CURRENT_CPU_LOGICAL_ID.store(logical_index + 1, Ordering::Relaxed);
+}
+#[unsafe(no_mangle)]
+extern "C" fn arch_current_cpu_logical_id() -> usize {
+    CURRENT_CPU_LOGICAL_ID.load(Ordering::Relaxed)
 }
 #[unsafe(no_mangle)]
 extern "C" fn arch_counter_now() -> u64 {

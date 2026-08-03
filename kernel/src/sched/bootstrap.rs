@@ -1,7 +1,8 @@
 use crate::time::TimeHandlers;
 
 use super::{
-    Result, SchedError, Scheduler, THREAD_STACK_SIZE, preempt, scheduler_slot_mut, thread,
+    Result, SchedError, Scheduler, THREAD_STACK_SIZE, current_cpu, preempt, scheduler_slot_mut,
+    thread,
 };
 
 #[derive(Copy, Clone)]
@@ -70,6 +71,7 @@ pub(crate) fn bootstrap(
     if scheduler_slot_mut().is_some() {
         return Err(SchedError::AlreadyBootstrapped);
     }
+    let cpu = current_cpu();
 
     // Bootstrap ordering is intentionally split into two phases:
     // 1. Build and publish the global scheduler so timer-owned callbacks always
@@ -77,6 +79,7 @@ pub(crate) fn bootstrap(
     // 2. Only then initialize `kernel::time`, which is the first point where
     //    timer IRQ dispatch can invoke scheduler callbacks.
     let scheduler = Scheduler::bootstrap_new(
+        cpu,
         idle_entry,
         idle_arg,
         threads,
@@ -84,6 +87,7 @@ pub(crate) fn bootstrap(
         thread_capacity,
     )?;
     let thread_count = scheduler.transition_thread_count();
+    crate::sync::preempt::assert_boot_state_quiescent(cpu);
     *scheduler_slot_mut() = Some(scheduler);
     init_time_after_scheduler_publish(thread_count);
     Ok(())
@@ -103,6 +107,7 @@ fn init_time_after_scheduler_publish(thread_count: usize) {
 
 impl Scheduler {
     fn bootstrap_new(
+        cpu: crate::cpu::CpuId,
         idle_entry: thread::ThreadEntry,
         idle_arg: thread::ThreadArg,
         threads: &[StaticThread],
@@ -115,18 +120,23 @@ impl Scheduler {
         }
 
         let mut scheduler = Self::transition_new(thread_capacity, rr_quantum_ms);
-        scheduler.transition_append_bootstrap(idle_entry, idle_arg, true);
+        scheduler
+            .on_cpu(cpu)
+            .transition_append_bootstrap(idle_entry, idle_arg, true);
         for thread in threads {
-            let id = scheduler.transition_append_bootstrap(thread.entry, thread.arg, false);
+            let id =
+                scheduler
+                    .on_cpu(cpu)
+                    .transition_append_bootstrap(thread.entry, thread.arg, false);
             crate::debug!("sched: bootstrap thread {id}");
         }
         scheduler.transition_fill_free_slots(thread_capacity);
 
-        scheduler.transition_initial_dispatch()?;
+        scheduler.on_cpu(cpu).transition_initial_dispatch()?;
         crate::debug!(
             "sched: thread_capacity={} ready_queue_capacity={} stack_size={} quantum={}ms",
             scheduler.transition_thread_count(),
-            scheduler.transition_ready_capacity(),
+            scheduler.on_cpu(cpu).transition_ready_capacity(),
             THREAD_STACK_SIZE,
             scheduler.rr_quantum_ms
         );

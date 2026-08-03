@@ -20,6 +20,11 @@
 .type _start, %function
 
 _start:
+    // Zero the architecture-owned logical CPU binding before either the boot
+    // CPU enters Rust or a secondary CPU parks. Runtime binds a registered
+    // CpuId as index + 1; zero therefore remains the explicit unbound value.
+    msr TPIDR_EL1, xzr
+
     // QEMU virt может стартовать несколько CPU. genrt пока single-core, поэтому
     // все secondary CPUs паркуются в WFE. Primary CPU имеет MPIDR_EL1.Aff0 == 0.
     mrs x1, mpidr_el1

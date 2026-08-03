@@ -62,6 +62,8 @@ pub(super) fn spawn_errno(err: sched::SpawnError) -> errno::Errno {
     match err {
         sched::SpawnError::NoThreadSlots | sched::SpawnError::NoStackSlots => errno::EAGAIN,
         sched::SpawnError::SchedulerNotInitialized
+        | sched::SpawnError::InvalidCpuAffinity
+        | sched::SpawnError::CpuOffline
         | sched::SpawnError::UserThreadMustBeJoinable => errno::EINVAL,
     }
 }

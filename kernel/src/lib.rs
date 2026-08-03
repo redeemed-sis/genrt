@@ -14,6 +14,7 @@ pub mod arch;
 pub mod boot;
 mod config;
 pub mod console;
+pub mod cpu;
 mod dtb;
 pub mod errno;
 pub mod fs;
@@ -44,6 +45,10 @@ const PRODUCTION_THREADS: [sched::StaticThread; 1] = [sched::StaticThread::new(
 pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
     crate::info!("kernel_main entered");
     crate::info!("bootinfo: arch=aarch64");
+
+    let boot_cpu = cpu::register_boot_cpu()
+        .unwrap_or_else(|err| panic!("cpu: failed to register boot CPU: {err:?}"));
+    crate::info!("cpu: registered boot CPU{}", boot_cpu.index());
 
     if boot.dtb_pa != 0 {
         crate::info!("bootinfo: dtb=present size={} bytes", boot.dtb_size);
