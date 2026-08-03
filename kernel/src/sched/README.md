@@ -1,9 +1,23 @@
 # Scheduler, time, and blocking
 
-The scheduler is a bounded single-core round-robin engine. `Thread` is its only
-schedulable entity. Context switches save a borrowed `ActiveContext` into the
-current thread's owned `SavedContext` and restore the selected thread into the
-live return context.
+The scheduler is a bounded CPU0-only round-robin engine with preallocated
+per-logical-CPU contexts. `Thread` is its only schedulable entity. Context
+switches save a borrowed `ActiveContext` into the current thread's owned
+`SavedContext` and restore the selected thread into the live return context.
+
+`CpuId` is a checked logical identity supplied by the boot CPU registry; generic
+scheduler code never uses raw MPIDR. Every context owns its current thread,
+idle thread, ready queue, initialized/online state, and matching preemption
+state. CPU0 is registered and bootstrapped before scheduler publication; all
+other bounded contexts remain offline. `ThreadAttrs` chooses an immutable home
+CPU before publication. Runtime wakeups enqueue only on that home CPU; there is
+no migration, IPI, work stealing, or secondary execution in the active target.
+
+Current-CPU entry points resolve `CpuId` once and bind a short-lived
+`CpuScheduler` view. Local transition, wait, and preemption methods use the
+view's stable identity instead of repeating architecture lookup or accepting a
+`CpuId` parameter at every layer. Bootstrap, explicit affinity, wakeup to a
+thread's `home_cpu`, and invariant validation select a target CPU explicitly.
 
 ## Thread table and states
 

@@ -66,6 +66,23 @@ Changes that invalidate one require architecture review and an ADR.
 
 - The active implementation is single-core. Local IRQ exclusion is not an SMP
   lock and must not be documented as one.
+- Logical `CpuId` is the only generic-kernel CPU identity. AArch64-normalized
+  hardware IDs are boot-registration keys, never scheduler indexes. Each
+  registered CPU receives an architecture-owned logical binding; runtime
+  current-CPU resolution reads that binding in O(1), and unbound or invalid
+  CPUs never default to CPU0.
+- Every CPU scheduler context owns its current thread, idle thread, ready queue,
+  initialized/online state, and matching CPU-local preemption state. A thread's
+  immutable home CPU owns its ready membership and wakeup destination; no
+  migration, remote notification, or secondary execution exists yet.
+- One local scheduler operation binds one stable `CpuId` through a
+  `CpuScheduler` view. Target/home-CPU operations select their destination
+  explicitly and must not silently substitute the executing CPU.
+- Fixed CPU-local preemption backing is available before heap bootstrap; after
+  scheduler publication, each CPU context owns its runtime preemption state. A
+  `PreemptGuard` cannot cross that publication boundary, is bound to its
+  creating CPU, and must not be dropped on another CPU. The current
+  single-active-CPU assumption is not SMP exclusion.
 - Thread and process handles use generations; stale handles never name a reused
   slot. `ThreadId` directly indexes one bounded `ThreadSlot`; there is no second
   schedulable identity.

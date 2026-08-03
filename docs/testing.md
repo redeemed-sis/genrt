@@ -34,8 +34,9 @@ cargo xtask test-aarch64 --case shell-contract --timeout-secs 30
 ## Test layers
 
 `kernel-contract` and `user-fault` use kernels compiled with scenario-specific
-`qemu-test` features. Their coordinators test scheduler/timing/mailbox behavior
-and exact user-fault classification.
+`qemu-test` features. Their coordinators test CPU0 identity, per-CPU scheduler
+context ownership, scheduler/timing/mailbox behavior, and exact user-fault
+classification.
 
 `userspace-contract` and `shell-contract` use the production kernel with a
 test-only initramfs. `/init` is a supervisor that performs

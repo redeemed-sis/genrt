@@ -11,6 +11,14 @@ QEMU-loaded DTB, builds bootstrap TTBR0/TTBR1 tables, programs EL1 translation
 state, enables the MMU, switches to a high stack alias, and enters high-linked
 Rust.
 
+The trampoline parks QEMU secondary CPUs in `WFE`. After high Rust entry, the
+AArch64 facade alone reads `MPIDR_EL1`, normalizes Aff3:Aff0 into an opaque
+hardware key, and the generic kernel registers that executing boot CPU as
+logical CPU0. The key is not a logical scheduler index. The trampoline clears
+software-owned `TPIDR_EL1` on every CPU; registration stores the logical index
+plus one there, so runtime current-CPU resolution is an O(1) register read and
+zero remains an explicit unbound state.
+
 Main kernel sections have high VMAs and low LMAs through linker `AT(...)`; no
 runtime section copy is required. The address convention is:
 

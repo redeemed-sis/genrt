@@ -7,7 +7,8 @@ stores complete evidence below `target/test-results/`.
 
 - `kernel-contract`: test-enabled kernel coordinator for timer, sleep,
   deferred-preemption safe points, exact wait registration/completion, mailbox,
-  thread lifecycle, and allocator ownership contracts. Its wait cases cover
+  thread lifecycle, CPU0 identity/per-CPU scheduler context, and allocator
+  ownership contracts. Its wait cases cover
   wake-before-block, duplicate completion, both event/timeout orders, late
   timeout isolation, slot reuse, and bounded mailbox loser cleanup. Its
   preemption cases use bounded task/atomic protocols and a test-only timer-IRQ

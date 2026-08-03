@@ -8,8 +8,10 @@ hooks.
 
 | Module | Responsibility |
 | --- | --- |
+| `config` | Central architecture-neutral capacities, scheduler policy values, and ABI limits |
 | `memory` | Physical map, frame allocator, heap, kernel/user VM, user copies |
-| `sched` | Thread states, controlled scheduler calls, preemption, typed waits, and lifecycle |
+| `cpu` | Typed logical CPU identity and bounded boot hardware registry |
+| `sched` | Per-CPU thread states, controlled scheduler calls, preemption, typed waits, and lifecycle |
 | `time` | Monotonic counter conversion and one-shot timed events |
 | `ipc` | Bounded mailbox buffers, wait queues, and timeout integration |
 | `process` | [Bounded process table and lifecycle](src/process/README.md), address-space/image ownership, fork/exec/wait, cwd/FD access |
@@ -24,10 +26,11 @@ Detailed ownership lives in the [memory](src/memory/README.md),
 
 ## Execution model
 
-After architecture boot, `kernel_main` initializes physical memory, switches to
-runtime TTBR1 tables, mounts initramfs, bootstraps scheduler storage, and enters
-the first selected trap frame. The init kernel thread spawns `/init` as a normal
-user process and joins it.
+After architecture boot, `kernel_main` registers the normalized boot hardware
+CPU as logical CPU0, initializes physical memory, switches to runtime TTBR1
+tables, mounts initramfs, bootstraps scheduler storage, and enters the first
+selected trap frame. The init kernel thread spawns `/init` as a normal user
+process and joins it.
 
 The production scheduler starts with exactly two kernel threads: the permanent
 idle thread and one non-idle `kernel_init_thread`. QEMU scenario features replace

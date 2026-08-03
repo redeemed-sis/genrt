@@ -8,7 +8,7 @@ accepted ADRs remain authoritative when details differ.
 - Architecture: AArch64.
 - Rust target: `aarch64-unknown-none-softfloat`.
 - Machine: QEMU `virt` with GICv2.
-- Execution model: single core, EL1 kernel and freestanding EL0 processes.
+- Execution model: CPU0-only execution, EL1 kernel and freestanding EL0 processes.
 - Kernel image: low physical load with a high-half virtual runtime mapping.
 
 ## Boot and platform
@@ -49,7 +49,18 @@ accepted ADRs remain authoritative when details differ.
 
 ## Scheduling and time
 
-- The scheduler is round-robin, preemptive, and single-core.
+- The scheduler is round-robin, preemptive, and CPU0-only. A bounded registry
+  maps the normalized AArch64 boot CPU hardware identity to logical `CpuId(0)`
+  before scheduler bootstrap. AArch64 then retains the logical binding in
+  CPU-local `TPIDR_EL1`, making runtime current-CPU resolution O(1); unbound or
+  invalid CPUs are rejected rather than treated as CPU0.
+- Scheduler contexts are preallocated per logical CPU. Each owns local current,
+  idle, ready queue, initialized/online state, and matching preemption state.
+  CPU0 alone is initialized and becomes online at first thread entry; secondary
+  contexts remain offline. Runtime scheduler entry points resolve the executing
+  CPU once and bind a `CpuScheduler` view for the complete local operation;
+  affinity, home-CPU wakeup, bootstrap, and validation retain explicit target
+  selection.
 - Production bootstrap starts only the permanent idle thread and one kernel init
   thread; the latter launches and joins userspace `/init`.
 - Context switching replaces the saved trap frame selected for IRQ or syscall
@@ -72,8 +83,10 @@ accepted ADRs remain authoritative when details differ.
   saved IRQ state is safe.
 - Kernel yield under preemption exclusion returns to the same thread. Blocking
   waits and terminal thread/process transitions fail fast under a guard.
-- Kernel thread slots, stacks, ready queues, and handles are bounded and
-  generation-checked.
+- Kernel thread slots, stacks, per-CPU ready queues, and handles are bounded
+  and generation-checked. Each thread has immutable `home_cpu` selected from
+  `ThreadAttrs` before publication; wakeups use that home queue and migration
+  is not implemented.
 - `ThreadId { index, generation }` directly indexes an occupied bounded slot;
   free and stale generations are rejected without a second scheduler identity.
 - A free slot parks its preallocated kernel stack and next wait sequence. An
