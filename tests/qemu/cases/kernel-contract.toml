@@ -11,6 +11,16 @@ step_timeout_secs = 15
 [[steps]]
 action = "expect_case"
 producer = "kernel"
+subject = "cpu-identity"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "per-cpu-scheduler-context"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
 subject = "sleep-deadline"
 
 [[steps]]

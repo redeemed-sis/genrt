@@ -151,6 +151,35 @@ pub(crate) fn init() {
 fn coordinator(_arg: ThreadArg) -> usize {
     protocol::ready(SUITE);
 
+    protocol::case_start("cpu-identity");
+    crate::cpu::validate_boot_cpu_for_test();
+    protocol::pass("cpu-identity");
+
+    protocol::case_start("per-cpu-scheduler-context");
+    sched::validate_cpu_context_for_test();
+    let cpu0 = crate::cpu::current_id()
+        .unwrap_or_else(|_| protocol::fail("per-cpu-scheduler-context", "CPU_LOOKUP"));
+    let affinity_worker = sched::thread_spawn(
+        worker,
+        ThreadArg::empty(),
+        ThreadAttrs::joinable().with_affinity(cpu0),
+    )
+    .unwrap_or_else(|_| protocol::fail("per-cpu-scheduler-context", "CPU0_AFFINITY"));
+    if sched::thread_join(affinity_worker) != Ok(WORKER_EXIT) {
+        protocol::fail("per-cpu-scheduler-context", "CPU0_AFFINITY_JOIN");
+    }
+    let cpu1 = crate::cpu::CpuId::from_index(1)
+        .unwrap_or_else(|| protocol::fail("per-cpu-scheduler-context", "NO_CPU1_SLOT"));
+    if sched::thread_spawn(
+        worker,
+        ThreadArg::empty(),
+        ThreadAttrs::joinable().with_affinity(cpu1),
+    ) != Err(sched::SpawnError::InvalidCpuAffinity)
+    {
+        protocol::fail("per-cpu-scheduler-context", "OFFLINE_CPU_ACCEPTED");
+    }
+    protocol::pass("per-cpu-scheduler-context");
+
     protocol::case_start("sleep-deadline");
     let started = crate::time::uptime_ms();
     sched::msleep(25);
