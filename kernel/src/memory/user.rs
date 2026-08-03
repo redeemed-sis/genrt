@@ -11,7 +11,7 @@
 
 use alloc::vec::Vec;
 
-pub use crate::limits::GENRT_PATH_MAX;
+pub use crate::config::GENRT_PATH_MAX;
 
 use super::{
     FrameRange, PAGE_SIZE, VirtAddr, align_down,

@@ -20,7 +20,6 @@ pub mod errno;
 pub mod fs;
 mod init;
 pub mod ipc;
-pub mod limits;
 pub mod loader;
 pub mod log;
 pub mod memory;

@@ -415,7 +415,7 @@ fn sys_getcwd(context: &mut ActiveContext<'_>, request: SyscallRequest) {
             return Err(errno::ERANGE);
         }
 
-        user::copy_cstr_to_user(ptr, cwd, crate::limits::GENRT_PATH_MAX + 1)
+        user::copy_cstr_to_user(ptr, cwd, crate::config::GENRT_PATH_MAX + 1)
             .map_err(user_copy_errno)?;
         Ok(required)
     })();

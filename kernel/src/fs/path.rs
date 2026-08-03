@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::limits::GENRT_PATH_MAX;
+use crate::config::GENRT_PATH_MAX;
 
 use super::ramfs;
 
