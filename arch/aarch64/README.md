@@ -65,9 +65,12 @@ kernel/user/fork entry state, and performs bounded live-to-saved transfers.
 Compile-time checks require the architecture frame to fit with compatible
 alignment; the assembly restore layout remains unchanged.
 
-GICv2 dispatches the architected timer and PL011 RX IRQ. Timer expiry enters the
-generic time/scheduler path and may replace the return frame. UART IRQ drains a
-bounded RX FIFO path and wakes stdin waiters without allocation.
+GICv2 dispatches the architected timer and PL011 RX IRQ. Each PE owns its
+physical timer registers; generic time state therefore keeps one bounded queue
+per logical CPU and only the executing owner programs that timer. Expiry enters
+the generic time path, which invokes the scheduler facade after releasing queue
+ownership and may replace the return frame. UART IRQ drains a bounded RX FIFO
+path and wakes stdin waiters without allocation.
 
 ## Build invariants
 

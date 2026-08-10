@@ -31,16 +31,19 @@ accepted ADRs remain authoritative when details differ.
 - A fixed 16 MiB bootstrap heap is allocated from physical frames and exposed
   through the high direct map.
 - Heap allocation is permitted during bootstrap and thread context. The heap and
-  runtime physical frame allocator use thread-context-only `PreemptLock`. Its nested
-  disable depth permits IRQ progress, forbids thread handoff until unlock, and is
-  forbidden in IRQ paths.
+  runtime physical frame allocator use Acquire/Release `SpinLock`; it owns
+  nested preemption exclusion, is forbidden in IRQ paths, and releases before a
+  possible scheduler checkpoint.
 - Boot-discovered physical regions and the heap range are immutable after
   initialization. Runtime free-list state is separately locked and does not
   expose references outside its guard.
 - Scheduler and timed-event containers allocate and reserve capacity before
   entering IRQ-sensitive operation.
 - Runtime TTBR1 APIs map, unmap, protect, and translate kernel regions after
-  the boot tables have been replaced.
+  the boot tables have been replaced. The generic VM layer serializes writers;
+  AArch64 reads live TTBR roots from registers, performs break-before-make and
+  inner-shareable TLBI, and defers table-frame reclaim until invalidation
+  completes.
 - Each user process owns an allocator-backed `OwnedUserAddressSpace`. ELF
   segments and thread-owned user stacks use 4 KiB mappings with user-specific
   permissions.
@@ -55,7 +58,9 @@ accepted ADRs remain authoritative when details differ.
   CPU-local `TPIDR_EL1`, making runtime current-CPU resolution O(1); unbound or
   invalid CPUs are rejected rather than treated as CPU0.
 - Scheduler contexts are preallocated per logical CPU. Each owns local current,
-  idle, ready queue, initialized/online state, and matching preemption state.
+  idle, ready queue, and initialized/online state; separate CPU-local fixed
+  preemption backing keeps lock acquisition independent of shared lifecycle
+  storage.
   CPU0 alone is initialized and becomes online at first thread entry; secondary
   contexts remain offline. Runtime scheduler entry points resolve the executing
   CPU once and bind a `CpuScheduler` view for the complete local operation;
@@ -74,19 +79,23 @@ accepted ADRs remain authoritative when details differ.
 - Raw context pointers and `TrapFrame` casts are confined to the AArch64 facade
   and assembly entry boundary. Context switching remains bounded and
   allocation-free.
-- The architected timer runs in one-shot nearest-deadline mode.
-- `kernel::time` owns the preallocated deadline queue for exact wait deadlines
-  and scheduler quantum expiration.
+- The architected timer runs in per-CPU one-shot nearest-deadline mode.
+- `kernel::time` owns one preallocated, IRQ-safe deadline queue per logical
+  CPU for exact wait deadlines and scheduler quantum expiration. Timed events
+  carry their CPU owner; only that CPU inserts events and programs its physical
+  timer. IRQ dispatch drops the queue owner before calling the scheduler facade
+  directly.
 - Reschedule requests coalesce in `kernel::sync::preempt`. Timer IRQ return and
   a private typed sched-call checkpoint may consume them only at disable depth
   zero; outermost guard release invokes that checkpoint automatically when the
   saved IRQ state is safe.
 - Kernel yield under preemption exclusion returns to the same thread. Blocking
   waits and terminal thread/process transitions fail fast under a guard.
-- Kernel thread slots, stacks, per-CPU ready queues, and handles are bounded
-  and generation-checked. Each thread has immutable `home_cpu` selected from
-  `ThreadAttrs` before publication; wakeups use that home queue and migration
-  is not implemented.
+- Kernel thread slots, stacks, per-CPU ready queues, remote-ready ingress, and
+  handles are bounded and generation-checked. Each thread has immutable
+  `home_cpu` selected from `ThreadAttrs` before publication. A remote wake
+  publishes into the home CPU's ingress, which only that CPU drains into its
+  local ready queue; migration and IPI notification are not implemented.
 - `ThreadId { index, generation }` directly indexes an occupied bounded slot;
   free and stale generations are rejected without a second scheduler identity.
 - A free slot parks its preallocated kernel stack and next wait sequence. An
@@ -97,11 +106,12 @@ accepted ADRs remain authoritative when details differ.
   complete `ThreadId` generations; debug and QEMU-test builds run a bounded
   invariant validator after lifecycle transitions.
 - Each blocking episode has a scheduler-owned `WaitToken` containing a complete
-  `ThreadId` and a checked per-slot sequence. Inline wait metadata moves through
-  `Prepared`, `Blocked`, and `Completed`; the sequence survives slot reuse.
+  `ThreadId`, immutable home `CpuId`, and a checked per-slot sequence. Inline
+  wait metadata moves through `Prepared`, `Blocked`, and `Completed`; the
+  sequence survives slot reuse.
 - Wait-deadline events carry the exact `WaitToken`, while scheduler-quantum
-  events carry `ThreadId`. Stale generations and earlier waits by the same live
-  thread cannot complete a later wait.
+  events carry `ThreadId`; both carry their queue-owning CPU. Stale generations
+  and earlier waits by the same live thread cannot complete a later wait.
 - Transition selection returns a context-free switch outcome. Context
   save/restore, TTBR0 activation, and switch logging remain in handoff code.
 - Sleep, thread join, process wait, mailbox, and stdin condition owners publish
@@ -145,6 +155,10 @@ accepted ADRs remain authoritative when details differ.
   `user/c/programs.toml` and installed under `/bin`.
 - PL011 RX interrupts feed a bounded kernel stdin ring. `read(0)` blocks and is
   restarted after input; line editing and command policy live in userspace.
+  Stdin, mailbox, and process owner state use IRQ-safe SMP locks; completion
+  occurs after the owner is released. Logging enqueues complete records into a
+  bounded allocation-free TX ring and one drainer performs UART polling outside
+  the lock. Panic and test-abort output use a non-waiting emergency path.
 
 ## Verification and releases
 
@@ -161,7 +175,9 @@ accepted ADRs remain authoritative when details differ.
 
 ## Current boundaries
 
-- No SMP scheduling, cross-core synchronization, or TLB shootdown.
+- No secondary CPU startup, IPI/remote reschedule or remote timer-insertion
+  notification, migration, or userspace TLB shootdown. Shared runtime owners
+  are already cross-CPU locked.
 - No FP/SIMD context ownership; the soft-float target is intentional.
 - No ASIDs, copy-on-write, demand paging, recoverable usercopy faults, signals,
   or multiple user threads within one process.

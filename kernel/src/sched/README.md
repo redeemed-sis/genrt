@@ -7,17 +7,29 @@ switches save a borrowed `ActiveContext` into the current thread's owned
 
 `CpuId` is a checked logical identity supplied by the boot CPU registry; generic
 scheduler code never uses raw MPIDR. Every context owns its current thread,
-idle thread, ready queue, initialized/online state, and matching preemption
-state. CPU0 is registered and bootstrapped before scheduler publication; all
+idle thread, ready queue, and initialized/online state. Preemption bookkeeping
+uses separate fixed CPU-local storage available before heap initialization and
+retained after scheduler publication. CPU0 is registered and bootstrapped; all
 other bounded contexts remain offline. `ThreadAttrs` chooses an immutable home
-CPU before publication. Runtime wakeups enqueue only on that home CPU; there is
-no migration, IPI, work stealing, or secondary execution in the active target.
+CPU before publication. Local wakeups enter that CPU's ready queue. Remote
+wakeups publish into a bounded per-target ingress that only the target CPU
+drains into its local ready queue. There is no migration, IPI notification,
+work stealing, or secondary execution in the active target.
 
 Current-CPU entry points resolve `CpuId` once and bind a short-lived
 `CpuScheduler` view. Local transition, wait, and preemption methods use the
 view's stable identity instead of repeating architecture lookup or accepting a
 `CpuId` parameter at every layer. Bootstrap, explicit affinity, wakeup to a
 thread's `home_cpu`, and invariant validation select a target CPU explicitly.
+
+The bounded `ThreadTable`, free-slot lifecycle storage, and remote ingress use a
+cross-CPU IRQ-safe scheduler lock so publication and lifecycle transitions stay
+atomic. CPU contexts remain owner-local: mutable `current`, `idle`, ready-queue,
+and online-state access is rejected from another CPU. Fixed preemption storage
+performs the same current-CPU ownership check independently. This milestone does
+not add remote notification or migration; a published remote wake becomes
+runnable when the owner next enters the scheduler, and issue #4 must add the IPI
+that prompts that entry.
 
 ## Thread table and states
 
@@ -83,11 +95,18 @@ address space.
 
 ## Preemption and time
 
-The architected timer is programmed to the nearest deadline. `kernel::time`
-owns a preallocated event queue containing exact wait deadlines and quantum
-expiration. IRQ dispatch collects expired events, completes deadline tokens,
-updates scheduler state, and programs the next deadline. No callback allocation
-or queue growth occurs in the interrupt path.
+Each logical CPU owns one preallocated deadline queue and its architected
+physical timer. Timed events retain that CPU identity, and only the owner CPU
+inserts events or programs its one-shot nearest deadline. IRQ dispatch collects
+expired events, releases the queue lock, then directly invokes the narrow
+scheduler facade to complete tokens, account quantum expiration, and perform
+IRQ-return handoff. No callback table, allocation, or queue growth occurs in
+the interrupt path.
+
+Cross-CPU cancellation may remove an exact event without touching the remote
+physical timer; at worst the old deadline causes one harmless early interrupt.
+Prompt remote insertion is rejected until secondary bring-up provides an IPI
+command path.
 
 Ready insertion requests scheduling when a runnable peer appears, so idle
 cannot remain selected indefinitely. A quantum switch is committed only at the

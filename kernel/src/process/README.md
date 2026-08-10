@@ -23,7 +23,9 @@ corresponding `Thread` owns its `OwnedUserStack` and retains only a non-owning
 `AddressSpaceId`.
 
 The table publishes and clears the reverse index with `main_thread`; scheduler
-code never stores or resolves a `ProcessId`.
+code never stores or resolves a `ProcessId`. Its IRQ-safe SMP lock covers only
+bounded slot/index mutation. It is released before waiter completion,
+scheduler handoff, user copy, parsing, or resource cleanup.
 
 Operation modules use sibling interfaces, never the public facade. Table
 critical sections cover slot/index and bounded process-local mutations;

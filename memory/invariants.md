@@ -38,6 +38,13 @@ Changes that invalidate one require architecture review and an ADR.
   Yield cannot bypass a guard, and blocking or terminal transitions fail fast
   while task preemption is disabled.
 - Neither local IRQ nor thread-preemption exclusion provides SMP synchronization.
+- Shared state uses Acquire/Release `SpinLock` or `IrqSpinLock`; the latter
+  masks local IRQs before acquisition and releases before restoration. Guards
+  are non-send and never cross blocking, scheduler handoff, user copy, parsing,
+  heap allocation, logging bursts, or destructive cleanup. Permitted nesting is
+  condition owner -> scheduler -> CPU-local time and kernel VM -> frame allocator;
+  logging is terminal. CPU-registry and heap locks are standalone owners and
+  are not nested with another shared lock.
 - Blocking thread operations hand ownership to the scheduler; they do not poll.
 - Human-readable logging is diagnostic and may perturb timing. It is never a
   functional test protocol.
@@ -57,6 +64,10 @@ Changes that invalidate one require architecture review and an ADR.
   own user-stack frames.
 - Boot-owned page tables are never reclaimed through the runtime frame
   allocator.
+- Generic kernel VM entry points serialize runtime TTBR1 writers. AArch64 owns
+  descriptor replacement, break-before-make where needed, inner-shareable
+  TLBI, and barriers; table frames are not reclaimed before invalidation
+  completes.
 - Resource ownership is extracted atomically before frames, address spaces, or
   stacks are destroyed outside a critical section.
 - User-copy helpers operate on the current active user address space unless an
@@ -72,17 +83,24 @@ Changes that invalidate one require architecture review and an ADR.
   current-CPU resolution reads that binding in O(1), and unbound or invalid
   CPUs never default to CPU0.
 - Every CPU scheduler context owns its current thread, idle thread, ready queue,
-  initialized/online state, and matching CPU-local preemption state. A thread's
-  immutable home CPU owns its ready membership and wakeup destination; no
-  migration, remote notification, or secondary execution exists yet.
+  and initialized/online state. CPU-local preemption state is separate fixed
+  storage so acquiring a shared `SpinLock` never needs the scheduler lock. A thread's
+  immutable home CPU owns its ready membership and wakeup destination. A remote
+  completion publishes into a bounded ingress for that CPU, and only the owner
+  drains it into the local ready queue; no migration, IPI notification, or
+  secondary execution exists yet.
+- Every logical CPU owns one bounded deadline queue and one architected physical
+  timer. Timed events carry that owner. Only the owner CPU inserts events and
+  programs the timer; no time lock is retained across direct scheduler dispatch.
+  Remote cancellation may leave an early interrupt, but cannot delay a remaining
+  deadline. Remote insertion requires a future IPI command path.
 - One local scheduler operation binds one stable `CpuId` through a
   `CpuScheduler` view. Target/home-CPU operations select their destination
   explicitly and must not silently substitute the executing CPU.
-- Fixed CPU-local preemption backing is available before heap bootstrap; after
-  scheduler publication, each CPU context owns its runtime preemption state. A
-  `PreemptGuard` cannot cross that publication boundary, is bound to its
-  creating CPU, and must not be dropped on another CPU. The current
-  single-active-CPU assumption is not SMP exclusion.
+- Fixed CPU-local preemption backing is available before heap bootstrap and
+  remains independent of shared scheduler storage afterward. A `PreemptGuard`
+  is bound to its creating CPU and must not be dropped on another CPU. The
+  current single-active-CPU assumption is not SMP exclusion.
 - Thread and process handles use generations; stale handles never name a reused
   slot. `ThreadId` directly indexes one bounded `ThreadSlot`; there is no second
   schedulable identity.
@@ -94,8 +112,9 @@ Changes that invalidate one require architecture review and an ADR.
   the preallocated kernel stack and next wait sequence; an occupied `Thread`
   owns the stack, context, active wait, join/exit state, and optional user stack.
 - Every blocking episode has one exact `WaitToken` containing a generation-aware
-  `ThreadId` and checked per-slot sequence. The sequence allocator survives slot
-  reuse; stale generation or sequence completions cannot affect a later wait.
+  `ThreadId`, immutable home `CpuId`, and checked per-slot sequence. The
+  sequence allocator survives slot reuse; stale generation or sequence
+  completions cannot affect a later wait.
 - A thread is scheduler-blocked exactly when its inline wait metadata is
   `Blocked`. `Prepared` belongs only to the current running thread; `Completed`
   retains one first-wins cause until exact consumption.

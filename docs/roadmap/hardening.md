@@ -18,16 +18,26 @@ explicit acceptance criteria.
 3. **Interrupt API boundaries**
    - replace ad hoc architecture dispatch wiring with explicit IRQ ownership
      interfaces while keeping GIC/ESR details in AArch64 code;
+   - add exception-context-aware per-CPU lock-rank tracking before enabling
+     runtime lockdep, so an interrupting context does not inherit the
+     interrupted context's logical lock stack;
    - measure heap/frame allocator critical-section latency before claiming a
      hard upper bound;
    - retain allocation-free bounded handlers.
+4. **Secondary CPU activation**
+   - add CPU-interface bring-up, IPI acknowledgement, and remote wake
+     notification on top of ADR-0036 shared-state synchronization;
+   - add an IPI-backed remote timer command for prompt insertion into another
+     CPU's existing per-CPU deadline queue;
+   - define userspace TLB shootdown ownership before executing EL0 on another
+     CPU.
 
 ## Boundary cleanup
 
-4. Evolve the current console-owned stdin ring and wait registration into TTY
+5. Evolve the current console-owned stdin ring and wait registration into TTY
    semantics without moving line discipline into the scheduler or changing fd
    semantics prematurely.
-5. Consolidate trap-frame initialization and remove interfaces no longer used by
+6. Consolidate trap-frame initialization and remove interfaces no longer used by
    the established EL1/EL0 restore model.
 
 ## Maintainability

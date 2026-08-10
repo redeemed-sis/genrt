@@ -14,11 +14,12 @@ frames and stores free-list metadata through explicit high direct-map aliases.
 The bootstrap heap is one contiguous 16 MiB frame range. Once allocated, it is
 removed from the frame free list and initialized through its HVA. Allocation is
 allowed during bootstrap and thread context. The heap and runtime frame free list
-use thread-context-only `PreemptLock` ownership. IRQs remain enabled when permitted by the
-caller, while nested preemption exclusion prevents another thread from observing
-allocator mutation; a requested switch is deferred until the outermost lock is
-released. Boot-discovered regions and the heap range become immutable metadata
-after initialization and can be read without holding the allocator lock.
+use SMP `SpinLock` ownership. IRQs remain enabled when permitted by the caller,
+while nested preemption exclusion prevents a holder from being switched away; a
+requested switch is deferred until release. Frame ownership is removed under
+that lock, then zeroing/copying happens after release. Boot-discovered regions
+and the heap range use Release/Acquire immutable publication and can be read
+without holding the allocator lock.
 
 ## Kernel mappings
 
@@ -29,8 +30,10 @@ returns `VmError::NotInitialized`, preventing lost mappings or accidental
 reclaim of `.boot.bss` page tables.
 
 The VM API exposes explicit physical/direct-map conversion, translation, and
-kernel map/unmap/protect operations. Current kernel region mutation is limited
-to its documented alignment and granularity.
+kernel map/unmap/protect operations. The generic VM facade serializes TTBR1
+writers and may nest only into the frame allocator. AArch64 keeps descriptor
+updates and the barrier/TLBI sequence architecture-local, uses inner-shareable
+broadcast invalidation, and only reclaims table frames after invalidation.
 
 ## User address spaces
 
@@ -74,7 +77,7 @@ belongs inside this module, not in individual syscalls.
 - Convert PA to HVA only at explicit dereference boundaries.
 - Do not free boot tables through the runtime allocator.
 - Keep user-copy, parsing, and frame destruction outside IRQ-disabled sections.
-- Do not acquire heap or frame allocator `PreemptLock` state from IRQ context.
+- Do not acquire heap or frame allocator `SpinLock` state from IRQ context.
 - No reference into mutable frame allocator state may escape its guard.
 
 Related decisions: ADR-0007, ADR-0009 through ADR-0011, ADR-0015, ADR-0016, and
