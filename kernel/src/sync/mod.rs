@@ -1,3 +1,9 @@
+//! Allocation-free synchronization for shared kernel state.
+//!
+//! Local IRQ masking prevents re-entry on one CPU only.  Cross-CPU ownership
+//! always uses [`SpinLock`] or [`IrqSpinLock`]; neither lock sleeps, yields, or
+//! enters the scheduler while held.
+
 use core::{
     cell::UnsafeCell,
     marker::PhantomData,
@@ -17,11 +23,8 @@ unsafe extern "C" {
 
 /// Saves local IRQ state and masks IRQ delivery until dropped.
 ///
-/// This is the current single-core critical-section primitive. It is deliberately
-/// small and architecture-backed; higher-level locks should use this type rather
-/// than calling the architecture hooks directly. Guards may be nested because
-/// each instance restores the exact IRQ state observed on entry. Construction
-/// is bounded and allocation-free.
+/// This guard prevents local interrupt re-entry only; it is never an SMP
+/// mutual-exclusion primitive. Construction is bounded and allocation-free.
 pub(crate) struct LocalIrqGuard {
     saved_daif: u64,
     _not_send: PhantomData<*mut ()>,
@@ -32,13 +35,13 @@ impl LocalIrqGuard {
     ///
     /// # Returns
     ///
-    /// Returns a non-copyable guard that restores the saved IRQ state when
-    /// dropped. The operation is bounded, allocation-free, and does not alter
-    /// scheduler policy.
+    /// Returns a non-send guard that restores exactly the saved architecture
+    /// state on drop. This is bounded, allocation-free, and does not block or
+    /// enter the scheduler.
     #[inline(always)]
     pub(crate) fn save_and_disable() -> Self {
-        // SAFETY: the architecture layer returns the current local DAIF state and masks
-        // IRQ delivery on this single core until `Drop` restores the saved state.
+        // SAFETY: the architecture hook pairs this value with restore on the
+        // current CPU.
         let saved_daif = unsafe { arch_local_irq_save_and_disable() };
         Self {
             saved_daif,
@@ -46,13 +49,13 @@ impl LocalIrqGuard {
         }
     }
 
-    #[inline(always)]
-    /// Return the architecture-owned IRQ state saved when this guard entered.
+    /// Return the opaque architecture IRQ state saved at entry.
     ///
     /// # Returns
     ///
-    /// Returns the opaque architecture IRQ-state value. Reading it is bounded,
-    /// allocation-free, and does not alter IRQ state or scheduler policy.
+    /// Returns the state without changing IRQ delivery, allocating, or
+    /// blocking.
+    #[inline(always)]
     pub(crate) fn saved_state(&self) -> u64 {
         self.saved_daif
     }
@@ -60,37 +63,75 @@ impl LocalIrqGuard {
 
 impl Drop for LocalIrqGuard {
     fn drop(&mut self) {
-        // SAFETY: `saved_daif` came from `arch_local_irq_save_and_disable()` on the
-        // same core, so restoring it here returns the caller to its prior IRQ state.
+        // SAFETY: `saved_daif` was captured by the paired save hook on this
+        // same CPU; the non-send marker prevents a safe cross-thread drop.
         unsafe { arch_local_irq_restore(self.saved_daif) }
     }
 }
 
-/// Local-IRQ exclusion lock for state shared with interrupt handlers.
+/// Non-fair raw spin primitive shared by both lock domains.
 ///
-/// In the current single-core kernel this masks local IRQs and treats recursive
-/// or contended entry as a bug. It is not a spinlock and provides no SMP
-/// synchronization guarantee. Locking is bounded and allocation-free.
-pub(crate) struct LocalIrqLock<T> {
+/// Successful acquisition is Acquire, retry polling is Relaxed, and release is
+/// Release. It never allocates, sleeps, blocks the scheduler, or guarantees
+/// fairness.
+struct RawSpin {
     locked: AtomicBool,
+}
+
+impl RawSpin {
+    const fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+        }
+    }
+
+    fn lock(&self) {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            while self.locked.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    fn try_lock(&self) -> bool {
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    fn unlock(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+}
+
+/// SMP spin lock for thread/bootstrap state.
+///
+/// Acquiring this lock enters a `PreemptGuard` before spinning, so a holder is
+/// never switched away in normal thread context. IRQ users must use
+/// [`IrqSpinLock`] instead. Guards are non-send, non-fair, allocation-free,
+/// and must not perform blocking, scheduler handoff, user copies, parsing, or
+/// cleanup while held.
+pub struct SpinLock<T> {
+    raw: RawSpin,
     value: UnsafeCell<T>,
 }
 
-/// Exclusive borrow returned by [`LocalIrqLock::lock`].
-///
-/// Dropping the guard releases the lock before restoring the caller's saved
-/// local IRQ state. The guard is intentionally neither `Copy` nor `Clone`.
-pub(crate) struct LocalIrqLockGuard<'a, T> {
-    owner: &'a LocalIrqLock<T>,
-    _irq_guard: LocalIrqGuard,
+/// Exclusive borrow from [`SpinLock`].
+pub struct SpinLockGuard<'a, T> {
+    owner: &'a SpinLock<T>,
+    preempt_guard: Option<ManuallyDrop<PreemptGuard>>,
+    _not_send: PhantomData<*mut ()>,
 }
 
-// SAFETY: access to `value` is serialized by local IRQ exclusion and the
-// recursive-entry flag on the active single core.
-unsafe impl<T: Send> Sync for LocalIrqLock<T> {}
+// SAFETY: `RawSpin` serializes cross-CPU access; callers require `T: Send`.
+unsafe impl<T: Send> Sync for SpinLock<T> {}
 
-impl<T> LocalIrqLock<T> {
-    /// Construct a local-IRQ exclusion lock.
+impl<T> SpinLock<T> {
+    /// Construct an unlocked thread/bootstrap spin lock.
     ///
     /// # Arguments
     ///
@@ -98,166 +139,299 @@ impl<T> LocalIrqLock<T> {
     ///
     /// # Returns
     ///
-    /// Returns an unlocked container. Construction is constant-time,
-    /// allocation-free, and does not alter IRQ state.
-    pub(crate) const fn new(value: T) -> Self {
+    /// Returns an unlocked, allocation-free lock. Construction does not alter
+    /// IRQ state or enter the scheduler.
+    pub const fn new(value: T) -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            raw: RawSpin::new(),
             value: UnsafeCell::new(value),
         }
     }
 
-    /// Mask local IRQs and exclusively borrow the protected value.
+    /// Acquire exclusive cross-CPU access.
     ///
     /// # Returns
     ///
-    /// Returns a guard that restores the previous IRQ state when dropped. The
-    /// operation is bounded and allocation-free.
-    ///
-    /// # Panics
-    ///
-    /// Panics on recursive or otherwise contended entry.
-    pub(crate) fn lock(&self) -> LocalIrqLockGuard<'_, T> {
-        let irq_guard = LocalIrqGuard::save_and_disable();
-        if self
-            .locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            drop(irq_guard);
-            panic!("sync: recursive or contended local IRQ lock entry");
-        }
-
-        LocalIrqLockGuard {
+    /// Returns a non-send guard after an Acquire acquisition. The operation
+    /// spins without allocation or scheduler blocking and leaves IRQ state
+    /// unchanged.
+    pub fn lock(&self) -> SpinLockGuard<'_, T> {
+        let preempt_guard = enter_preempt_guard();
+        self.raw.lock();
+        SpinLockGuard {
             owner: self,
-            _irq_guard: irq_guard,
+            preempt_guard,
+            _not_send: PhantomData,
         }
+    }
+
+    /// Attempt exclusive access without spinning.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some(guard)` on Acquire success and `None` when another CPU
+    /// owns the lock. It allocates nothing and is suitable for panic/emergency
+    /// fallbacks; it leaves IRQ state unchanged.
+    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        let preempt_guard = enter_preempt_guard();
+        if !self.raw.try_lock() {
+            drop(preempt_guard);
+            return None;
+        }
+        Some(SpinLockGuard {
+            owner: self,
+            preempt_guard,
+            _not_send: PhantomData,
+        })
     }
 }
 
-impl<T> Deref for LocalIrqLockGuard<'_, T> {
+impl<T> Deref for SpinLockGuard<'_, T> {
     type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: the guard owns exclusive access while the lock is held.
+    fn deref(&self) -> &T {
         unsafe { &*self.owner.value.get() }
     }
 }
-
-impl<T> DerefMut for LocalIrqLockGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: the guard owns exclusive access while the lock is held.
+impl<T> DerefMut for SpinLockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.owner.value.get() }
     }
 }
-
-impl<T> Drop for LocalIrqLockGuard<'_, T> {
+impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
-        self.owner.locked.store(false, Ordering::Release);
+        self.owner.raw.unlock();
+        // SAFETY: this guard uniquely owns its preemption guard. Releasing the
+        // raw lock precedes a possible scheduler checkpoint on guard drop.
+        if let Some(preempt_guard) = self.preempt_guard.as_mut() {
+            // SAFETY: this guard uniquely owns the nested preemption guard.
+            unsafe { ManuallyDrop::drop(preempt_guard) };
+        }
     }
 }
 
-/// Thread-preemption exclusion lock for bootstrap and thread-only mutable state.
+#[cfg(not(test))]
+fn enter_preempt_guard() -> Option<ManuallyDrop<PreemptGuard>> {
+    Some(ManuallyDrop::new(PreemptGuard::enter()))
+}
+
+// Unit tests intentionally exercise raw cross-host-thread exclusion before a
+// synthetic kernel CPU is registered. The production constructor always owns a
+// PreemptGuard; host tests use OS threads that cannot safely share CPU-local
+// kernel preemption bookkeeping.
+#[cfg(test)]
+fn enter_preempt_guard() -> Option<ManuallyDrop<PreemptGuard>> {
+    None
+}
+
+/// SMP spin lock for state shared with local IRQ handlers.
 ///
-/// This lock must not be acquired from interrupt context. Recursive or
-/// contended entry is a bug. It keeps local IRQs enabled while the value is
-/// borrowed, deferring a requested reschedule until its [`PreemptGuard`] drops.
-/// It provides no SMP synchronization guarantee. Locking is bounded and
-/// allocation-free.
-pub(crate) struct PreemptLock<T> {
-    locked: AtomicBool,
+/// Acquisition saves and disables local IRQs before spinning. Drop releases
+/// the raw lock before restoring IRQ state. The guard is non-send and must not
+/// block, schedule, allocate, copy userspace, parse, or perform heavy cleanup.
+pub struct IrqSpinLock<T> {
+    raw: RawSpin,
     value: UnsafeCell<T>,
 }
 
-/// Exclusive borrow returned by [`PreemptLock::lock`].
-///
-/// Dropping the guard releases the value and ends thread preemption exclusion.
-/// An outermost drop may suspend at the private scheduler checkpoint after the
-/// lock has been published as free. The guard is intentionally neither `Copy`
-/// nor `Clone`.
-pub(crate) struct PreemptLockGuard<'a, T> {
-    owner: &'a PreemptLock<T>,
-    preempt_guard: ManuallyDrop<PreemptGuard>,
+/// Exclusive borrow from [`IrqSpinLock`].
+pub struct IrqSpinLockGuard<'a, T> {
+    owner: &'a IrqSpinLock<T>,
+    irq_guard: ManuallyDrop<LocalIrqGuard>,
+    _not_send: PhantomData<*mut ()>,
 }
 
-// SAFETY: thread-context access to `value` is serialized by preemption exclusion
-// and the recursive-entry flag on the active single core. IRQ callers are
-// forbidden by the type's contract.
-unsafe impl<T: Send> Sync for PreemptLock<T> {}
+// SAFETY: the raw lock serializes CPUs and every guard masks local IRQs.
+unsafe impl<T: Send> Sync for IrqSpinLock<T> {}
 
-impl<T> PreemptLock<T> {
-    /// Construct a thread-preemption exclusion lock.
+impl<T> IrqSpinLock<T> {
+    /// Construct an unlocked IRQ-safe spin lock.
     ///
     /// # Arguments
     ///
-    /// * `value` - Initial thread-only value owned by the lock.
+    /// * `value` - Initial value owned by the lock.
     ///
     /// # Returns
     ///
-    /// Returns an unlocked container. Construction is constant-time,
-    /// allocation-free, and does not alter IRQ state.
-    pub(crate) const fn new(value: T) -> Self {
+    /// Returns an allocation-free lock. Construction does not change IRQ
+    /// state, block, or enter the scheduler.
+    pub const fn new(value: T) -> Self {
         Self {
-            locked: AtomicBool::new(false),
+            raw: RawSpin::new(),
             value: UnsafeCell::new(value),
         }
     }
 
-    /// Exclude thread preemption and exclusively borrow the protected value.
+    /// Mask local IRQs and acquire exclusive cross-CPU access.
     ///
     /// # Returns
     ///
-    /// Returns a guard that ends preemption exclusion when dropped. Local IRQs
-    /// remain enabled; an outermost drop can enter the bounded thread-call
-    /// scheduler checkpoint. The operation is bounded and allocation-free.
-    ///
-    /// # Panics
-    ///
-    /// Panics on recursive or otherwise contended entry.
-    pub(crate) fn lock(&self) -> PreemptLockGuard<'_, T> {
-        let preempt_guard = PreemptGuard::enter();
-        if self
-            .locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            drop(preempt_guard);
-            panic!("sync: recursive or contended preemption lock entry");
-        }
-
-        PreemptLockGuard {
+    /// Returns a non-send guard after an Acquire acquisition. Retry polling is
+    /// Relaxed and allocation-free; the operation never blocks the scheduler.
+    pub fn lock(&self) -> IrqSpinLockGuard<'_, T> {
+        let irq_guard = LocalIrqGuard::save_and_disable();
+        self.raw.lock();
+        IrqSpinLockGuard {
             owner: self,
-            preempt_guard: ManuallyDrop::new(preempt_guard),
+            irq_guard: ManuallyDrop::new(irq_guard),
+            _not_send: PhantomData,
         }
+    }
+
+    /// Try to acquire without spinning while IRQs are locally masked.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some(guard)` on Acquire success and `None` after restoring the
+    /// prior IRQ state when contended. This is allocation-free and suitable for
+    /// panic or logging fallbacks.
+    pub fn try_lock(&self) -> Option<IrqSpinLockGuard<'_, T>> {
+        let irq_guard = LocalIrqGuard::save_and_disable();
+        if !self.raw.try_lock() {
+            drop(irq_guard);
+            return None;
+        }
+        Some(IrqSpinLockGuard {
+            owner: self,
+            irq_guard: ManuallyDrop::new(irq_guard),
+            _not_send: PhantomData,
+        })
     }
 }
 
-impl<T> Deref for PreemptLockGuard<'_, T> {
+impl<T> Deref for IrqSpinLockGuard<'_, T> {
     type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        // SAFETY: the guard owns exclusive thread-context access while the lock
-        // is held.
+    fn deref(&self) -> &T {
         unsafe { &*self.owner.value.get() }
     }
 }
-
-impl<T> DerefMut for PreemptLockGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: the guard owns exclusive thread-context access while the lock
-        // is held.
+impl<T> DerefMut for IrqSpinLockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.owner.value.get() }
     }
 }
-
-impl<T> Drop for PreemptLockGuard<'_, T> {
+impl<T> Drop for IrqSpinLockGuard<'_, T> {
     fn drop(&mut self) {
-        // Release the protected access before ending preemption exclusion: the
-        // guard drop may synchronously hand off to another thread.
-        self.owner.locked.store(false, Ordering::Release);
-        // SAFETY: this is the sole owner of the manually dropped guard. The
-        // Release store above makes a deferred checkpoint unable to observe the
-        // lock as still held.
-        unsafe { ManuallyDrop::drop(&mut self.preempt_guard) };
+        self.owner.raw.unlock();
+        // SAFETY: restore occurs only after the Release unlock, so a newly
+        // delivered local IRQ cannot observe protected state still locked.
+        unsafe { ManuallyDrop::drop(&mut self.irq_guard) };
+    }
+}
+
+/// One-shot Release publication for immutable-after-init state.
+pub(crate) struct OncePublication<T> {
+    init_lock: RawSpin,
+    published: AtomicBool,
+    value: UnsafeCell<core::mem::MaybeUninit<T>>,
+}
+
+// SAFETY: publication performs the only write before Release; reads occur
+// only after Acquire observation and require `T: Sync`.
+unsafe impl<T: Send + Sync> Sync for OncePublication<T> {}
+
+impl<T> OncePublication<T> {
+    /// Construct an unpublished storage cell.
+    pub(crate) const fn new() -> Self {
+        Self {
+            init_lock: RawSpin::new(),
+            published: AtomicBool::new(false),
+            value: UnsafeCell::new(core::mem::MaybeUninit::uninit()),
+        }
+    }
+
+    /// Publish an immutable value exactly once with Release ordering.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - Fully initialized value transferred into immutable storage.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after publication or `Err(value)` when another value
+    /// was already published. This does not allocate, block, or alter IRQ state.
+    pub(crate) fn publish(&self, value: T) -> Result<(), T> {
+        self.init_lock.lock();
+        if self.published.load(Ordering::Relaxed) {
+            self.init_lock.unlock();
+            return Err(value);
+        }
+        // SAFETY: `init_lock` serializes publishers. The Release store below
+        // makes initialization visible to readers that observe `true`.
+        unsafe { (*self.value.get()).write(value) };
+        self.published.store(true, Ordering::Release);
+        self.init_lock.unlock();
+        Ok(())
+    }
+
+    /// Acquire a shared immutable reference after successful publication.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some` only after an Acquire load observes publication; returns
+    /// `None` before initialization. Reading is allocation-free and nonblocking.
+    pub(crate) fn get(&self) -> Option<&T> {
+        self.published
+            .load(Ordering::Acquire)
+            .then(|| unsafe { (&*self.value.get()).assume_init_ref() })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+        vec::Vec,
+    };
+
+    #[test]
+    fn spin_lock_serializes_host_threads() {
+        let lock = Arc::new(SpinLock::new(0usize));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let lock = Arc::clone(&lock);
+                thread::spawn(move || {
+                    for _ in 0..500 {
+                        *lock.lock() += 1
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(*lock.lock(), 2_000);
+    }
+
+    #[test]
+    fn publication_is_visible_after_acquire() {
+        let publication = Arc::new(OncePublication::new());
+        let barrier = Arc::new(Barrier::new(2));
+        let publisher = Arc::clone(&publication);
+        let publisher_barrier = Arc::clone(&barrier);
+        let thread = thread::spawn(move || {
+            publisher_barrier.wait();
+            publisher.publish(42usize).unwrap();
+        });
+        barrier.wait();
+        while publication.get().is_none() {
+            core::hint::spin_loop();
+        }
+        thread.join().unwrap();
+        assert_eq!(publication.get(), Some(&42));
+        assert!(publication.publish(7).is_err());
+    }
+
+    #[test]
+    fn irq_spin_lock_restores_saved_irq_state() {
+        assert_eq!(crate::test_arch_stubs::irq_mask_state(), 0);
+        {
+            let lock = IrqSpinLock::new(7usize);
+            let guard = lock.lock();
+            assert_eq!(crate::test_arch_stubs::irq_mask_state(), 1);
+            assert_eq!(*guard, 7);
+        }
+        assert_eq!(crate::test_arch_stubs::irq_mask_state(), 0);
     }
 }

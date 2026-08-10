@@ -82,13 +82,26 @@ where
         frames: usize,
         page_size: usize,
     ) -> Option<AddrRange<A>> {
+        self.alloc_contiguous_aligned(frames, page_size, page_size)
+    }
+
+    pub(crate) fn alloc_contiguous_aligned(
+        &mut self,
+        frames: usize,
+        page_size: usize,
+        align: usize,
+    ) -> Option<AddrRange<A>> {
         if frames == 0 {
+            return None;
+        }
+        if align < page_size || !align.is_power_of_two() {
             return None;
         }
 
         let mut prev: Option<A> = None;
         let mut current = self.head;
-        let mut run_prev: Option<A> = None;
+        let mut previous_frame: Option<A> = None;
+        let mut candidate_prev: Option<A> = None;
         let mut run_start: Option<A> = None;
         let mut run_end: Option<A> = None;
         let mut run_len = 0usize;
@@ -98,23 +111,31 @@ where
             let next_raw = unsafe { S::read_next_free_frame(frame) };
             let next = (next_raw != S::free_list_end()).then_some(next_raw);
 
-            match run_end {
-                Some(last) if frame.to_usize() == last.to_usize() + page_size => {
-                    run_end = Some(frame);
-                    run_len += 1;
-                }
-                _ => {
-                    run_prev = prev;
-                    run_start = Some(frame);
-                    run_end = Some(frame);
-                    run_len = 1;
-                }
+            let contiguous = match previous_frame {
+                Some(last) if frame.to_usize() == last.to_usize() + page_size => true,
+                _ => false,
+            };
+            if !contiguous {
+                candidate_prev = None;
+                run_start = None;
+                run_end = None;
+                run_len = 0;
+            }
+
+            if run_start.is_none() && frame.to_usize() & (align - 1) == 0 {
+                candidate_prev = prev;
+                run_start = Some(frame);
+                run_end = Some(frame);
+                run_len = 1;
+            } else if run_start.is_some() {
+                run_end = Some(frame);
+                run_len += 1;
             }
 
             if run_len == frames {
-                if let Some(before_run) = run_prev {
+                if let Some(before_run) = candidate_prev {
                     // SAFETY: `before_run` remains in the free list; we splice the
-                    // contiguous run out by redirecting its next pointer.
+                    // aligned contiguous run out by redirecting its next pointer.
                     unsafe {
                         S::write_next_free_frame(before_run, next.unwrap_or_else(S::free_list_end))
                     };
@@ -135,6 +156,7 @@ where
             }
 
             prev = Some(frame);
+            previous_frame = Some(frame);
             current = next;
         }
 
@@ -249,5 +271,66 @@ where
 
             prev = next.expect("next free frame must exist while traversing list");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::SpinLock;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::{sync::Arc, thread, vec::Vec};
+
+    const TEST_PAGE_SIZE: usize = 4096;
+    const TEST_FRAMES: usize = 128;
+    static NEXT: [AtomicUsize; TEST_FRAMES] = [const { AtomicUsize::new(usize::MAX) }; TEST_FRAMES];
+
+    struct AtomicStorage;
+
+    impl FreeListStorage<usize> for AtomicStorage {
+        fn free_list_end() -> usize {
+            usize::MAX
+        }
+
+        unsafe fn read_next_free_frame(frame: usize) -> usize {
+            NEXT[frame / TEST_PAGE_SIZE].load(Ordering::Acquire)
+        }
+
+        unsafe fn write_next_free_frame(frame: usize, next: usize) {
+            NEXT[frame / TEST_PAGE_SIZE].store(next, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn spin_locked_allocator_survives_host_contention() {
+        let allocator = Arc::new(SpinLock::new(FrameAllocator::<usize, AtomicStorage>::new()));
+        allocator.lock().init_from_ranges(
+            &[AddrRange {
+                start: 0,
+                end: TEST_FRAMES * TEST_PAGE_SIZE,
+            }],
+            TEST_PAGE_SIZE,
+        );
+
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let allocator = Arc::clone(&allocator);
+                thread::spawn(move || {
+                    for _ in 0..1_000 {
+                        let frame = loop {
+                            if let Some(frame) = allocator.lock().alloc_frame() {
+                                break frame;
+                            }
+                            thread::yield_now();
+                        };
+                        allocator.lock().free_frame(frame);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(allocator.lock().free_frames(), TEST_FRAMES);
     }
 }

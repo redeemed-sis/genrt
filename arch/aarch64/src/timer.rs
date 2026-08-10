@@ -1,4 +1,7 @@
-use core::arch::asm;
+use core::{
+    arch::asm,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 const CNTP_CTL_ENABLE: u32 = 1 << 0;
 const CNTP_CTL_IMASK: u32 = 1 << 1;
@@ -7,13 +10,13 @@ const CNTP_CTL_ISTATUS: u32 = 1 << 2;
 pub const TIMER_IRQ_ID_PHYS: u32 = 30;
 
 #[unsafe(no_mangle)]
-pub static mut BOOT_TIMER_FREQ_HZ: u64 = 0;
+pub static BOOT_TIMER_FREQ_HZ: AtomicU64 = AtomicU64::new(0);
 #[unsafe(no_mangle)]
-pub static mut BOOT_TIMER_CTL: u64 = 0;
+pub static BOOT_TIMER_CTL: AtomicU64 = AtomicU64::new(0);
 #[unsafe(no_mangle)]
-pub static mut BOOT_TIMER_COUNTER: u64 = 0;
+pub static BOOT_TIMER_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[unsafe(no_mangle)]
-pub static mut BOOT_TIMER_NEXT_DEADLINE: u64 = 0;
+pub static BOOT_TIMER_NEXT_DEADLINE: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 pub fn frequency_hz() -> u64 {
@@ -90,9 +93,9 @@ pub unsafe fn arm_deadline(deadline: u64) {
     unsafe {
         write_cval(effective_deadline);
         write_ctl(CNTP_CTL_ENABLE);
-        BOOT_TIMER_COUNTER = now;
-        BOOT_TIMER_NEXT_DEADLINE = effective_deadline;
-        BOOT_TIMER_CTL = control() as u64;
+        BOOT_TIMER_COUNTER.store(now, Ordering::Relaxed);
+        BOOT_TIMER_NEXT_DEADLINE.store(effective_deadline, Ordering::Relaxed);
+        BOOT_TIMER_CTL.store(control() as u64, Ordering::Relaxed);
     }
 }
 
@@ -100,9 +103,9 @@ pub unsafe fn arm_deadline(deadline: u64) {
 pub unsafe fn disable() {
     unsafe {
         write_ctl(0);
-        BOOT_TIMER_COUNTER = counter();
-        BOOT_TIMER_NEXT_DEADLINE = 0;
-        BOOT_TIMER_CTL = control() as u64;
+        BOOT_TIMER_COUNTER.store(counter(), Ordering::Relaxed);
+        BOOT_TIMER_NEXT_DEADLINE.store(0, Ordering::Relaxed);
+        BOOT_TIMER_CTL.store(control() as u64, Ordering::Relaxed);
     }
 }
 
@@ -116,9 +119,9 @@ pub unsafe fn disable() {
 pub unsafe fn early_init() {
     unsafe {
         let freq = frequency_hz();
-        BOOT_TIMER_FREQ_HZ = freq;
-        BOOT_TIMER_COUNTER = counter();
-        BOOT_TIMER_NEXT_DEADLINE = 0;
+        BOOT_TIMER_FREQ_HZ.store(freq, Ordering::Relaxed);
+        BOOT_TIMER_COUNTER.store(counter(), Ordering::Relaxed);
+        BOOT_TIMER_NEXT_DEADLINE.store(0, Ordering::Relaxed);
         disable();
     }
 
@@ -146,10 +149,8 @@ pub unsafe fn enable_cpu_irq() {
 /// Returns after generic timed-event dispatch and any scheduler frame
 /// replacement. The path does not allocate or block.
 pub(crate) fn on_timer_irq(context: &mut kernel::arch::ActiveContext<'_>) {
-    unsafe {
-        BOOT_TIMER_COUNTER = counter();
-        BOOT_TIMER_CTL = control() as u64;
-    }
+    BOOT_TIMER_COUNTER.store(counter(), Ordering::Relaxed);
+    BOOT_TIMER_CTL.store(control() as u64, Ordering::Relaxed);
 
     kernel::time::on_timer_interrupt(context);
 }

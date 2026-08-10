@@ -11,45 +11,29 @@ unsafe extern "C" {
     fn arch_irq_state_allows_sched_call(saved_irq_state: u64) -> bool;
 }
 
-/// CPU-local thread-preemption bookkeeping owned by one scheduler context.
+/// CPU-local thread-preemption bookkeeping stored outside scheduler state.
 ///
-/// Before scheduler publication, the same operations use separate fixed boot
-/// backing so heap initialization remains available. Fields are mutated only
-/// under short local-IRQ exclusion while CPU0 is the only active kernel
-/// executor; this is not SMP synchronization.
+/// The same fixed-capacity backing is available before heap initialization and
+/// remains active after scheduler publication. Fields are mutated only by the
+/// owning CPU under short local-IRQ exclusion; this is CPU-local ownership, not
+/// cross-CPU synchronization.
 pub(crate) struct PreemptionState {
-    cpu: CpuId,
     disable_depth: usize,
     reschedule_pending: bool,
 }
 
 impl PreemptionState {
-    /// Construct empty bookkeeping for one logical CPU.
-    ///
-    /// # Arguments
-    ///
-    /// * `cpu` - Logical CPU that permanently owns this state.
+    /// Construct empty CPU-local bookkeeping.
     ///
     /// # Returns
     ///
     /// Returns disabled-depth zero with no pending request. Construction is
     /// allocation-free and does not alter IRQ state.
-    pub(crate) const fn new(cpu: CpuId) -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
-            cpu,
             disable_depth: 0,
             reschedule_pending: false,
         }
-    }
-
-    /// Return the logical CPU that permanently owns this state.
-    ///
-    /// # Returns
-    ///
-    /// Returns the immutable owner without allocating, blocking, or changing
-    /// IRQ state.
-    pub(crate) const fn owner(&self) -> CpuId {
-        self.cpu
     }
 
     /// Increment this CPU's nested preemption-disable depth.
@@ -148,29 +132,27 @@ impl PreemptionState {
 
 struct PreemptionCell(UnsafeCell<PreemptionState>);
 
-// SAFETY: genrt's active target is single-core. Every access takes a short
-// LocalIrqGuard, so thread and IRQ paths cannot concurrently mutate the state.
+// SAFETY: each cell is accessed only by its architecture-bound owning CPU.
+// Every access also takes a short LocalIrqGuard, so owner thread and IRQ paths
+// cannot concurrently mutate the same cell. Remote CPUs publish ready work in
+// scheduler storage but do not touch this bookkeeping before IPI support.
 unsafe impl Sync for PreemptionCell {}
 
-static BOOT_PREEMPTION: [PreemptionCell; KERNEL_CPU_CAPACITY] = [const {
-    PreemptionCell(UnsafeCell::new(PreemptionState::new(
-        CpuId::from_index(0).unwrap(),
-    )))
-}; KERNEL_CPU_CAPACITY];
+static CPU_PREEMPTION: [PreemptionCell; KERNEL_CPU_CAPACITY] =
+    [const { PreemptionCell(UnsafeCell::new(PreemptionState::new())) }; KERNEL_CPU_CAPACITY];
 
 #[inline(always)]
-fn state_mut(cpu: CpuId) -> (&'static mut PreemptionState, bool) {
-    if let Some(state) = crate::sched::runtime_preemption_state_mut(cpu) {
-        return (state, true);
+fn with_state<R>(cpu: CpuId, f: impl FnOnce(&mut PreemptionState) -> R) -> R {
+    if current_cpu() != cpu {
+        panic!("preempt: remote CPU-local state access");
     }
-    // SAFETY: callers hold LocalIrqGuard for the complete mutable access and
-    // only CPU0 executes kernel code until the SMP synchronization milestone.
-    let state = unsafe { &mut *BOOT_PREEMPTION[cpu.index()].0.get() };
-    // Boot storage is initialized with CPU0 because stable const array
-    // repetition cannot derive an index. Rewrite its owner before first use;
-    // only the registered boot CPU is reachable in this milestone.
-    state.cpu = cpu;
-    (state, false)
+    // SAFETY: this is CPU-local state indexed by the architecture-bound logical
+    // CPU. Callers hold local IRQ exclusion, so neither local IRQ re-entry nor
+    // another CPU can mutate this CPU's cell. Keeping it outside `Scheduler`
+    // lets `SpinLock` enter PreemptGuard without taking the shared scheduler
+    // lock.
+    let state = unsafe { &mut *CPU_PREEMPTION[cpu.index()].0.get() };
+    f(state)
 }
 
 #[inline(always)]
@@ -178,29 +160,30 @@ fn current_cpu() -> CpuId {
     cpu::current_id().unwrap_or_else(|err| panic!("preempt: current CPU lookup failed: {err:?}"))
 }
 
-/// Verify that fixed pre-scheduler backing can hand ownership to the scheduler.
+/// Verify that CPU-local preemption state is quiescent before scheduler publication.
 ///
 /// Bootstrap calls this after all heap-backed scheduler storage has been built
-/// and before publishing runtime CPU contexts. The check is bounded,
+/// and before scheduler checkpoints become available. The fixed CPU-local
+/// backing itself is retained for runtime. The check is bounded,
 /// allocation-free, and uses short local IRQ exclusion.
 ///
 /// # Arguments
 ///
-/// * `cpu` - Registered boot CPU whose fixed backing is being retired.
+/// * `cpu` - Registered boot CPU whose state must be quiescent.
 ///
 /// # Returns
 ///
-/// Returns when no guard or pending request remains in boot backing.
+/// Returns when no guard or pending request remains before publication.
 ///
 /// # Panics
 ///
-/// Panics if a guard crosses scheduler publication or bootstrap leaves a
-/// reschedule request without a valid checkpoint.
-pub(crate) fn assert_boot_state_quiescent(cpu: CpuId) {
+/// Panics if bootstrap attempts publication with an active guard or a
+/// reschedule request that has no valid checkpoint yet.
+pub(crate) fn assert_pre_scheduler_state_quiescent(cpu: CpuId) {
     let _irq_guard = LocalIrqGuard::save_and_disable();
     // SAFETY: scheduler state is not yet published and the local IRQ guard
     // serializes access on the only active CPU.
-    let state = unsafe { &mut *BOOT_PREEMPTION[cpu.index()].0.get() };
+    let state = unsafe { &mut *CPU_PREEMPTION[cpu.index()].0.get() };
     if state.disable_depth != 0 || state.reschedule_pending {
         panic!("preempt: non-quiescent state at scheduler publication");
     }
@@ -209,12 +192,11 @@ pub(crate) fn assert_boot_state_quiescent(cpu: CpuId) {
 /// Excludes thread preemption until dropped while preserving local IRQ state.
 ///
 /// This primitive is for bootstrap or ordinary thread context only and must not
-/// be used from an interrupt handler. Entry and drop mutate the private
-/// single-core state under a short local-IRQ guard; neither operation allocates
+/// be used from an interrupt handler. Entry and drop mutate the executing CPU's
+/// fixed local state under a short local-IRQ guard; neither operation allocates
 /// nor blocks. An outermost drop may enter the private sched-call checkpoint.
 pub(crate) struct PreemptGuard {
     cpu: CpuId,
-    runtime_state: bool,
     _not_send: PhantomData<*mut ()>,
 }
 
@@ -229,15 +211,14 @@ impl PreemptGuard {
     ///
     /// # Panics
     ///
-    /// Panics when the single-core preemption nesting counter overflows.
+    /// Panics when the current CPU's preemption nesting counter overflows.
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn enter() -> Self {
         let cpu = current_cpu();
         let _irq_guard = LocalIrqGuard::save_and_disable();
-        let (state, runtime_state) = state_mut(cpu);
-        state.enter();
+        with_state(cpu, PreemptionState::enter);
         Self {
             cpu,
-            runtime_state,
             _not_send: PhantomData,
         }
     }
@@ -254,13 +235,7 @@ impl Drop for PreemptGuard {
             // core. The architecture hook owns DAIF encoding details.
             unsafe { arch_irq_state_allows_sched_call(irq_guard.saved_state()) }
         };
-        let pending_at_depth_zero = {
-            let (state, runtime_state) = state_mut(self.cpu);
-            if runtime_state != self.runtime_state {
-                panic!("preempt: guard crossed scheduler publication");
-            }
-            state.leave()
-        };
+        let pending_at_depth_zero = with_state(self.cpu, PreemptionState::leave);
         let checkpoint = pending_at_depth_zero
             && crate::sched::scheduler_online(self.cpu)
             && prior_irq_allows_sched_call;
@@ -287,7 +262,7 @@ impl Drop for PreemptGuard {
 pub(crate) fn is_disabled() -> bool {
     let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    state_mut(cpu).0.is_disabled()
+    with_state(cpu, |state| state.is_disabled())
 }
 
 /// Request one coalesced scheduler checkpoint.
@@ -302,7 +277,28 @@ pub(crate) fn is_disabled() -> bool {
 pub(crate) fn request_reschedule() {
     let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    state_mut(cpu).0.request();
+    with_state(cpu, PreemptionState::request);
+}
+
+/// Request a checkpoint on one explicitly selected CPU-local state.
+pub(crate) fn request_reschedule_on(cpu: CpuId) {
+    // A remote wake publishes ready membership under scheduler synchronization,
+    // but issue #4 owns the IPI that will make the target CPU observe it. Never
+    // mutate another CPU's local preemption state as a notification substitute.
+    if current_cpu() != cpu {
+        return;
+    }
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    with_state(cpu, PreemptionState::request);
+}
+
+/// Consume one pending checkpoint request for `cpu`.
+pub(crate) fn consume_checkpoint_on(cpu: CpuId, online: bool) -> bool {
+    if current_cpu() != cpu {
+        panic!("preempt: remote checkpoint consumption");
+    }
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    with_state(cpu, |state| state.consume_checkpoint(online))
 }
 
 /// Return whether a scheduler checkpoint is pending.
@@ -317,7 +313,7 @@ pub(crate) fn request_reschedule() {
 pub(crate) fn reschedule_pending() -> bool {
     let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    state_mut(cpu).0.pending()
+    with_state(cpu, |state| state.pending())
 }
 
 /// Return whether thread entry has made scheduler checkpoints available.
@@ -352,7 +348,7 @@ pub(crate) fn scheduler_online() -> bool {
 /// Panics when the selected CPU has an active preemption guard.
 pub(crate) fn assert_preemption_enabled_on(cpu: CpuId, operation: &'static str) {
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    state_mut(cpu).0.assert_enabled(operation);
+    with_state(cpu, |state| state.assert_enabled(operation));
 }
 
 /// Fail before an operation that would block or make a terminal handoff.
@@ -378,10 +374,8 @@ mod tests {
 
     #[test]
     fn preemption_state_is_cpu_local() {
-        let cpu0 = CpuId::from_index(0).unwrap();
-        let cpu1 = CpuId::from_index(1).unwrap();
-        let mut first = PreemptionState::new(cpu0);
-        let mut second = PreemptionState::new(cpu1);
+        let mut first = PreemptionState::new();
+        let mut second = PreemptionState::new();
 
         first.enter();
         first.request();

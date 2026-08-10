@@ -9,15 +9,25 @@ use core::{
     ffi::c_void,
     sync::atomic::{AtomicUsize, Ordering},
 };
+use std::cell::Cell;
 
 static CURRENT_CPU_LOGICAL_ID: AtomicUsize = AtomicUsize::new(0);
+std::thread_local! {
+    static IRQ_MASK_STATE: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(crate) fn irq_mask_state() -> usize {
+    IRQ_MASK_STATE.with(Cell::get)
+}
 
 #[unsafe(no_mangle)]
 extern "C" fn arch_local_irq_save_and_disable() -> u64 {
-    0
+    IRQ_MASK_STATE.with(|state| state.replace(1)) as u64
 }
 #[unsafe(no_mangle)]
-extern "C" fn arch_local_irq_restore(_saved: u64) {}
+extern "C" fn arch_local_irq_restore(saved: u64) {
+    IRQ_MASK_STATE.with(|state| state.set(saved as usize));
+}
 #[unsafe(no_mangle)]
 extern "C" fn arch_irq_state_allows_sched_call(_saved: u64) -> bool {
     true

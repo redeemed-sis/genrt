@@ -1,12 +1,10 @@
-use core::cell::UnsafeCell;
-
 use crate::{
     config::KERNEL_THREAD_CAPACITY,
     fs::fd::FdTable,
     loader::elf::UserElfImage,
     memory::vm::OwnedUserAddressSpace,
     sched::{self, ThreadId},
-    sync::LocalIrqGuard,
+    sync::{IrqSpinLock, LocalIrqGuard},
 };
 
 use super::{
@@ -135,14 +133,7 @@ impl ProcessTable {
     }
 }
 
-struct ProcessTableCell(UnsafeCell<ProcessTable>);
-
-// SAFETY: genrt is single-core for this milestone. Process table mutations run
-// either in short IRQ-disabled thread-context sections or in the synchronous
-// lower-EL trap path for the currently running thread.
-unsafe impl Sync for ProcessTableCell {}
-
-static PROCESS_TABLE: ProcessTableCell = ProcessTableCell(UnsafeCell::new(ProcessTable::new()));
+static PROCESS_TABLE: IrqSpinLock<ProcessTable> = IrqSpinLock::new(ProcessTable::new());
 
 pub(super) fn current_process_id() -> Option<ProcessId> {
     let _irq_guard = LocalIrqGuard::save_and_disable();
@@ -159,7 +150,7 @@ pub(super) fn allocate_process_slot(
         return Err(ProcessError::InvalidProcess);
     }
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    let table = table_mut();
+    let mut table = table_mut();
     let Some(index) = table
         .slots
         .iter()
@@ -184,7 +175,7 @@ pub(super) fn attach_process_resources(
     user_image: UserElfImage,
 ) {
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    let table = table_mut();
+    let mut table = table_mut();
     let slot = table
         .slot_mut(pid)
         .unwrap_or_else(|| panic!("process: reserved slot disappeared before resource attach"));
@@ -202,7 +193,7 @@ pub(super) fn attach_process_main_thread(pid: ProcessId, main_thread: ThreadId) 
 
 pub(super) fn take_process_image_resources(pid: ProcessId) -> ProcessImageResources {
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    let table = table_mut();
+    let mut table = table_mut();
     let Some(slot) = table.slot_mut(pid) else {
         return ProcessImageResources::empty();
     };
@@ -214,7 +205,7 @@ pub(super) fn take_process_image_resources(pid: ProcessId) -> ProcessImageResour
 
 pub(super) fn free_process_slot(pid: ProcessId) {
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    let table = table_mut();
+    let mut table = table_mut();
     if let Some(generation) = table.slot(pid).map(|slot| slot.generation) {
         table.release_slot(pid, generation);
     }
@@ -229,9 +220,8 @@ pub(super) fn next_generation(generation: u32) -> u32 {
     }
 }
 
-pub(super) fn table_mut() -> &'static mut ProcessTable {
-    // SAFETY: single-core access discipline is documented on `ProcessTableCell`.
-    unsafe { &mut *PROCESS_TABLE.0.get() }
+pub(super) fn table_mut() -> crate::sync::IrqSpinLockGuard<'static, ProcessTable> {
+    PROCESS_TABLE.lock()
 }
 
 #[cfg(test)]

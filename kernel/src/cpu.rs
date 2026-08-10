@@ -4,9 +4,9 @@
 //! that CPU's logical identity explicit so scheduler execution-local state can
 //! be partitioned before secondary CPUs are brought up.
 
-use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::config::KERNEL_CPU_CAPACITY;
+use crate::{config::KERNEL_CPU_CAPACITY, sync::IrqSpinLock};
 
 unsafe extern "C" {
     fn arch_current_cpu_hardware_id() -> u64;
@@ -104,28 +104,8 @@ impl CpuRegistry {
     }
 }
 
-struct CpuRegistryCell(UnsafeCell<CpuRegistry>);
-
-// SAFETY: registration happens before the first scheduler entry.  Afterwards
-// the active system executes kernel code only on CPU0; any SMP enablement must
-// replace this with synchronization before a second CPU may access the table.
-unsafe impl Sync for CpuRegistryCell {}
-
-static REGISTRY: CpuRegistryCell = CpuRegistryCell(UnsafeCell::new(CpuRegistry::new()));
-
-#[inline(always)]
-fn registry_mut() -> &'static mut CpuRegistry {
-    // SAFETY: boot registration is the only mutable access and completes
-    // before runtime or interrupt-side registry readers exist.
-    unsafe { &mut *REGISTRY.0.get() }
-}
-
-#[inline(always)]
-fn registry() -> &'static CpuRegistry {
-    // SAFETY: the registry is immutable after boot registration. Shared
-    // runtime reads may therefore overlap across thread and IRQ context.
-    unsafe { &*REGISTRY.0.get() }
-}
+static REGISTRY: IrqSpinLock<CpuRegistry> = IrqSpinLock::new(CpuRegistry::new());
+static REGISTERED_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[inline(always)]
 fn current_hardware_id() -> HardwareCpuId {
@@ -148,7 +128,7 @@ fn current_hardware_id() -> HardwareCpuId {
 /// Returns [`CpuRegistrationError::AlreadyRegistered`] when invoked twice, or
 /// [`CpuRegistrationError::CapacityExceeded`] if the fixed registry is full.
 pub(crate) fn register_boot_cpu() -> Result<CpuId, CpuRegistrationError> {
-    let registry = registry_mut();
+    let mut registry = REGISTRY.lock();
     if registry.count != 0 {
         return Err(CpuRegistrationError::AlreadyRegistered);
     }
@@ -156,6 +136,7 @@ pub(crate) fn register_boot_cpu() -> Result<CpuId, CpuRegistrationError> {
     // SAFETY: `register` returned a checked logical ID owned by the executing
     // hardware CPU, and boot registration runs before runtime readers exist.
     unsafe { arch_bind_current_cpu_logical_id(id.index()) };
+    REGISTERED_COUNT.store(registry.count, Ordering::Release);
     Ok(id)
 }
 
@@ -199,7 +180,7 @@ pub(crate) fn current_id() -> Result<CpuId, CpuRegistrationError> {
 /// Returns `true` only when boot registration published this logical CPU. The
 /// direct count check allocates nothing and does not alter IRQ state.
 pub(crate) fn is_registered(cpu: CpuId) -> bool {
-    cpu.index() < registry().count
+    cpu.index() < REGISTERED_COUNT.load(Ordering::Acquire)
 }
 
 /// Return the number of registered logical CPUs.
@@ -210,7 +191,7 @@ pub(crate) fn is_registered(cpu: CpuId) -> bool {
 /// state changes.
 #[cfg(feature = "qemu-test-kernel-runtime")]
 pub(crate) fn registered_count() -> usize {
-    registry().count
+    REGISTERED_COUNT.load(Ordering::Acquire)
 }
 
 /// Validate the boot CPU registry contract for the QEMU kernel coordinator.

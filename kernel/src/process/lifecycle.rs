@@ -90,7 +90,7 @@ pub(super) fn finish_current_process(
 }
 
 fn finish_process(pid: ProcessId, status: ProcessExitStatus) -> Option<Option<WaitToken>> {
-    let table = table_mut();
+    let mut table = table_mut();
     let waiter = {
         let slot = table.slot_mut(pid)?;
         if slot.process.exit_status.is_some() {
@@ -110,7 +110,8 @@ fn claim_process_consumer(
     caller: crate::sched::ThreadId,
 ) -> Result<crate::sched::ThreadId, ProcessJoinError> {
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    let slot = table_mut()
+    let mut table = table_mut();
+    let slot = table
         .slot_mut(pid)
         .ok_or(ProcessJoinError::InvalidProcess)?;
     if slot.process.process_consumer.is_some() {
@@ -134,7 +135,7 @@ fn consume_process_for_join(
     caller: crate::sched::ThreadId,
 ) -> Result<ReclaimedProcess, ConsumeProcessError> {
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    let table = table_mut();
+    let mut table = table_mut();
     let slot = table
         .slot_mut(pid)
         .ok_or(ConsumeProcessError::Join(ProcessJoinError::InvalidProcess))?;

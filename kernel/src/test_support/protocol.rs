@@ -5,8 +5,6 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::sync::LocalIrqGuard;
-
 #[used]
 #[unsafe(link_section = ".genrt.test_marker")]
 static TEST_ARTIFACT_MARKER: [u8; 22] = *b"GENRT_TEST_ARTIFACT_V1";
@@ -44,7 +42,7 @@ impl Write for RecordBuffer {
     }
 }
 
-fn emit(event: &str, subject: &str, detail: Option<&str>) {
+fn emit_with_policy(event: &str, subject: &str, detail: Option<&str>, emergency: bool) {
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let mut record = RecordBuffer::new();
     let mut result = write!(record, "\x1eGTRT/1|kernel|{sequence:06}|{event}|{subject}");
@@ -53,12 +51,24 @@ fn emit(event: &str, subject: &str, detail: Option<&str>) {
     }
     result = result.and_then(|()| record.write_str("\n"));
 
-    let _irq_guard = LocalIrqGuard::save_and_disable();
     if result.is_ok() {
-        crate::console::puts(record.as_str());
+        if emergency {
+            crate::console::emergency_write(core::format_args!("{}", record.as_str()));
+        } else {
+            crate::console::puts(record.as_str());
+        }
     } else {
-        crate::console::puts("\x1eGTRT/1|kernel|999999|ABORT|protocol|OVERFLOW\n");
+        let overflow = core::format_args!("\x1eGTRT/1|kernel|999999|ABORT|protocol|OVERFLOW\n");
+        if emergency {
+            crate::console::emergency_write(overflow);
+        } else {
+            let _ = crate::console::try_write_fmt(overflow);
+        }
     }
+}
+
+fn emit(event: &str, subject: &str, detail: Option<&str>) {
+    emit_with_policy(event, subject, detail, false);
 }
 
 /// Announce that a kernel test coordinator reached its runnable boundary.
@@ -145,5 +155,5 @@ pub(crate) fn done(suite: &str) -> ! {
 /// This function returns after writing the record so the normal fatal path can
 /// retain control of final machine shutdown.
 pub(crate) fn abort(subject: &str, reason: &str) {
-    emit("ABORT", subject, Some(reason));
+    emit_with_policy("ABORT", subject, Some(reason), true);
 }

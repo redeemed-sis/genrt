@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
+
+use crate::sync::OncePublication;
 
 /// File entry discovered in the mounted readonly ramfs.
 ///
@@ -204,14 +205,7 @@ pub enum MountError {
     OutOfMemory,
 }
 
-struct RamfsCell(UnsafeCell<Option<MountedRamfs>>);
-
-// SAFETY: the initramfs is mounted once during single-core boot before the
-// scheduler starts. After a successful mount the filesystem index is immutable;
-// thread context only performs shared lookups.
-unsafe impl Sync for RamfsCell {}
-
-static RAMFS: RamfsCell = RamfsCell(UnsafeCell::new(None));
+static RAMFS: OncePublication<MountedRamfs> = OncePublication::new();
 
 /// Install the global readonly ramfs index.
 ///
@@ -229,13 +223,7 @@ static RAMFS: RamfsCell = RamfsCell(UnsafeCell::new(None));
 ///
 /// Returns `MountError::AlreadyMounted` if an index has already been installed.
 pub fn mount(fs: MountedRamfs) -> Result<(), MountError> {
-    let slot = ramfs_mut();
-    if slot.is_some() {
-        return Err(MountError::AlreadyMounted);
-    }
-
-    *slot = Some(fs);
-    Ok(())
+    RAMFS.publish(fs).map_err(|_| MountError::AlreadyMounted)
 }
 
 /// Return whether a ramfs index has already been mounted.
@@ -393,15 +381,7 @@ pub fn counts() -> (usize, usize) {
 }
 
 fn ramfs() -> Option<&'static MountedRamfs> {
-    // SAFETY: see `RamfsCell` Sync invariant. Once mounted, the value is not
-    // mutated while shared references are used.
-    unsafe { (&*RAMFS.0.get()).as_ref() }
-}
-
-fn ramfs_mut() -> &'static mut Option<MountedRamfs> {
-    // SAFETY: mutation happens only during single-core boot before scheduler
-    // start, and mount is rejected after a filesystem is already installed.
-    unsafe { &mut *RAMFS.0.get() }
+    RAMFS.get()
 }
 
 fn push_dir_with_parents(dirs: &mut Vec<Vec<u8>>, path: &[u8]) -> Result<(), MountError> {

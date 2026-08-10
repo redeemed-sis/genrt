@@ -1,4 +1,6 @@
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use kernel::sync::IrqSpinLock;
 
 use crate::{
     mmio::{mmio_read32, mmio_write8, mmio_write32},
@@ -9,51 +11,58 @@ use crate::{
 // INTID value returned when no pending interrupt is available.
 const GICV2_SPURIOUS_IRQ_ID: u32 = 1023;
 
-static GIC_INIT_DONE: AtomicBool = AtomicBool::new(false);
 static GICD_BASE: AtomicUsize = AtomicUsize::new(0);
 static GICC_BASE: AtomicUsize = AtomicUsize::new(0);
+static DISTRIBUTOR: IrqSpinLock<bool> = IrqSpinLock::new(false);
 
 pub fn configure_from_platform(platform: &PlatformInfo) {
     if platform.gic_distributor.is_present() && platform.gic_cpu_interface.is_present() {
+        let mut initialized = DISTRIBUTOR.lock();
         GICD_BASE.store(
             phys_to_hva_const(platform.gic_distributor.start as usize),
-            Ordering::Relaxed,
+            Ordering::Release,
         );
         GICC_BASE.store(
             phys_to_hva_const(platform.gic_cpu_interface.start as usize),
-            Ordering::Relaxed,
+            Ordering::Release,
         );
-        GIC_INIT_DONE.store(false, Ordering::Relaxed);
+        *initialized = false;
     }
 }
 
 pub fn init_controller_minimal() {
-    if GIC_INIT_DONE.load(Ordering::Relaxed) {
-        return;
-    }
     let Some((gicd, gicc)) = bases() else {
         return;
     };
 
-    // SAFETY: GIC base addresses came from the parsed DTB GIC `reg` property.
-    unsafe {
-        // Enable distributor.
-        mmio_write32(gicd, 1);
+    {
+        let mut initialized = DISTRIBUTOR.lock();
+        if !*initialized {
+            // SAFETY: the distributor base came from the parsed DTB GIC
+            // `reg` property. The global lock serializes shared distributor
+            // initialization across CPUs.
+            unsafe { mmio_write32(gicd, 1) };
+            *initialized = true;
+        }
+    }
 
+    // GICC is banked CPU-interface state. Each CPU initializes its own view;
+    // no global distributor lock is needed around these local MMIO writes.
+    // SAFETY: the CPU-interface base came from the parsed DTB GIC property.
+    unsafe {
         // Accept all priorities on CPU interface.
         mmio_write32(gicc + 0x004, 0xff);
 
         // Enable CPU interface.
         mmio_write32(gicc, 1);
     }
-
-    GIC_INIT_DONE.store(true, Ordering::Relaxed);
 }
 
 pub fn enable_irq(irq_id: u32, priority: u8) {
     let Some((gicd, _)) = bases() else {
         return;
     };
+    let _distributor = DISTRIBUTOR.lock();
 
     // SAFETY: GIC base addresses came from the parsed DTB GIC `reg` property.
     unsafe {
@@ -107,7 +116,7 @@ pub const fn is_spurious(irq_id: u32) -> bool {
 
 #[inline(always)]
 fn bases() -> Option<(usize, usize)> {
-    let gicd = GICD_BASE.load(Ordering::Relaxed);
-    let gicc = GICC_BASE.load(Ordering::Relaxed);
+    let gicd = GICD_BASE.load(Ordering::Acquire);
+    let gicc = GICC_BASE.load(Ordering::Acquire);
     (gicd != 0 && gicc != 0).then_some((gicd, gicc))
 }

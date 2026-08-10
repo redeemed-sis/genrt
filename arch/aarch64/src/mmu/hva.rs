@@ -5,7 +5,10 @@
 //! пишется physical address; HVA используется только для разыменования backing
 //! memory page tables.
 
-use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
+use core::{
+    ptr::{addr_of, addr_of_mut, read_volatile, write_volatile},
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use kernel::memory::{PAGE_SIZE, PhysAddr, VirtAddr};
 
@@ -118,33 +121,17 @@ impl MappedPageTable {
     }
 }
 
-static mut CURRENT_TTBR0_L0_PA: usize = 0;
-static mut CURRENT_TTBR1_L0_PA: usize = 0;
-static mut RUNTIME_TABLES_ACTIVE: bool = false;
+static RUNTIME_TABLES_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Save physical roots of initial boot page tables for high-side VM API.
-pub(super) unsafe fn save_boot_roots(ttbr0_l0: usize, ttbr1_l0: usize) {
-    unsafe {
-        set_current_ttbr_roots(ttbr0_l0, ttbr1_l0);
-        set_runtime_tables_active(false);
-    }
-}
-
-unsafe fn set_current_ttbr_roots(ttbr0_l0: usize, ttbr1_l0: usize) {
-    unsafe {
-        CURRENT_TTBR0_L0_PA = ttbr0_l0;
-        CURRENT_TTBR1_L0_PA = ttbr1_l0;
-    }
-}
-
-unsafe fn set_runtime_tables_active(active: bool) {
-    unsafe {
-        RUNTIME_TABLES_ACTIVE = active;
-    }
+pub(super) unsafe fn save_boot_roots(_ttbr0_l0: usize, _ttbr1_l0: usize) {
+    // The live roots are read from TTBRx_EL1, not mirrored in global software
+    // state. This boot publication only marks runtime mutation unavailable.
+    RUNTIME_TABLES_ACTIVE.store(false, Ordering::Release);
 }
 
 fn runtime_tables_active() -> bool {
-    unsafe { RUNTIME_TABLES_ACTIVE }
+    RUNTIME_TABLES_ACTIVE.load(Ordering::Acquire)
 }
 
 fn require_runtime_tables() -> Result<(), VmError> {
@@ -157,12 +144,12 @@ fn require_runtime_tables() -> Result<(), VmError> {
 
 /// Current physical root of TTBR0 L0 table.
 fn ttbr0_l0_pa() -> usize {
-    unsafe { CURRENT_TTBR0_L0_PA }
+    read_ttbr0() & DESC_ADDR_MASK as usize
 }
 
 /// Current physical root of TTBR1 L0 table.
 fn ttbr1_l0_pa() -> usize {
-    unsafe { CURRENT_TTBR1_L0_PA }
+    read_ttbr1() & DESC_ADDR_MASK as usize
 }
 
 /// Const helper для MMIO base constants: `HVA = PA + KERNEL_HVA_OFFSET`.
@@ -338,16 +325,25 @@ pub(super) unsafe fn map_kernel_region(
     require_runtime_tables()?;
     validate_kernel_region(va, pa, size)?;
 
+    let mut preflight_offset = 0usize;
+    while preflight_offset < size {
+        ensure_kernel_block_unmapped(va + preflight_offset)?;
+        preflight_offset += BLOCK_SIZE_2M;
+    }
+
     let mut offset = 0usize;
     while offset < size {
         let current_va = va + offset;
         let current_pa = pa + offset;
-        let l2 = ensure_l2_table(current_va)?;
+        let l2 = match ensure_l2_table(current_va) {
+            Ok(l2) => l2,
+            Err(err) => {
+                rollback_kernel_map(va, offset);
+                return Err(err);
+            }
+        };
         let index = l2_index(current_va);
-        let old = l2.read(index);
-        if old & DESC_VALID != 0 {
-            return Err(VmError::AlreadyMapped);
-        }
+        debug_assert_eq!(l2.read(index) & DESC_VALID, 0);
         l2.write(index, block_desc(current_pa, attr_to_index(attr), flags));
         offset += BLOCK_SIZE_2M;
     }
@@ -361,23 +357,28 @@ pub(super) unsafe fn unmap_kernel_region(va: VirtAddr, size: usize) -> Result<()
     require_runtime_tables()?;
     validate_kernel_va_size(va, size)?;
 
+    validate_existing_kernel_blocks(va, size)?;
+
     let mut offset = 0usize;
     while offset < size {
         let current_va = va + offset;
-        let Some(l2) = existing_l2_table(current_va) else {
-            return Err(VmError::MissingMapping);
-        };
+        let l2 = existing_l2_table(current_va)
+            .unwrap_or_else(|| panic!("MMU: preflight mapping disappeared"));
         let index = l2_index(current_va);
-        let old = l2.read(index);
-        if !is_block_desc(old) {
-            return Err(VmError::MissingMapping);
-        }
+        debug_assert!(is_block_desc(l2.read(index)));
         l2.write(index, 0);
-        reclaim_empty_tables_for_va(current_va);
         offset += BLOCK_SIZE_2M;
     }
 
     unsafe { flush_tlb_all() };
+    // Leaf descriptors are invalidated before parent tables are detached.
+    // Each detached parent is globally invalidated before its backing frame is
+    // returned to the allocator.
+    let mut reclaim_offset = 0usize;
+    while reclaim_offset < size {
+        reclaim_detached_tables_for_va(va + reclaim_offset);
+        reclaim_offset += BLOCK_SIZE_2M;
+    }
     Ok(())
 }
 
@@ -393,19 +394,20 @@ pub(super) unsafe fn protect_kernel_region(
     require_runtime_tables()?;
     validate_kernel_va_size(va, size)?;
 
+    validate_existing_kernel_blocks(va, size)?;
+
+    // Preflight guarantees that no fallible exit remains once mutation starts.
+    // Apply BBM per descriptor so its original PA and AttrIndx stay available
+    // without allocating temporary storage under the VM writer lock.
     let mut offset = 0usize;
     while offset < size {
         let current_va = va + offset;
-        let Some(l2) = existing_l2_table(current_va) else {
-            return Err(VmError::MissingMapping);
-        };
+        let l2 = existing_l2_table(current_va)
+            .unwrap_or_else(|| panic!("MMU: preflight mapping disappeared"));
         let index = l2_index(current_va);
         let old = l2.read(index);
-        if !is_block_desc(old) {
-            return Err(VmError::MissingMapping);
-        }
-
-        let attr = ((old >> 2) & 0b111) as u64;
+        debug_assert!(is_block_desc(old));
+        let attr = (old >> 2) & 0b111;
         let pa = desc_pa(old);
         l2.write(index, 0);
         unsafe { flush_tlb_all() };
@@ -510,17 +512,14 @@ pub(super) unsafe fn switch_to_runtime_kernel_tables() -> Result<(), VmError> {
     );
 
     unsafe { install_runtime_ttbrs(l0_frame.pa()) };
-    let l0_pa = l0_frame.release();
+    l0_frame.release();
     l1_frame.release();
     l2_gic_frame.release();
     if let Some(frame) = l2_uart_frame.as_mut() {
         frame.release();
     }
     l2_ram_frame.release();
-    unsafe {
-        set_current_ttbr_roots(0, l0_pa);
-        set_runtime_tables_active(true);
-    }
+    RUNTIME_TABLES_ACTIVE.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -615,7 +614,6 @@ pub(super) unsafe fn activate_user_address_space(root_pa: PhysAddr) -> Result<()
         dsb_sy();
         set_ttbr0(root_pa);
         flush_tlb_all();
-        set_current_ttbr_roots(root_pa, ttbr1_l0_pa());
     }
     Ok(())
 }
@@ -626,7 +624,6 @@ pub(super) unsafe fn clear_user_address_space() -> Result<(), VmError> {
         dsb_sy();
         clear_ttbr0();
         flush_tlb_all();
-        set_current_ttbr_roots(0, ttbr1_l0_pa());
     }
     Ok(())
 }
@@ -864,7 +861,7 @@ fn ensure_l2_table(va: VirtAddr) -> Result<MappedPageTable, VmError> {
         let pa = match alloc_table_frame() {
             Ok(pa) => pa,
             Err(err) => {
-                reclaim_empty_tables_for_va(va);
+                reclaim_detached_tables_for_va(va);
                 return Err(err);
             }
         };
@@ -972,17 +969,23 @@ fn user_mapping_info_from_desc(desc: u64, va: VirtAddr) -> UserMappingInfo {
 /// This relies on the post-memory-init invariant that TTBR1 has already been
 /// switched away from boot `.boot.bss.pt` tables to frames owned by the generic
 /// frame allocator.
-fn reclaim_empty_tables_for_va(va: VirtAddr) {
+/// Detach empty intermediate tables without freeing their backing frames.
+///
+/// The caller must complete an inner-shareable TLB invalidation after the
+/// parent descriptor writes and before returning any reported frame to the
+/// allocator.
+fn detach_empty_tables_for_va(va: VirtAddr) -> [Option<PhysAddr>; 2] {
+    let mut detached = [None, None];
     let root = ttbr1_l0_pa();
     if root == 0 {
-        return;
+        return detached;
     }
 
     let l0 = MappedPageTable::from_pa(root);
     let l0_index = l0_index(va);
     let l0e = l0.read(l0_index);
     if !is_table_desc(l0e) {
-        return;
+        return detached;
     }
 
     let l1_pa = desc_pa(l0e);
@@ -994,13 +997,27 @@ fn reclaim_empty_tables_for_va(va: VirtAddr) {
         let l2 = MappedPageTable::from_pa(l2_pa);
         if l2.is_empty() {
             l1.write(l1_index, 0);
-            kernel::memory::free_frame(l2_pa);
+            detached[0] = Some(l2_pa);
         }
     }
 
     if l1.is_empty() {
         l0.write(l0_index, 0);
-        kernel::memory::free_frame(l1_pa);
+        detached[1] = Some(l1_pa);
+    }
+    detached
+}
+
+fn reclaim_detached_tables_for_va(va: VirtAddr) {
+    let detached = detach_empty_tables_for_va(va);
+    if detached.iter().all(Option::is_none) {
+        return;
+    }
+    // SAFETY: the caller serializes TTBR1 mutation. Parent descriptors were
+    // cleared above, and the broadcast completion precedes frame reuse.
+    unsafe { flush_tlb_all() };
+    for frame in detached.into_iter().flatten() {
+        kernel::memory::free_frame(frame);
     }
 }
 
@@ -1020,6 +1037,70 @@ fn existing_l2_table(va: VirtAddr) -> Option<MappedPageTable> {
     let l1 = MappedPageTable::from_pa(desc_pa(l0e));
     let l1e = l1.read(l1_index(va));
     is_table_desc(l1e).then(|| MappedPageTable::from_pa(desc_pa(l1e)))
+}
+
+fn ensure_kernel_block_unmapped(va: VirtAddr) -> Result<(), VmError> {
+    let root = ttbr1_l0_pa();
+    if root == 0 {
+        return Err(VmError::NotInitialized);
+    }
+    let l0e = MappedPageTable::from_pa(root).read(l0_index(va));
+    if l0e & DESC_VALID == 0 {
+        return Ok(());
+    }
+    if !is_table_desc(l0e) {
+        return Err(VmError::Unsupported);
+    }
+    let l1e = MappedPageTable::from_pa(desc_pa(l0e)).read(l1_index(va));
+    if l1e & DESC_VALID == 0 {
+        return Ok(());
+    }
+    if !is_table_desc(l1e) {
+        return Err(VmError::Unsupported);
+    }
+    let leaf = MappedPageTable::from_pa(desc_pa(l1e)).read(l2_index(va));
+    if leaf & DESC_VALID == 0 {
+        Ok(())
+    } else {
+        Err(VmError::AlreadyMapped)
+    }
+}
+
+fn validate_existing_kernel_blocks(va: VirtAddr, size: usize) -> Result<(), VmError> {
+    let mut offset = 0usize;
+    while offset < size {
+        let current_va = va + offset;
+        let Some(l2) = existing_l2_table(current_va) else {
+            return Err(VmError::MissingMapping);
+        };
+        if !is_block_desc(l2.read(l2_index(current_va))) {
+            return Err(VmError::MissingMapping);
+        }
+        offset += BLOCK_SIZE_2M;
+    }
+    Ok(())
+}
+
+fn rollback_kernel_map(va: VirtAddr, mapped_size: usize) {
+    let mut offset = 0usize;
+    while offset < mapped_size {
+        let current_va = va + offset;
+        if let Some(l2) = existing_l2_table(current_va) {
+            l2.write(l2_index(current_va), 0);
+        }
+        offset += BLOCK_SIZE_2M;
+    }
+    if mapped_size != 0 {
+        // SAFETY: the generic VM writer lock serializes this rollback. Leaf
+        // invalidation completes on all inner-shareable PEs before table
+        // detachment and frame reuse.
+        unsafe { flush_tlb_all() };
+    }
+    let mut offset = 0usize;
+    while offset < mapped_size {
+        reclaim_detached_tables_for_va(va + offset);
+        offset += BLOCK_SIZE_2M;
+    }
 }
 
 /// Получить physical frame для новой page table.
@@ -1134,6 +1215,32 @@ unsafe fn set_ttbr0(root_pa: PhysAddr) {
     }
 }
 
+#[inline(always)]
+fn read_ttbr0() -> usize {
+    let root: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {root}, ttbr0_el1",
+            root = out(reg) root,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    root as usize
+}
+
+#[inline(always)]
+fn read_ttbr1() -> usize {
+    let root: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {root}, ttbr1_el1",
+            root = out(reg) root,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    root as usize
+}
+
 unsafe fn clear_ttbr0() {
     unsafe {
         core::arch::asm!(
@@ -1165,15 +1272,18 @@ unsafe fn clear_ttbr1() {
     }
 }
 
-/// Глобальная TLB invalidation sequence для текущего single-core этапа.
+/// Inner-shareable TLB invalidation for a serialized kernel mapping mutation.
 ///
-/// На SMP это место надо заменить на shootdown protocol; пока все mappings
-/// меняются на одном core и не из IRQ fast path.
+/// `VMALLE1IS` broadcasts to every PE in the Inner Shareable domain. The first
+/// barrier publishes descriptor writes before invalidation; the second waits
+/// for completion before later code can reuse detached page-table frames, and
+/// `ISB` synchronizes the issuing PE's instruction stream. The `SY` barriers
+/// are deliberately stronger than the minimum `ISH` scope.
 unsafe fn flush_tlb_all() {
     unsafe {
         core::arch::asm!(
             "dsb sy",
-            "tlbi vmalle1",
+            "tlbi vmalle1is",
             "dsb sy",
             "isb",
             options(nostack, preserves_flags)

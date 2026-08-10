@@ -127,7 +127,8 @@ fn commit_exec_image(
     let old_stack =
         crate::sched::replace_current_user_resources(staged.address_space.id(), staged.stack)
             .unwrap_or_else(|_| panic!("process: staged exec address-space activation failed"));
-    let slot = table_mut()
+    let mut table = table_mut();
+    let slot = table
         .slot_mut(pid)
         .unwrap_or_else(|| panic!("process: prevalidated exec slot disappeared during swap"));
     let old = ProcessImageResources {

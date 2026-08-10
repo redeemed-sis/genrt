@@ -180,9 +180,15 @@ impl Scheduler {
                 .unwrap_or_else(|| panic!("sched: CPU storage index exceeds fixed capacity"));
             CpuSchedulerState::new(cpu, thread_capacity)
         });
+        let remote_ready = core::array::from_fn(|_| {
+            let mut queue = alloc::collections::VecDeque::new();
+            queue.reserve_exact(thread_capacity.saturating_sub(1));
+            queue
+        });
         Self {
             lifecycle: ThreadTable::with_capacity(thread_capacity),
             cpus,
+            remote_ready,
             rr_quantum_ms: rr_quantum_ms.max(1),
         }
     }
@@ -244,6 +250,7 @@ impl CpuScheduler<'_> {
             thread::thread_entry_bootstrap as *const () as usize,
         );
         self.publish(
+            self.cpu(),
             id,
             context,
             None,
@@ -256,18 +263,22 @@ impl CpuScheduler<'_> {
 
     pub(super) fn transition_publish_runtime(
         &mut self,
+        home_cpu: CpuId,
         id: usize,
         context: SavedContext,
         user: Option<UserThreadResources>,
         joinable: bool,
     ) -> ThreadId {
         let generation = next_generation(self.lifecycle.slots[id].generation);
-        self.publish(id, context, user, joinable, generation, false, false);
+        self.publish(
+            home_cpu, id, context, user, joinable, generation, false, false,
+        );
         self.thread_id(id)
     }
 
     fn publish(
         &mut self,
+        home_cpu: CpuId,
         id: usize,
         context: SavedContext,
         user: Option<UserThreadResources>,
@@ -276,7 +287,9 @@ impl CpuScheduler<'_> {
         bootstrap: bool,
         idle: bool,
     ) {
-        let home_cpu = self.cpu();
+        if idle && home_cpu != self.cpu() {
+            panic!("sched: remote idle publication");
+        }
         let slot = &mut self.lifecycle.slots[id];
         if slot.thread.is_some() {
             panic!("sched: publish into occupied slot {id}");
@@ -308,12 +321,15 @@ impl CpuScheduler<'_> {
                     self.cpu().index()
                 );
             }
-        } else {
+        } else if home_cpu == self.cpu() {
             let was_empty = self.state().ready_queue.is_empty();
             self.ready_push_back(self.thread_id(id));
             if !bootstrap && was_empty {
                 self.note_ready_peer();
             }
+        } else {
+            self.scheduler
+                .publish_remote_ready(self.thread_id(id), home_cpu);
         }
         self.validate_after_transition();
     }
@@ -350,9 +366,10 @@ impl CpuScheduler<'_> {
         &mut self,
         prepared: PreparedWait,
     ) -> (CommitState, Option<SwitchOutcome>) {
-        self.state()
-            .preemption
-            .assert_enabled("scheduler blocking transition");
+        crate::sync::preempt::assert_preemption_enabled_on(
+            self.cpu(),
+            "scheduler blocking transition",
+        );
         let from = self
             .state()
             .current
@@ -374,15 +391,17 @@ impl CpuScheduler<'_> {
     }
 
     pub(super) fn transition_prepare_wait(&mut self) -> PreparedWait {
-        self.state()
-            .preemption
-            .assert_enabled("scheduler wait preparation");
+        crate::sync::preempt::assert_preemption_enabled_on(
+            self.cpu(),
+            "scheduler wait preparation",
+        );
         let current = self
             .state()
             .current
             .unwrap_or_else(|| panic!("sched: wait preparation without a running thread"));
         self.assert_current_running(current, "wait preparation");
-        let prepared = self.thread_mut(current.index()).wait.prepare(current);
+        let cpu = self.cpu();
+        let prepared = self.thread_mut(current.index()).wait.prepare(current, cpu);
         self.validate_after_transition();
         prepared
     }
@@ -404,7 +423,12 @@ impl Scheduler {
                 panic!("sched: blocked wait completion has non-blocked thread state");
             }
             let cpu = self.thread_home_cpu(id);
-            self.on_cpu(cpu).make_ready_and_queue(token.thread(), true);
+            if cpu == super::current_cpu() {
+                self.on_cpu(cpu).make_ready_and_queue(token.thread(), true);
+            } else {
+                self.thread_mut(id).state = ThreadState::Ready;
+                self.publish_remote_ready(token.thread(), cpu);
+            }
         } else if result == CompletionResult::CompletedPrepared
             && self.thread_state(id) != ThreadState::Running
         {
@@ -412,6 +436,20 @@ impl Scheduler {
         }
         self.validate_after_transition();
         result
+    }
+
+    fn publish_remote_ready(&mut self, id: ThreadId, cpu: CpuId) {
+        let queue = self
+            .remote_ready
+            .get_mut(cpu.index())
+            .unwrap_or_else(|| panic!("sched: invalid remote-ready CPU"));
+        if queue.iter().any(|queued| *queued == id) {
+            panic!("sched: duplicate remote-ready publication {id}");
+        }
+        if queue.len() == queue.capacity() {
+            panic!("sched: remote-ready ingress capacity exhausted");
+        }
+        queue.push_back(id);
     }
 
     pub(super) fn transition_finish_wait(
@@ -560,6 +598,7 @@ impl CpuScheduler<'_> {
     }
 
     fn ready_pop_front(&mut self) -> Option<ThreadId> {
+        self.drain_remote_ready();
         let id = self.state_mut().ready_queue.pop_front()?;
         if !self.thread_matches(id)
             || self.thread(id.index()).state != ThreadState::Ready
@@ -569,6 +608,22 @@ impl CpuScheduler<'_> {
             panic!("sched: stale or invalid ready queue entry {id}");
         }
         Some(id)
+    }
+
+    pub(super) fn drain_remote_ready(&mut self) {
+        loop {
+            let id = { self.scheduler.remote_ready[self.cpu().index()].pop_front() };
+            let Some(id) = id else {
+                return;
+            };
+            if !self.thread_matches(id)
+                || self.thread_state(id.index()) != ThreadState::Ready
+                || self.thread_home_cpu(id.index()) != self.cpu()
+            {
+                panic!("sched: stale or invalid remote-ready entry {id}");
+            }
+            self.ready_push_back(id);
+        }
     }
 
     fn make_ready_and_queue(&mut self, id: ThreadId, notify_new_peer: bool) {
@@ -747,9 +802,12 @@ impl Scheduler {
 
     #[cfg(any(debug_assertions, feature = "qemu-test"))]
     pub(super) fn validate_invariants(&self) {
-        for state in &self.cpus {
+        for (cpu_index, state) in self.cpus.iter().enumerate() {
             if state.ready_queue.len() > state.ready_queue.capacity() {
                 panic!("sched: ready queue exceeds capacity");
+            }
+            if self.remote_ready[cpu_index].len() > self.remote_ready[cpu_index].capacity() {
+                panic!("sched: remote-ready ingress exceeds capacity");
             }
             if state.online && !state.initialized {
                 panic!("sched: online CPU context is not initialized");
@@ -767,6 +825,10 @@ impl Scheduler {
                     .cpus
                     .iter()
                     .any(|state| state.ready_queue.iter().any(|queued| queued.index() == id))
+                    || self
+                        .remote_ready
+                        .iter()
+                        .any(|queue| queue.iter().any(|queued| queued.index() == id))
                 {
                     panic!("sched: free slot {id} remains queued");
                 }
@@ -778,7 +840,11 @@ impl Scheduler {
                 .ready_queue
                 .iter()
                 .filter(|queued| **queued == tid)
-                .count();
+                .count()
+                + self.remote_ready[cpu.index()]
+                    .iter()
+                    .filter(|queued| **queued == tid)
+                    .count();
             if queued > 1 {
                 panic!("sched: duplicate ready entry {tid}");
             }
@@ -824,11 +890,13 @@ impl Scheduler {
                 panic!("sched: blocked wait has invalid thread state {id}");
             }
         }
-        for state in &self.cpus {
+        for (cpu_index, state) in self.cpus.iter().enumerate() {
+            let owner = CpuId::from_index(cpu_index)
+                .unwrap_or_else(|| panic!("sched: invalid CPU context index {cpu_index}"));
             for queued in &state.ready_queue {
                 if !self.thread_matches(*queued)
                     || self.thread_state(queued.index()) != ThreadState::Ready
-                    || self.thread_home_cpu(queued.index()) != state.preemption.owner()
+                    || self.thread_home_cpu(queued.index()) != owner
                     || state.idle == Some(*queued)
                 {
                     panic!("sched: stale ready queue entry {queued}");
@@ -852,11 +920,7 @@ impl Scheduler {
     #[cfg(feature = "qemu-test-kernel-runtime")]
     pub(super) fn validate_cpu_context_for_test(&self, cpu: CpuId) {
         let state = self.cpu_state_for(cpu);
-        if cpu.index() != 0
-            || !state.initialized
-            || !state.online
-            || state.preemption.owner() != cpu
-        {
+        if cpu.index() != 0 || !state.initialized || !state.online {
             panic!("sched test: CPU0 context was not initialized and online");
         }
         let current = state
@@ -903,7 +967,30 @@ mod tests {
         let context = SavedContext::kernel_entry(scheduler.stack_top(slot), 0, 0, 0);
         scheduler
             .on_cpu(CPU0)
-            .transition_publish_runtime(slot, context, None, true)
+            .transition_publish_runtime(CPU0, slot, context, None, true)
+    }
+
+    #[test]
+    fn remote_ready_is_consumed_only_by_target_cpu() {
+        let cpu1 = CpuId::from_index(1).unwrap();
+        let mut scheduler = Scheduler::transition_new(2, 1);
+        scheduler.transition_fill_free_slots(2);
+        scheduler.cpus[cpu1.index()].initialized = true;
+        scheduler.cpus[cpu1.index()].online = true;
+        let slot = scheduler.take_free_slot().unwrap();
+        let context = SavedContext::kernel_entry(scheduler.stack_top(slot), 0, 0, 0);
+        let thread = scheduler
+            .on_cpu(CPU0)
+            .transition_publish_runtime(cpu1, slot, context, None, true);
+
+        assert!(scheduler.cpus[cpu1.index()].ready_queue.is_empty());
+        assert_eq!(scheduler.remote_ready[cpu1.index()].front(), Some(&thread));
+        scheduler.on_cpu(cpu1).drain_remote_ready();
+        assert!(scheduler.remote_ready[cpu1.index()].is_empty());
+        assert_eq!(
+            scheduler.cpus[cpu1.index()].ready_queue.front(),
+            Some(&thread)
+        );
     }
 
     #[test]
@@ -962,7 +1049,7 @@ mod tests {
         let first = scheduler
             .thread_mut(slot)
             .wait
-            .prepare(first_id)
+            .prepare(first_id, CPU0)
             .token()
             .sequence();
         scheduler.thread_mut(slot).wait.clear_active();
@@ -975,7 +1062,7 @@ mod tests {
         let second = scheduler
             .thread_mut(reused_slot)
             .wait
-            .prepare(reused_id)
+            .prepare(reused_id, CPU0)
             .token()
             .sequence();
         assert_eq!(reused_slot, slot);

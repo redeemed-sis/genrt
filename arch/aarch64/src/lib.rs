@@ -1,6 +1,9 @@
 #![no_std]
 
-use core::arch::{asm, global_asm};
+use core::{
+    arch::{asm, global_asm},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use bootinfo::BootInfo;
 
@@ -19,7 +22,7 @@ global_asm!(include_str!("boot.s"));
 global_asm!(include_str!("exceptions.s"));
 
 #[unsafe(no_mangle)]
-pub static mut BOOT_CURRENT_EL: u64 = 0;
+pub static BOOT_CURRENT_EL: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "C" {
     static __bss_start: u8;
@@ -33,7 +36,7 @@ pub extern "C" fn rust_entry(boot_mmu_params_pa: usize) -> ! {
         zero_bss();
         mmu::init_from_boot_params(boot_mmu_params_pa);
         install_vectors();
-        BOOT_CURRENT_EL = current_el();
+        BOOT_CURRENT_EL.store(current_el(), Ordering::Relaxed);
     }
     let boot_platform_params = mmu::platform_params_from_boot_params(boot_mmu_params_pa);
     let (dtb_pa, _) = platform::dtb_from_boot_params(boot_platform_params);

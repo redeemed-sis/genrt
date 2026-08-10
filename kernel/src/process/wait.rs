@@ -119,7 +119,7 @@ fn prepare_wait_child_locked(
     child_pid: ProcessId,
     caller: crate::sched::ThreadId,
 ) -> WaitChildPrepare {
-    let table = table_mut();
+    let mut table = table_mut();
     let Some(slot) = table.slot_mut(child_pid) else {
         return WaitChildPrepare::Err(errno::ECHILD);
     };

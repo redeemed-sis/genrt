@@ -1,8 +1,5 @@
-use crate::time::TimeHandlers;
-
 use super::{
-    Result, SchedError, Scheduler, THREAD_STACK_SIZE, current_cpu, preempt, scheduler_slot_mut,
-    thread,
+    Result, SchedError, Scheduler, THREAD_STACK_SIZE, current_cpu, scheduler_slot_mut, thread,
 };
 
 #[derive(Copy, Clone)]
@@ -73,11 +70,9 @@ pub(crate) fn bootstrap(
     }
     let cpu = current_cpu();
 
-    // Bootstrap ordering is intentionally split into two phases:
-    // 1. Build and publish the global scheduler so timer-owned callbacks always
-    //    have a concrete scheduler instance to reach.
-    // 2. Only then initialize `kernel::time`, which is the first point where
-    //    timer IRQ dispatch can invoke scheduler callbacks.
+    // Publish scheduler state before enabling this CPU's deadline queue. Timer
+    // dispatch calls the scheduler facade directly and therefore requires the
+    // shared lifecycle table to exist first.
     let scheduler = Scheduler::bootstrap_new(
         cpu,
         idle_entry,
@@ -87,7 +82,7 @@ pub(crate) fn bootstrap(
         thread_capacity,
     )?;
     let thread_count = scheduler.transition_thread_count();
-    crate::sync::preempt::assert_boot_state_quiescent(cpu);
+    crate::sync::preempt::assert_pre_scheduler_state_quiescent(cpu);
     *scheduler_slot_mut() = Some(scheduler);
     init_time_after_scheduler_publish(thread_count);
     Ok(())
@@ -95,12 +90,7 @@ pub(crate) fn bootstrap(
 
 #[inline(always)]
 fn init_time_after_scheduler_publish(thread_count: usize) {
-    crate::time::init(
-        TimeHandlers {
-            finish_timer_interrupt: preempt::finish_timer_interrupt,
-            wait_deadline: preempt::on_wait_deadline,
-            quantum_expired: preempt::on_quantum_expired,
-        },
+    crate::time::init_current_cpu(
         thread_count.saturating_mul(crate::time::TIMED_EVENT_CAPACITY_PER_THREAD),
     );
 }

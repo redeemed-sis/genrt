@@ -240,9 +240,7 @@ fn sys_write(context: &mut ActiveContext<'_>, request: SyscallRequest) {
         let mut buffer = [0u8; user::MAX_USER_COPY];
         user::copy_from_user(&mut buffer[..len], ptr).map_err(user_copy_errno)?;
 
-        for byte in &buffer[..len] {
-            console::putc(*byte);
-        }
+        console::write_bytes(&buffer[..len]);
 
         Ok(len)
     })();

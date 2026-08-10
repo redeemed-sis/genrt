@@ -252,7 +252,8 @@ fn with_current_file_state<T>(
 ) -> Result<T, FdError> {
     let pid = current_process_id().ok_or(FdError::BadFd)?;
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    let process = &table_mut().slot_mut(pid).ok_or(FdError::BadFd)?.process;
+    let mut table = table_mut();
+    let process = &table.slot_mut(pid).ok_or(FdError::BadFd)?.process;
     f(&process.resources.files)
 }
 
@@ -261,6 +262,7 @@ fn with_current_file_state_mut<T>(
 ) -> Result<T, FdError> {
     let pid = current_process_id().ok_or(FdError::BadFd)?;
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    let process = &mut table_mut().slot_mut(pid).ok_or(FdError::BadFd)?.process;
+    let mut table = table_mut();
+    let process = &mut table.slot_mut(pid).ok_or(FdError::BadFd)?.process;
     f(&mut process.resources.files)
 }

@@ -5,6 +5,12 @@
 //! the high-side storage/validation surface for arch platform ranges; concrete
 //! boot-protocol constants live in platform-specific submodules.
 
+use core::{
+    cell::UnsafeCell,
+    mem::MaybeUninit,
+    sync::atomic::{AtomicU8, Ordering},
+};
+
 mod boot_dtb;
 pub(crate) mod qemu;
 
@@ -12,6 +18,7 @@ pub(crate) use self::boot_dtb::{BootDeviceRange, BootPlatformInfo, parse_boot_pl
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum PlatformError {
+    AlreadyInitialized,
     MissingRam,
     MissingUart,
     MissingGic,
@@ -24,10 +31,6 @@ pub struct DeviceRange {
 }
 
 impl DeviceRange {
-    pub const fn empty() -> Self {
-        Self { start: 0, size: 0 }
-    }
-
     pub const fn is_present(self) -> bool {
         self.start != 0 && self.size != 0
     }
@@ -42,15 +45,6 @@ pub struct PlatformInfo {
 }
 
 impl PlatformInfo {
-    pub const fn empty() -> Self {
-        Self {
-            ram: DeviceRange::empty(),
-            uart: DeviceRange::empty(),
-            gic_distributor: DeviceRange::empty(),
-            gic_cpu_interface: DeviceRange::empty(),
-        }
-    }
-
     fn validate(self) -> Result<Self, PlatformError> {
         if !self.ram.is_present() {
             return Err(PlatformError::MissingRam);
@@ -99,19 +93,49 @@ impl BootPlatformParams {
     }
 }
 
-static mut PLATFORM: PlatformInfo = PlatformInfo::empty();
+const PLATFORM_EMPTY: u8 = 0;
+const PLATFORM_INITIALIZING: u8 = 1;
+const PLATFORM_READY: u8 = 2;
 
-pub unsafe fn init(info: PlatformInfo) -> Result<&'static PlatformInfo, PlatformError> {
-    let valid = info.validate()?;
-    unsafe {
-        PLATFORM = valid;
-        Ok(&*core::ptr::addr_of!(PLATFORM))
+struct PlatformPublication {
+    state: AtomicU8,
+    value: UnsafeCell<MaybeUninit<PlatformInfo>>,
+}
+
+// SAFETY: `init` claims the sole write with an atomic state transition and
+// publishes the immutable value with Release ordering. Readers dereference it
+// only after an Acquire load observes `PLATFORM_READY`.
+unsafe impl Sync for PlatformPublication {}
+
+static PLATFORM: PlatformPublication = PlatformPublication {
+    state: AtomicU8::new(PLATFORM_EMPTY),
+    value: UnsafeCell::new(MaybeUninit::uninit()),
+};
+
+pub unsafe fn init(platform: PlatformInfo) -> Result<&'static PlatformInfo, PlatformError> {
+    let valid = platform.validate()?;
+    if PLATFORM
+        .state
+        .compare_exchange(
+            PLATFORM_EMPTY,
+            PLATFORM_INITIALIZING,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return Err(PlatformError::AlreadyInitialized);
     }
+    // SAFETY: this initializer exclusively owns the unpublished storage.
+    unsafe { (*PLATFORM.value.get()).write(valid) };
+    PLATFORM.state.store(PLATFORM_READY, Ordering::Release);
+    info().ok_or(PlatformError::AlreadyInitialized)
 }
 
 pub fn info() -> Option<&'static PlatformInfo> {
-    let platform = unsafe { &*core::ptr::addr_of!(PLATFORM) };
-    platform.validate().ok().map(|_| platform)
+    (PLATFORM.state.load(Ordering::Acquire) == PLATFORM_READY)
+        // SAFETY: Acquire observed the Release publication after initialization.
+        .then(|| unsafe { (&*PLATFORM.value.get()).assume_init_ref() })
 }
 
 /// Write the platform-owned boot params tail from low `.boot.text`.

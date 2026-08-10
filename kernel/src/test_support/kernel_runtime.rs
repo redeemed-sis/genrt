@@ -1,18 +1,14 @@
 //! Finite scheduler, timing, mailbox, and lifecycle contract scenarios.
 
 use alloc::vec::Vec;
-use core::{
-    cell::UnsafeCell,
-    mem::MaybeUninit,
-    sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
-};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::{
     ipc::{Mailbox, RecvTimeoutError},
     memory,
     sched::{self, ThreadArg, ThreadAttrs},
     sync::{
-        LocalIrqGuard, PreemptLock,
+        LocalIrqGuard, OncePublication, SpinLock,
         preempt::{PreemptGuard, reschedule_pending},
     },
 };
@@ -25,31 +21,19 @@ const DELIVERY_VALUE: usize = 0x51;
 const ALLOCATOR_WORKER_COUNT: usize = 3;
 const ALLOCATOR_CYCLES: usize = 6;
 const ALLOCATOR_HEAP_ITEMS: usize = 64;
+const KERNEL_MAPPING_BLOCK_SIZE: usize = 2 * 1024 * 1024;
+const KERNEL_MAPPING_TEST_SIZE: usize = 2 * KERNEL_MAPPING_BLOCK_SIZE;
+const KERNEL_MAPPING_TEST_VA: usize = 0xffff_8000_0000_0000;
 const ALLOCATOR_WORKER_OK: usize = 0;
 const ALLOCATOR_FRAME_FAILED: usize = 1;
 const ALLOCATOR_RANGE_FAILED: usize = 2;
 const ALLOCATOR_HEAP_FAILED: usize = 3;
-const MAILBOX_UNINITIALIZED: u8 = 0;
-const MAILBOX_INITIALIZING: u8 = 1;
-const MAILBOX_READY: u8 = 2;
 const CYCLE_WORKERS: usize = 3;
 const CYCLE_EXIT_BASE: usize = 0x80;
 const WAIT_TOKEN_STRESS_CYCLES: usize =
     (crate::config::KERNEL_THREAD_CAPACITY * crate::time::TIMED_EVENT_CAPACITY_PER_THREAD) + 1;
 
-struct TestMailboxCell {
-    value: UnsafeCell<MaybeUninit<Mailbox<usize>>>,
-    state: AtomicU8,
-}
-
-// SAFETY: init publishes the mailbox before scheduler entry. Mailbox provides
-// its own IRQ-save synchronization for all runtime access.
-unsafe impl Sync for TestMailboxCell {}
-
-static TEST_MAILBOX: TestMailboxCell = TestMailboxCell {
-    value: UnsafeCell::new(MaybeUninit::uninit()),
-    state: AtomicU8::new(MAILBOX_UNINITIALIZED),
-};
+static TEST_MAILBOX: OncePublication<Mailbox<usize>> = OncePublication::new();
 static DELIVERY_STAGE: AtomicUsize = AtomicUsize::new(0);
 static DELIVERY_RESULT: AtomicUsize = AtomicUsize::new(0);
 static DELIVERY_ELAPSED_MS: AtomicUsize = AtomicUsize::new(0);
@@ -68,17 +52,8 @@ static WAIT_WORKER_STAGE: AtomicUsize = AtomicUsize::new(0);
 static WAIT_CAUSE_A: AtomicUsize = AtomicUsize::new(0);
 static WAIT_CAUSE_B: AtomicUsize = AtomicUsize::new(0);
 static MAILBOX_WAIT_RESULT: AtomicUsize = AtomicUsize::new(0);
-static TEST_PREEMPT_LOCK: PreemptLock<usize> = PreemptLock::new(0);
-
-struct PublishedWaitToken(UnsafeCell<MaybeUninit<sched::WaitToken>>);
-
-// SAFETY: the worker writes one Copy token before publishing the release
-// counter; the coordinator reads only after the matching acquire observation.
-// Test cases serialize publications and never overwrite a token while read.
-unsafe impl Sync for PublishedWaitToken {}
-
-static PUBLISHED_WAIT_TOKEN: PublishedWaitToken =
-    PublishedWaitToken(UnsafeCell::new(MaybeUninit::uninit()));
+static TEST_PREEMPT_LOCK: SpinLock<usize> = SpinLock::new(0);
+static PUBLISHED_WAIT_TOKEN: SpinLock<Option<sched::WaitToken>> = SpinLock::new(None);
 
 /// Publish one exact token from the test-only scheduler wait seam.
 ///
@@ -93,9 +68,7 @@ static PUBLISHED_WAIT_TOKEN: PublishedWaitToken =
 ///
 /// Returns after publishing the token for one bounded contract step.
 pub(crate) fn publish_wait_token(token: sched::WaitToken) {
-    // SAFETY: contract cases serialize one writer and wait for each publication
-    // before allowing the worker to publish another token.
-    unsafe { (*PUBLISHED_WAIT_TOKEN.0.get()).write(token) };
+    *PUBLISHED_WAIT_TOKEN.lock() = Some(token);
     WAIT_TOKEN_PUBLISH_COUNT.fetch_add(1, Ordering::Release);
 }
 
@@ -130,22 +103,11 @@ pub(crate) const THREADS: [sched::StaticThread; 4] = [
 /// Panics if called more than once.
 pub(crate) fn init() {
     if TEST_MAILBOX
-        .state
-        .compare_exchange(
-            MAILBOX_UNINITIALIZED,
-            MAILBOX_INITIALIZING,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        )
+        .publish(Mailbox::with_capacity(1, THREADS.len() + 1))
         .is_err()
     {
         panic!("qemu-test: runtime fixtures initialized twice");
     }
-    // SAFETY: this runs once before any static thread can access the cell.
-    unsafe {
-        (*TEST_MAILBOX.value.get()).write(Mailbox::with_capacity(1, THREADS.len() + 1));
-    }
-    TEST_MAILBOX.state.store(MAILBOX_READY, Ordering::Release);
 }
 
 fn coordinator(_arg: ThreadArg) -> usize {
@@ -299,6 +261,10 @@ fn coordinator(_arg: ThreadArg) -> usize {
     protocol::case_start("yield-inside-preempt-guard");
     run_yield_inside_preempt_guard_case();
     protocol::pass("yield-inside-preempt-guard");
+
+    protocol::case_start("kernel-mapping-lifecycle");
+    run_kernel_mapping_lifecycle();
+    protocol::pass("kernel-mapping-lifecycle");
 
     protocol::case_start("allocator-preemption-lifecycle");
     let free_frames_before = memory::free_frame_count()
@@ -569,9 +535,9 @@ fn wait_for_published_wait(previous: usize, case: &str) -> (usize, sched::WaitTo
     loop {
         let observed = WAIT_TOKEN_PUBLISH_COUNT.load(Ordering::Acquire);
         if observed > previous {
-            // SAFETY: the release/acquire counter pair publishes the initialized
-            // Copy token, and cases serialize one publication at a time.
-            let token = unsafe { (*PUBLISHED_WAIT_TOKEN.0.get()).assume_init_read() };
+            let token = PUBLISHED_WAIT_TOKEN
+                .lock()
+                .unwrap_or_else(|| protocol::fail(case, "TOKEN_NOT_PUBLISHED"));
             return (observed, token);
         }
         if crate::time::now_counter() >= deadline {
@@ -825,10 +791,77 @@ fn allocator_worker(arg: ThreadArg) -> usize {
     ALLOCATOR_WORKER_OK
 }
 
-fn test_mailbox() -> &'static Mailbox<usize> {
-    if TEST_MAILBOX.state.load(Ordering::Acquire) != MAILBOX_READY {
-        panic!("qemu-test: mailbox not initialized");
+fn run_kernel_mapping_lifecycle() {
+    use crate::memory::vm::{VmError, VmFlags, VmMemoryAttr};
+
+    const CASE: &str = "kernel-mapping-lifecycle";
+    let free_before =
+        memory::free_frame_count().unwrap_or_else(|| protocol::fail(CASE, "NOT_INITIALIZED"));
+    let backing = memory::alloc_contiguous_frames_aligned(
+        KERNEL_MAPPING_TEST_SIZE / memory::PAGE_SIZE,
+        KERNEL_MAPPING_BLOCK_SIZE,
+    )
+    .unwrap_or_else(|| protocol::fail(CASE, "BACKING_ALLOCATION"));
+    let rw = VmFlags::READ.union(VmFlags::WRITE).union(VmFlags::GLOBAL);
+    let ro = VmFlags::READ.union(VmFlags::GLOBAL);
+
+    // SAFETY: the test VA is a dedicated aligned TTBR1 range, `backing` is an
+    // owned aligned physical block, and every successful mapping is removed
+    // before the frames are returned to the allocator.
+    unsafe {
+        if memory::vm::map_kernel_region(
+            KERNEL_MAPPING_TEST_VA,
+            backing.start,
+            KERNEL_MAPPING_TEST_SIZE,
+            VmMemoryAttr::NormalWriteBack,
+            rw,
+        ) != Ok(())
+        {
+            protocol::fail(CASE, "MAP");
+        }
+        if memory::vm::translate_kernel_va(KERNEL_MAPPING_TEST_VA) != Some(backing.start)
+            || memory::vm::translate_kernel_va(KERNEL_MAPPING_TEST_VA + KERNEL_MAPPING_BLOCK_SIZE)
+                != Some(backing.start + KERNEL_MAPPING_BLOCK_SIZE)
+        {
+            protocol::fail(CASE, "TRANSLATE");
+        }
+        if memory::vm::map_kernel_region(
+            KERNEL_MAPPING_TEST_VA,
+            backing.start,
+            KERNEL_MAPPING_TEST_SIZE,
+            VmMemoryAttr::NormalWriteBack,
+            rw,
+        ) != Err(VmError::AlreadyMapped)
+        {
+            protocol::fail(CASE, "DUPLICATE_MAP");
+        }
+        if memory::vm::protect_kernel_region(KERNEL_MAPPING_TEST_VA, KERNEL_MAPPING_TEST_SIZE, ro)
+            != Ok(())
+            || memory::vm::translate_kernel_va(KERNEL_MAPPING_TEST_VA) != Some(backing.start)
+        {
+            protocol::fail(CASE, "PROTECT");
+        }
+        if memory::vm::unmap_kernel_region(KERNEL_MAPPING_TEST_VA, KERNEL_MAPPING_TEST_SIZE)
+            != Ok(())
+            || memory::vm::translate_kernel_va(KERNEL_MAPPING_TEST_VA).is_some()
+        {
+            protocol::fail(CASE, "UNMAP");
+        }
+        if memory::vm::unmap_kernel_region(KERNEL_MAPPING_TEST_VA, KERNEL_MAPPING_TEST_SIZE)
+            != Err(VmError::MissingMapping)
+        {
+            protocol::fail(CASE, "DUPLICATE_UNMAP");
+        }
     }
-    // SAFETY: acquire observes the mailbox initialized before scheduler entry.
-    unsafe { (&*TEST_MAILBOX.value.get()).assume_init_ref() }
+
+    memory::free_contiguous_frames(backing);
+    if memory::free_frame_count() != Some(free_before) {
+        protocol::fail(CASE, "FRAME_LEAK");
+    }
+}
+
+fn test_mailbox() -> &'static Mailbox<usize> {
+    TEST_MAILBOX
+        .get()
+        .unwrap_or_else(|| panic!("qemu-test: mailbox not initialized"))
 }

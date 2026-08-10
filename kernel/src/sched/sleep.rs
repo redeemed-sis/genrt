@@ -55,7 +55,7 @@ pub(crate) fn on_sleep_sync(
     let prepared = prepare_wait();
     let token = prepared.token();
     output.record_token(token);
-    crate::time::schedule_event(deadline, TimedEvent::WaitDeadline(token));
+    crate::time::schedule_event(deadline, TimedEvent::wait_deadline(token));
     match commit_wait(context, prepared) {
         CommitResult::Blocked(_) => {}
         CommitResult::Early(cause) => output.record_early(cause),

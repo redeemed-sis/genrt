@@ -119,7 +119,8 @@ impl ForkSnapshot {
 fn fork_snapshot_current() -> Result<ForkSnapshot, errno::Errno> {
     let parent_pid = current_process_id().ok_or(errno::EINVAL)?;
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    let slot = table_mut().slot_mut(parent_pid).ok_or(errno::EINVAL)?;
+    let mut table = table_mut();
+    let slot = table.slot_mut(parent_pid).ok_or(errno::EINVAL)?;
     let user_image = slot
         .process
         .resources

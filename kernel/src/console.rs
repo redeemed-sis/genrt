@@ -1,9 +1,11 @@
-use core::cell::UnsafeCell;
-
 use crate::{
     arch::ActiveContext,
     sched::{self, CommitResult, WaitCause, WaitToken},
-    sync::LocalIrqGuard,
+    sync::{IrqSpinLock, LocalIrqGuard},
+};
+use core::{
+    fmt::{self, Write},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 #[cfg(not(test))]
@@ -45,6 +47,8 @@ fn console_putc_raw(c: u8) {
 }
 
 const STDIN_RX_CAPACITY: usize = 256;
+const CONSOLE_TX_CAPACITY: usize = 32 * 1024;
+const CONSOLE_TX_DRAIN_CHUNK: usize = 64;
 
 struct StdinRx {
     ring: [u8; STDIN_RX_CAPACITY],
@@ -124,19 +128,56 @@ impl StdinRx {
     }
 }
 
-struct StdinCell(UnsafeCell<StdinRx>);
+static STDIN_RX: IrqSpinLock<StdinRx> = IrqSpinLock::new(StdinRx::new());
+static CONSOLE_TX: IrqSpinLock<ConsoleTx> = IrqSpinLock::new(ConsoleTx::new());
+static CONSOLE_DRAINING: AtomicBool = AtomicBool::new(false);
 
-// SAFETY: stdin state is protected by local IRQ masking on the current
-// single-core milestone. UART IRQ and syscall paths never access it concurrently
-// with IRQs enabled.
-unsafe impl Sync for StdinCell {}
+struct ConsoleTx {
+    ring: [u8; CONSOLE_TX_CAPACITY],
+    head: usize,
+    tail: usize,
+    len: usize,
+}
 
-static STDIN_RX: StdinCell = StdinCell(UnsafeCell::new(StdinRx::new()));
+impl ConsoleTx {
+    const fn new() -> Self {
+        Self {
+            ring: [0; CONSOLE_TX_CAPACITY],
+            head: 0,
+            tail: 0,
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> bool {
+        if bytes.len() > CONSOLE_TX_CAPACITY - self.len {
+            return false;
+        }
+        for byte in bytes {
+            self.ring[self.tail] = *byte;
+            self.tail = (self.tail + 1) % CONSOLE_TX_CAPACITY;
+        }
+        self.len += bytes.len();
+        true
+    }
+
+    fn pop_chunk(&mut self, out: &mut [u8; CONSOLE_TX_DRAIN_CHUNK]) -> usize {
+        let count = self.len.min(out.len());
+        for destination in &mut out[..count] {
+            *destination = self.ring[self.head];
+            self.head = (self.head + 1) % CONSOLE_TX_CAPACITY;
+        }
+        self.len -= count;
+        count
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
 
 #[inline]
-pub fn putc(c: u8) {
-    console_init_once();
-
+fn putc_raw(c: u8) {
     if c == b'\n' {
         console_putc_raw(b'\r');
     }
@@ -144,16 +185,147 @@ pub fn putc(c: u8) {
     console_putc_raw(c);
 }
 
-pub fn puts(s: &str) {
-    for b in s.bytes() {
-        putc(b);
+fn write_bytes_raw(bytes: &[u8]) {
+    for byte in bytes {
+        putc_raw(*byte);
     }
+}
+
+struct QueueWriter<'a> {
+    queue: &'a mut ConsoleTx,
+    accepted: bool,
+}
+
+impl Write for QueueWriter<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.accepted && self.queue.push(value.as_bytes()) {
+            Ok(())
+        } else {
+            self.accepted = false;
+            Err(fmt::Error)
+        }
+    }
+}
+
+#[cfg(not(test))]
+struct EmergencyWriter;
+
+#[cfg(not(test))]
+impl Write for EmergencyWriter {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        write_bytes_raw(value.as_bytes());
+        Ok(())
+    }
+}
+
+fn drain_console() {
+    if CONSOLE_DRAINING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
+    loop {
+        loop {
+            let mut bytes = [0u8; CONSOLE_TX_DRAIN_CHUNK];
+            let count = CONSOLE_TX.lock().pop_chunk(&mut bytes);
+            if count == 0 {
+                break;
+            }
+            write_bytes_raw(&bytes[..count]);
+        }
+
+        CONSOLE_DRAINING.store(false, Ordering::Release);
+        if CONSOLE_TX.lock().is_empty()
+            || CONSOLE_DRAINING
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+    }
+}
+
+#[inline]
+pub fn putc(c: u8) {
+    write_bytes(core::slice::from_ref(&c));
+}
+
+pub fn puts(s: &str) {
+    write_bytes(s.as_bytes());
+}
+
+/// Write one byte slice as an indivisible normal console message.
+///
+/// # Arguments
+///
+/// * `bytes` - Bytes to write to the architecture console. Newline bytes are
+///   expanded to the console's CRLF sequence by the single TX drainer.
+///
+/// # Returns
+///
+/// Returns after enqueueing the complete message and attempting synchronous
+/// drain. The operation allocates nothing; local IRQs are masked only while
+/// copying into the bounded queue, never while polling UART hardware. A full
+/// queue drops the complete diagnostic message rather than interleaving it.
+pub fn write_bytes(bytes: &[u8]) {
+    console_init_once();
+    if CONSOLE_TX.lock().push(bytes) {
+        drain_console();
+    }
+}
+
+/// Try to format one indivisible normal console message.
+///
+/// # Arguments
+///
+/// * `args` - Borrowed formatting arguments written without heap allocation.
+///
+/// # Returns
+///
+/// Returns `true` after atomically enqueueing the complete message, or `false`
+/// when bounded queue capacity is unavailable. UART polling happens outside
+/// the queue lock with local IRQ delivery restored.
+pub(crate) fn try_write_fmt(args: fmt::Arguments<'_>) -> bool {
+    console_init_once();
+    let accepted = {
+        let mut queue = CONSOLE_TX.lock();
+        let original_tail = queue.tail;
+        let original_len = queue.len;
+        let mut writer = QueueWriter {
+            queue: &mut queue,
+            accepted: true,
+        };
+        let _ = writer.write_fmt(args);
+        let accepted = writer.accepted;
+        drop(writer);
+        if !accepted {
+            queue.tail = original_tail;
+            queue.len = original_len;
+        }
+        accepted
+    };
+    if accepted {
+        drain_console();
+    }
+    accepted
+}
+
+/// Write emergency diagnostics without acquiring the logging serializer.
+///
+/// This is the panic/re-entrant logging fallback. Output may interleave with a
+/// normal message, but it never waits on the logging lock and never allocates.
+#[cfg(not(test))]
+pub(crate) fn emergency_write(args: fmt::Arguments<'_>) {
+    console_init_once();
+    let _ = EmergencyWriter.write_fmt(args);
 }
 
 pub fn on_stdin_byte(byte: u8) {
     let waiter = {
         let _irq_guard = LocalIrqGuard::save_and_disable();
-        let stdin = stdin_mut();
+        let mut stdin = stdin_mut();
         stdin.push(byte)
     };
 
@@ -170,7 +342,7 @@ pub fn read_stdin(buffer: &mut [u8]) -> usize {
     let current = sched::current_thread_id();
     let (len, completed) = {
         let _irq_guard = LocalIrqGuard::save_and_disable();
-        let stdin = stdin_mut();
+        let mut stdin = stdin_mut();
         let len = stdin.pop_into(buffer);
         let completed = current.and_then(|thread| stdin.take_completed(thread));
         (len, completed)
@@ -218,14 +390,15 @@ pub(crate) fn block_current_stdin_read_if_empty(
 ) -> Result<bool, ()> {
     let prepared = {
         let _irq_guard = LocalIrqGuard::save_and_disable();
-        if !stdin_ref().is_empty() {
+        let mut stdin = stdin_mut();
+        if !stdin.is_empty() {
             return Ok(false);
         }
 
         crate::sync::preempt::assert_preemption_enabled("stdin waiter registration");
         let prepared = sched::prepare_wait();
         let token = prepared.token();
-        if !stdin_mut().register_waiter(token) {
+        if !stdin.register_waiter(token) {
             let _ = sched::cancel_wait(prepared);
             return Err(());
         }
@@ -242,12 +415,6 @@ pub(crate) fn block_current_stdin_read_if_empty(
     Ok(true)
 }
 
-fn stdin_mut() -> &'static mut StdinRx {
-    // SAFETY: access discipline documented on `StdinCell`.
-    unsafe { &mut *STDIN_RX.0.get() }
-}
-
-fn stdin_ref() -> &'static StdinRx {
-    // SAFETY: access discipline documented on `StdinCell`.
-    unsafe { &*STDIN_RX.0.get() }
+fn stdin_mut() -> crate::sync::IrqSpinLockGuard<'static, StdinRx> {
+    STDIN_RX.lock()
 }

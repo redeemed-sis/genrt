@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use crate::{
     mmio::{mmio_read32, mmio_write32},
@@ -19,26 +19,45 @@ const ICR_RXIC: u32 = 1 << 4;
 const ICR_RTIC: u32 = 1 << 6;
 const MAX_TX_SPINS: usize = 4096;
 
-static UART_INIT_DONE: AtomicBool = AtomicBool::new(false);
+const UART_UNINITIALIZED: u8 = 0;
+const UART_INITIALIZING: u8 = 1;
+const UART_READY: u8 = 2;
+
+static UART_INIT_STATE: AtomicU8 = AtomicU8::new(UART_UNINITIALIZED);
 static PL011_BASE: AtomicUsize = AtomicUsize::new(0);
 
 pub fn configure_from_platform(platform: &PlatformInfo) {
     if platform.uart.is_present() {
         PL011_BASE.store(
             phys_to_hva_const(platform.uart.start as usize),
-            Ordering::Relaxed,
+            Ordering::Release,
         );
-        UART_INIT_DONE.store(false, Ordering::Relaxed);
+        UART_INIT_STATE.store(UART_UNINITIALIZED, Ordering::Release);
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn arch_console_init_once() {
-    if UART_INIT_DONE.load(Ordering::Relaxed) {
+    if UART_INIT_STATE.load(Ordering::Acquire) == UART_READY {
         return;
     }
-    let base = PL011_BASE.load(Ordering::Relaxed);
+    let base = PL011_BASE.load(Ordering::Acquire);
     if base == 0 {
+        return;
+    }
+
+    if UART_INIT_STATE
+        .compare_exchange(
+            UART_UNINITIALIZED,
+            UART_INITIALIZING,
+            Ordering::Acquire,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        while UART_INIT_STATE.load(Ordering::Acquire) == UART_INITIALIZING {
+            core::hint::spin_loop();
+        }
         return;
     }
 
@@ -54,13 +73,13 @@ pub extern "C" fn arch_console_init_once() {
         mmio_write32(base + 0x30, CR_UARTEN | CR_TXE | CR_RXE);
     }
 
-    UART_INIT_DONE.store(true, Ordering::Relaxed);
+    UART_INIT_STATE.store(UART_READY, Ordering::Release);
 }
 
 pub fn enable_rx_interrupts() {
     arch_console_init_once();
 
-    let base = PL011_BASE.load(Ordering::Relaxed);
+    let base = PL011_BASE.load(Ordering::Acquire);
     if base == 0 {
         return;
     }
@@ -73,7 +92,7 @@ pub fn enable_rx_interrupts() {
 }
 
 pub fn on_uart_irq() {
-    let base = PL011_BASE.load(Ordering::Relaxed);
+    let base = PL011_BASE.load(Ordering::Acquire);
     if base == 0 {
         return;
     }
@@ -92,7 +111,7 @@ pub fn on_uart_irq() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn arch_console_putc_raw(c: u8) {
-    let base = PL011_BASE.load(Ordering::Relaxed);
+    let base = PL011_BASE.load(Ordering::Acquire);
     if base == 0 {
         return;
     }

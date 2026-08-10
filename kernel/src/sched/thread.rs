@@ -214,7 +214,7 @@ pub fn thread_spawn(
 ) -> core::result::Result<ThreadId, SpawnError> {
     let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    let Some(scheduler) = try_scheduler_mut() else {
+    let Some(mut scheduler) = try_scheduler_mut() else {
         return Err(SpawnError::SchedulerNotInitialized);
     };
 
@@ -251,7 +251,7 @@ pub fn thread_join(id: ThreadId) -> core::result::Result<usize, JoinError> {
 pub fn current_thread_id() -> Option<ThreadId> {
     let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    try_scheduler_mut().and_then(|scheduler| scheduler.on_cpu(cpu).running_thread_id())
+    try_scheduler_mut().and_then(|mut scheduler| scheduler.on_cpu(cpu).running_thread_id())
 }
 
 /// Return the active user thread's copyable address-space identifier.
@@ -266,7 +266,7 @@ pub fn current_thread_id() -> Option<ThreadId> {
 pub(crate) fn current_user_address_space() -> Option<AddressSpaceId> {
     let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    try_scheduler_mut().and_then(|scheduler| scheduler.on_cpu(cpu).running_user_address_space())
+    try_scheduler_mut().and_then(|mut scheduler| scheduler.on_cpu(cpu).running_user_address_space())
 }
 
 /// Return a raw pointer to the current user thread's owned stack.
@@ -287,7 +287,7 @@ pub(crate) fn current_user_address_space() -> Option<AddressSpaceId> {
 pub(crate) unsafe fn current_user_stack_ptr() -> Option<*const OwnedUserStack> {
     let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    try_scheduler_mut().and_then(|scheduler| {
+    try_scheduler_mut().and_then(|mut scheduler| {
         let current = scheduler.on_cpu(cpu).running_thread_id()?;
         scheduler
             .thread_user_stack(current.index())
@@ -330,7 +330,7 @@ pub(crate) fn thread_spawn_user(
 ) -> core::result::Result<ThreadId, (SpawnError, OwnedUserStack)> {
     let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    let Some(scheduler) = try_scheduler_mut() else {
+    let Some(mut scheduler) = try_scheduler_mut() else {
         return Err((SpawnError::SchedulerNotInitialized, stack));
     };
 
@@ -371,7 +371,7 @@ pub(crate) fn thread_spawn_user_from_context(
 ) -> core::result::Result<ThreadId, (SpawnError, OwnedUserStack)> {
     let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    let Some(scheduler) = try_scheduler_mut() else {
+    let Some(mut scheduler) = try_scheduler_mut() else {
         return Err((SpawnError::SchedulerNotInitialized, stack));
     };
 
@@ -406,7 +406,7 @@ pub(crate) fn replace_current_user_resources(
 ) -> core::result::Result<UserThreadResources, ((), OwnedUserStack)> {
     let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    let Some(scheduler) = try_scheduler_mut() else {
+    let Some(mut scheduler) = try_scheduler_mut() else {
         return Err(((), stack));
     };
 
@@ -504,8 +504,7 @@ impl CpuScheduler<'_> {
         );
 
         let thread_id =
-            self.for_cpu(target_cpu)
-                .transition_publish_runtime(id, context, None, attrs.joinable);
+            self.transition_publish_runtime(target_cpu, id, context, None, attrs.joinable);
 
         crate::debug!(
             "thread: spawned id={thread_id} joinable={} arg={}",
@@ -536,7 +535,8 @@ impl CpuScheduler<'_> {
         };
         let context = SavedContext::user_entry(user_entry, user_sp, self.stack_top(id), arg0);
 
-        let thread_id = self.for_cpu(target_cpu).transition_publish_runtime(
+        let thread_id = self.transition_publish_runtime(
+            target_cpu,
             id,
             context,
             Some(UserThreadResources::new(address_space, stack)),
@@ -568,7 +568,8 @@ impl CpuScheduler<'_> {
         };
         let child_context = SavedContext::fork_child(context, self.stack_top(id));
 
-        let thread_id = self.for_cpu(target_cpu).transition_publish_runtime(
+        let thread_id = self.transition_publish_runtime(
+            target_cpu,
             id,
             child_context,
             Some(UserThreadResources::new(address_space, stack)),
@@ -650,9 +651,7 @@ impl CpuScheduler<'_> {
             return;
         }
 
-        self.state()
-            .preemption
-            .assert_enabled("thread joiner publication");
+        crate::sync::preempt::assert_preemption_enabled_on(self.cpu(), "thread joiner publication");
         let prepared = self.transition_prepare_wait();
         let token = prepared.token();
         output.record_token(token);

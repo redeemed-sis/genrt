@@ -7,7 +7,27 @@ use super::{
 };
 
 /// Finish one bounded timer IRQ and optionally replace its return context.
-pub(super) fn finish_timer_interrupt(context: &mut ActiveContext<'_>, now: u64) {
+///
+/// The time subsystem calls this after releasing the executing CPU's deadline
+/// queue. The operation may consume one deferred reschedule request and replace
+/// the live IRQ-return context, but it does not allocate.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live timer IRQ context available for an optional
+///   scheduler handoff.
+/// * `now` - Counter value sampled by the time subsystem for this interrupt.
+///
+/// # Returns
+///
+/// Returns after retaining the current thread or installing the selected
+/// thread's saved context into `context`.
+///
+/// # Panics
+///
+/// Panics if current CPU resolution, scheduler ownership, or a context-switch
+/// invariant is invalid.
+pub(crate) fn finish_timer_interrupt(context: &mut ActiveContext<'_>, now: u64) {
     let cpu = current_cpu();
     scheduler_mut()
         .on_cpu(cpu)
@@ -24,11 +44,32 @@ pub(super) fn finish_timer_interrupt(context: &mut ActiveContext<'_>, now: u64) 
 ///
 /// Returns after a bounded completion attempt. Stale or already-completed
 /// deadlines are controlled no-ops.
-pub(super) fn on_wait_deadline(token: WaitToken) {
+///
+/// # Panics
+///
+/// Panics if scheduler ownership or an exact-wait transition invariant is
+/// invalid.
+pub(crate) fn on_wait_deadline(token: WaitToken) {
     let _ = complete_wait(token, WaitCause::Timeout);
 }
 
-pub(super) fn on_quantum_expired(thread: ThreadId) {
+/// Record expiration of one CPU-owned scheduler quantum.
+///
+/// # Arguments
+///
+/// * `thread` - Generation-aware thread identity carried by the expired
+///   quantum event.
+///
+/// # Returns
+///
+/// Returns after a bounded scheduler update. Stale or obsolete quantum events
+/// do not switch context directly; final handoff remains in
+/// finish_timer_interrupt.
+///
+/// # Panics
+///
+/// Panics if current CPU resolution or scheduler ownership is invalid.
+pub(crate) fn on_quantum_expired(thread: ThreadId) {
     let cpu = current_cpu();
     scheduler_mut().on_cpu(cpu).note_quantum_expired(thread);
 }
@@ -86,7 +127,17 @@ pub fn yield_now() {
 /// address-space activation fails.
 pub(crate) fn enter_running_thread() -> ! {
     let cpu = current_cpu();
-    scheduler_mut().on_cpu(cpu).enter_running_thread()
+    let context = {
+        let mut scheduler = scheduler_mut();
+        scheduler.on_cpu(cpu).prepare_running_thread_entry()
+    };
+
+    // SAFETY: the scheduler lock above published this thread as the sole
+    // running owner and returned a pointer into preallocated thread storage.
+    // No scheduler operation can release or replace that running slot before
+    // the first context starts executing. The lock must be dropped before the
+    // diverging architecture entry, otherwise it would remain held forever.
+    unsafe { (&*context).enter() }
 }
 
 /// Service one private EL1 preemption checkpoint against the active context.
@@ -121,18 +172,19 @@ impl CpuScheduler<'_> {
             Some(id) => id,
             None => return,
         };
-        let must_leave_idle = self.state().idle == Some(current) && self.has_runnable_peer();
+        let running_idle = self.state().idle == Some(current);
+        let must_leave_idle = running_idle && self.has_runnable_peer();
         let mut refreshed_quantum_event = false;
 
         if must_leave_idle {
-            self.state_mut().preemption.request();
+            crate::sync::preempt::request_reschedule_on(self.cpu());
         }
 
         // Safe point: timer IRQ return may replace the active frame, but only
         // after the deferred-preemption state confirms depth zero. Timed-event
         // dispatch and timer rearm continue even while a thread holds a guard.
         let online = self.state().online;
-        if self.state_mut().preemption.consume_checkpoint(online) {
+        if crate::sync::preempt::consume_checkpoint_on(self.cpu(), online) {
             self.handoff_optional(context);
 
             self.replace_quantum_event(now, current);
@@ -148,7 +200,7 @@ impl CpuScheduler<'_> {
         // Safe point: the private EL1 sched-call checkpoint owns the optional
         // thread-context handoff. It acknowledges only an existing request.
         let online = self.state().online;
-        if !self.state_mut().preemption.consume_checkpoint(online) {
+        if !crate::sync::preempt::consume_checkpoint_on(self.cpu(), online) {
             return;
         }
 
@@ -163,7 +215,7 @@ impl CpuScheduler<'_> {
         // A mandatory handoff also acknowledges any stale request at its
         // depth-zero checkpoint; it never needs to select a second thread.
         let online = self.state().online;
-        let _ = self.state_mut().preemption.consume_checkpoint(online);
+        let _ = crate::sync::preempt::consume_checkpoint_on(self.cpu(), online);
         let now = crate::time::now_counter();
         self.replace_quantum_event(now, current);
         if next != current {
@@ -171,7 +223,16 @@ impl CpuScheduler<'_> {
         }
     }
 
-    pub(super) fn enter_running_thread(&mut self) -> ! {
+    /// Publish first-entry state and return the stable saved context to enter.
+    ///
+    /// The caller must release scheduler ownership before invoking the
+    /// non-returning architecture entry on the returned pointer.
+    ///
+    /// # Returns
+    ///
+    /// Returns a stable pointer into the preallocated running thread slot.
+    /// This bounded preparation does not allocate or perform the context entry.
+    pub(super) fn prepare_running_thread_entry(&mut self) -> *const crate::arch::SavedContext {
         let running = self
             .running_thread()
             .unwrap_or_else(|| panic!("scheduler has no running thread"));
@@ -185,7 +246,7 @@ impl CpuScheduler<'_> {
         debug_assert_eq!(self.thread_state(running.index()), ThreadState::Running);
         self.activate_thread_address_space(running);
         self.state_mut().online = true;
-        self.saved_context(running).enter()
+        self.saved_context(running) as *const crate::arch::SavedContext
     }
 
     pub(super) fn running_thread(&self) -> Option<super::ThreadId> {
@@ -194,7 +255,7 @@ impl CpuScheduler<'_> {
 
     pub(super) fn note_quantum_expired(&mut self, thread: ThreadId) {
         if self.running_thread() == Some(thread) {
-            self.state_mut().preemption.request();
+            crate::sync::preempt::request_reschedule_on(self.cpu());
             crate::trace!("sched: quantum expired thread {thread}");
         }
     }
@@ -215,13 +276,14 @@ impl CpuScheduler<'_> {
         }
     }
 
-    pub(super) fn has_runnable_peer(&self) -> bool {
+    pub(super) fn has_runnable_peer(&mut self) -> bool {
+        self.drain_remote_ready();
         self.transition_has_ready()
     }
 
     pub(super) fn note_runnable_peer_available(&mut self) {
         if self.current_thread().is_some() && self.has_runnable_peer() {
-            self.state_mut().preemption.request();
+            crate::sync::preempt::request_reschedule_on(self.cpu());
             self.ensure_quantum_event(crate::time::now_counter());
         }
     }
@@ -231,7 +293,7 @@ impl CpuScheduler<'_> {
             return;
         };
 
-        let event = TimedEvent::QuantumExpired(current);
+        let event = TimedEvent::quantum_expired(self.cpu(), current);
         if !self.has_runnable_peer() {
             crate::time::cancel_event(event);
             return;
@@ -250,7 +312,7 @@ impl CpuScheduler<'_> {
     }
 
     pub(super) fn replace_quantum_event(&mut self, now: u64, obsolete_thread: ThreadId) {
-        crate::time::cancel_event(TimedEvent::QuantumExpired(obsolete_thread));
+        crate::time::cancel_event(TimedEvent::quantum_expired(self.cpu(), obsolete_thread));
         self.ensure_quantum_event(now);
     }
 

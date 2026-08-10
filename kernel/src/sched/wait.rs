@@ -4,7 +4,7 @@
 //! The transition layer consumes this module's inline state machine while it owns
 //! lifecycle state and ready-queue membership.
 
-use crate::{arch::ActiveContext, sched::ThreadId, sync::LocalIrqGuard};
+use crate::{arch::ActiveContext, cpu::CpuId, sched::ThreadId, sync::LocalIrqGuard};
 
 use super::{scheduler_mut, transition::SwitchOutcome};
 
@@ -19,11 +19,14 @@ pub(crate) struct WaitSequence(u64);
 /// Copyable identity for one exact scheduler wait registration.
 ///
 /// External bounded queues may retain this token, but they must not infer or
-/// store a wait payload in the scheduler. Completion validates both the thread
-/// generation and this per-slot sequence under scheduler transition ownership.
+/// store a wait payload in the scheduler. Completion validates the thread
+/// generation and per-slot sequence under scheduler transition ownership. The
+/// captured immutable home CPU identifies the deadline queue that may time out
+/// this wait.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct WaitToken {
     thread: ThreadId,
+    cpu: CpuId,
     sequence: WaitSequence,
 }
 
@@ -36,6 +39,17 @@ impl WaitToken {
     /// state, allocating, blocking, or touching IRQ state.
     pub(crate) const fn thread(self) -> ThreadId {
         self.thread
+    }
+
+    /// Return the immutable home CPU that owns this wait's timed events.
+    ///
+    /// # Returns
+    ///
+    /// Returns the logical CPU captured when the current thread prepared this
+    /// wait. This copy-only operation does not allocate, block, or alter IRQ
+    /// or scheduler state.
+    pub(crate) const fn cpu(self) -> CpuId {
+        self.cpu
     }
 
     /// Return the monotonically increasing identity of this wait episode.
@@ -162,7 +176,7 @@ impl WaitMetadata {
         self.next_sequence
     }
 
-    pub(super) fn prepare(&mut self, thread: ThreadId) -> PreparedWait {
+    pub(super) fn prepare(&mut self, thread: ThreadId, cpu: CpuId) -> PreparedWait {
         if self.state != WaitState::None {
             panic!("sched: new wait before prior completion is consumed");
         }
@@ -172,6 +186,7 @@ impl WaitMetadata {
             .unwrap_or_else(|| panic!("sched: wait sequence overflow before publication"));
         let token = WaitToken {
             thread,
+            cpu,
             sequence: WaitSequence(self.next_sequence),
         };
         self.state = WaitState::Prepared { token };
@@ -489,9 +504,13 @@ mod tests {
 
     const THREAD: ThreadId = ThreadId::new(1, 7);
 
+    fn cpu0() -> CpuId {
+        CpuId::from_index(0).unwrap()
+    }
+
     fn prepared() -> (WaitMetadata, PreparedWait) {
         let mut wait = WaitMetadata::with_next_sequence(0);
-        let prepared = wait.prepare(THREAD);
+        let prepared = wait.prepare(THREAD, cpu0());
         (wait, prepared)
     }
 
@@ -527,7 +546,7 @@ mod tests {
     fn cancel_and_first_completion_win() {
         let (mut wait, prepared) = prepared();
         assert_eq!(wait.cancel(prepared), CancelResult::Cancelled);
-        let prepared = wait.prepare(THREAD);
+        let prepared = wait.prepare(THREAD, cpu0());
         let token = prepared.token();
         assert_eq!(
             wait.complete(token, WaitCause::Notified),
@@ -541,7 +560,7 @@ mod tests {
             wait.commit(prepared),
             CommitState::Early(WaitCause::Notified)
         );
-        let prepared = wait.prepare(THREAD);
+        let prepared = wait.prepare(THREAD, cpu0());
         let token = prepared.token();
         assert_eq!(
             wait.complete(token, WaitCause::Timeout),
@@ -571,11 +590,11 @@ mod tests {
             CompletionResult::AlreadyCompleted
         );
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = wait.prepare(THREAD);
+            let _ = wait.prepare(THREAD, cpu0());
         }));
         assert!(rejected.is_err());
         assert_eq!(wait.finish(token), Ok(WaitCause::Notified));
-        let _next = wait.prepare(THREAD);
+        let _next = wait.prepare(THREAD, cpu0());
     }
 
     #[test]
@@ -584,10 +603,17 @@ mod tests {
         let token = prepared.token();
         let stale_sequence = WaitToken {
             thread: THREAD,
+            cpu: token.cpu,
             sequence: WaitSequence(99),
         };
         let stale_generation = WaitToken {
             thread: ThreadId::new(1, 8),
+            cpu: token.cpu,
+            sequence: token.sequence,
+        };
+        let stale_cpu = WaitToken {
+            thread: THREAD,
+            cpu: CpuId::from_index(1).unwrap(),
             sequence: token.sequence,
         };
         assert_eq!(
@@ -596,6 +622,10 @@ mod tests {
         );
         assert_eq!(
             wait.complete(stale_generation, WaitCause::Notified),
+            CompletionResult::Stale
+        );
+        assert_eq!(
+            wait.complete(stale_cpu, WaitCause::Notified),
             CompletionResult::Stale
         );
         assert_eq!(wait.commit(prepared), CommitState::Block(token));
@@ -607,6 +637,6 @@ mod tests {
     fn sequence_overflow_panics_before_publication() {
         let mut wait = WaitMetadata::with_next_sequence(0);
         wait.set_next_sequence_for_test(u64::MAX);
-        let _ = wait.prepare(THREAD);
+        let _ = wait.prepare(THREAD, cpu0());
     }
 }

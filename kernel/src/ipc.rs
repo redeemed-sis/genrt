@@ -6,7 +6,7 @@ use crate::{
     sched::{
         self, CommitResult, CompletionResult, WaitCause, WaitToken, call::SchedCallWaitOutput,
     },
-    sync::{LocalIrqGuard, LocalIrqLock},
+    sync::{IrqSpinLock, LocalIrqGuard},
     time::TimedEvent,
 };
 
@@ -59,11 +59,12 @@ impl MailboxWaitKind {
 /// runtime storage is reserved at construction, and send/receive paths do not
 /// allocate while the scheduler is active.
 pub struct Mailbox<T> {
-    control: LocalIrqLock<MailboxControl>,
+    control: IrqSpinLock<MailboxControl>,
     buffer: UnsafeCell<Vec<Option<T>>>,
 }
 
-// SAFETY: local IRQ exclusion serializes the control and generic buffer.
+// SAFETY: `control` is an IRQ-safe SMP lock that serializes buffer indices and
+// slots; generic payload ownership never escapes the critical section.
 unsafe impl<T: Send> Sync for Mailbox<T> {}
 
 impl<T> Mailbox<T> {
@@ -77,7 +78,7 @@ impl<T> Mailbox<T> {
             buffer.push(None);
         }
         Self {
-            control: LocalIrqLock::new(MailboxControl::with_capacity(capacity, waiter_capacity)),
+            control: IrqSpinLock::new(MailboxControl::with_capacity(capacity, waiter_capacity)),
             buffer: UnsafeCell::new(buffer),
         }
     }
@@ -96,7 +97,6 @@ impl<T> Mailbox<T> {
     }
 
     pub fn try_send(&self, msg: T) -> Result<(), SendError<T>> {
-        let _irq_guard = LocalIrqGuard::save_and_disable();
         let (len, waiter) = {
             let mut control = self.control.lock();
             if control.is_full() {
@@ -115,7 +115,6 @@ impl<T> Mailbox<T> {
     }
 
     pub fn try_recv(&self) -> Result<T, RecvError> {
-        let _irq_guard = LocalIrqGuard::save_and_disable();
         let (msg, len, waiter) = {
             let mut control = self.control.lock();
             if control.is_empty() {
@@ -231,17 +230,16 @@ impl<T> Mailbox<T> {
     }
 
     fn control_ptr(&self) -> *const core::ffi::c_void {
-        &self.control as *const LocalIrqLock<MailboxControl> as *const core::ffi::c_void
+        &self.control as *const IrqSpinLock<MailboxControl> as *const core::ffi::c_void
     }
 
     fn remove_waiter(&self, kind: MailboxWaitKind, token: WaitToken) -> bool {
-        let _irq_guard = LocalIrqGuard::save_and_disable();
         self.control.lock().remove_waiter(kind, token)
     }
 
     fn complete_claimed_waiters(&self, kind: MailboxWaitKind, mut token: Option<WaitToken>) {
         while let Some(wait) = token {
-            crate::time::cancel_event(TimedEvent::WaitDeadline(wait));
+            crate::time::cancel_event(TimedEvent::wait_deadline(wait));
             match sched::complete_wait(wait, WaitCause::Notified) {
                 CompletionResult::WokeBlocked | CompletionResult::CompletedPrepared => return,
                 CompletionResult::AlreadyCompleted | CompletionResult::Stale => {
@@ -362,7 +360,7 @@ impl MailboxControl {
 ///
 /// # Safety
 ///
-/// `control` must point to the live `LocalIrqLock<MailboxControl>` owned by the
+/// `control` must point to the live `IrqSpinLock<MailboxControl>` owned by the
 /// calling mailbox and remain valid across a blocked sched-call interval.
 pub(crate) fn on_mailbox_wait_sync(
     context: &mut ActiveContext<'_>,
@@ -378,7 +376,7 @@ pub(crate) fn on_mailbox_wait_sync(
         .unwrap_or_else(|| panic!("ipc: invalid mailbox wait kind {raw_wait_kind}"));
     let _irq_guard = LocalIrqGuard::save_and_disable();
     // SAFETY: sched-call users pass the stable control lock of their mailbox.
-    let owner = unsafe { &*(control.cast::<LocalIrqLock<MailboxControl>>()) };
+    let owner = unsafe { &*(control.cast::<IrqSpinLock<MailboxControl>>()) };
     let prepared = {
         let mut state = owner.lock();
         if !state.should_wait(kind) {
@@ -393,7 +391,7 @@ pub(crate) fn on_mailbox_wait_sync(
         output.record_token(token);
         state.enqueue_waiter(kind, token);
         if let Some(deadline) = timeout_deadline {
-            crate::time::schedule_event(deadline, TimedEvent::WaitDeadline(token));
+            crate::time::schedule_event(deadline, TimedEvent::wait_deadline(token));
         }
         prepared
     };
@@ -401,5 +399,50 @@ pub(crate) fn on_mailbox_wait_sync(
         CommitResult::Blocked(_) => {}
         CommitResult::Early(cause) => output.record_early(cause),
         CommitResult::Stale => panic!("ipc: mailbox wait became stale before commit"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::Arc, thread};
+
+    #[test]
+    fn mailbox_buffer_survives_host_contention() {
+        const ITEMS: usize = 2_000;
+        let mailbox = Arc::new(Mailbox::with_capacity(8, 0));
+        let producer_mailbox = Arc::clone(&mailbox);
+        let producer = thread::spawn(move || {
+            for value in 0..ITEMS {
+                let mut pending = value;
+                loop {
+                    match producer_mailbox.try_send(pending) {
+                        Ok(()) => break,
+                        Err(SendError::Full(value)) => {
+                            pending = value;
+                            thread::yield_now();
+                        }
+                    }
+                }
+            }
+        });
+        let consumer = thread::spawn(move || {
+            let mut sum = 0usize;
+            for _ in 0..ITEMS {
+                loop {
+                    match mailbox.try_recv() {
+                        Ok(value) => {
+                            sum += value;
+                            break;
+                        }
+                        Err(RecvError::Empty) => thread::yield_now(),
+                    }
+                }
+            }
+            sum
+        });
+
+        producer.join().unwrap();
+        assert_eq!(consumer.join().unwrap(), (0..ITEMS).sum());
     }
 }

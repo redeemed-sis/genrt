@@ -116,6 +116,11 @@ subject = "yield-inside-preempt-guard"
 [[steps]]
 action = "expect_case"
 producer = "kernel"
+subject = "kernel-mapping-lifecycle"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
 subject = "allocator-preemption-lifecycle"
 
 [[steps]]

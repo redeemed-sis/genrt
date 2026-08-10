@@ -1,10 +1,11 @@
-use alloc::vec::Vec;
-use core::cell::UnsafeCell;
-
 use crate::{
     arch::ActiveContext,
+    config::KERNEL_CPU_CAPACITY,
+    cpu::{self, CpuId},
     sched::{ThreadId, WaitToken},
+    sync::IrqSpinLock,
 };
+use alloc::vec::Vec;
 
 unsafe extern "C" {
     fn arch_counter_now() -> u64;
@@ -13,9 +14,6 @@ unsafe extern "C" {
     fn arch_timer_disarm();
 }
 
-type FinishTimerInterruptHandler = fn(&mut ActiveContext<'_>, u64);
-type TimedThreadHandler = fn(ThreadId);
-
 /// Preallocated timed-event slots reserved for each scheduler thread slot.
 ///
 /// One thread may concurrently own one exact wait deadline and one scheduler
@@ -23,39 +21,70 @@ type TimedThreadHandler = fn(ThreadId);
 /// scheduler bootstrap multiplies this constant by thread capacity.
 pub(crate) const TIMED_EVENT_CAPACITY_PER_THREAD: usize = 3;
 
+/// Exact deadline identity stored in one logical CPU's bounded time queue.
+///
+/// Event construction and comparison are copy-only. Queue mutation and timer
+/// programming occur only through the time subsystem APIs below.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TimedEvent {
     /// Time-owned deadline for one exact externally published wait.
-    WaitDeadline(WaitToken),
-    QuantumExpired(ThreadId),
+    WaitDeadline { cpu: CpuId, token: WaitToken },
+    /// Round-robin quantum owned by one CPU-local scheduler context.
+    QuantumExpired { cpu: CpuId, thread: ThreadId },
 }
 
 impl TimedEvent {
+    /// Construct a deadline event for one exact scheduler wait.
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - Exact wait registration whose immutable home CPU owns the
+    ///   resulting event.
+    ///
+    /// # Returns
+    ///
+    /// Returns a copyable event identity. Construction does not allocate,
+    /// block, or alter IRQ, timer, or scheduler state.
+    pub(crate) const fn wait_deadline(token: WaitToken) -> Self {
+        Self::WaitDeadline {
+            cpu: token.cpu(),
+            token,
+        }
+    }
+
+    /// Construct a quantum-expiration event for one running thread.
+    ///
+    /// # Arguments
+    ///
+    /// * `cpu` - Logical CPU whose scheduler context and timer own the event.
+    /// * `thread` - Generation-aware running thread identity.
+    ///
+    /// # Returns
+    ///
+    /// Returns a copyable event identity. Construction does not allocate,
+    /// block, or alter IRQ, timer, or scheduler state.
+    pub(crate) const fn quantum_expired(cpu: CpuId, thread: ThreadId) -> Self {
+        Self::QuantumExpired { cpu, thread }
+    }
+
+    const fn cpu(self) -> CpuId {
+        match self {
+            Self::WaitDeadline { cpu, .. } | Self::QuantumExpired { cpu, .. } => cpu,
+        }
+    }
+
     fn sort_key(self) -> (u8, usize, u32, u64) {
         match self {
-            Self::WaitDeadline(token) => (
+            Self::WaitDeadline { token, .. } => (
                 0,
                 token.thread().index(),
                 token.thread().generation(),
                 token.sequence(),
             ),
-            Self::QuantumExpired(thread) => (1, thread.index(), thread.generation(), 0),
+            Self::QuantumExpired { thread, .. } => (1, thread.index(), thread.generation(), 0),
         }
     }
 }
-
-#[derive(Copy, Clone)]
-pub(crate) struct TimeHandlers {
-    /// Finish one timer interrupt after all expired events are dispatched.
-    pub finish_timer_interrupt: FinishTimerInterruptHandler,
-    /// Complete one exact wait deadline without acquiring an owner lock.
-    pub wait_deadline: TimedWaitHandler,
-    /// Mark one generation-aware thread quantum as expired.
-    pub quantum_expired: TimedThreadHandler,
-}
-
-/// Allocation-free time callback for one exact wait deadline.
-pub(crate) type TimedWaitHandler = fn(WaitToken);
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct DeadlineEntry {
@@ -76,10 +105,6 @@ impl DeadlineQueue {
 
     fn capacity(&self) -> usize {
         self.entries.capacity()
-    }
-
-    fn reset(&mut self) {
-        self.entries.clear();
     }
 
     fn schedule(&mut self, deadline: u64, event: TimedEvent) {
@@ -202,10 +227,10 @@ impl DeadlineQueue {
 }
 
 struct TimeState {
-    // `kernel::time` remains the sole owner of timed events:
+    // Each logical CPU owns one independent instance of this state:
     // - registration/cancellation/update,
     // - nearest-deadline selection,
-    // - one-shot timer reprogramming,
+    // - that CPU's one-shot timer reprogramming,
     // - expired-event dispatch on timer IRQ.
     //
     // The deadline queue is heap-backed but fully reserved during bootstrap so
@@ -213,23 +238,15 @@ struct TimeState {
     queue: DeadlineQueue,
     armed_timer_deadline: Option<u64>,
     dispatching_irq: bool,
-    handlers: TimeHandlers,
 }
 
 impl TimeState {
-    fn new(handlers: TimeHandlers, deadline_capacity: usize) -> Self {
+    fn new(deadline_capacity: usize) -> Self {
         Self {
             queue: DeadlineQueue::with_capacity(deadline_capacity),
             armed_timer_deadline: None,
             dispatching_irq: false,
-            handlers,
         }
-    }
-
-    fn reset(&mut self) {
-        self.queue.reset();
-        self.armed_timer_deadline = None;
-        self.dispatching_irq = false;
     }
 
     fn schedule_event(&mut self, deadline: u64, event: TimedEvent) {
@@ -262,12 +279,11 @@ impl TimeState {
     }
 }
 
-struct TimeCell(UnsafeCell<Option<TimeState>>);
-
-// SAFETY: genrt currently mutates time state only on a single core.
-unsafe impl Sync for TimeCell {}
-
-static TIME: TimeCell = TimeCell(UnsafeCell::new(None));
+// Every queue is independently bounded and protected. Runtime APIs select a
+// queue by explicit event ownership or by the executing logical CPU; only the
+// owner CPU may program the corresponding architected physical timer.
+static CPU_TIME: [IrqSpinLock<Option<TimeState>>; KERNEL_CPU_CAPACITY] =
+    [const { IrqSpinLock::new(None) }; KERNEL_CPU_CAPACITY];
 
 #[inline(always)]
 pub fn now_counter() -> u64 {
@@ -301,45 +317,138 @@ pub fn uptime_ms() -> u64 {
     now_counter() / ms_to_counts(1)
 }
 
-pub(crate) fn init(handlers: TimeHandlers, deadline_capacity: usize) {
-    let slot = time_slot_mut();
+/// Initialize the executing CPU's bounded deadline queue and local timer.
+///
+/// Scheduler bootstrap calls this only after publishing shared scheduler
+/// lifecycle state. Capacity reservation allocates during bootstrap; runtime
+/// schedule, cancel, and IRQ dispatch paths never grow the queue.
+///
+/// # Arguments
+///
+/// * `deadline_capacity` - Maximum number of timed events owned concurrently
+///   by the executing logical CPU.
+///
+/// # Returns
+///
+/// Returns after publishing an empty queue and disarming the executing CPU's
+/// architected timer.
+///
+/// # Panics
+///
+/// Panics if the executing CPU is not registered, its queue is already
+/// initialized, or bootstrap allocation cannot reserve the requested capacity.
+pub(crate) fn init_current_cpu(deadline_capacity: usize) {
+    let cpu = current_cpu();
+    let mut slot = time_slot(cpu).lock();
     if slot.is_some() {
-        panic!("time: already initialized");
+        panic!("time: CPU{} already initialized", cpu.index());
     }
 
-    // Scheduler bootstrap publishes the global `Scheduler` before calling
-    // `time::init()`, so any timer callback installed here can safely resolve
-    // scheduler-owned state once timer IRQ dispatch becomes active.
-    let mut state = TimeState::new(handlers, deadline_capacity);
-    state.reset();
-    crate::debug!("time: deadline queue capacity={}", state.queue.capacity());
+    let state = TimeState::new(deadline_capacity);
+    let capacity = state.queue.capacity();
     program_timer_deadline(None);
     *slot = Some(state);
+    drop(slot);
+    crate::debug!(
+        "time: CPU{} deadline queue capacity={capacity}",
+        cpu.index()
+    );
 }
 
+/// Schedule or update an event on the executing CPU's deadline queue.
+///
+/// This bounded runtime path takes the owner queue's IRQ-safe lock and may
+/// reprogram only the executing CPU's architected timer. It never allocates.
+/// Remote insertion is rejected until an IPI-backed remote timer command
+/// exists.
+///
+/// # Arguments
+///
+/// * `deadline` - Absolute architecture counter value at which the event is
+///   eligible for dispatch.
+/// * `event` - Exact event identity whose owner must be the executing CPU.
+///
+/// # Returns
+///
+/// Returns after the event is present and the local timer reflects the nearest
+/// deadline.
+///
+/// # Panics
+///
+/// Panics if CPU identity cannot be resolved, the event belongs to another
+/// CPU, the local queue is uninitialized, or its reserved capacity is exhausted.
 pub(crate) fn schedule_event(deadline: u64, event: TimedEvent) {
-    let now = now_counter();
-    let time = time_mut();
-    time.schedule_event(deadline, event);
-    crate::trace!("time: scheduled {event:?} deadline={deadline}");
-    if !time.dispatching_irq {
-        time.rearm_timer(now);
+    let cpu = current_cpu();
+    if event.cpu() != cpu {
+        panic!(
+            "time: remote schedule from CPU{} to CPU{} requires IPI support",
+            cpu.index(),
+            event.cpu().index()
+        );
     }
-}
-
-pub(crate) fn cancel_event(event: TimedEvent) {
     let now = now_counter();
-    let time = time_mut();
-    if time.cancel_event(event) {
-        crate::trace!("time: canceled {event:?}");
+    with_time_mut(cpu, |time| {
+        time.schedule_event(deadline, event);
         if !time.dispatching_irq {
             time.rearm_timer(now);
         }
+    });
+    crate::trace!("time: scheduled {event:?} deadline={deadline}");
+}
+
+/// Cancel an exact event from its owning CPU queue.
+///
+/// Cancellation may be requested by another CPU after an external condition
+/// wins a timed wait. The target queue mutation is synchronized, but only the
+/// owner CPU may touch its physical timer. A remote cancellation can therefore
+/// leave one harmless early timer interrupt; that interrupt observes the
+/// updated queue and rearms locally. This path is bounded and allocation-free.
+///
+/// # Arguments
+///
+/// * `event` - Exact event identity, including its owning logical CPU.
+///
+/// # Returns
+///
+/// Returns after removing the event when present. Missing, already-dispatched,
+/// and stale events are controlled no-ops.
+///
+/// # Panics
+///
+/// Panics if current CPU identity cannot be resolved or the owner queue is not
+/// initialized.
+pub(crate) fn cancel_event(event: TimedEvent) {
+    let current = current_cpu();
+    let owner = event.cpu();
+    let now = now_counter();
+    let canceled = with_time_mut(owner, |time| {
+        let canceled = time.cancel_event(event);
+        if current == owner && !time.dispatching_irq {
+            time.rearm_timer(now);
+        }
+        canceled
+    });
+    if canceled {
+        crate::trace!("time: canceled {event:?}");
     }
 }
 
+/// Test whether an exact event remains queued on its owner CPU.
+///
+/// # Arguments
+///
+/// * `event` - Exact event identity, including its owning logical CPU.
+///
+/// # Returns
+///
+/// Returns `true` when the owner queue still contains the event, or `false`
+/// after cancellation or dispatch. The bounded query allocates nothing.
+///
+/// # Panics
+///
+/// Panics if the owner queue is not initialized.
 pub(crate) fn event_pending(event: TimedEvent) -> bool {
-    time_ref().event_pending(event)
+    with_time(event.cpu(), |time| time.event_pending(event))
 }
 
 /// Dispatch expired timed events and complete scheduler IRQ-return handoff.
@@ -361,9 +470,10 @@ pub fn on_timer_interrupt(context: &mut ActiveContext<'_>) {
     #[cfg(feature = "qemu-test-kernel-runtime")]
     crate::test_support::kernel_runtime::note_timer_irq();
 
-    if try_time_mut().is_none() {
+    let cpu = current_cpu();
+    if time_slot(cpu).lock().is_none() {
         // Keep stray early-boot timer IRQs from ever reaching scheduler
-        // callbacks before `time::init()` installs their handler table.
+        // state before this CPU's queue is initialized.
         program_timer_deadline(None);
         return;
     }
@@ -372,33 +482,43 @@ pub fn on_timer_interrupt(context: &mut ActiveContext<'_>) {
     // against local IRQ reentrancy for ordinary thread-context allocations, but
     // timed-event dispatch itself must stay on preallocated, bounded state.
     let now = now_counter();
-    let handlers = {
-        let time = time_mut();
+    with_time_mut(cpu, |time| {
         time.dispatching_irq = true;
-        time.handlers
-    };
+    });
 
-    while let Some(event) = time_mut().pop_expired(now) {
-        dispatch_expired_event(handlers, event);
+    // Do not retain the time owner across scheduler dispatch: completion can
+    // acquire scheduler state and potentially select another return context.
+    while let Some(event) = with_time_mut(cpu, |time| time.pop_expired(now)) {
+        dispatch_expired_event(cpu, event);
     }
 
-    (handlers.finish_timer_interrupt)(context, now);
+    crate::sched::finish_timer_interrupt(context, now);
 
-    let time = time_mut();
-    time.dispatching_irq = false;
-    time.rearm_timer(now);
+    with_time_mut(cpu, |time| {
+        time.dispatching_irq = false;
+        time.rearm_timer(now);
+    });
 }
 
 #[inline(always)]
-fn dispatch_expired_event(handlers: TimeHandlers, event: TimedEvent) {
+fn dispatch_expired_event(cpu: CpuId, event: TimedEvent) {
+    if event.cpu() != cpu {
+        panic!(
+            "time: CPU{} dequeued event owned by CPU{}",
+            cpu.index(),
+            event.cpu().index()
+        );
+    }
     match event {
-        TimedEvent::WaitDeadline(token) => {
+        TimedEvent::WaitDeadline { token, .. } => {
             crate::trace!("time: dispatch WaitDeadline({token:?})");
-            (handlers.wait_deadline)(token);
+            crate::sched::on_wait_deadline(token);
         }
-        TimedEvent::QuantumExpired(thread_id) => {
+        TimedEvent::QuantumExpired {
+            thread: thread_id, ..
+        } => {
             crate::trace!("time: dispatch QuantumExpired({thread_id})");
-            (handlers.quantum_expired)(thread_id);
+            crate::sched::on_quantum_expired(thread_id);
         }
     }
 }
@@ -418,28 +538,31 @@ fn program_timer_deadline(deadline: Option<u64>) {
 }
 
 #[inline(always)]
-fn time_slot_mut() -> &'static mut Option<TimeState> {
-    // SAFETY: Access is single-writer in the current single-core bring-up model.
-    unsafe { &mut *TIME.0.get() }
-}
-
-#[inline(always)]
-fn time_mut() -> &'static mut TimeState {
-    time_slot_mut()
+fn with_time_mut<R>(cpu: CpuId, f: impl FnOnce(&mut TimeState) -> R) -> R {
+    let mut time = time_slot(cpu).lock();
+    f(time
         .as_mut()
-        .unwrap_or_else(|| panic!("time: subsystem is not initialized"))
+        .unwrap_or_else(|| panic!("time: CPU{} is not initialized", cpu.index())))
 }
 
 #[inline(always)]
-fn try_time_mut() -> Option<&'static mut TimeState> {
-    time_slot_mut().as_mut()
-}
-
-#[inline(always)]
-fn time_ref() -> &'static TimeState {
-    time_slot_mut()
+fn with_time<R>(cpu: CpuId, f: impl FnOnce(&TimeState) -> R) -> R {
+    let time = time_slot(cpu).lock();
+    f(time
         .as_ref()
-        .unwrap_or_else(|| panic!("time: subsystem is not initialized"))
+        .unwrap_or_else(|| panic!("time: CPU{} is not initialized", cpu.index())))
+}
+
+#[inline(always)]
+fn time_slot(cpu: CpuId) -> &'static IrqSpinLock<Option<TimeState>> {
+    CPU_TIME
+        .get(cpu.index())
+        .unwrap_or_else(|| panic!("time: invalid CPU{} queue", cpu.index()))
+}
+
+#[inline(always)]
+fn current_cpu() -> CpuId {
+    cpu::current_id().unwrap_or_else(|err| panic!("time: current CPU lookup failed: {err:?}"))
 }
 
 #[inline(always)]
@@ -457,4 +580,28 @@ fn scale_to_counts(units: u64, denom_per_second: u64) -> u64 {
 #[inline(always)]
 fn div_ceil(numerator: u128, denominator: u128) -> u128 {
     numerator.div_ceil(denominator)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_queues_keep_cpu_owned_events_separate() {
+        let cpu0 = CpuId::from_index(0).unwrap();
+        let cpu1 = CpuId::from_index(1).unwrap();
+        let thread = ThreadId::new(3, 7);
+        let event0 = TimedEvent::quantum_expired(cpu0, thread);
+        let event1 = TimedEvent::quantum_expired(cpu1, thread);
+        let mut queue0 = DeadlineQueue::with_capacity(1);
+        let mut queue1 = DeadlineQueue::with_capacity(1);
+
+        queue0.schedule(10, event0);
+        queue1.schedule(20, event1);
+
+        assert!(queue0.event_pending(event0));
+        assert!(!queue0.event_pending(event1));
+        assert!(queue1.event_pending(event1));
+        assert!(!queue1.event_pending(event0));
+    }
 }

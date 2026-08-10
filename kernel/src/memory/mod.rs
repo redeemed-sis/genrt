@@ -1,11 +1,6 @@
-use core::{
-    cell::UnsafeCell,
-    sync::atomic::{AtomicBool, Ordering},
-};
-
 use bootinfo::BootInfo;
 
-use crate::sync::PreemptLock;
+use crate::sync::{OncePublication, SpinLock};
 
 mod frame_alloc;
 pub mod heap;
@@ -119,15 +114,7 @@ impl MemoryMetadata {
     }
 }
 
-struct MemoryMetadataCell(UnsafeCell<MemoryMetadata>);
-
-// SAFETY: metadata is written only during single-core boot before scheduler
-// entry and remains immutable for the rest of runtime.
-unsafe impl Sync for MemoryMetadataCell {}
-
-static MEMORY_METADATA: MemoryMetadataCell =
-    MemoryMetadataCell(UnsafeCell::new(MemoryMetadata::new()));
-static MEMORY_METADATA_READY: AtomicBool = AtomicBool::new(false);
+static MEMORY_METADATA: OncePublication<MemoryMetadata> = OncePublication::new();
 
 struct RuntimeFrameAllocator {
     initialized: bool,
@@ -148,8 +135,8 @@ impl RuntimeFrameAllocator {
     }
 }
 
-static FRAME_ALLOCATOR: PreemptLock<RuntimeFrameAllocator> =
-    PreemptLock::new(RuntimeFrameAllocator::new());
+static FRAME_ALLOCATOR: SpinLock<RuntimeFrameAllocator> =
+    SpinLock::new(RuntimeFrameAllocator::new());
 
 /// Initialize immutable physical-memory metadata and the runtime allocators.
 ///
@@ -217,7 +204,7 @@ pub(crate) fn init(boot: &'static BootInfo) -> Result<()> {
     sort_ranges(&mut reserved_ranges, reserved_count);
     reserved_count = merge_ranges(&mut reserved_ranges, reserved_count);
 
-    let metadata = metadata_mut();
+    let mut metadata = MemoryMetadata::new();
     metadata.reset();
 
     build_memory_map(
@@ -289,7 +276,9 @@ pub(crate) fn init(boot: &'static BootInfo) -> Result<()> {
     crate::debug!("memory: running heap smoke tests");
     heap::run_heap_smoke_tests().map_err(MemoryError::HeapSmokeTest)?;
     crate::debug!("memory: heap smoke tests completed");
-    MEMORY_METADATA_READY.store(true, Ordering::Release);
+    MEMORY_METADATA
+        .publish(metadata)
+        .unwrap_or_else(|_| panic!("memory: metadata published twice"));
 
     crate::info!(
         "memory: initialized usable_ranges={} free_frames={} heap_kib={} heap_phys_range={:?} heap_virt_range={:?}",
@@ -335,12 +324,31 @@ pub fn alloc_frame() -> Option<PhysAddr> {
 /// allocator lock is held during free-list traversal; the operation does not
 /// allocate from the kernel heap or block.
 pub fn alloc_contiguous_frames(frames: usize) -> Option<FrameRange> {
+    alloc_contiguous_frames_aligned(frames, PAGE_SIZE)
+}
+
+/// Allocate one contiguous physical frame range with explicit alignment.
+///
+/// # Arguments
+///
+/// * `frames` - Number of contiguous page-sized frames to allocate.
+/// * `align` - Required power-of-two physical alignment, at least one page.
+///
+/// # Returns
+///
+/// Returns the aligned range, or `None` for invalid arguments, an uninitialized
+/// allocator, or unavailable contiguous storage. The operation performs a
+/// bounded free-list traversal under the frame allocator spin lock; it does not
+/// allocate from the heap, block, or alter local IRQ state.
+pub(crate) fn alloc_contiguous_frames_aligned(frames: usize, align: usize) -> Option<FrameRange> {
     let mut runtime = FRAME_ALLOCATOR.lock();
     if !runtime.initialized {
         return None;
     }
 
-    runtime.allocator.alloc_contiguous(frames, PAGE_SIZE)
+    runtime
+        .allocator
+        .alloc_contiguous_aligned(frames, PAGE_SIZE, align)
 }
 
 /// Return one physical frame to the runtime free list.
@@ -481,10 +489,9 @@ fn copy_phys_range(src_pa: PhysAddr, dst_pa: PhysAddr, size: usize) {
 /// initialization the slice is empty. No runtime allocator lock is acquired,
 /// and the returned ranges never change after boot.
 pub fn usable_ranges() -> &'static [FrameRange] {
-    if !MEMORY_METADATA_READY.load(Ordering::Acquire) {
+    let Some(metadata) = MEMORY_METADATA.get() else {
         return &[];
-    }
-    let metadata = metadata_ref();
+    };
     // SAFETY: usable ranges are immutable after memory initialization.
     unsafe {
         core::slice::from_raw_parts(metadata.usable_ranges.as_ptr(), metadata.usable_range_count)
@@ -499,10 +506,9 @@ pub fn usable_ranges() -> &'static [FrameRange] {
 /// frame allocator, or `None` before that point. The value comes from immutable
 /// boot metadata and requires no runtime allocator lock.
 pub fn heap_range() -> Option<FrameRange> {
-    if !MEMORY_METADATA_READY.load(Ordering::Acquire) {
-        return None;
-    }
-    metadata_ref().heap_range
+    MEMORY_METADATA
+        .get()
+        .and_then(|metadata| metadata.heap_range)
 }
 
 fn run_allocator_self_check(
@@ -570,18 +576,4 @@ fn phys_to_kernel_va(pa: PhysAddr) -> VirtAddr {
 #[inline(always)]
 fn phys_to_kernel_ptr<T>(pa: PhysAddr) -> *mut T {
     phys_to_kernel_va(pa) as *mut T
-}
-
-#[inline(always)]
-fn metadata_mut() -> &'static mut MemoryMetadata {
-    // SAFETY: boot initialization is the sole writer and completes before any
-    // runtime thread can observe immutable memory metadata.
-    unsafe { &mut *MEMORY_METADATA.0.get() }
-}
-
-#[inline(always)]
-fn metadata_ref() -> &'static MemoryMetadata {
-    // SAFETY: metadata is immutable after boot initialization and has static
-    // backing storage.
-    unsafe { &*MEMORY_METADATA.0.get() }
 }

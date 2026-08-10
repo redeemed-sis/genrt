@@ -1,4 +1,5 @@
 use bootinfo::{BootInfo, MemoryRegion, MemoryRegionKind};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dtb::{MAX_BOOT_MEMORY_REGIONS, parse_memory_regions};
 
@@ -20,6 +21,7 @@ static mut BOOT_MEMORY_MAP: [MemoryRegion; MAX_BOOT_MEMORY_REGIONS] = [MemoryReg
     size: 0,
     kind: MemoryRegionKind::Reserved,
 }; MAX_BOOT_MEMORY_REGIONS];
+static BOOTINFO_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" {
     static __boot_stack_bottom_value: usize;
@@ -35,9 +37,36 @@ pub struct BootstrapStackUsage {
     pub lowest_used_addr: usize,
 }
 
+/// Parse and publish the immutable generic boot information.
+///
+/// # Arguments
+///
+/// * `dtb_pa` - Physical address of the firmware-provided DTB.
+/// * `dtb_va` - Readable kernel virtual alias of the same DTB.
+///
+/// # Returns
+///
+/// Returns the permanently published boot information. Parsing uses fixed
+/// boot-owned storage and performs no heap allocation or scheduler blocking.
+///
+/// # Panics
+///
+/// Panics if publication was already claimed or DTB memory-map parsing fails.
+/// The atomic claim makes the boot-only mutable storage unreachable through a
+/// second initialization attempt.
+///
 /// # Safety
-/// Must be called exactly once during early boot, before interrupts and SMP are enabled.
+///
+/// This must run on the boot CPU before interrupts, scheduler entry, and
+/// secondary CPU startup. `dtb_va` must reference the complete DTB containing
+/// `dtb_pa` for the duration of parsing.
 pub unsafe fn init_bootinfo(dtb_pa: usize, dtb_va: usize) -> &'static BootInfo {
+    if BOOTINFO_CLAIMED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        panic!("bootinfo: initialized twice");
+    }
     unsafe {
         crate::debug!("bootinfo: parsing dtb");
         let parsed = parse_memory_regions(dtb_va, &mut *core::ptr::addr_of_mut!(BOOT_MEMORY_MAP))

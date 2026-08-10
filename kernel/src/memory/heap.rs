@@ -11,15 +11,15 @@ use core::{
 
 use linked_list_allocator::Heap;
 
-use crate::sync::PreemptLock;
+use crate::sync::SpinLock;
 
-// Heap allocation policy for the current single-core kernel:
+// Heap allocation policy:
 // - allowed during bootstrap/init code,
 // - allowed in ordinary thread context,
-// - protected against thread preemption by the thread-only allocator lock,
+// - protected by an SMP spin lock that owns a preemption guard,
 // - still forbidden in timer/scheduler/exception fast paths.
 //
-// PreemptLock preserves the caller's IRQ state. Timer/deadline IRQ bookkeeping
+// SpinLock preserves the caller's IRQ state. Timer/deadline IRQ bookkeeping
 // may continue while allocator state is borrowed, but thread handoff is deferred
 // until the outermost allocator guard releases the lock.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -38,12 +38,12 @@ pub enum HeapSmokeError {
 }
 
 struct KernelHeap {
-    heap: PreemptLock<Heap>,
+    heap: SpinLock<Heap>,
     initialized: AtomicBool,
 }
 
-// SAFETY: allocator state is shared globally, but access is serialized through
-// the thread-only preemption lock. Allocation from IRQ context remains forbidden.
+// SAFETY: allocator state is shared globally and serialized by `SpinLock`.
+// Allocation from IRQ context remains forbidden.
 unsafe impl Sync for KernelHeap {}
 
 #[cfg_attr(not(test), global_allocator)]
@@ -55,7 +55,7 @@ static KERNEL_HEAP: KernelHeap = KernelHeap::empty();
 impl KernelHeap {
     const fn empty() -> Self {
         Self {
-            heap: PreemptLock::new(Heap::empty()),
+            heap: SpinLock::new(Heap::empty()),
             initialized: AtomicBool::new(false),
         }
     }

@@ -1,14 +1,12 @@
 use alloc::collections::VecDeque;
-use core::{
-    cell::UnsafeCell,
-    ops::{Deref, DerefMut},
-};
+use core::ops::{Deref, DerefMut};
 
 use core::fmt;
 
 use crate::{
     config::KERNEL_CPU_CAPACITY,
     cpu::{self, CpuId},
+    sync::{IrqSpinLock, IrqSpinLockGuard},
 };
 
 mod bootstrap;
@@ -25,7 +23,10 @@ pub(crate) use self::preempt::validate_invariants_for_test;
 pub(crate) use self::wait::on_test_wait_sync;
 pub(crate) use self::{
     bootstrap::{StaticThread, bootstrap},
-    preempt::{enter_running_thread, on_preempt_checkpoint},
+    preempt::{
+        enter_running_thread, finish_timer_interrupt, on_preempt_checkpoint, on_quantum_expired,
+        on_wait_deadline,
+    },
     sleep::on_sleep_sync,
     thread::{
         current_user_address_space, current_user_stack_ptr, on_thread_exit_sync,
@@ -52,12 +53,31 @@ pub(crate) use transition::UserThreadResources;
 const THREAD_STACK_SIZE: usize = 32768;
 const INITIAL_THREAD_GENERATION: u32 = 1;
 
-struct SchedulerCell(UnsafeCell<Option<Scheduler>>);
+static SCHEDULER: IrqSpinLock<Option<Scheduler>> = IrqSpinLock::new(None);
 
-// SAFETY: genrt currently mutates scheduler state only on a single core.
-unsafe impl Sync for SchedulerCell {}
+/// Scoped borrow of the published shared scheduler lifecycle table.
+///
+/// The guard masks local IRQs and serializes cross-CPU thread-table updates.
+/// It must not cross an architecture handoff or a blocking operation.
+struct SchedulerGuard(IrqSpinLockGuard<'static, Option<Scheduler>>);
 
-static SCHEDULER: SchedulerCell = SchedulerCell(UnsafeCell::new(None));
+impl Deref for SchedulerGuard {
+    type Target = Scheduler;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_ref()
+            .unwrap_or_else(|| panic!("sched: scheduler is not initialized"))
+    }
+}
+
+impl DerefMut for SchedulerGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
+            .as_mut()
+            .unwrap_or_else(|| panic!("sched: scheduler is not initialized"))
+    }
+}
 
 /// Errors produced while constructing the bounded scheduler bootstrap state.
 ///
@@ -85,6 +105,9 @@ pub(crate) struct Scheduler {
     // The vector is fully allocated and populated at scheduler bootstrap; no
     // transition, IRQ path, or handoff may grow it or a local ready queue.
     cpus: [CpuSchedulerState; KERNEL_CPU_CAPACITY],
+    // Cross-CPU wake publication lands here. The target CPU alone drains this
+    // bounded ingress into its owner-only ready queue at a scheduler safe point.
+    remote_ready: [VecDeque<ThreadId>; KERNEL_CPU_CAPACITY],
     rr_quantum_ms: u64,
 }
 
@@ -114,6 +137,10 @@ impl Scheduler {
     /// retains `cpu` for the borrow lifetime. Invalid fixed-storage indexes
     /// panic when the view first accesses local state.
     pub(super) fn on_cpu(&mut self, cpu: CpuId) -> CpuScheduler<'_> {
+        #[cfg(not(test))]
+        if current_cpu() != cpu {
+            panic!("sched: remote mutable CPU scheduler view");
+        }
         CpuScheduler {
             scheduler: self,
             cpu,
@@ -154,10 +181,6 @@ impl CpuScheduler<'_> {
     fn state_mut(&mut self) -> &mut CpuSchedulerState {
         self.scheduler.cpu_state_for_mut(self.cpu)
     }
-
-    fn for_cpu(&mut self, cpu: CpuId) -> CpuScheduler<'_> {
-        self.scheduler.on_cpu(cpu)
-    }
 }
 
 impl Deref for CpuScheduler<'_> {
@@ -176,20 +199,19 @@ impl DerefMut for CpuScheduler<'_> {
 
 /// Bounded scheduling state owned by one logical CPU.
 ///
-/// The embedded preemption state's immutable owner matches this context's
-/// array index. A guard and its scheduler checkpoint therefore address the
-/// same CPU-local runtime state after scheduler publication.
+/// Preemption bookkeeping is separate CPU-local fixed storage, so a
+/// [`crate::sync::SpinLock`] can enter its guard without acquiring shared
+/// scheduler lifecycle state.
 struct CpuSchedulerState {
     current: Option<ThreadId>,
     idle: Option<ThreadId>,
     ready_queue: VecDeque<ThreadId>,
     initialized: bool,
     online: bool,
-    preemption: crate::sync::preempt::PreemptionState,
 }
 
 impl CpuSchedulerState {
-    fn new(cpu: CpuId, thread_capacity: usize) -> Self {
+    fn new(_cpu: CpuId, thread_capacity: usize) -> Self {
         let mut ready_queue = VecDeque::new();
         ready_queue.reserve_exact(thread_capacity.saturating_sub(1));
         Self {
@@ -198,48 +220,24 @@ impl CpuSchedulerState {
             ready_queue,
             initialized: false,
             online: false,
-            preemption: crate::sync::preempt::PreemptionState::new(cpu),
         }
     }
 }
 
 #[inline(always)]
-fn scheduler_slot_mut() -> &'static mut Option<Scheduler> {
-    // SAFETY: Access is single-writer in the current single-core bring-up model.
-    unsafe { &mut *SCHEDULER.0.get() }
+fn scheduler_slot_mut() -> IrqSpinLockGuard<'static, Option<Scheduler>> {
+    SCHEDULER.lock()
 }
 
 #[inline(always)]
-fn scheduler_mut() -> &'static mut Scheduler {
-    scheduler_slot_mut()
-        .as_mut()
-        .unwrap_or_else(|| panic!("sched: scheduler is not initialized"))
+fn scheduler_mut() -> SchedulerGuard {
+    SchedulerGuard(scheduler_slot_mut())
 }
 
 #[inline(always)]
-fn try_scheduler_mut() -> Option<&'static mut Scheduler> {
-    scheduler_slot_mut().as_mut()
-}
-
-/// Borrow one published CPU context's preemption state.
-///
-/// This internal bridge lets pre-scheduler synchronization code switch from
-/// fixed boot backing to scheduler-owned runtime backing after publication.
-/// Callers must hold local IRQ exclusion and must not already borrow the
-/// scheduler. The lookup is bounded and allocation-free.
-///
-/// # Arguments
-///
-/// * `cpu` - Logical CPU whose runtime preemption state is requested.
-///
-/// # Returns
-///
-/// Returns `Some` after scheduler publication, or `None` while bootstrap still
-/// uses the fixed pre-scheduler backing.
-pub(crate) fn runtime_preemption_state_mut(
-    cpu: CpuId,
-) -> Option<&'static mut crate::sync::preempt::PreemptionState> {
-    try_scheduler_mut().map(|scheduler| &mut scheduler.cpu_state_for_mut(cpu).preemption)
+fn try_scheduler_mut() -> Option<SchedulerGuard> {
+    let guard = scheduler_slot_mut();
+    guard.is_some().then_some(SchedulerGuard(guard))
 }
 
 #[inline(always)]
@@ -263,9 +261,12 @@ pub(super) fn current_cpu() -> CpuId {
 /// context. The query does not allocate or block.
 pub(crate) fn scheduler_online(cpu: CpuId) -> bool {
     let _irq_guard = crate::sync::LocalIrqGuard::save_and_disable();
-    try_scheduler_mut()
-        .and_then(|scheduler| scheduler.cpus.get(cpu.index()))
-        .is_some_and(|state| state.online)
+    try_scheduler_mut().is_some_and(|scheduler| {
+        scheduler
+            .cpus
+            .get(cpu.index())
+            .is_some_and(|state| state.online)
+    })
 }
 
 /// Validate the active CPU's identity and scheduler-local ownership for QEMU.

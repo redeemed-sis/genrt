@@ -1,4 +1,4 @@
-use core::fmt::{self, Write};
+use core::fmt;
 
 use crate::console;
 
@@ -65,15 +65,6 @@ pub const ACTIVE_LOG_LEVEL: LogLevel = if cfg!(feature = "log-level-error") {
     LogLevel::Info
 };
 
-struct ConsoleWriter;
-
-impl Write for ConsoleWriter {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        console::puts(s);
-        Ok(())
-    }
-}
-
 #[inline(always)]
 pub fn enabled(level: LogLevel) -> bool {
     level <= ACTIVE_LOG_LEVEL
@@ -81,21 +72,13 @@ pub fn enabled(level: LogLevel) -> bool {
 
 #[inline]
 pub fn _print(args: fmt::Arguments<'_>) {
-    let mut writer = ConsoleWriter;
-    let _ = writer.write_fmt(args);
+    let _ = console::try_write_fmt(args);
 }
 
 #[inline]
 pub fn _log(level: LogLevel, args: fmt::Arguments<'_>) {
-    // Logging is allocation-free and lock-free, so occasional use from IRQ context is
-    // acceptable during bring-up. Trace-heavy logging can still perturb timing and should
-    // remain a debug-oriented tool rather than a steady-state execution mode.
-    let mut writer = ConsoleWriter;
-    let _ = writer.write_str("[");
-    let _ = writer.write_str(level.tag());
-    let _ = writer.write_str("] ");
-    let _ = writer.write_fmt(args);
-    let _ = writer.write_str("\n");
+    let record = core::format_args!("[{}] {}\n", level.tag(), args);
+    let _ = console::try_write_fmt(record);
 }
 
 #[macro_export]
@@ -111,8 +94,7 @@ macro_rules! kprintln {
         $crate::log::_print(core::format_args!("\n"));
     }};
     ($($arg:tt)*) => {{
-        $crate::log::_print(core::format_args!($($arg)*));
-        $crate::log::_print(core::format_args!("\n"));
+        $crate::log::_print(core::format_args!("{}\n", core::format_args!($($arg)*)));
     }};
 }
 

@@ -26,7 +26,7 @@ pub mod memory;
 pub mod panic;
 pub mod process;
 pub mod sched;
-pub(crate) mod sync;
+pub mod sync;
 pub mod syscall;
 #[cfg(feature = "qemu-test")]
 mod test_support;

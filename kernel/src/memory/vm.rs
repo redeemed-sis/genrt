@@ -1,4 +1,7 @@
 use super::{PAGE_SIZE, PhysAddr, PhysRange, VirtAddr};
+use crate::sync::SpinLock;
+
+static KERNEL_VM_LOCK: SpinLock<()> = SpinLock::new(());
 
 unsafe extern "C" {
     fn arch_phys_to_virt(pa: usize) -> usize;
@@ -153,6 +156,7 @@ pub fn virt_to_phys_direct(va: VirtAddr) -> Option<PhysAddr> {
 }
 
 pub fn translate_kernel_va(va: VirtAddr) -> Option<PhysAddr> {
+    let _guard = KERNEL_VM_LOCK.lock();
     let mut pa = 0usize;
     match unsafe { arch_translate_kernel_va(va, &mut pa as *mut usize) } {
         0 => Some(pa),
@@ -167,10 +171,12 @@ pub unsafe fn map_kernel_region(
     attr: VmMemoryAttr,
     flags: VmFlags,
 ) -> Result<(), VmError> {
+    let _guard = KERNEL_VM_LOCK.lock();
     vm_result(unsafe { arch_map_kernel_region(va, pa, size, attr as u32, flags.bits()) })
 }
 
 pub unsafe fn unmap_kernel_region(va: VirtAddr, size: usize) -> Result<(), VmError> {
+    let _guard = KERNEL_VM_LOCK.lock();
     vm_result(unsafe { arch_unmap_kernel_region(va, size) })
 }
 
@@ -179,6 +185,7 @@ pub unsafe fn protect_kernel_region(
     size: usize,
     flags: VmFlags,
 ) -> Result<(), VmError> {
+    let _guard = KERNEL_VM_LOCK.lock();
     vm_result(unsafe { arch_protect_kernel_region(va, size, flags.bits()) })
 }
 
@@ -187,6 +194,7 @@ pub unsafe fn drop_boot_identity_mapping() -> Result<(), VmError> {
 }
 
 pub unsafe fn switch_to_runtime_kernel_tables() -> Result<(), VmError> {
+    let _guard = KERNEL_VM_LOCK.lock();
     vm_result(unsafe { arch_switch_to_runtime_kernel_tables() })
 }
 
