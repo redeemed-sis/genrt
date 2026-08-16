@@ -15,6 +15,9 @@ stores complete evidence below `target/test-results/`.
   counter without asserting scheduling jitter.
 - `user-fault`: test-enabled kernel coordinator that joins a faulting EL0
   process and verifies exact fault classification.
+- `smp-boot`: four-CPU test kernel that validates PSCI secondary high-half
+  entry, unique logical/hardware/stack ownership, parked readiness, and offline
+  secondary scheduler contexts.
 - `userspace-contract`: production kernel plus test supervisor and exact
   production-program invocations.
 - `shell-contract`: production kernel and shell plus test-only helpers and a
@@ -41,8 +44,9 @@ is retained but never evaluated as an assertion.
 
 ## Cases, fixtures, and programs
 
-Case TOML declares suite/supervisor, expected structured events, bounded host
-actions, and timeout. `tests/qemu/program-contracts.toml` maps every dynamic
+Case TOML declares suite/supervisor, CPU count, expected structured events,
+bounded host actions, and timeout. CPU count defaults to one and cannot exceed
+the kernel's fixed topology capacity. `tests/qemu/program-contracts.toml` maps every dynamic
 production product to one exact executable path, argv, expected status, and
 case. `xtask` generates supervisor invocation tables from that plan.
 

@@ -8,13 +8,22 @@ accepted ADRs remain authoritative when details differ.
 - Architecture: AArch64.
 - Rust target: `aarch64-unknown-none-softfloat`.
 - Machine: QEMU `virt` with GICv2.
-- Execution model: CPU0-only execution, EL1 kernel and freestanding EL0 processes.
+- Execution model: CPU0-only scheduling plus bounded high-half bring-up of
+  registered secondary CPUs into a scheduler-offline parked state.
 - Kernel image: low physical load with a high-half virtual runtime mapping.
 
 ## Boot and platform
 
 - A low-linked `.boot.*` trampoline parses the QEMU-provided DTB, constructs
   bootstrap translation tables, enables the MMU, and enters high-linked Rust.
+- The runtime DTB supplies the enabled CPU count, hardware affinity targets,
+  and PSCI HVC CPU_ON metadata. CPU0 starts secondaries sequentially only after
+  runtime TTBR1 is active and publishes that root with Release ordering.
+- Four fixed linker-owned 32 KiB bootstrap-stack slots bound the current QEMU
+  topology. Every secondary enters low `secondary_start` through PSCI, enables
+  the MMU with boot TTBR0 plus runtime TTBR1, enters high Rust, clears its local
+  TTBR0, registers in generic kernel code, and parks with asynchronous
+  exceptions masked.
 - `.boot.text`, `.boot.rodata`, and `.boot.bss` are autonomous before MMU
   enable. `xtask` checks the linked image for relocations, runtime thunks,
   high-VA operands, and branches outside `.boot.*`.
@@ -53,19 +62,19 @@ accepted ADRs remain authoritative when details differ.
 ## Scheduling and time
 
 - The scheduler is round-robin, preemptive, and CPU0-only. A bounded registry
-  maps the normalized AArch64 boot CPU hardware identity to logical `CpuId(0)`
-  before scheduler bootstrap. AArch64 then retains the logical binding in
+  maps normalized AArch64 hardware identities to CPU0-first logical `CpuId`
+  values before scheduler bootstrap. AArch64 retains each logical binding in
   CPU-local `TPIDR_EL1`, making runtime current-CPU resolution O(1); unbound or
   invalid CPUs are rejected rather than treated as CPU0.
 - Scheduler contexts are preallocated per logical CPU. Each owns local current,
   idle, ready queue, and initialized/online state; separate CPU-local fixed
   preemption backing keeps lock acquisition independent of shared lifecycle
   storage.
-  CPU0 alone is initialized and becomes online at first thread entry; secondary
-  contexts remain offline. Runtime scheduler entry points resolve the executing
-  CPU once and bind a `CpuScheduler` view for the complete local operation;
-  affinity, home-CPU wakeup, bootstrap, and validation retain explicit target
-  selection.
+  CPU0 alone is initialized and becomes online at first thread entry; registered
+  secondary contexts remain offline while their CPUs stay in the architecture
+  park loop. Runtime scheduler entry points resolve the executing CPU once and
+  bind a `CpuScheduler` view for the complete local operation; affinity,
+  home-CPU wakeup, bootstrap, and validation retain explicit target selection.
 - Production bootstrap starts only the permanent idle thread and one kernel init
   thread; the latter launches and joins userspace `/init`.
 - Context switching replaces the saved trap frame selected for IRQ or syscall
@@ -175,9 +184,12 @@ accepted ADRs remain authoritative when details differ.
 
 ## Current boundaries
 
-- No secondary CPU startup, IPI/remote reschedule or remote timer-insertion
-  notification, migration, or userspace TLB shootdown. Shared runtime owners
-  are already cross-CPU locked.
+- Secondary CPUs reach generic registration and a controlled parked state, but
+  have no local GIC CPU-interface/timer initialization and perform no normal
+  scheduling, kernel-thread, or userspace execution.
+- No IPI/remote reschedule or remote timer-insertion notification, migration,
+  CPU hotplug, or userspace TLB shootdown. Shared runtime owners are already
+  cross-CPU locked.
 - No FP/SIMD context ownership; the soft-float target is intentional.
 - No ASIDs, copy-on-write, demand paging, recoverable usercopy faults, signals,
   or multiple user threads within one process.

@@ -27,10 +27,15 @@ Detailed ownership lives in the [memory](src/memory/README.md),
 ## Execution model
 
 After architecture boot, `kernel_main` registers the normalized boot hardware
-CPU as logical CPU0, initializes physical memory, switches to runtime TTBR1
-tables, mounts initramfs, bootstraps scheduler storage, and enters the first
-selected trap frame. The init kernel thread spawns `/init` as a normal user
-process and joins it.
+CPU as logical CPU0, validates the DTB-derived CPU count, initializes physical
+memory, switches to runtime TTBR1 tables, and mounts initramfs. CPU0 then asks
+the architecture to start each expected secondary. Every secondary enters
+`kernel_secondary_main`, registers through the same bounded CPU registry,
+verifies its runtime logical binding, publishes parked readiness, and returns
+to an architecture-owned terminal park loop. Only after all expected CPUs are
+parked does CPU0 bootstrap scheduler storage and enter the first selected trap
+frame. The init kernel thread spawns `/init` as a normal user process and joins
+it.
 
 The production scheduler starts with exactly two kernel threads: the permanent
 idle thread and one non-idle `kernel_init_thread`. QEMU scenario features replace
@@ -66,14 +71,14 @@ frame.
 
 ## Allocation and synchronization
 
-The active system is single-core. `LocalIrqLock`/`LocalIrqGuard` protect state
-shared with interrupt handlers. `PreemptLock` identifies thread-context-only state such
-as the fixed heap and runtime frame allocator. Its nested `PreemptGuard` leaves
-IRQs in their caller-selected state, coalesces scheduler requests, and performs
-a deferred handoff only at a typed timer-return or private sched-call checkpoint.
-Neither domain is an SMP lock. Heap use is allowed in bootstrap and normal thread
-context. IRQ, scheduler, timed-event, and frame-handoff paths operate on bounded
-preallocated storage.
+`LocalIrqGuard` prevents interrupt re-entry on one CPU only. Shared runtime
+owners use allocation-free `SpinLock` or IRQ-safe `IrqSpinLock`; CPU-local
+scheduler, preemption, timer, and ready state remains owner-local. Nested
+`PreemptGuard` leaves IRQs in their caller-selected state, coalesces scheduler
+requests, and performs a deferred handoff only at a typed timer-return or
+private sched-call checkpoint. Heap use is allowed in bootstrap and normal
+thread context. IRQ, scheduler, timed-event, and frame-handoff paths operate on
+bounded preallocated storage.
 
 Blocking and terminal thread transitions are forbidden under `PreemptGuard`.
 Kernel yield under a guard records a pending reschedule and returns to the same

@@ -25,8 +25,10 @@ explicit acceptance criteria.
      hard upper bound;
    - retain allocation-free bounded handlers.
 4. **Secondary CPU activation**
-   - add CPU-interface bring-up, IPI acknowledgement, and remote wake
-     notification on top of ADR-0036 shared-state synchronization;
+   - activate the registered parked CPUs with local GIC CPU-interface setup,
+     scheduler idle/current state, and timer ownership;
+   - add IPI acknowledgement and remote wake notification on top of ADR-0036
+     shared-state synchronization and ADR-0038 secondary bring-up;
    - add an IPI-backed remote timer command for prompt insertion into another
      CPU's existing per-CPU deadline queue;
    - define userspace TLB shootdown ownership before executing EL0 on another

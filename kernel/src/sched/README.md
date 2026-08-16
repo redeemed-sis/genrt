@@ -1,7 +1,8 @@
 # Scheduler, time, and blocking
 
 The scheduler is a bounded CPU0-only round-robin engine with preallocated
-per-logical-CPU contexts. `Thread` is its only schedulable entity. Context
+per-logical-CPU contexts. Secondary CPUs are registered and parked but their
+scheduler contexts remain offline. `Thread` is the only schedulable entity. Context
 switches save a borrowed `ActiveContext` into the current thread's owned
 `SavedContext` and restore the selected thread into the live return context.
 
@@ -9,12 +10,13 @@ switches save a borrowed `ActiveContext` into the current thread's owned
 scheduler code never uses raw MPIDR. Every context owns its current thread,
 idle thread, ready queue, and initialized/online state. Preemption bookkeeping
 uses separate fixed CPU-local storage available before heap initialization and
-retained after scheduler publication. CPU0 is registered and bootstrapped; all
-other bounded contexts remain offline. `ThreadAttrs` chooses an immutable home
+retained after scheduler publication. CPU0 and every DTB-described secondary
+are registered before scheduler bootstrap; CPU0 alone is initialized and
+online, while all secondary contexts remain offline. `ThreadAttrs` chooses an immutable home
 CPU before publication. Local wakeups enter that CPU's ready queue. Remote
 wakeups publish into a bounded per-target ingress that only the target CPU
 drains into its local ready queue. There is no migration, IPI notification,
-work stealing, or secondary execution in the active target.
+work stealing, or secondary scheduling in the active target.
 
 Current-CPU entry points resolve `CpuId` once and bind a short-lived
 `CpuScheduler` view. Local transition, wait, and preemption methods use the
@@ -27,9 +29,9 @@ cross-CPU IRQ-safe scheduler lock so publication and lifecycle transitions stay
 atomic. CPU contexts remain owner-local: mutable `current`, `idle`, ready-queue,
 and online-state access is rejected from another CPU. Fixed preemption storage
 performs the same current-CPU ownership check independently. This milestone does
-not add remote notification or migration; a published remote wake becomes
-runnable when the owner next enters the scheduler, and issue #4 must add the IPI
-that prompts that entry.
+not add remote notification or migration; affinity to an offline parked CPU is
+rejected, so normal runnable work remains owned by CPU0 until a later IPI and
+secondary scheduler activation milestone.
 
 ## Thread table and states
 
@@ -105,8 +107,8 @@ the interrupt path.
 
 Cross-CPU cancellation may remove an exact event without touching the remote
 physical timer; at worst the old deadline causes one harmless early interrupt.
-Prompt remote insertion is rejected until secondary bring-up provides an IPI
-command path.
+Prompt remote insertion is rejected until a later activation milestone
+provides an IPI command path and enables the target scheduler context.
 
 Ready insertion requests scheduling when a runnable peer appears, so idle
 cannot remain selected indefinitely. A quantum switch is committed only at the
@@ -157,7 +159,10 @@ own finite static-thread arrays without changing round-robin behavior.
 
 ## Constraints
 
-- Single core; local IRQ exclusion is not SMP synchronization.
+- Scheduling, timer service, and normal IRQ handling remain CPU0-only;
+  registered secondary CPUs execute only their bounded bring-up and park path.
+- Local IRQ exclusion is not SMP synchronization; shared owners use explicit
+  cross-CPU locks.
 - No heap allocation or unbounded work in scheduling, timer, or frame-handoff
   fast paths.
 - Idle is permanent, non-joinable, and never reclaimed.
@@ -168,4 +173,4 @@ own finite static-thread arrays without changing round-robin behavior.
   process/address space remain future work.
 
 Related decisions: ADR-0003, ADR-0005, ADR-0006, ADR-0011 through ADR-0014,
-ADR-0020, and ADR-0027 through ADR-0033.
+ADR-0020, ADR-0027 through ADR-0033, and ADR-0035 through ADR-0038.

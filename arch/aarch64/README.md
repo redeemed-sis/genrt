@@ -1,23 +1,35 @@
 # AArch64 architecture
 
-This is the active genrt architecture: `aarch64-unknown-none-softfloat` on
-single-core QEMU `virt,gic-version=2`.
+This is the active genrt architecture: `aarch64-unknown-none-softfloat` on QEMU
+`virt,gic-version=2`. CPU0 owns global initialization and scheduling;
+DTB-described secondary CPUs can be started through PSCI and parked after
+high-half registration.
 
 ## Boot sequence
 
-The kernel is loaded at physical `0x4008_0000`. A low-linked trampoline in
-`.boot.*` parks secondary CPUs, establishes a boot stack, parses the
-QEMU-loaded DTB, builds bootstrap TTBR0/TTBR1 tables, programs EL1 translation
-state, enables the MMU, switches to a high stack alias, and enters high-linked
-Rust.
+The kernel is loaded at physical `0x4008_0000`. CPU0 enters the low-linked
+`_start` trampoline, uses bootstrap stack slot zero, parses the QEMU-loaded DTB,
+builds bootstrap TTBR0/TTBR1 tables, programs EL1 translation state, enables
+the MMU, switches to a high stack alias, and enters high-linked Rust. CPU0 then
+performs all global platform, memory, filesystem, and scheduler initialization.
 
-The trampoline parks QEMU secondary CPUs in `WFE`. After high Rust entry, the
-AArch64 facade alone reads `MPIDR_EL1`, normalizes Aff3:Aff0 into an opaque
-hardware key, and the generic kernel registers that executing boot CPU as
-logical CPU0. The key is not a logical scheduler index. The trampoline clears
-software-owned `TPIDR_EL1` on every CPU; registration stores the logical index
-plus one there, so runtime current-CPU resolution is an O(1) register read and
-zero remains an explicit unbound state.
+High Rust parses enabled `/cpus` nodes and the DTB-selected PSCI HVC conduit
+into immutable AArch64 topology. After allocator-owned runtime TTBR1 tables are
+active, CPU0 starts each secondary sequentially with PSCI `CPU_ON`. The low
+`secondary_start` entry receives only an architecture bootstrap-stack slot,
+uses a distinct fixed 32 KiB stack, installs boot TTBR0 plus CPU0-published
+runtime TTBR1, enables the MMU, and branches to `secondary_rust_entry` in the
+high half. It does not clear BSS or repeat global initialization.
+
+The AArch64 facade alone reads `MPIDR_EL1`, normalizes Aff3:Aff0 into an opaque
+hardware key, and exposes CPU-local logical binding primitives. The generic
+kernel registers CPU0 and every secondary, assigns logical IDs, and verifies
+that each PSCI target matches the executing hardware identity. Registration
+stores the logical index plus one in `TPIDR_EL1`, so runtime current-CPU
+resolution is an O(1) register read and zero remains an explicit unbound state.
+Secondaries clear their local TTBR0 after high entry, publish parked readiness,
+and enter the architecture-owned `WFE` loop with asynchronous exceptions
+masked. Their scheduler contexts remain offline.
 
 Main kernel sections have high VMAs and low LMAs through linker `AT(...)`; no
 runtime section copy is required. The address convention is:
@@ -34,10 +46,12 @@ closed world.
 
 ## Platform data
 
-`xtask` generates the QEMU `virt` DTB and loads it into a reserved platform
-slot. The low parser extracts only RAM, PL011, and GICv2 ranges needed for
-initial mappings. The QEMU platform module owns a documented emergency fallback
-for early UART diagnostics; generic kernel code does not own platform constants.
+`xtask` generates a QEMU `virt` DTB for the requested bounded CPU count and
+loads it into a reserved platform slot. The low parser extracts only RAM,
+PL011, and GICv2 ranges needed for initial mappings. High Rust additionally
+parses enabled CPU identities and PSCI metadata before generic boot entry. The
+QEMU platform module owns a documented emergency fallback for early UART
+diagnostics; generic kernel code does not own platform constants.
 
 ## MMU ownership
 
@@ -82,7 +96,10 @@ path and wakes stdin waiters without allocation.
 - MMIO accesses use documented Device mappings and localized volatile `unsafe`.
 - Boot, linker, exception, MMU, and IRQ changes require post-link verification
   and the relevant QEMU contracts.
+- Bootstrap-stack capacity, generic `KERNEL_CPU_CAPACITY`, and accepted QEMU
+  CPU count must agree; CPU topology and runtime TTBR1 handoff are published
+  with Release/Acquire ordering before secondary use.
 
-Related decisions: ADR-0002 through ADR-0004, ADR-0008, ADR-0015, ADR-0027, and
-ADR-0028 in
+Related decisions: ADR-0002 through ADR-0004, ADR-0008, ADR-0015, ADR-0027,
+ADR-0028, and ADR-0038 in
 [`memory/decisions/`](../../memory/decisions/README.md).

@@ -75,20 +75,29 @@ Changes that invalidate one require architecture review and an ADR.
 
 ## Scheduling and lifecycle
 
-- The active implementation is single-core. Local IRQ exclusion is not an SMP
-  lock and must not be documented as one.
+- CPU0 is the sole scheduler, normal IRQ/timer, kernel-thread, and userspace
+  execution owner. Registered secondary CPUs may execute only the bounded boot
+  path and architecture park loop; local IRQ exclusion is never an SMP lock.
 - Logical `CpuId` is the only generic-kernel CPU identity. AArch64-normalized
-  hardware IDs are boot-registration keys, never scheduler indexes. Each
-  registered CPU receives an architecture-owned logical binding; runtime
-  current-CPU resolution reads that binding in O(1), and unbound or invalid
-  CPUs never default to CPU0.
+  hardware IDs are boot-registration keys and PSCI targets, never scheduler
+  indexes. CPU0 remains logical CPU0; each registered CPU receives an
+  architecture-owned logical binding, runtime current-CPU resolution reads it
+  in O(1), and unbound or invalid CPUs never default to CPU0.
+- Expected CPU count and hardware topology come from immutable boot/platform
+  data and must agree with fixed generic and linker bootstrap-stack capacity.
+  Each CPU owns one non-overlapping bootstrap stack. CPU0 alone performs global
+  initialization and starts secondaries after publishing runtime TTBR1.
+- Secondary registration and parked readiness are scheduler-independent,
+  allocation-free, Release/Acquire-published, and bounded by a boot deadline.
+  A failed, duplicate, unexpected, or unready secondary terminates boot rather
+  than being omitted silently.
 - Every CPU scheduler context owns its current thread, idle thread, ready queue,
   and initialized/online state. CPU-local preemption state is separate fixed
   storage so acquiring a shared `SpinLock` never needs the scheduler lock. A thread's
   immutable home CPU owns its ready membership and wakeup destination. A remote
   completion publishes into a bounded ingress for that CPU, and only the owner
-  drains it into the local ready queue; no migration, IPI notification, or
-  secondary execution exists yet.
+  drains it into the local ready queue. Parked secondary contexts remain
+  offline; there is no migration, IPI notification, or secondary scheduling.
 - Every logical CPU owns one bounded deadline queue and one architected physical
   timer. Timed events carry that owner. Only the owner CPU inserts events and
   programs the timer; no time lock is retained across direct scheduler dispatch.
@@ -100,7 +109,7 @@ Changes that invalidate one require architecture review and an ADR.
 - Fixed CPU-local preemption backing is available before heap bootstrap and
   remains independent of shared scheduler storage afterward. A `PreemptGuard`
   is bound to its creating CPU and must not be dropped on another CPU. The
-  current single-active-CPU assumption is not SMP exclusion.
+  CPU0-only scheduler assumption is not SMP exclusion.
 - Thread and process handles use generations; stale handles never name a reused
   slot. `ThreadId` directly indexes one bounded `ThreadSlot`; there is no second
   schedulable identity.

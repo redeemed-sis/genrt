@@ -29,6 +29,7 @@ Cases can be listed or selected explicitly:
 cargo xtask test-aarch64 --list
 cargo xtask test-aarch64 --case kernel-contract
 cargo xtask test-aarch64 --case shell-contract --timeout-secs 30
+cargo xtask test-aarch64 --case smp-boot
 ```
 
 ## Test layers
@@ -37,6 +38,12 @@ cargo xtask test-aarch64 --case shell-contract --timeout-secs 30
 `qemu-test` features. Their coordinators test CPU0 identity, per-CPU scheduler
 context ownership, scheduler/timing/mailbox behavior, and exact user-fault
 classification.
+
+`smp-boot` uses a dedicated test kernel and a four-CPU DTB/QEMU topology. CPU0
+starts each secondary through PSCI; the coordinator validates unique hardware
+identities and bootstrap stacks, stable logical bindings, complete parked
+readiness, and offline secondary scheduler contexts. It does not claim
+secondary scheduling, timer, or interrupt participation.
 
 `userspace-contract` and `shell-contract` use the production kernel with a
 test-only initramfs. `/init` is a supervisor that performs

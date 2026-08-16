@@ -4,6 +4,11 @@
 
 Accepted
 
+Partially superseded by
+[ADR-0038](ADR-0038-secondary-cpu-psci-boot-and-parked-state.md) for CPU0-only
+registration and the absence of secondary execution. Its logical identity,
+affinity, and scheduler ownership decisions remain active.
+
 ## Context
 
 The active AArch64 target starts only the QEMU `virt` boot CPU. Secondary CPUs
