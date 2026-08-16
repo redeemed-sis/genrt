@@ -114,7 +114,7 @@ pub(crate) fn run(options: Options) -> Result<()> {
     let mut results = Vec::new();
     let mut failed = false;
     let mut production_users = Vec::new();
-    let mut last_kernel: Option<(Profile, String, Vec<String>, Aarch64Artifacts)> = None;
+    let mut last_kernel: Option<(Profile, String, Vec<String>, usize, Aarch64Artifacts)> = None;
 
     for mut case in selected {
         let profile = options.profile.unwrap_or(case.profile);
@@ -138,14 +138,14 @@ pub(crate) fn run(options: Options) -> Result<()> {
             None
         };
         let built_kernel = if options.prepared.is_none() {
-            let reusable =
-                last_kernel
-                    .as_ref()
-                    .is_some_and(|(last_profile, log_level, features, _)| {
-                        *last_profile == profile
-                            && log_level == &case.log_level
-                            && features == &case.kernel_features
-                    });
+            let reusable = last_kernel.as_ref().is_some_and(
+                |(last_profile, log_level, features, cpu_count, _)| {
+                    *last_profile == profile
+                        && log_level == &case.log_level
+                        && features == &case.kernel_features
+                        && *cpu_count == case.cpu_count
+                },
+            );
             if !reusable {
                 let features = case
                     .kernel_features
@@ -153,17 +153,23 @@ pub(crate) fn run(options: Options) -> Result<()> {
                     .map(String::as_str)
                     .collect::<Vec<_>>();
                 let log_level = parse_log_level(&case.log_level)?;
-                let artifacts = workflow::build_aarch64(profile, Some(log_level), &features)?;
+                let artifacts = workflow::build_aarch64_for_cpus(
+                    profile,
+                    Some(log_level),
+                    &features,
+                    case.cpu_count,
+                )?;
                 last_kernel = Some((
                     profile,
                     case.log_level.clone(),
                     case.kernel_features.clone(),
+                    case.cpu_count,
                     artifacts,
                 ));
             }
             last_kernel
                 .as_ref()
-                .map(|(_, _, _, artifacts)| artifacts.clone())
+                .map(|(_, _, _, _, artifacts)| artifacts.clone())
         } else {
             None
         };
@@ -228,6 +234,14 @@ fn prepare_case(
             bail!(
                 "prepared production kernel cannot run feature test {}",
                 case.name
+            );
+        }
+        if prepared.artifacts.cpu_count() != case.cpu_count {
+            bail!(
+                "prepared artifacts contain a {}-CPU DTB, but case {} requests {} CPUs",
+                prepared.artifacts.cpu_count(),
+                case.name,
+                case.cpu_count
             );
         }
         return Ok((prepared.artifacts.clone(), prepared.initramfs.clone()));

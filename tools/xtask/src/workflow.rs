@@ -58,11 +58,14 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             arch,
             initramfs,
             profile,
-        } => qemu_cmd(arch, initramfs, profile),
+            cpus,
+        } => qemu_cmd(arch, initramfs, profile, cpus),
         Commands::GdbCmd { arch } => gdb_cmd(arch),
-        Commands::BuildAarch64 { log_level, profile } => {
-            build_aarch64(profile, log_level, &[]).map(|_| ())
-        }
+        Commands::BuildAarch64 {
+            log_level,
+            profile,
+            cpus,
+        } => build_aarch64_for_cpus(profile, log_level, &[], cpus).map(|_| ()),
         Commands::BuildUserHello => build_user_program(Profile::Debug, "hello", false).map(|_| ()),
         Commands::BuildUserFault => {
             build_user_program(Profile::Debug, "fault_null", false).map(|_| ())
@@ -87,13 +90,23 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             initramfs_root,
             init,
             profile,
-        } => run_aarch64(false, profile, log_level, initramfs, initramfs_root, init),
+            cpus,
+        } => run_aarch64(
+            false,
+            profile,
+            log_level,
+            initramfs,
+            initramfs_root,
+            init,
+            cpus,
+        ),
         Commands::DebugAarch64 {
             log_level,
             initramfs,
             initramfs_root,
             init,
             profile,
+            cpus,
         } => run_aarch64(
             true,
             profile,
@@ -101,6 +114,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             initramfs,
             initramfs_root,
             init,
+            cpus,
         ),
     }
 }
@@ -231,10 +245,16 @@ fn repo_tree() -> Result<()> {
     Ok(())
 }
 
-fn qemu_cmd(arch: Arch, initramfs: Option<PathBuf>, profile: Profile) -> Result<()> {
+fn qemu_cmd(
+    arch: Arch,
+    initramfs: Option<PathBuf>,
+    profile: Profile,
+    cpu_count: usize,
+) -> Result<()> {
     match arch {
         Arch::Aarch64 => {
-            let artifacts = Aarch64Artifacts::new(profile);
+            validate_qemu_cpu_count(cpu_count)?;
+            let artifacts = Aarch64Artifacts::for_cpu_count(profile, cpu_count);
             let initramfs = match initramfs {
                 Some(path) => {
                     validate_initramfs_payload(&path)?;
@@ -300,8 +320,36 @@ pub(crate) fn build_aarch64(
     log_level: Option<LogLevel>,
     extra_features: &[&str],
 ) -> Result<Aarch64Artifacts> {
-    let artifacts = Aarch64Artifacts::new(profile);
-    let dtb_path = generate_qemu_virt_dtb(&artifacts)?;
+    build_aarch64_for_cpus(profile, log_level, extra_features, 1)
+}
+
+/// Build and post-link one AArch64 kernel for an explicit QEMU CPU topology.
+///
+/// # Arguments
+///
+/// * `profile` - Cargo profile and artifact subtree.
+/// * `log_level` - Optional compile-time kernel log level.
+/// * `extra_features` - Additional architecture crate features.
+/// * `cpu_count` - CPU count encoded in the generated DTB and later QEMU run.
+///
+/// # Returns
+///
+/// Returns canonical paths for the generated kernel ELF and topology-specific
+/// DTB.
+///
+/// # Errors
+///
+/// Returns an error for a zero/unsupported CPU count or when DTB generation,
+/// Cargo, linking, or boot-text verification fails.
+pub(crate) fn build_aarch64_for_cpus(
+    profile: Profile,
+    log_level: Option<LogLevel>,
+    extra_features: &[&str],
+    cpu_count: usize,
+) -> Result<Aarch64Artifacts> {
+    validate_qemu_cpu_count(cpu_count)?;
+    let artifacts = Aarch64Artifacts::for_cpu_count(profile, cpu_count);
+    let dtb_path = generate_qemu_virt_dtb(&artifacts, cpu_count)?;
 
     let mut build = Command::new("cargo");
     build.args([
@@ -361,8 +409,9 @@ fn run_aarch64(
     initramfs: Option<PathBuf>,
     initramfs_root: Option<PathBuf>,
     init: Option<PathBuf>,
+    cpu_count: usize,
 ) -> Result<()> {
-    let artifacts = build_aarch64(profile, log_level, &[])?;
+    let artifacts = build_aarch64_for_cpus(profile, log_level, &[], cpu_count)?;
     let initramfs = selected_or_build_initramfs_path(profile, initramfs, initramfs_root, init)?;
     let mut config = qemu::Config::from_artifacts(&artifacts, initramfs);
     config.wait_for_gdb = wait_for_gdb;
@@ -1016,7 +1065,7 @@ fn aarch64_user_compile_args() -> [&'static str; 13] {
     ]
 }
 
-fn generate_qemu_virt_dtb(artifacts: &Aarch64Artifacts) -> Result<PathBuf> {
+fn generate_qemu_virt_dtb(artifacts: &Aarch64Artifacts, cpu_count: usize) -> Result<PathBuf> {
     let dtb_path = env::current_dir()
         .context("failed to query current directory")?
         .join(artifacts.dtb());
@@ -1027,17 +1076,10 @@ fn generate_qemu_virt_dtb(artifacts: &Aarch64Artifacts) -> Result<PathBuf> {
     let status = Command::new("qemu-system-aarch64")
         .arg("-machine")
         .arg(format!("{},dumpdtb={}", qemu::MACHINE, dtb_path.display()))
+        .args(["-cpu", qemu::CPU, "-smp"])
+        .arg(cpu_count.to_string())
         .args([
-            "-cpu",
-            qemu::CPU,
-            "-display",
-            "none",
-            "-serial",
-            "null",
-            "-monitor",
-            "none",
-            "-nic",
-            "none",
+            "-display", "none", "-serial", "null", "-monitor", "none", "-nic", "none",
         ])
         .status()
         .context("failed to invoke qemu-system-aarch64 for DTB generation")?;
@@ -1050,6 +1092,16 @@ fn generate_qemu_virt_dtb(artifacts: &Aarch64Artifacts) -> Result<PathBuf> {
     compact_dtb(&dtb_path)?;
     trim_dtb_to_fdt_totalsize(&dtb_path)?;
     Ok(dtb_path)
+}
+
+fn validate_qemu_cpu_count(cpu_count: usize) -> Result<()> {
+    if !(1..=qemu::MAX_CPUS).contains(&cpu_count) {
+        bail!(
+            "QEMU CPU count {cpu_count} is outside supported range 1..={}",
+            qemu::MAX_CPUS
+        );
+    }
+    Ok(())
 }
 
 fn remove_nondeterministic_dtb_seeds(path: &Path) -> Result<()> {

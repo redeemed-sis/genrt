@@ -38,6 +38,7 @@ pub(super) struct CaseResult {
     pub(super) duration_ms: u128,
     pub(super) profile: Profile,
     pub(super) kernel_features: Vec<String>,
+    pub(super) cpu_count: usize,
     pub(super) exit_reason: String,
     pub(super) failed_step: Option<usize>,
 }
@@ -167,6 +168,7 @@ pub(super) fn run_case(
         duration_ms: started.elapsed().as_millis(),
         profile: case.profile,
         kernel_features: case.kernel_features.clone(),
+        cpu_count: case.cpu_count,
         exit_reason,
         failed_step,
     })
@@ -548,6 +550,7 @@ mod tests {
             profile: Profile::Debug,
             log_level: "info".to_owned(),
             kernel_features: Vec::new(),
+            cpu_count: 1,
             init: InitImage::KernelContract,
             timeout_secs: 1,
             step_timeout_secs: 1,

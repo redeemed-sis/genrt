@@ -279,6 +279,7 @@ fn package(
         kernel: PathBuf::from("genrt-aarch64.elf"),
         dtb: PathBuf::from("qemu-virt.dtb"),
         initramfs: PathBuf::from("initramfs.cpio"),
+        cpu_count: 1,
         wait_for_gdb: false,
     };
     fs::write(

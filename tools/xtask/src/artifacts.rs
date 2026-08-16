@@ -83,6 +83,7 @@ impl Profile {
 #[derive(Clone, Debug)]
 pub(crate) struct Aarch64Artifacts {
     root: PathBuf,
+    cpu_count: usize,
 }
 
 impl Aarch64Artifacts {
@@ -100,6 +101,27 @@ impl Aarch64Artifacts {
             root: PathBuf::from("target")
                 .join(AARCH64_TARGET)
                 .join(profile.dir_name()),
+            cpu_count: 1,
+        }
+    }
+
+    /// Construct artifact paths for one explicit QEMU CPU topology.
+    ///
+    /// # Arguments
+    ///
+    /// * `profile` - Selects either the debug or release subtree.
+    /// * `cpu_count` - CPU count used for DTB generation and QEMU launch.
+    ///
+    /// # Returns
+    ///
+    /// Returns a path bundle whose DTB name is topology-specific. Validation
+    /// of the bounded count remains the workflow caller's responsibility.
+    pub(crate) fn for_cpu_count(profile: Profile, cpu_count: usize) -> Self {
+        Self {
+            root: PathBuf::from("target")
+                .join(AARCH64_TARGET)
+                .join(profile.dir_name()),
+            cpu_count,
         }
     }
 
@@ -114,8 +136,28 @@ impl Aarch64Artifacts {
     }
 
     /// Return the generated QEMU virt DTB path.
+    ///
+    /// # Returns
+    ///
+    /// Returns the legacy single-CPU filename for topology one and a
+    /// CPU-count-qualified filename for multi-CPU topologies. No file is
+    /// created or validated.
     pub(crate) fn dtb(&self) -> PathBuf {
-        self.root.join("qemu-virt.dtb")
+        if self.cpu_count == 1 {
+            self.root.join("qemu-virt.dtb")
+        } else {
+            self.root
+                .join(format!("qemu-virt-smp{}.dtb", self.cpu_count))
+        }
+    }
+
+    /// Return the CPU count represented by this artifact bundle's DTB.
+    ///
+    /// # Returns
+    ///
+    /// Returns the exact count selected when the bundle was constructed.
+    pub(crate) const fn cpu_count(&self) -> usize {
+        self.cpu_count
     }
 
     /// Return the default CPIO initramfs path.

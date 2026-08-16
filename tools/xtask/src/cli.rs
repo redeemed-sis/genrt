@@ -48,6 +48,9 @@ pub(crate) enum Commands {
         initramfs: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = Profile::Debug)]
         profile: Profile,
+        /// CPU count represented by both the existing DTB and QEMU `-smp`.
+        #[arg(long, default_value_t = 1)]
+        cpus: usize,
     },
     GdbCmd {
         #[arg(long, value_enum)]
@@ -58,6 +61,9 @@ pub(crate) enum Commands {
         log_level: Option<LogLevel>,
         #[arg(long, value_enum, default_value_t = Profile::Debug)]
         profile: Profile,
+        /// CPU count encoded in the generated DTB; supported range is 1..=4.
+        #[arg(long, default_value_t = 1)]
+        cpus: usize,
     },
     BuildUserHello,
     BuildUserFault,
@@ -88,6 +94,9 @@ pub(crate) enum Commands {
         init: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = Profile::Debug)]
         profile: Profile,
+        /// CPU count encoded in the generated DTB and passed to QEMU `-smp`.
+        #[arg(long, default_value_t = 1)]
+        cpus: usize,
     },
     DebugAarch64 {
         #[arg(long, value_enum)]
@@ -100,6 +109,9 @@ pub(crate) enum Commands {
         init: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = Profile::Debug)]
         profile: Profile,
+        /// CPU count encoded in the generated DTB and passed to QEMU `-smp`.
+        #[arg(long, default_value_t = 1)]
+        cpus: usize,
     },
 }
 

@@ -26,6 +26,8 @@ pub(super) struct Case {
     pub(super) log_level: String,
     #[serde(default)]
     pub(super) kernel_features: Vec<String>,
+    #[serde(default = "default_cpu_count")]
+    pub(super) cpu_count: usize,
     pub(super) init: InitImage,
     #[serde(default = "default_case_timeout")]
     pub(super) timeout_secs: u64,
@@ -69,6 +71,10 @@ fn default_case_timeout() -> u64 {
     60
 }
 
+fn default_cpu_count() -> usize {
+    1
+}
+
 fn default_step_timeout() -> u64 {
     15
 }
@@ -88,6 +94,7 @@ pub(super) fn load_all(root: &Path) -> Result<Vec<Case>> {
             .with_context(|| format!("failed to read {}", path.display()))?;
         let case: Case = toml::from_str(&source)
             .with_context(|| format!("failed to parse {}", path.display()))?;
+        validate_cpu_count(&case)?;
         if cases
             .iter()
             .any(|existing: &Case| existing.name == case.name)
@@ -100,6 +107,18 @@ pub(super) fn load_all(root: &Path) -> Result<Vec<Case>> {
         bail!("no QEMU cases found in {}", root.display());
     }
     Ok(cases)
+}
+
+fn validate_cpu_count(case: &Case) -> Result<()> {
+    if !(1..=crate::qemu::MAX_CPUS).contains(&case.cpu_count) {
+        bail!(
+            "QEMU case {} requests {} CPUs; supported range is 1..={}",
+            case.name,
+            case.cpu_count,
+            crate::qemu::MAX_CPUS
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -117,5 +136,22 @@ mod tests {
             steps = []
         "#;
         assert!(toml::from_str::<Case>(source).is_err());
+    }
+
+    #[test]
+    fn defaults_to_one_cpu_and_rejects_excessive_topology() {
+        let source = r#"
+            name = "case"
+            suite = "suite"
+            supervisor = "supervisor"
+            init = "kernel-contract"
+            steps = []
+        "#;
+        let mut case = toml::from_str::<Case>(source).expect("valid case");
+        assert_eq!(case.cpu_count, 1);
+        assert!(validate_cpu_count(&case).is_ok());
+
+        case.cpu_count = crate::qemu::MAX_CPUS + 1;
+        assert!(validate_cpu_count(&case).is_err());
     }
 }

@@ -10,6 +10,8 @@ pub(crate) const CPU: &str = "cortex-a72";
 pub(crate) const DTB_LOAD_ADDR: &str = "0x40000000";
 /// Physical address of the QEMU-loaded initramfs.
 pub(crate) const INITRAMFS_LOAD_ADDR: &str = "0x47000000";
+/// Maximum QEMU CPUs supported by the kernel's fixed logical CPU storage.
+pub(crate) const MAX_CPUS: usize = 4;
 
 /// Complete input set for one AArch64 QEMU invocation.
 #[derive(Clone, Debug)]
@@ -20,6 +22,8 @@ pub(crate) struct Config {
     pub(crate) dtb: PathBuf,
     /// CPIO archive loaded into the reserved initramfs window.
     pub(crate) initramfs: PathBuf,
+    /// Number of virtual CPUs represented by both QEMU and the loaded DTB.
+    pub(crate) cpu_count: usize,
     /// Whether QEMU starts halted with a GDB server on the default port.
     pub(crate) wait_for_gdb: bool,
 }
@@ -40,23 +44,23 @@ impl Config {
             kernel: artifacts.kernel_elf(),
             dtb: artifacts.dtb(),
             initramfs,
+            cpu_count: artifacts.cpu_count(),
             wait_for_gdb: false,
         }
     }
 
     /// Build the canonical QEMU command shared by run, debug, tests, and dist.
     ///
-    /// Returns an unspawned command. Callers choose inherited or piped stdio.
+    /// # Returns
+    ///
+    /// Returns an unspawned command using the artifact CPU count for `-smp`.
+    /// Callers choose inherited or piped stdio.
     pub(crate) fn command(&self) -> Command {
         let mut command = Command::new("qemu-system-aarch64");
         command
+            .args(["-machine", MACHINE, "-cpu", CPU, "-smp"])
+            .arg(self.cpu_count.to_string())
             .args([
-                "-machine",
-                MACHINE,
-                "-cpu",
-                CPU,
-                "-smp",
-                "1",
                 "-display",
                 "none",
                 "-monitor",
@@ -109,5 +113,27 @@ fn shell_quote(value: &str) -> String {
         value.to_owned()
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::artifacts::Profile;
+
+    #[test]
+    fn command_uses_artifact_cpu_topology() {
+        let artifacts = Aarch64Artifacts::for_cpu_count(Profile::Debug, 4);
+        let config = Config::from_artifacts(&artifacts, PathBuf::from("initramfs.cpio"));
+        let command = config.command();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let smp = args
+            .iter()
+            .position(|arg| arg == "-smp")
+            .expect("QEMU command must contain -smp");
+        assert_eq!(args.get(smp + 1).map(String::as_str), Some("4"));
     }
 }
