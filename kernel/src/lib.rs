@@ -41,6 +41,30 @@ const PRODUCTION_THREADS: [sched::StaticThread; 1] = [sched::StaticThread::new(
 )];
 
 #[unsafe(no_mangle)]
+/// Initialize global generic kernel state on logical CPU0 and enter scheduling.
+///
+/// The boot CPU registers itself, validates the platform CPU count, initializes
+/// memory and initramfs, starts and waits for parked secondary CPUs, then
+/// bootstraps the sole online scheduler context.
+///
+/// # Arguments
+///
+/// * `boot` - Permanently resident immutable boot information published by the
+///   architecture layer.
+///
+/// # Returns
+///
+/// This function never returns after entering the first scheduler context.
+///
+/// # Panics
+///
+/// Panics through the fatal path when CPU topology, memory, initramfs,
+/// secondary startup, or scheduler bootstrap fails.
+///
+/// # Safety
+///
+/// The architecture must call this exactly once on the boot CPU with global
+/// BSS and platform state initialized and with `boot` resident forever.
 pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
     crate::info!("kernel_main entered");
     crate::info!("bootinfo: arch=aarch64");
@@ -48,6 +72,9 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
     let boot_cpu = cpu::register_boot_cpu()
         .unwrap_or_else(|err| panic!("cpu: failed to register boot CPU: {err:?}"));
     crate::info!("cpu: registered boot CPU{}", boot_cpu.index());
+    cpu::configure_expected_count(boot.cpu_count as usize)
+        .unwrap_or_else(|err| panic!("cpu: invalid boot topology: {err:?}"));
+    crate::info!("cpu: platform expects {} CPU(s)", boot.cpu_count);
 
     if boot.dtb_pa != 0 {
         crate::info!("bootinfo: dtb=present size={} bytes", boot.dtb_size);
@@ -74,6 +101,9 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
         crate::error!("initramfs: mount failed: {:?}", err);
         panic!("initramfs: failed to mount loader image");
     }
+
+    cpu::start_and_park_secondaries()
+        .unwrap_or_else(|err| panic!("cpu: secondary startup failed: {err:?}"));
 
     #[cfg(feature = "qemu-test-kernel-runtime")]
     test_support::kernel_runtime::init();
@@ -109,6 +139,47 @@ fn static_threads() -> &'static [sched::StaticThread] {
     {
         &PRODUCTION_THREADS
     }
+}
+
+unsafe extern "C" {
+    fn arch_park_current_cpu() -> !;
+}
+
+/// Complete generic registration for one architecture-started secondary CPU.
+///
+/// This entry performs no global initialization and never enables the
+/// secondary scheduler context. Successful CPUs publish parked readiness and
+/// enter the architecture-owned terminal wait loop; failed CPUs publish a
+/// startup failure and enter the same terminal loop.
+///
+/// # Arguments
+///
+/// * `logical_index` - CPU0-selected logical slot carried through PSCI and used
+///   by the architecture for the matching private bootstrap stack.
+///
+/// # Returns
+///
+/// This function never returns.
+///
+/// # Safety
+///
+/// The architecture must call this only on the secondary represented by
+/// `logical_index`, after high-half entry on that slot's private bootstrap
+/// stack and before enabling normal asynchronous exceptions.
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_secondary_main(logical_index: usize) -> ! {
+    let result = cpu::register_secondary_cpu(logical_index).and_then(|id| {
+        if sched::scheduler_online(id) {
+            return Err(cpu::CpuRegistrationError::UnexpectedCpu);
+        }
+        cpu::mark_secondary_parked(id)
+    });
+    if result.is_err() {
+        cpu::record_secondary_startup_failure();
+    }
+    // SAFETY: secondary startup is terminal for this milestone. The
+    // architecture masks local asynchronous exceptions before parking.
+    unsafe { arch_park_current_cpu() }
 }
 
 fn idle_thread(_arg: sched::ThreadArg) -> usize {

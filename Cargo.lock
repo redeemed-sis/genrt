@@ -262,6 +262,7 @@ name = "genrt-arch-aarch64"
 version = "0.1.0"
 dependencies = [
  "bootinfo",
+ "fdt-raw",
  "kernel",
 ]
 

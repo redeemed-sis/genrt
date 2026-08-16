@@ -28,7 +28,11 @@ SECTIONS
 
     .boot_stack (NOLOAD) : ALIGN(16) {
         __boot_stack_bottom = .;
+        __boot_cpu_stack_bottom = .;
         . = . + 0x8000;
+        __boot_cpu_stack_top = .;
+        /* Four fixed 32 KiB bootstrap stacks; keep in sync with kernel config. */
+        . = . + (3 * 0x8000);
         __boot_stack_top = .;
     }
 
@@ -60,6 +64,12 @@ SECTIONS
         QUAD(__boot_stack_bottom);
         __boot_stack_top_value = .;
         QUAD(__boot_stack_top);
+        __boot_cpu_stack_top_value = .;
+        QUAD(__boot_cpu_stack_top);
+        __secondary_start_value = .;
+        QUAD(secondary_start);
+        __secondary_ttbr1_value = .;
+        QUAD(SECONDARY_TTBR1);
     }
 
     .data : AT(ADDR(.data) - KERNEL_HVA_OFFSET) ALIGN(4K) {

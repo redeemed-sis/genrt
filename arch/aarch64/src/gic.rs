@@ -66,7 +66,7 @@ pub fn enable_irq(irq_id: u32, priority: u8) {
 
     // SAFETY: GIC base addresses came from the parsed DTB GIC `reg` property.
     unsafe {
-        // Route SPIs to CPU0 in the current single-core QEMU virt milestone.
+        // Route SPIs to CPU0 while secondary scheduler/IRQ contexts are parked.
         // SGIs/PPIs use banked targeting and do not have writable ITARGETSR
         // entries in the same way.
         if irq_id >= 32 {

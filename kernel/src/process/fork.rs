@@ -46,7 +46,7 @@ use super::{
 /// # Panics
 ///
 /// Panics if a reserved child process slot disappears after publication begins;
-/// that would violate single-core process-table ownership.
+/// that would violate process-table lock ownership and slot reservation.
 pub(crate) fn fork_current(context: &mut ActiveContext<'_>) -> Result<usize, errno::Errno> {
     let snapshot = fork_snapshot_current()?;
     let child_pid =

@@ -21,3 +21,4 @@ qemu-test-user-fault = ["kernel/qemu-test-user-fault"]
 [dependencies]
 kernel = { path = "../../kernel" }
 bootinfo = { path = "../../crates/bootinfo" }
+fdt-raw = { version = "0.3.0", default-features = false }

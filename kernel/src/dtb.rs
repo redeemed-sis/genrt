@@ -24,11 +24,41 @@ impl core::fmt::Debug for DtbError {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+/// Summary of the bounded generic DTB parse.
 pub(crate) struct ParsedDtbInfo {
+    /// Total resident DTB byte length from its header.
     pub dtb_size: u64,
+    /// Number of initialized entries in the caller's memory-region array.
     pub region_count: usize,
+    /// Number of enabled direct CPU children described below `/cpus`.
+    pub cpu_count: usize,
 }
 
+/// Parse boot memory regions and enabled CPU count from a resident DTB.
+///
+/// The parser clears and fills caller-owned fixed storage. It performs no heap
+/// allocation, scheduler operation, or IRQ-state change.
+///
+/// # Arguments
+///
+/// * `dtb_va` - Readable kernel virtual address of the complete resident DTB,
+///   or zero to publish an empty result.
+/// * `out` - Fixed output array receiving sorted usable and reserved regions.
+///
+/// # Returns
+///
+/// Returns DTB size, initialized region count, and enabled CPU count. A zero
+/// `dtb_va` returns all zero counts.
+///
+/// # Errors
+///
+/// Returns [`DtbError`] for an invalid/truncated DTB, parser failure, or region
+/// output-capacity exhaustion.
+///
+/// # Safety
+///
+/// Nonzero `dtb_va` must identify a readable DTB whose complete
+/// header-declared range remains resident for parsing.
 pub(crate) unsafe fn parse_memory_regions(
     dtb_va: usize,
     out: &mut [MemoryRegion; MAX_BOOT_MEMORY_REGIONS],
@@ -38,11 +68,13 @@ pub(crate) unsafe fn parse_memory_regions(
         return Ok(ParsedDtbInfo {
             dtb_size: 0,
             region_count: 0,
+            cpu_count: 0,
         });
     }
 
     let dtb = unsafe { dtb_slice_from_va(dtb_va)? };
     let fdt = Fdt::from_bytes(dtb).map_err(DtbError::Parse)?;
+    let cpu_count = enabled_cpu_count(&fdt);
     let mut count = 0usize;
 
     for reservation in fdt.memory_reservations() {
@@ -98,7 +130,18 @@ pub(crate) unsafe fn parse_memory_regions(
     Ok(ParsedDtbInfo {
         dtb_size: fdt.header().totalsize as u64,
         region_count: count,
+        cpu_count,
     })
+}
+
+fn enabled_cpu_count(fdt: &Fdt<'_>) -> usize {
+    fdt.find_children_by_path("/cpus")
+        .filter(|node| node.find_property_str("device_type") == Some("cpu"))
+        .filter(|node| {
+            node.find_property_str("status")
+                .is_none_or(|status| matches!(status, "ok" | "okay"))
+        })
+        .count()
 }
 
 unsafe fn dtb_slice_from_va(base_va: usize) -> Result<&'static [u8], DtbError> {

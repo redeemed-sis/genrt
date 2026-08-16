@@ -58,7 +58,7 @@ const BOOT_TCR: u64 = TCR_T0SZ_48BIT
 /// Параметры, которые low Rust builder передает assembly trampoline.
 ///
 /// Layout фиксирован `repr(C)` и используется в `boot.s` по offsets:
-/// `0, 8, 16, 24, 32`. Поля после `high_stack` читает уже high Rust side.
+/// `0, 8, 16, 24, 32`. Поля после `high_stack_base` читает уже high Rust side.
 #[repr(C)]
 pub struct BootMmuParams {
     /// Low PA корневой L0 table для TTBR0_EL1 temporary identity mappings.
@@ -69,20 +69,27 @@ pub struct BootMmuParams {
     pub tcr: u64,
     /// Полное значение MAIR_EL1.
     pub mair: u64,
-    /// High VA alias `__boot_stack_top`.
-    pub high_stack: u64,
+    /// High VA alias of the first bounded bootstrap stack base.
+    pub high_stack_base: u64,
     /// Platform-owned DTB/RAM/MMIO ranges discovered before MMU enable.
     pub platform: crate::platform::BootPlatformParams,
 }
 
 impl BootMmuParams {
+    /// Construct empty low-boot MMU handoff storage.
+    ///
+    /// # Returns
+    ///
+    /// Returns an all-zero value suitable only for `.boot.bss` placement. The
+    /// low page-table builder must populate every consumed field before
+    /// assembly enables translation.
     pub const fn zeroed() -> Self {
         Self {
             ttbr0: 0,
             ttbr1: 0,
             tcr: 0,
             mair: 0,
-            high_stack: 0,
+            high_stack_base: 0,
             platform: crate::platform::BootPlatformParams::zeroed(),
         }
     }
@@ -115,7 +122,7 @@ static mut TTBR1_L2_GIC: PageTable = PageTable::new();
 static mut TTBR1_L2_UART: PageTable = PageTable::new();
 
 unsafe extern "C" {
-    static __boot_stack_top: u8;
+    static __boot_stack_bottom: u8;
     static __kernel_image_phys_start: u8;
     static __kernel_image_phys_end: u8;
 }
@@ -275,7 +282,8 @@ pub unsafe extern "C" fn boot_build_page_tables(params: *mut BootMmuParams) {
         write_param(
             params,
             4,
-            (core::ptr::addr_of!(__boot_stack_top) as usize).wrapping_add(KERNEL_HVA_OFFSET) as u64,
+            (core::ptr::addr_of!(__boot_stack_bottom) as usize).wrapping_add(KERNEL_HVA_OFFSET)
+                as u64,
         );
         crate::platform::write_boot_platform_params(
             core::ptr::addr_of_mut!((*params).platform),

@@ -12,9 +12,11 @@ use core::{
 };
 
 mod boot_dtb;
+mod cpu;
 pub(crate) mod qemu;
 
 pub(crate) use self::boot_dtb::{BootDeviceRange, BootPlatformInfo, parse_boot_platform};
+pub(crate) use self::cpu::{cpu_count, expected_hardware_id, init_cpu_topology, psci_cpu_on_call};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum PlatformError {

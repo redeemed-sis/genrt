@@ -20,6 +20,8 @@ pub enum MemoryRegionKind {
 #[repr(C)]
 pub struct BootInfo {
     pub boot_cpu_id: u64,
+    /// Number of enabled CPUs described by the boot platform.
+    pub cpu_count: u32,
     pub dtb_pa: u64,
     pub dtb_size: u64,
     pub rsdp_pa: u64,
@@ -27,9 +29,16 @@ pub struct BootInfo {
 }
 
 impl BootInfo {
+    /// Construct empty boot information before platform publication.
+    ///
+    /// # Returns
+    ///
+    /// Returns a zeroed descriptor with no memory map and no declared CPUs.
+    /// Platform boot code must populate and publish it before kernel entry.
     pub const fn new() -> Self {
         Self {
             boot_cpu_id: 0,
+            cpu_count: 0,
             dtb_pa: 0,
             dtb_size: 0,
             rsdp_pa: 0,

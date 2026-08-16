@@ -45,6 +45,26 @@ extern "C" fn arch_current_cpu_logical_id() -> usize {
     CURRENT_CPU_LOGICAL_ID.load(Ordering::Relaxed)
 }
 #[unsafe(no_mangle)]
+extern "C" fn arch_expected_cpu_count() -> usize {
+    1
+}
+#[unsafe(no_mangle)]
+extern "C" fn arch_bootstrap_stack_capacity() -> usize {
+    crate::config::KERNEL_CPU_CAPACITY
+}
+#[unsafe(no_mangle)]
+extern "C" fn arch_secondary_cpu_identity_matches(_logical_index: usize) -> bool {
+    true
+}
+#[unsafe(no_mangle)]
+extern "C" fn arch_start_secondary_cpu(_logical_index: usize) -> i64 {
+    -1
+}
+#[unsafe(no_mangle)]
+extern "C" fn arch_park_current_cpu() -> ! {
+    panic!("host test parked a CPU")
+}
+#[unsafe(no_mangle)]
 extern "C" fn arch_counter_now() -> u64 {
     0
 }

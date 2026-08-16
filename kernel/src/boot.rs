@@ -25,7 +25,7 @@ static BOOTINFO_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" {
     static __boot_stack_bottom_value: usize;
-    static __boot_stack_top_value: usize;
+    static __boot_cpu_stack_top_value: usize;
     fn arch_phys_to_virt(pa: usize) -> usize;
 }
 
@@ -73,6 +73,8 @@ pub unsafe fn init_bootinfo(dtb_pa: usize, dtb_va: usize) -> &'static BootInfo {
             .unwrap_or_else(|err| panic!("bootinfo: failed to parse DTB memory map: {err:?}"));
         BOOT_INFO.dtb_pa = dtb_pa as u64;
         BOOT_INFO.dtb_size = parsed.dtb_size;
+        BOOT_INFO.cpu_count = u32::try_from(parsed.cpu_count)
+            .unwrap_or_else(|_| panic!("bootinfo: DTB CPU count does not fit u32"));
         BOOT_INFO.memory_map = if parsed.region_count == 0 {
             &[]
         } else {
@@ -82,9 +84,16 @@ pub unsafe fn init_bootinfo(dtb_pa: usize, dtb_va: usize) -> &'static BootInfo {
     }
 }
 
+/// Measure CPU0's linker-owned bootstrap stack high-water mark.
+///
+/// # Returns
+///
+/// Returns total, used, and unused byte counts plus the lowest used physical
+/// address for bootstrap stack slot zero. The bounded scan allocates nothing,
+/// does not block, and does not inspect secondary stack slots.
 pub fn bootstrap_stack_usage() -> BootstrapStackUsage {
     let bottom_pa = unsafe { core::ptr::addr_of!(__boot_stack_bottom_value).read_volatile() };
-    let top_pa = unsafe { core::ptr::addr_of!(__boot_stack_top_value).read_volatile() };
+    let top_pa = unsafe { core::ptr::addr_of!(__boot_cpu_stack_top_value).read_volatile() };
     let bottom = unsafe { arch_phys_to_virt(bottom_pa) };
     let top = unsafe { arch_phys_to_virt(top_pa) };
     let mut cursor = bottom;
