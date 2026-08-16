@@ -34,7 +34,11 @@ pub mod time;
 
 use bootinfo::BootInfo;
 
-#[cfg(not(any(feature = "qemu-test-kernel-runtime", feature = "qemu-test-user-fault")))]
+#[cfg(not(any(
+    feature = "qemu-test-kernel-runtime",
+    feature = "qemu-test-user-fault",
+    feature = "qemu-test-smp-boot"
+)))]
 const PRODUCTION_THREADS: [sched::StaticThread; 1] = [sched::StaticThread::new(
     crate::init::kernel_init_thread,
     sched::ThreadArg::empty(),
@@ -135,7 +139,15 @@ fn static_threads() -> &'static [sched::StaticThread] {
     {
         &test_support::user_fault::THREADS
     }
-    #[cfg(not(any(feature = "qemu-test-kernel-runtime", feature = "qemu-test-user-fault")))]
+    #[cfg(feature = "qemu-test-smp-boot")]
+    {
+        &test_support::smp_boot::THREADS
+    }
+    #[cfg(not(any(
+        feature = "qemu-test-kernel-runtime",
+        feature = "qemu-test-user-fault",
+        feature = "qemu-test-smp-boot"
+    )))]
     {
         &PRODUCTION_THREADS
     }

@@ -17,6 +17,7 @@ log-level-trace = []
 qemu-test = []
 qemu-test-kernel-runtime = ["qemu-test"]
 qemu-test-user-fault = ["qemu-test"]
+qemu-test-smp-boot = ["qemu-test"]
 
 [dependencies]
 bootinfo = { path = "../crates/bootinfo" }

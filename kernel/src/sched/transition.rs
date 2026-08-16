@@ -950,6 +950,37 @@ impl Scheduler {
             }
         }
     }
+
+    #[cfg(feature = "qemu-test-smp-boot")]
+    pub(super) fn validate_secondary_contexts_offline_for_test(
+        &self,
+        boot_cpu: CpuId,
+        registered_cpus: usize,
+    ) {
+        if boot_cpu.index() != 0 || registered_cpus <= 1 || registered_cpus > self.cpus.len() {
+            panic!("sched test: invalid SMP boot topology");
+        }
+        let cpu0 = self.cpu_state_for(boot_cpu);
+        if !cpu0.initialized || !cpu0.online || cpu0.current.is_none() || cpu0.idle.is_none() {
+            panic!("sched test: CPU0 context is not active");
+        }
+        if self.cpus[1..registered_cpus].iter().any(|state| {
+            state.initialized
+                || state.online
+                || state.current.is_some()
+                || state.idle.is_some()
+                || !state.ready_queue.is_empty()
+        }) {
+            panic!("sched test: registered secondary scheduler context became active");
+        }
+        if self.lifecycle.slots.iter().any(|slot| {
+            slot.thread
+                .as_ref()
+                .is_some_and(|thread| thread.home_cpu != boot_cpu)
+        }) {
+            panic!("sched test: a thread was published away from CPU0");
+        }
+    }
 }
 
 fn next_generation(generation: u32) -> u32 {

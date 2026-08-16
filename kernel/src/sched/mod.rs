@@ -291,6 +291,28 @@ pub(crate) fn validate_cpu_context_for_test() {
     scheduler_mut().validate_cpu_context_for_test(cpu);
 }
 
+/// Validate that registered secondary CPU scheduler contexts remain offline.
+///
+/// # Arguments
+///
+/// * `registered_cpus` - Number of logical CPUs published by the CPU registry.
+///
+/// # Returns
+///
+/// Returns after a bounded allocation-free inspection under local IRQ
+/// exclusion.
+///
+/// # Panics
+///
+/// Panics when CPU0 is not the sole initialized/online context, a secondary
+/// owns current/idle/ready state, or any thread is assigned away from CPU0.
+#[cfg(feature = "qemu-test-smp-boot")]
+pub(crate) fn validate_secondary_contexts_offline_for_test(registered_cpus: usize) {
+    let cpu = current_cpu();
+    let _irq_guard = crate::sync::LocalIrqGuard::save_and_disable();
+    scheduler_mut().validate_secondary_contexts_offline_for_test(cpu, registered_cpus);
+}
+
 /// Generation-checked scheduler-thread handle.
 ///
 /// The index directly names a bounded scheduler slot; the generation changes

@@ -1,0 +1,15 @@
+name = "smp-boot"
+suite = "smp-boot"
+supervisor = "kernel"
+profile = "debug"
+log_level = "info"
+kernel_features = ["qemu-test-smp-boot"]
+cpu_count = 4
+init = "kernel-contract"
+timeout_secs = 45
+step_timeout_secs = 15
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "secondary-cpus-parked"

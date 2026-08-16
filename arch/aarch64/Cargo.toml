@@ -17,6 +17,7 @@ log-level-trace = ["kernel/log-level-trace"]
 qemu-test = ["kernel/qemu-test"]
 qemu-test-kernel-runtime = ["kernel/qemu-test-kernel-runtime"]
 qemu-test-user-fault = ["kernel/qemu-test-user-fault"]
+qemu-test-smp-boot = ["kernel/qemu-test-smp-boot"]
 
 [dependencies]
 kernel = { path = "../../kernel" }

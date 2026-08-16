@@ -7,3 +7,6 @@ pub(crate) mod kernel_runtime;
 
 #[cfg(feature = "qemu-test-user-fault")]
 pub(crate) mod user_fault;
+
+#[cfg(feature = "qemu-test-smp-boot")]
+pub(crate) mod smp_boot;
