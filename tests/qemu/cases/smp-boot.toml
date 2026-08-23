@@ -12,4 +12,9 @@ step_timeout_secs = 15
 [[steps]]
 action = "expect_case"
 producer = "kernel"
-subject = "secondary-cpus-parked"
+subject = "per-cpu-interrupt-state"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "per-cpu-timer-irqs"
