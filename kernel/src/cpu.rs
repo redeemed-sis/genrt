@@ -13,6 +13,8 @@ unsafe extern "C" {
     fn arch_bootstrap_stack_capacity() -> usize;
     fn arch_secondary_cpu_identity_matches(logical_index: usize) -> bool;
     fn arch_start_secondary_cpu(logical_index: usize) -> i64;
+    #[cfg(feature = "qemu-test-smp-boot")]
+    fn arch_smp_device_routing_ready_for_test() -> bool;
 }
 
 const SECONDARY_START_TIMEOUT_MS: u64 = 5_000;
@@ -91,7 +93,8 @@ pub(crate) enum CpuRegistrationError {
     ArchitectureStartFailed,
     /// A started CPU reported a registration or identity failure.
     SecondaryStartupFailed,
-    /// A started CPU did not publish parked readiness before the boot deadline.
+    /// A started CPU did not publish parked readiness after architecture-local
+    /// setup before the boot deadline.
     SecondaryStartupTimeout,
     /// The executing hardware CPU has no logical registration.
     UnknownCurrentCpu,
@@ -306,15 +309,15 @@ pub(crate) fn register_secondary_cpu(logical_index: usize) -> Result<CpuId, CpuR
 /// Start every platform-described secondary CPU and wait for parked readiness.
 ///
 /// CPU0 invokes PSCI sequentially so logical registration order is stable and
-/// each started CPU either reaches its exact parked state or terminates global
-/// boot with a controlled error. This path allocates nothing and does not use
-/// the scheduler.
+/// each started CPU either completes its architecture-owned local setup and
+/// publishes its exact parked state or terminates global boot with a controlled
+/// error. This path allocates nothing and does not enter any scheduler context.
 ///
 /// # Returns
 ///
 /// Returns after every expected secondary CPU has registered, verified its
-/// runtime identity, and published parked state. A single-core topology returns
-/// immediately.
+/// runtime identity, and published parked state after local architecture
+/// setup. A single-core topology returns immediately.
 ///
 /// # Errors
 ///
@@ -359,6 +362,11 @@ pub(crate) fn start_and_park_secondaries() -> Result<(), CpuRegistrationError> {
 }
 
 /// Publish that the executing secondary CPU reached its terminal parked boundary.
+///
+/// Architecture entry code may call this only after completing all CPU-local
+/// exception, interrupt-controller, and timer initialization. The process-wide
+/// registry deliberately stores no duplicate architecture-readiness flag: this
+/// transition is the generic publication point for successful local setup.
 ///
 /// # Arguments
 ///
@@ -451,12 +459,13 @@ pub(crate) fn registered_count() -> usize {
     REGISTERED_COUNT.load(Ordering::Acquire)
 }
 
-/// Return whether every platform-described secondary CPU is registered and parked.
+/// Return whether every platform-described secondary completed architecture
+/// setup and entered its terminal park transition.
 ///
 /// # Returns
 ///
 /// Returns `true` only when startup has not failed, the registry count matches
-/// the expected topology, and every non-boot record has published parked state.
+/// the expected topology and every non-boot record has published parked state.
 /// The bounded query allocates nothing and does not block the scheduler.
 #[cfg(feature = "qemu-test-smp-boot")]
 pub(crate) fn secondary_boot_complete() -> bool {
@@ -506,6 +515,25 @@ pub(crate) fn validate_smp_boot_for_test() {
                 panic!("cpu test: duplicate hardware identity or bootstrap stack");
             }
         }
+    }
+}
+
+/// Validate architecture-owned shared-device routing for the QEMU contract.
+///
+/// # Returns
+///
+/// Returns after checking CPU0-only UART SPI routing. CPU-local interrupt and
+/// timer readiness is exercised separately by the per-CPU timer probe.
+///
+/// # Panics
+///
+/// Panics when global device routing does not match the platform contract.
+#[cfg(feature = "qemu-test-smp-boot")]
+pub(crate) fn validate_smp_device_routing_for_test() {
+    // SAFETY: the test hook performs bounded read-only validation of GIC
+    // distributor state.
+    if !unsafe { arch_smp_device_routing_ready_for_test() } {
+        panic!("cpu test: device interrupt routing is incorrect");
     }
 }
 

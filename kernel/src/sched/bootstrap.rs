@@ -46,8 +46,9 @@ impl StaticThread {
 ///
 /// # Returns
 ///
-/// Returns `Ok(())` after publishing the scheduler and initializing timer
-/// callbacks that reference it.
+/// Returns `Ok(())` after publishing bounded scheduler state. Generic boot
+/// publishes per-CPU time queues separately; architecture entry code owns
+/// CPU-local interrupt initialization.
 ///
 /// # Errors
 ///
@@ -70,9 +71,9 @@ pub(crate) fn bootstrap(
     }
     let cpu = current_cpu();
 
-    // Publish scheduler state before enabling this CPU's deadline queue. Timer
-    // dispatch calls the scheduler facade directly and therefore requires the
-    // shared lifecycle table to exist first.
+    // Publish scheduler state before generic boot publishes deadline queues.
+    // Timer dispatch calls the scheduler facade directly and therefore
+    // requires the shared lifecycle table to exist first.
     let scheduler = Scheduler::bootstrap_new(
         cpu,
         idle_entry,
@@ -81,18 +82,9 @@ pub(crate) fn bootstrap(
         rr_quantum_ms,
         thread_capacity,
     )?;
-    let thread_count = scheduler.transition_thread_count();
     crate::sync::preempt::assert_pre_scheduler_state_quiescent(cpu);
     *scheduler_slot_mut() = Some(scheduler);
-    init_time_after_scheduler_publish(thread_count);
     Ok(())
-}
-
-#[inline(always)]
-fn init_time_after_scheduler_publish(thread_count: usize) {
-    crate::time::init_current_cpu(
-        thread_count.saturating_mul(crate::time::TIMED_EVENT_CAPACITY_PER_THREAD),
-    );
 }
 
 impl Scheduler {

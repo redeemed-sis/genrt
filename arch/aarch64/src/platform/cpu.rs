@@ -8,7 +8,7 @@ use core::{
 
 use fdt_raw::Fdt;
 
-const MAX_BOOT_CPUS: usize = 4;
+pub(super) const MAX_BOOT_CPUS: usize = 4;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CpuTopologyError {

@@ -1,11 +1,13 @@
 use crate::{
     arch::ActiveContext,
-    config::KERNEL_CPU_CAPACITY,
+    config::{KERNEL_CPU_CAPACITY, KERNEL_THREAD_CAPACITY},
     cpu::{self, CpuId},
     sched::{ThreadId, WaitToken},
     sync::IrqSpinLock,
 };
 use alloc::vec::Vec;
+#[cfg(feature = "qemu-test-smp-boot")]
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 unsafe extern "C" {
     fn arch_counter_now() -> u64;
@@ -18,8 +20,24 @@ unsafe extern "C" {
 ///
 /// One thread may concurrently own one exact wait deadline and one scheduler
 /// quantum. The third slot preserves the configured bounded queue headroom;
-/// scheduler bootstrap multiplies this constant by thread capacity.
+/// CPU-local time initialization multiplies this constant by configured thread
+/// capacity before any local timer IRQ is enabled.
 pub(crate) const TIMED_EVENT_CAPACITY_PER_THREAD: usize = 3;
+
+/// Errors from publishing one CPU's bounded deadline queue.
+///
+/// These diagnostics are copy-only and never carry allocator-owned state.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TimeInitError {
+    /// Requested topology is empty or exceeds fixed CPU capacity.
+    InvalidCpuCount,
+    /// The executing CPU already owns a published time state.
+    AlreadyInitialized,
+    /// Configured thread/event capacity overflowed `usize`.
+    CapacityOverflow,
+    /// Bootstrap allocation could not reserve the bounded queue storage.
+    OutOfMemory,
+}
 
 /// Exact deadline identity stored in one logical CPU's bounded time queue.
 ///
@@ -97,14 +115,12 @@ struct DeadlineQueue {
 }
 
 impl DeadlineQueue {
-    fn with_capacity(capacity: usize) -> Self {
+    fn try_with_capacity(capacity: usize) -> Result<Self, TimeInitError> {
         let mut entries = Vec::new();
-        entries.reserve_exact(capacity);
-        Self { entries }
-    }
-
-    fn capacity(&self) -> usize {
-        self.entries.capacity()
+        entries
+            .try_reserve_exact(capacity)
+            .map_err(|_| TimeInitError::OutOfMemory)?;
+        Ok(Self { entries })
     }
 
     fn schedule(&mut self, deadline: u64, event: TimedEvent) {
@@ -241,12 +257,12 @@ struct TimeState {
 }
 
 impl TimeState {
-    fn new(deadline_capacity: usize) -> Self {
-        Self {
-            queue: DeadlineQueue::with_capacity(deadline_capacity),
+    fn try_new(deadline_capacity: usize) -> Result<Self, TimeInitError> {
+        Ok(Self {
+            queue: DeadlineQueue::try_with_capacity(deadline_capacity)?,
             armed_timer_deadline: None,
             dispatching_irq: false,
-        }
+        })
     }
 
     fn schedule_event(&mut self, deadline: u64, event: TimedEvent) {
@@ -285,6 +301,10 @@ impl TimeState {
 static CPU_TIME: [IrqSpinLock<Option<TimeState>>; KERNEL_CPU_CAPACITY] =
     [const { IrqSpinLock::new(None) }; KERNEL_CPU_CAPACITY];
 
+#[cfg(feature = "qemu-test-smp-boot")]
+static TIMER_PROBE_COMPLETIONS: [AtomicUsize; KERNEL_CPU_CAPACITY] =
+    [const { AtomicUsize::new(0) }; KERNEL_CPU_CAPACITY];
+
 #[inline(always)]
 pub fn now_counter() -> u64 {
     // SAFETY: the architecture layer exposes a monotonic hardware counter.
@@ -317,42 +337,54 @@ pub fn uptime_ms() -> u64 {
     now_counter() / ms_to_counts(1)
 }
 
-/// Initialize the executing CPU's bounded deadline queue and local timer.
+/// Preallocate and publish bounded deadline queues for the boot CPU topology.
 ///
-/// Scheduler bootstrap calls this only after publishing shared scheduler
-/// lifecycle state. Capacity reservation allocates during bootstrap; runtime
-/// schedule, cancel, and IRQ dispatch paths never grow the queue.
+/// CPU0 calls this once after publishing shared scheduler lifecycle state and
+/// before starting secondary CPUs. All capacity reservation therefore occurs
+/// on CPU0; secondary bring-up and every runtime schedule, cancel, and IRQ path
+/// remain allocation-free. Architecture-local timer registers are initialized
+/// separately by each executing CPU.
 ///
 /// # Arguments
 ///
-/// * `deadline_capacity` - Maximum number of timed events owned concurrently
-///   by the executing logical CPU.
+/// * `cpu_count` - Number of logical CPU slots described by the accepted boot
+///   topology.
 ///
 /// # Returns
 ///
-/// Returns after publishing an empty queue and disarming the executing CPU's
-/// architected timer.
+/// Returns `Ok(())` after publishing one empty fixed-capacity queue for every
+/// CPU in the topology.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the executing CPU is not registered, its queue is already
-/// initialized, or bootstrap allocation cannot reserve the requested capacity.
-pub(crate) fn init_current_cpu(deadline_capacity: usize) {
-    let cpu = current_cpu();
-    let mut slot = time_slot(cpu).lock();
-    if slot.is_some() {
-        panic!("time: CPU{} already initialized", cpu.index());
+/// Returns [`TimeInitError`] when the topology is invalid, capacity arithmetic
+/// or reservation fails, or any selected CPU slot is already initialized.
+pub(crate) fn init_cpu_states(cpu_count: usize) -> Result<(), TimeInitError> {
+    if cpu_count == 0 || cpu_count > KERNEL_CPU_CAPACITY {
+        return Err(TimeInitError::InvalidCpuCount);
+    }
+    let deadline_capacity = KERNEL_THREAD_CAPACITY
+        .checked_mul(TIMED_EVENT_CAPACITY_PER_THREAD)
+        .ok_or(TimeInitError::CapacityOverflow)?;
+    for slot in &CPU_TIME[..cpu_count] {
+        if slot.lock().is_some() {
+            return Err(TimeInitError::AlreadyInitialized);
+        }
     }
 
-    let state = TimeState::new(deadline_capacity);
-    let capacity = state.queue.capacity();
-    program_timer_deadline(None);
-    *slot = Some(state);
-    drop(slot);
-    crate::debug!(
-        "time: CPU{} deadline queue capacity={capacity}",
-        cpu.index()
-    );
+    let mut prepared: [Option<TimeState>; KERNEL_CPU_CAPACITY] = core::array::from_fn(|_| None);
+    for state in &mut prepared[..cpu_count] {
+        *state = Some(TimeState::try_new(deadline_capacity)?);
+    }
+    for (slot, state) in CPU_TIME[..cpu_count]
+        .iter()
+        .zip(prepared[..cpu_count].iter_mut())
+    {
+        *slot.lock() = state.take();
+    }
+
+    crate::debug!("time: initialized {cpu_count} CPU queue(s), capacity={deadline_capacity} each");
+    Ok(())
 }
 
 /// Schedule or update an event on the executing CPU's deadline queue.
@@ -467,10 +499,12 @@ pub(crate) fn event_pending(event: TimedEvent) -> bool {
 /// Returns after all events expired at the sampled counter value are handled,
 /// the scheduler handoff is committed, and the one-shot timer is rearmed.
 pub fn on_timer_interrupt(context: &mut ActiveContext<'_>) {
+    let cpu = current_cpu();
+    crate::trace!("time: timer IRQ cpu={}", cpu.index());
+
     #[cfg(feature = "qemu-test-kernel-runtime")]
     crate::test_support::kernel_runtime::note_timer_irq();
 
-    let cpu = current_cpu();
     if time_slot(cpu).lock().is_none() {
         // Keep stray early-boot timer IRQs from ever reaching scheduler
         // state before this CPU's queue is initialized.
@@ -498,6 +532,69 @@ pub fn on_timer_interrupt(context: &mut ActiveContext<'_>) {
         time.dispatching_irq = false;
         time.rearm_timer(now);
     });
+}
+
+/// Arm the first local physical-timer interrupt in the SMP QEMU probe.
+///
+/// # Returns
+///
+/// Returns after programming a short owner-local deadline. The function is
+/// allocation-free and leaves IRQ state unchanged.
+///
+/// # Panics
+///
+/// Panics if the executing CPU is unregistered, its bounded time queue is not
+/// initialized/empty, or its probe was already started.
+#[cfg(feature = "qemu-test-smp-boot")]
+pub(crate) fn arm_local_timer_probe_for_test() {
+    let cpu = current_cpu();
+    if with_time(cpu, |time| time.queue.next_deadline().is_some()) {
+        panic!("time test: CPU{} probe found queued deadline", cpu.index());
+    }
+    if TIMER_PROBE_COMPLETIONS[cpu.index()].load(Ordering::Acquire) != 0 {
+        panic!("time test: CPU{} probe started twice", cpu.index());
+    }
+    let deadline = now_counter().saturating_add(us_to_counts(1_000).max(1));
+    program_timer_deadline(Some(deadline));
+}
+
+/// Record one fully acknowledged and EOI-completed local timer probe IRQ.
+///
+/// The AArch64 dispatcher calls this only after writing GICC_EOIR. Completion
+/// of the first interrupt arms a second deadline, so observing two completions
+/// proves that the executing CPU can accept another local PPI after EOI.
+///
+/// # Returns
+///
+/// Returns after one bounded atomic update and optional owner-local timer
+/// programming. The IRQ-context path allocates nothing and does not enter the
+/// scheduler.
+#[cfg(feature = "qemu-test-smp-boot")]
+pub fn on_local_timer_probe_eoi_for_test() {
+    let cpu = current_cpu();
+    let previous = TIMER_PROBE_COMPLETIONS[cpu.index()].fetch_add(1, Ordering::AcqRel);
+    if previous == 0 {
+        let deadline = now_counter().saturating_add(us_to_counts(1_000).max(1));
+        program_timer_deadline(Some(deadline));
+    }
+}
+
+/// Test whether every expected CPU completed two local timer probe IRQs.
+///
+/// # Arguments
+///
+/// * `cpu_count` - Number of registered logical CPUs expected by the QEMU case.
+///
+/// # Returns
+///
+/// Returns `true` only when each expected CPU reports exactly two completed
+/// acknowledge/EOI cycles. The bounded query allocates nothing.
+#[cfg(feature = "qemu-test-smp-boot")]
+pub(crate) fn local_timer_probes_complete_for_test(cpu_count: usize) -> bool {
+    cpu_count <= KERNEL_CPU_CAPACITY
+        && TIMER_PROBE_COMPLETIONS[..cpu_count]
+            .iter()
+            .all(|count| count.load(Ordering::Acquire) == 2)
 }
 
 #[inline(always)]
@@ -587,14 +684,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn topology_init_preallocates_every_selected_cpu_queue() {
+        assert_eq!(init_cpu_states(0), Err(TimeInitError::InvalidCpuCount));
+        assert_eq!(init_cpu_states(2), Ok(()));
+
+        let expected_capacity = KERNEL_THREAD_CAPACITY * TIMED_EVENT_CAPACITY_PER_THREAD;
+        for slot in &CPU_TIME[..2] {
+            let state = slot.lock();
+            assert_eq!(
+                state.as_ref().map(|time| time.queue.entries.capacity()),
+                Some(expected_capacity)
+            );
+        }
+        assert!(CPU_TIME[2].lock().is_none());
+        assert_eq!(init_cpu_states(2), Err(TimeInitError::AlreadyInitialized));
+    }
+
+    #[test]
     fn deadline_queues_keep_cpu_owned_events_separate() {
         let cpu0 = CpuId::from_index(0).unwrap();
         let cpu1 = CpuId::from_index(1).unwrap();
         let thread = ThreadId::new(3, 7);
         let event0 = TimedEvent::quantum_expired(cpu0, thread);
         let event1 = TimedEvent::quantum_expired(cpu1, thread);
-        let mut queue0 = DeadlineQueue::with_capacity(1);
-        let mut queue1 = DeadlineQueue::with_capacity(1);
+        let mut queue0 = DeadlineQueue::try_with_capacity(1).expect("queue0 allocation");
+        let mut queue1 = DeadlineQueue::try_with_capacity(1).expect("queue1 allocation");
 
         queue0.schedule(10, event0);
         queue1.schedule(20, event1);

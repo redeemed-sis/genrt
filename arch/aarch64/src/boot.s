@@ -47,6 +47,10 @@
 _start:
     // QEMU enters only CPU0 here. Secondary CPUs use `secondary_start` through
     // PSCI CPU_ON with their intended logical slot in x0.
+    // Keep asynchronous exceptions masked while high Rust installs VBAR and
+    // initializes CPU0-local GICC/PPI/timer state, then while generic boot
+    // publishes the bounded runtime owners needed before IRQ delivery.
+    msr daifset, #0xf
     // TPIDR_EL1=0 is the explicit unbound state expected by the generic CPU
     // registry; CPU0 must not inherit a stale logical binding from firmware.
     msr TPIDR_EL1, xzr
@@ -121,9 +125,11 @@ boot_stack_ready:
 .global secondary_start
 .type secondary_start, %function
 secondary_start:
-    // Keep every asynchronous exception masked until a later SMP milestone
-    // initializes this CPU's interrupt and timer ownership. Clear TPIDR_EL1 so
-    // generic current_cpu() cannot accidentally classify this CPU as CPU0.
+    // Keep every asynchronous exception masked while high Rust installs local
+    // vectors, registers this CPU with generic state, and initializes its
+    // GICC/PPI and physical timer before entering the IRQ-enabled park loop.
+    // Clear TPIDR_EL1 so generic current_cpu() cannot accidentally classify
+    // this CPU as CPU0.
     msr  daifset, #0xf
     msr  TPIDR_EL1, xzr
     mov  x19, x0

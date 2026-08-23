@@ -17,6 +17,7 @@ pub(crate) mod qemu;
 
 pub(crate) use self::boot_dtb::{BootDeviceRange, BootPlatformInfo, parse_boot_platform};
 pub(crate) use self::cpu::{cpu_count, expected_hardware_id, init_cpu_topology, psci_cpu_on_call};
+pub(crate) const CPU_CAPACITY: usize = cpu::MAX_BOOT_CPUS;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum PlatformError {

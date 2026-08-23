@@ -61,10 +61,6 @@ extern "C" fn arch_start_secondary_cpu(_logical_index: usize) -> i64 {
     -1
 }
 #[unsafe(no_mangle)]
-extern "C" fn arch_park_current_cpu() -> ! {
-    panic!("host test parked a CPU")
-}
-#[unsafe(no_mangle)]
 extern "C" fn arch_counter_now() -> u64 {
     0
 }

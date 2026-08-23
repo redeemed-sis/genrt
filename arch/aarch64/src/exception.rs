@@ -17,7 +17,8 @@ pub extern "C" fn irq_entry(frame: *mut TrapFrame) {
     let irq_id = gic::irq_id_from_iar(iar);
 
     if !gic::is_spurious(irq_id) {
-        if irq_id == timer::TIMER_IRQ_ID_PHYS {
+        let timer_irq = irq_id == timer::TIMER_IRQ_ID_PHYS;
+        if timer_irq {
             timer::on_timer_irq(&mut active);
         } else if irq_id == platform::qemu::UART0_IRQ_ID {
             console::on_uart_irq();
@@ -25,6 +26,10 @@ pub extern "C" fn irq_entry(frame: *mut TrapFrame) {
             kernel::warn!("irq: unexpected id=0x{irq_id:08x}");
         }
         gic::end_irq(iar);
+        #[cfg(feature = "qemu-test-smp-boot")]
+        if timer_irq {
+            kernel::time::on_local_timer_probe_eoi_for_test();
+        }
     }
 }
 

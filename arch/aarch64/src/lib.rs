@@ -88,12 +88,15 @@ pub extern "C" fn rust_entry(boot_mmu_params_pa: usize, bootstrap_slot: usize) -
     if bootinfo.cpu_count as usize != platform::cpu_count() {
         panic!("arch: generic and AArch64 CPU topology counts differ");
     }
-    unsafe {
-        gic::init_controller_minimal();
-        gic::enable_irq(timer::TIMER_IRQ_ID_PHYS, 0x40);
-        console::enable_rx_interrupts();
-        gic::enable_irq(platform::qemu::UART0_IRQ_ID, 0x60);
-        timer::early_init();
+    if !gic::init_global_distributor() {
+        panic!("arch: failed to initialize GIC distributor");
+    }
+    console::enable_rx_interrupts();
+    if !gic::enable_spi_on_cpu0(platform::qemu::UART0_IRQ_ID, 0x60) {
+        panic!("arch: failed to route UART SPI to CPU0");
+    }
+    if !init_current_cpu_interrupt_state() {
+        panic!("arch: failed to initialize CPU0 interrupt state");
     }
     kernel::kernel_main(bootinfo)
 }
@@ -119,8 +122,9 @@ pub extern "C" fn rust_entry(boot_mmu_params_pa: usize, bootstrap_slot: usize) -
 /// asynchronous exceptions.
 #[unsafe(no_mangle)]
 pub extern "C" fn secondary_rust_entry(_boot_mmu_params_pa: usize, bootstrap_slot: usize) -> ! {
-    // SAFETY: the secondary owns its DAIF and VBAR_EL1 registers. All
-    // asynchronous exceptions remain masked throughout this milestone.
+    // SAFETY: the secondary owns its DAIF, VBAR_EL1, and TTBR0_EL1 registers.
+    // IRQ remains masked until generic registration and the complete local
+    // interrupt/timer initialization sequence have both succeeded.
     unsafe {
         asm!(
             "msr daifset, #0xf",
@@ -130,7 +134,41 @@ pub extern "C" fn secondary_rust_entry(_boot_mmu_params_pa: usize, bootstrap_slo
         install_vectors();
         clear_local_ttbr0();
     }
-    kernel::kernel_secondary_main(bootstrap_slot)
+    if !kernel::kernel_prepare_secondary_cpu(bootstrap_slot) {
+        hard_park_current_cpu()
+    }
+    if !init_current_cpu_interrupt_state() {
+        kernel::kernel_fail_secondary_cpu_startup();
+        hard_park_current_cpu()
+    }
+    if !kernel::kernel_complete_secondary_cpu_startup(bootstrap_slot) {
+        hard_park_current_cpu()
+    }
+    park_current_cpu_with_irq()
+}
+
+/// Initialize CPU-local GIC, PPI, and physical timer state.
+///
+/// Returns `true` after local register readback succeeds. Shared GIC state must
+/// already be configured and IRQ must remain masked until generic time state is
+/// available. This architecture-owned operation is bounded and allocation-free.
+fn init_current_cpu_interrupt_state() -> bool {
+    // SAFETY: the executing CPU exclusively owns CNTP_* and its banked
+    // GICC/PPI view. Both architecture entries install and verify VBAR_EL1
+    // before reaching this helper. Masking IRQ closes the publication window
+    // even if a caller reached this hook with a permissive DAIF value.
+    let ready = unsafe {
+        asm!(
+            "msr daifset, #2",
+            "isb",
+            options(nomem, nostack, preserves_flags)
+        );
+        timer::init_current_cpu()
+    } && gic::init_current_cpu_interface()
+        && gic::enable_current_cpu_private_irq(timer::TIMER_IRQ_ID_PHYS, 0x40)
+        && vectors_installed();
+
+    ready
 }
 
 #[unsafe(no_mangle)]
@@ -223,12 +261,6 @@ pub extern "C" fn arch_start_secondary_cpu(logical_index: usize) -> i64 {
         );
     }
     status as i64
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn arch_irq_enable() {
-    // SAFETY: Called once the kernel is ready to receive timer IRQs.
-    unsafe { timer::enable_cpu_irq() }
 }
 
 #[unsafe(no_mangle)]
@@ -414,16 +446,32 @@ pub extern "C" fn arch_hard_fault() -> ! {
     }
 }
 
-/// Park the executing secondary CPU with asynchronous exceptions masked.
-///
-/// # Returns
-///
-/// This function never returns. It executes an allocation-free architecture
-/// wait loop and does not initialize interrupts, timers, or scheduling.
-#[unsafe(no_mangle)]
-pub extern "C" fn arch_park_current_cpu() -> ! {
-    // SAFETY: parked secondary CPUs own their local DAIF state and have no
-    // runnable context to preserve.
+/// Park an initialized secondary in an IRQ-enabled architecture idle loop.
+fn park_current_cpu_with_irq() -> ! {
+    // SAFETY: this path is reached only after architecture-local interrupt
+    // setup and generic readiness publication both succeeded.
+    unsafe {
+        asm!(
+            "msr daifset, #0xf",
+            "isb",
+            options(nomem, nostack, preserves_flags)
+        );
+        asm!(
+            "msr daifclr, #2",
+            "isb",
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    loop {
+        // SAFETY: the CPU owns its bootstrap stack and all local IRQ state.
+        unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
+    }
+}
+
+/// Park a failed secondary with every asynchronous exception masked.
+fn hard_park_current_cpu() -> ! {
+    // SAFETY: failed startup is terminal and owns only this CPU's local DAIF
+    // state and bootstrap stack.
     unsafe {
         asm!(
             "msr daifset, #0xf",
@@ -432,11 +480,16 @@ pub extern "C" fn arch_park_current_cpu() -> ! {
         );
     }
     loop {
-        // SAFETY: WFE is the controlled architecture idle state for a parked
-        // CPU. Events may wake it transiently, after which it immediately waits
-        // again without observing runtime state.
-        unsafe { asm!("wfe", options(nomem, nostack, preserves_flags)) };
+        // SAFETY: masked WFI is a terminal architecture wait state.
+        unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
     }
+}
+
+/// Validate test-only CPU0 device interrupt routing.
+#[cfg(feature = "qemu-test-smp-boot")]
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_smp_device_routing_ready_for_test() -> bool {
+    gic::spi_targets_cpu0(platform::qemu::UART0_IRQ_ID)
 }
 
 unsafe fn clear_local_ttbr0() {
@@ -492,6 +545,19 @@ unsafe fn install_vectors() {
             options(nostack, preserves_flags)
         );
     }
+}
+
+fn vectors_installed() -> bool {
+    let current: usize;
+    // SAFETY: VBAR_EL1 is CPU-local and readable at EL1.
+    unsafe {
+        asm!(
+            "mrs {current}, VBAR_EL1",
+            current = out(reg) current,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    current == core::ptr::addr_of!(__vectors) as usize
 }
 
 fn current_el() -> u64 {
