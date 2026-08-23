@@ -16,8 +16,9 @@ stores complete evidence below `target/test-results/`.
 - `user-fault`: test-enabled kernel coordinator that joins a faulting EL0
   process and verifies exact fault classification.
 - `smp-boot`: four-CPU test kernel that validates PSCI secondary high-half
-  entry, unique logical/hardware/stack ownership, parked readiness, and offline
-  secondary scheduler contexts.
+  entry, unique logical/hardware/stack ownership, architecture-owned per-CPU
+  exception/GICC/PPI setup, two local timer acknowledge/EOI cycles, CPU0-only
+  device routing, and offline secondary scheduler contexts.
 - `userspace-contract`: production kernel plus test supervisor and exact
   production-program invocations.
 - `shell-contract`: production kernel and shell plus test-only helpers and a

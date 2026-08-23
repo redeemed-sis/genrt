@@ -1,8 +1,8 @@
 # Scheduler, time, and blocking
 
 The scheduler is a bounded CPU0-only round-robin engine with preallocated
-per-logical-CPU contexts. Secondary CPUs are registered and parked but their
-scheduler contexts remain offline. `Thread` is the only schedulable entity. Context
+per-logical-CPU contexts. Secondary CPUs are interrupt-ready and parked but
+their scheduler contexts remain offline. `Thread` is the only schedulable entity. Context
 switches save a borrowed `ActiveContext` into the current thread's owned
 `SavedContext` and restore the selected thread into the live return context.
 
@@ -13,7 +13,10 @@ uses separate fixed CPU-local storage available before heap initialization and
 retained after scheduler publication. CPU0 and every DTB-described secondary
 are registered before scheduler bootstrap; CPU0 alone is initialized and
 online, while all secondary contexts remain offline. `ThreadAttrs` chooses an immutable home
-CPU before publication. Local wakeups enter that CPU's ready queue. Remote
+CPU before publication. Scheduler storage and all per-CPU time queues are
+published by CPU0 before secondary startup. Architecture entry code owns each
+CPU's local interrupt readiness; only CPU0's scheduler is initialized/online.
+Local wakeups enter that CPU's ready queue. Remote
 wakeups publish into a bounded per-target ingress that only the target CPU
 drains into its local ready queue. There is no migration, IPI notification,
 work stealing, or secondary scheduling in the active target.
@@ -98,7 +101,10 @@ address space.
 ## Preemption and time
 
 Each logical CPU owns one preallocated deadline queue and its architected
-physical timer. Timed events retain that CPU identity, and only the owner CPU
+physical timer. For secondaries, CPU-local queue publication precedes PSCI
+startup, timer PPI enable, and IRQ unmasking. CPU0 initializes its local timer
+hardware earlier with IRQ masked and does not unmask until generic queue and
+scheduler publication are complete. Timed events retain that CPU identity, and only the owner CPU
 inserts events or programs its one-shot nearest deadline. IRQ dispatch collects
 expired events, releases the queue lock, then directly invokes the narrow
 scheduler facade to complete tokens, account quantum expiration, and perform
@@ -159,8 +165,9 @@ own finite static-thread arrays without changing round-robin behavior.
 
 ## Constraints
 
-- Scheduling, timer service, and normal IRQ handling remain CPU0-only;
-  registered secondary CPUs execute only their bounded bring-up and park path.
+- Normal scheduling, device IRQs, threads, and userspace remain CPU0-only.
+  Registered secondary CPUs service only bounded local physical-timer IRQs and
+  return to their architecture park loop.
 - Local IRQ exclusion is not SMP synchronization; shared owners use explicit
   cross-CPU locks.
 - No heap allocation or unbounded work in scheduling, timer, or frame-handoff
@@ -173,4 +180,4 @@ own finite static-thread arrays without changing round-robin behavior.
   process/address space remain future work.
 
 Related decisions: ADR-0003, ADR-0005, ADR-0006, ADR-0011 through ADR-0014,
-ADR-0020, ADR-0027 through ADR-0033, and ADR-0035 through ADR-0038.
+ADR-0020, ADR-0027 through ADR-0033, and ADR-0035 through ADR-0039.

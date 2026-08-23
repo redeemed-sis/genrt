@@ -9,7 +9,8 @@ accepted ADRs remain authoritative when details differ.
 - Rust target: `aarch64-unknown-none-softfloat`.
 - Machine: QEMU `virt` with GICv2.
 - Execution model: CPU0-only scheduling plus bounded high-half bring-up of
-  registered secondary CPUs into a scheduler-offline parked state.
+  registered secondary CPUs into an interrupt-ready, scheduler-offline parked
+  state.
 - Kernel image: low physical load with a high-half virtual runtime mapping.
 
 ## Boot and platform
@@ -22,8 +23,11 @@ accepted ADRs remain authoritative when details differ.
 - Four fixed linker-owned 32 KiB bootstrap-stack slots bound the current QEMU
   topology. Every secondary enters low `secondary_start` through PSCI, enables
   the MMU with boot TTBR0 plus runtime TTBR1, enters high Rust, clears its local
-  TTBR0, registers in generic kernel code, and parks with asynchronous
-  exceptions masked.
+  TTBR0, installs VBAR, binds logical identity through a generic prepare call,
+  initializes local GICC/timer PPI/physical timer state, publishes generic
+  parked completion, and enters `WFI` with IRQ enabled. CPU0 performs its local
+  architecture setup before `kernel_main`; generic code never invokes either
+  CPU's interrupt setup or chooses its DAIF park policy.
 - `.boot.text`, `.boot.rodata`, and `.boot.bss` are autonomous before MMU
   enable. `xtask` checks the linked image for relocations, runtime thunks,
   high-VA operands, and branches outside `.boot.*`.
@@ -71,9 +75,9 @@ accepted ADRs remain authoritative when details differ.
   preemption backing keeps lock acquisition independent of shared lifecycle
   storage.
   CPU0 alone is initialized and becomes online at first thread entry; registered
-  secondary contexts remain offline while their CPUs stay in the architecture
-  park loop. Runtime scheduler entry points resolve the executing CPU once and
-  bind a `CpuScheduler` view for the complete local operation; affinity,
+  secondary contexts remain offline while their interrupt-ready CPUs stay in
+  the architecture park loop. Runtime scheduler entry points resolve the
+  executing CPU once and bind a `CpuScheduler` view for the complete local operation; affinity,
   home-CPU wakeup, bootstrap, and validation retain explicit target selection.
 - Production bootstrap starts only the permanent idle thread and one kernel init
   thread; the latter launches and joins userspace `/init`.
@@ -94,6 +98,13 @@ accepted ADRs remain authoritative when details differ.
   carry their CPU owner; only that CPU inserts events and programs its physical
   timer. IRQ dispatch drops the queue owner before calling the scheduler facade
   directly.
+- CPU0 alone initializes the shared GIC distributor and routes device SPIs.
+  Architecture entry initializes each CPU's vector base, banked GICC interface,
+  physical-timer PPI, and local `CNTP_*` state. CPU0 preallocates all generic
+  deadline queues before PSCI startup. Generic secondary parked publication
+  occurs only after local setup, without a duplicate interrupt-readiness flag.
+  Secondary timer IRQs are attributed to their logical CPU and return to park
+  without making the offline scheduler context runnable.
 - Reschedule requests coalesce in `kernel::sync::preempt`. Timer IRQ return and
   a private typed sched-call checkpoint may consume them only at disable depth
   zero; outermost guard release invokes that checkpoint automatically when the
@@ -184,9 +195,9 @@ accepted ADRs remain authoritative when details differ.
 
 ## Current boundaries
 
-- Secondary CPUs reach generic registration and a controlled parked state, but
-  have no local GIC CPU-interface/timer initialization and perform no normal
-  scheduling, kernel-thread, or userspace execution.
+- Secondary CPUs are interrupt-ready and can acknowledge/EOI their local
+  physical-timer PPI while parked. They perform no normal scheduling,
+  kernel-thread, device-IRQ, or userspace execution.
 - No IPI/remote reschedule or remote timer-insertion notification, migration,
   CPU hotplug, or userspace TLB shootdown. Shared runtime owners are already
   cross-CPU locked.

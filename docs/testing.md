@@ -41,9 +41,10 @@ classification.
 
 `smp-boot` uses a dedicated test kernel and a four-CPU DTB/QEMU topology. CPU0
 starts each secondary through PSCI; the coordinator validates unique hardware
-identities and bootstrap stacks, stable logical bindings, complete parked
-readiness, and offline secondary scheduler contexts. It does not claim
-secondary scheduling, timer, or interrupt participation.
+identities and bootstrap stacks, stable logical bindings, completed parked
+publication after architecture-local setup, CPU0-only device routing, two local physical-timer
+acknowledge/EOI cycles per CPU, and offline secondary scheduler contexts. It
+does not claim secondary scheduling or normal device IRQ participation.
 
 `userspace-contract` and `shell-contract` use the production kernel with a
 test-only initramfs. `/init` is a supervisor that performs

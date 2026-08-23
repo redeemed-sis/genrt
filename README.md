@@ -7,9 +7,9 @@
 genrt is an experimental hard real-time operating system written primarily in
 Rust. The active platform is AArch64 QEMU `virt`; CPU0 runs the kernel and
 userspace while DTB-described secondary CPUs complete high-half bring-up and
-remain in a controlled parked state. The project uses that environment to make
-boot, scheduling, userspace, testing, and release invariants explicit before
-expanding runtime SMP scope.
+remain interrupt-ready in a scheduler-offline parked state. The project uses
+that environment to make boot, scheduling, userspace, testing, and release
+invariants explicit before expanding runtime SMP scope.
 
 genrt is aimed at operating-system and embedded developers who want a compact,
 inspectable codebase for studying deterministic kernel mechanisms. Its focus is
@@ -24,7 +24,8 @@ a production-ready or latency-certified operating system.
 - DTB-driven RAM/platform discovery, physical frame allocation, runtime TTBR1
   mappings, and a fixed bootstrap heap.
 - Bounded PSCI bring-up of secondary CPUs into unique high-half bootstrap
-  stacks and scheduler-offline parked states.
+  stacks with architecture-owned per-CPU exception/timer setup and offline
+  schedulers.
 - Preemptive IRQ-return scheduler with one-shot deadlines, bounded kernel
   threads, sleep, and mailbox IPC.
 - Process-owned TTBR0 address spaces, static AArch64 ELF loading, lower-EL fault
@@ -136,8 +137,9 @@ and [docs/releases.md](docs/releases.md).
 
 ## Current boundaries
 
-- Scheduling and interrupt/timer service remain CPU0-only; secondary CPUs are
-  registered and parked, with no IPI activation, migration, or TLB shootdown.
+- Scheduling, device IRQs, and userspace remain CPU0-only; secondary CPUs
+  service only their local physical timer while parked, with no IPI activation,
+  migration, or TLB shootdown.
 - Shared runtime state has SMP synchronization, but runtime SMP scheduling and
   latency certification are not implemented.
 - No FP/SIMD context ownership; kernel Rust uses the soft-float target.

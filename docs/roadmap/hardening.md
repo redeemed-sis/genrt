@@ -25,8 +25,8 @@ explicit acceptance criteria.
      hard upper bound;
    - retain allocation-free bounded handlers.
 4. **Secondary CPU activation**
-   - activate the registered parked CPUs with local GIC CPU-interface setup,
-     scheduler idle/current state, and timer ownership;
+   - initialize secondary scheduler idle/current state now that local
+     exceptions, GICC/PPI, physical timers, and generic time queues are ready;
    - add IPI acknowledgement and remote wake notification on top of ADR-0036
      shared-state synchronization and ADR-0038 secondary bring-up;
    - add an IPI-backed remote timer command for prompt insertion into another

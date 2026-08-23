@@ -27,9 +27,15 @@ kernel registers CPU0 and every secondary, assigns logical IDs, and verifies
 that each PSCI target matches the executing hardware identity. Registration
 stores the logical index plus one in `TPIDR_EL1`, so runtime current-CPU
 resolution is an O(1) register read and zero remains an explicit unbound state.
-Secondaries clear their local TTBR0 after high entry, publish parked readiness,
-and enter the architecture-owned `WFE` loop with asynchronous exceptions
-masked. Their scheduler contexts remain offline.
+CPU0 installs its vectors and initializes its local GICC, timer PPI, and
+physical timer entirely in `rust_entry` before entering generic kernel boot.
+Secondaries clear their local TTBR0 after high entry, install vectors, and call
+a narrow generic prepare stage to bind logical identity. AArch64 then performs
+the same local GICC/PPI/timer setup and calls generic completion before entering
+an IRQ-enabled `WFI` loop. Generic code never invokes architecture interrupt
+initialization or selects the park mask policy. CPU0 has already preallocated
+every topology CPU's bounded time state before PSCI startup, and every secondary
+scheduler context remains offline.
 
 Main kernel sections have high VMAs and low LMAs through linker `AT(...)`; no
 runtime section copy is required. The address convention is:
@@ -79,12 +85,20 @@ kernel/user/fork entry state, and performs bounded live-to-saved transfers.
 Compile-time checks require the architecture frame to fit with compatible
 alignment; the assembly restore layout remains unchanged.
 
-GICv2 dispatches the architected timer and PL011 RX IRQ. Each PE owns its
-physical timer registers; generic time state therefore keeps one bounded queue
-per logical CPU and only the executing owner programs that timer. Expiry enters
-the generic time path, which invokes the scheduler facade after releasing queue
-ownership and may replace the return frame. UART IRQ drains a bounded RX FIFO
-path and wakes stdin waiters without allocation.
+GICv2 initialization follows register ownership. CPU0 alone enables the shared
+distributor and routes device SPIs, including PL011, to CPU0. Each architecture
+entry installs that CPU's vector base, initializes its banked GICC interface,
+enables the physical-timer PPI, and resets its `CNTP_*` state before local IRQ
+delivery. Generic parked readiness is published only after this sequence; no
+duplicate interrupt-readiness flag exists in the generic CPU registry.
+
+Each PE owns its physical timer registers; generic time state therefore keeps
+one bounded queue per logical CPU and only the executing owner programs that
+timer. Timer IRQ entry resolves the existing logical binding, acknowledges and
+EOIs through the executing CPU's GICC interface, and dispatches only that CPU's
+queue. An offline secondary scheduler produces no context handoff and returns
+to `WFI`. UART IRQ drains a bounded RX FIFO path on CPU0 and wakes stdin waiters
+without allocation.
 
 ## Build invariants
 
@@ -101,5 +115,5 @@ path and wakes stdin waiters without allocation.
   with Release/Acquire ordering before secondary use.
 
 Related decisions: ADR-0002 through ADR-0004, ADR-0008, ADR-0015, ADR-0027,
-ADR-0028, and ADR-0038 in
+ADR-0028, ADR-0038, and ADR-0039 in
 [`memory/decisions/`](../../memory/decisions/README.md).

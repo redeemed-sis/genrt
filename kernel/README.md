@@ -26,16 +26,18 @@ Detailed ownership lives in the [memory](src/memory/README.md),
 
 ## Execution model
 
-After architecture boot, `kernel_main` registers the normalized boot hardware
-CPU as logical CPU0, validates the DTB-derived CPU count, initializes physical
-memory, switches to runtime TTBR1 tables, and mounts initramfs. CPU0 then asks
-the architecture to start each expected secondary. Every secondary enters
-`kernel_secondary_main`, registers through the same bounded CPU registry,
-verifies its runtime logical binding, publishes parked readiness, and returns
-to an architecture-owned terminal park loop. Only after all expected CPUs are
-parked does CPU0 bootstrap scheduler storage and enter the first selected trap
-frame. The init kernel thread spawns `/init` as a normal user process and joins
-it.
+Before `kernel_main`, AArch64 initializes CPU0's shared GIC policy and local
+vectors/GICC/PPI/physical-timer state. Generic boot then registers CPU0,
+validates the DTB-derived CPU count, initializes physical memory, switches to
+runtime TTBR1 tables, mounts initramfs, publishes bounded scheduler storage,
+and preallocates every topology CPU's time queue. CPU0 then asks AArch64 to
+start each expected secondary. Each secondary uses a narrow generic prepare
+call to bind logical identity, completes local architecture setup, and uses a
+generic completion call to publish parked readiness before entering an
+IRQ-enabled architecture park loop. Generic code neither invokes local
+interrupt setup nor controls DAIF. Secondary scheduler contexts remain offline.
+After all expected CPUs are parked, CPU0 enters the first selected trap frame.
+The init kernel thread spawns `/init` as a normal user process and joins it.
 
 The production scheduler starts with exactly two kernel threads: the permanent
 idle thread and one non-idle `kernel_init_thread`. QEMU scenario features replace
