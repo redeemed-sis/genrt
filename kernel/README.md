@@ -31,12 +31,13 @@ vectors/GICC/PPI/physical-timer state. Generic boot then registers CPU0,
 validates the DTB-derived CPU count, initializes physical memory, switches to
 runtime TTBR1 tables, mounts initramfs, publishes bounded scheduler storage,
 and preallocates every topology CPU's time queue. CPU0 then asks AArch64 to
-start each expected secondary. Each secondary uses a narrow generic prepare
-call to bind logical identity, completes local architecture setup, and uses a
-generic completion call to publish parked readiness before entering an
-IRQ-enabled architecture park loop. Generic code neither invokes local
-interrupt setup nor controls DAIF. Secondary scheduler contexts remain offline.
-After all expected CPUs are parked, CPU0 enters the first selected trap frame.
+start each expected secondary. Each secondary completes local architecture
+setup first, then enters one generic function that binds logical identity,
+initializes one scheduler-owned idle/current context from CPU0-reserved storage,
+and enters that saved frame. Generic code neither invokes local interrupt setup
+nor controls DAIF. The scheduler marks each context online immediately before
+the saved frame entry; CPU0 waits sequentially for every exact context. CPU0
+then enters its first selected trap frame.
 The init kernel thread spawns `/init` as a normal user process and joins it.
 
 The production scheduler starts with exactly two kernel threads: the permanent

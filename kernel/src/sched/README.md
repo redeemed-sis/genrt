@@ -1,8 +1,10 @@
 # Scheduler, time, and blocking
 
-The scheduler is a bounded CPU0-only round-robin engine with preallocated
-per-logical-CPU contexts. Secondary CPUs are interrupt-ready and parked but
-their scheduler contexts remain offline. `Thread` is the only schedulable entity. Context
+The scheduler is a bounded round-robin engine with one shared thread table and
+fixed per-logical-CPU contexts. CPU0 preallocates one permanent idle slot for
+every expected CPU. Each registered CPU initializes local idle/current state
+and becomes online only at first saved-frame entry. `Thread` is the only
+schedulable entity. Context
 switches save a borrowed `ActiveContext` into the current thread's owned
 `SavedContext` and restore the selected thread into the live return context.
 
@@ -11,15 +13,19 @@ scheduler code never uses raw MPIDR. Every context owns its current thread,
 idle thread, ready queue, and initialized/online state. Preemption bookkeeping
 uses separate fixed CPU-local storage available before heap initialization and
 retained after scheduler publication. CPU0 and every DTB-described secondary
-are registered before scheduler bootstrap; CPU0 alone is initialized and
-online, while all secondary contexts remain offline. `ThreadAttrs` chooses an immutable home
+are registered before scheduler bootstrap; CPU0 reserves idle capacity for the
+full topology, and each CPU initializes one local context. `ThreadAttrs` chooses an immutable home
 CPU before publication. Scheduler storage and all per-CPU time queues are
 published by CPU0 before secondary startup. Architecture entry code owns each
-CPU's local interrupt readiness; only CPU0's scheduler is initialized/online.
+CPU's local interrupt readiness.
 Local wakeups enter that CPU's ready queue. Remote
 wakeups publish into a bounded per-target ingress that only the target CPU
-drains into its local ready queue. There is no migration, IPI notification,
-work stealing, or secondary scheduling in the active target.
+drains into its local ready queue. Every online current thread retains a local
+RR quantum even with no peer, so late remote-ready ingress is drained and runs
+within one RR quantum. This is a bounded no-IPI fallback, not immediate
+notification; Issue #7 owns the future IPI notification path. There is no
+migration, work stealing, remote timer insertion, or userspace secondary
+execution in the active target.
 
 Current-CPU entry points resolve `CpuId` once and bind a short-lived
 `CpuScheduler` view. Local transition, wait, and preemption methods use the
@@ -31,10 +37,9 @@ The bounded `ThreadTable`, free-slot lifecycle storage, and remote ingress use a
 cross-CPU IRQ-safe scheduler lock so publication and lifecycle transitions stay
 atomic. CPU contexts remain owner-local: mutable `current`, `idle`, ready-queue,
 and online-state access is rejected from another CPU. Fixed preemption storage
-performs the same current-CPU ownership check independently. This milestone does
-not add remote notification or migration; affinity to an offline parked CPU is
-rejected, so normal runnable work remains owned by CPU0 until a later IPI and
-secondary scheduler activation milestone.
+performs the same current-CPU ownership check independently. Explicit affinity
+to an unregistered or offline CPU is rejected. The existing remote ingress
+does not program a remote timer or mutate remote preemption state.
 
 ## Thread table and states
 
@@ -159,15 +164,20 @@ context, and queues it without growing scheduler storage. Reap extracts any
 `OwnedUserStack` under short local-IRQ exclusion and destroys it only after the
 guard is released.
 
+Exit first records the outgoing thread in one CPU-local retired slot. The
+thread remains occupied while exception return still uses its kernel stack;
+only the next scheduler entry on that CPU may finalize join completion and
+publish the stack for reuse. This prevents another CPU from reusing a live
+handoff stack.
+
 Production bootstrap publishes the permanent idle thread and one static init
 thread, which launches userspace `/init`. Dedicated QEMU features select their
 own finite static-thread arrays without changing round-robin behavior.
 
 ## Constraints
 
-- Normal scheduling, device IRQs, threads, and userspace remain CPU0-only.
-  Registered secondary CPUs service only bounded local physical-timer IRQs and
-  return to their architecture park loop.
+- Device IRQs and userspace remain CPU0-only. Registered secondary CPUs run
+  permanent idle threads and explicitly pinned kernel threads.
 - Local IRQ exclusion is not SMP synchronization; shared owners use explicit
   cross-CPU locks.
 - No heap allocation or unbounded work in scheduling, timer, or frame-handoff

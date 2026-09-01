@@ -18,7 +18,9 @@ stores complete evidence below `target/test-results/`.
 - `smp-boot`: four-CPU test kernel that validates PSCI secondary high-half
   entry, unique logical/hardware/stack ownership, architecture-owned per-CPU
   exception/GICC/PPI setup, two local timer acknowledge/EOI cycles, CPU0-only
-  device routing, and offline secondary scheduler contexts.
+  device routing, online secondary scheduler contexts, pinned kernel workers,
+  timer round-robin, late remote-ready pickup, and recurring local timer
+  progress.
 - `userspace-contract`: production kernel plus test supervisor and exact
   production-program invocations.
 - `shell-contract`: production kernel and shell plus test-only helpers and a

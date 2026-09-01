@@ -8,9 +8,9 @@ accepted ADRs remain authoritative when details differ.
 - Architecture: AArch64.
 - Rust target: `aarch64-unknown-none-softfloat`.
 - Machine: QEMU `virt` with GICv2.
-- Execution model: CPU0-only scheduling plus bounded high-half bring-up of
-  registered secondary CPUs into an interrupt-ready, scheduler-offline parked
-  state.
+- Execution model: CPU0-owned global initialization and userspace plus bounded
+  high-half bring-up of registered secondary CPUs into active kernel scheduler
+  contexts.
 - Kernel image: low physical load with a high-half virtual runtime mapping.
 
 ## Boot and platform
@@ -23,11 +23,12 @@ accepted ADRs remain authoritative when details differ.
 - Four fixed linker-owned 32 KiB bootstrap-stack slots bound the current QEMU
   topology. Every secondary enters low `secondary_start` through PSCI, enables
   the MMU with boot TTBR0 plus runtime TTBR1, enters high Rust, clears its local
-  TTBR0, installs VBAR, binds logical identity through a generic prepare call,
-  initializes local GICC/timer PPI/physical timer state, publishes generic
-  parked completion, and enters `WFI` with IRQ enabled. CPU0 performs its local
-  architecture setup before `kernel_main`; generic code never invokes either
-  CPU's interrupt setup or chooses its DAIF park policy.
+  TTBR0, installs VBAR, and initializes local GICC/timer PPI/physical timer
+  state. It then enters one generic secondary function that binds logical
+  identity, initializes idle/current scheduler state, and enters that idle
+  thread through its saved frame. CPU0 likewise performs its local architecture
+  setup before `kernel_main`; generic code never invokes either CPU's interrupt
+  setup or chooses DAIF.
 - `.boot.text`, `.boot.rodata`, and `.boot.bss` are autonomous before MMU
   enable. `xtask` checks the linked image for relocations, runtime thunks,
   high-VA operands, and branches outside `.boot.*`.
@@ -65,7 +66,7 @@ accepted ADRs remain authoritative when details differ.
 
 ## Scheduling and time
 
-- The scheduler is round-robin, preemptive, and CPU0-only. A bounded registry
+- The scheduler is round-robin and preemptive. A bounded registry
   maps normalized AArch64 hardware identities to CPU0-first logical `CpuId`
   values before scheduler bootstrap. AArch64 retains each logical binding in
   CPU-local `TPIDR_EL1`, making runtime current-CPU resolution O(1); unbound or
@@ -74,9 +75,9 @@ accepted ADRs remain authoritative when details differ.
   idle, ready queue, and initialized/online state; separate CPU-local fixed
   preemption backing keeps lock acquisition independent of shared lifecycle
   storage.
-  CPU0 alone is initialized and becomes online at first thread entry; registered
-  secondary contexts remain offline while their interrupt-ready CPUs stay in
-  the architecture park loop. Runtime scheduler entry points resolve the
+  CPU0 preflights capacity for one idle slot per expected CPU. Every registered
+  CPU initializes local idle/current state and becomes online only at first
+  saved-frame entry. Runtime scheduler entry points resolve the
   executing CPU once and bind a `CpuScheduler` view for the complete local operation; affinity,
   home-CPU wakeup, bootstrap, and validation retain explicit target selection.
 - Production bootstrap starts only the permanent idle thread and one kernel init
@@ -101,10 +102,10 @@ accepted ADRs remain authoritative when details differ.
 - CPU0 alone initializes the shared GIC distributor and routes device SPIs.
   Architecture entry initializes each CPU's vector base, banked GICC interface,
   physical-timer PPI, and local `CNTP_*` state. CPU0 preallocates all generic
-  deadline queues before PSCI startup. Generic secondary parked publication
-  occurs only after local setup, without a duplicate interrupt-readiness flag.
-  Secondary timer IRQs are attributed to their logical CPU and return to park
-  without making the offline scheduler context runnable.
+  deadline queues before PSCI startup. Generic secondary scheduler
+  initialization occurs only after local setup, without a duplicate
+  interrupt-readiness flag. Secondary timer IRQs are attributed to their
+  logical CPU and may make local scheduler handoff.
 - Reschedule requests coalesce in `kernel::sync::preempt`. Timer IRQ return and
   a private typed sched-call checkpoint may consume them only at disable depth
   zero; outermost guard release invokes that checkpoint automatically when the
@@ -115,12 +116,19 @@ accepted ADRs remain authoritative when details differ.
   handles are bounded and generation-checked. Each thread has immutable
   `home_cpu` selected from `ThreadAttrs` before publication. A remote wake
   publishes into the home CPU's ingress, which only that CPU drains into its
-  local ready queue; migration and IPI notification are not implemented.
+  local ready queue. Every online current retains a local RR deadline with no
+  peer, bounding late remote affinity publication and cross-CPU completion
+  pickup to one RR quantum. This is not immediate notification; Issue #7 owns
+  the IPI path. Migration and remote timer insertion are not implemented.
 - `ThreadId { index, generation }` directly indexes an occupied bounded slot;
   free and stale generations are rejected without a second scheduler identity.
 - A free slot parks its preallocated kernel stack and next wait sequence. An
   occupied `Thread` owns that stack, `SavedContext`, lifecycle/join state,
   active wait metadata, and optional userspace resources.
+- After exit selection, the outgoing thread remains occupied in one CPU-local
+  retired slot until the next scheduler entry proves execution moved to the new
+  kernel stack. Only then can join completion or detached reap publish that
+  stack in the free-slot pool.
 - The private scheduler transition layer exclusively mutates thread state, slot
   generation, current identity, and ready-queue membership. Ready entries carry
   complete `ThreadId` generations; debug and QEMU-test builds run a bounded
@@ -195,9 +203,9 @@ accepted ADRs remain authoritative when details differ.
 
 ## Current boundaries
 
-- Secondary CPUs are interrupt-ready and can acknowledge/EOI their local
-  physical-timer PPI while parked. They perform no normal scheduling,
-  kernel-thread, device-IRQ, or userspace execution.
+- Secondary CPUs execute permanent idle and explicitly pinned kernel threads,
+  and can acknowledge/EOI their local physical-timer PPI. They perform no
+  device-IRQ or userspace execution.
 - No IPI/remote reschedule or remote timer-insertion notification, migration,
   CPU hotplug, or userspace TLB shootdown. Shared runtime owners are already
   cross-CPU locked.

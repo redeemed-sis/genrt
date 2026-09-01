@@ -75,9 +75,10 @@ Changes that invalidate one require architecture review and an ADR.
 
 ## Scheduling and lifecycle
 
-- CPU0 is the sole scheduler, device-IRQ, kernel-thread, and userspace execution
-  owner. Registered secondary CPUs may execute only bounded boot, local timer
-  IRQ, and architecture park paths; local IRQ exclusion is never an SMP lock.
+- CPU0 is the sole global-init, device-IRQ, and userspace execution owner.
+  Registered secondary CPUs execute bounded boot, local timer IRQ, permanent
+  idle, and explicitly pinned kernel-thread paths; local IRQ exclusion is never
+  an SMP lock.
 - Logical `CpuId` is the only generic-kernel CPU identity. AArch64-normalized
   hardware IDs are boot-registration keys and PSCI targets, never scheduler
   indexes. CPU0 remains logical CPU0; each registered CPU receives an
@@ -87,29 +88,34 @@ Changes that invalidate one require architecture review and an ADR.
   data and must agree with fixed generic and linker bootstrap-stack capacity.
   Each CPU owns one non-overlapping bootstrap stack. CPU0 alone performs global
   initialization and starts secondaries after publishing runtime TTBR1.
-- Secondary registration and parked readiness are scheduler-independent and
-  allocation-free, Release/Acquire-published, and bounded by a boot deadline.
-  Architecture code performs local interrupt setup between generic prepare and
-  completion calls; successful parked publication therefore implies that setup
-  completed without storing a duplicate readiness flag. CPU0 preallocates every
-  selected time queue before PSCI startup. A failed, duplicate, unexpected, or
-  unready secondary terminates boot rather than being omitted silently.
+- Secondary startup is allocation-free and bounded by a boot deadline.
+  Architecture code completes local interrupt setup before entering generic
+  code. One generic entry then registers the CPU, consumes one CPU0-reserved
+  idle slot, selects local current state, and enters its saved frame. Online is
+  published only by saved-frame entry immediately before control leaves the
+  bootstrap stack. CPU0 waits for each exact registered context to become
+  scheduler-online. A failed, duplicate, unexpected, or unready secondary
+  terminates boot rather than being omitted.
 - CPU0 alone owns shared GIC distributor initialization and device SPI routing.
   Every CPU owns its VBAR, banked GICC/SGI/PPI state, physical timer registers,
   and generic deadline queue. Local IRQ cannot be unmasked until logical
   identity and every CPU-local IRQ dependency are published.
-- Parked and scheduler-online are distinct states. Local interrupt setup and
-  DAIF policy remain architecture-owned; generic code accepts parked completion
-  only after that setup. A secondary timer IRQ resolves the executing logical
-  CPU, touches only that CPU's GICC/timer/queue state, completes EOI, and returns
-  to park without a scheduler handoff.
+- CPU registry identity/topology and scheduler-online state have separate
+  owners. Local interrupt setup and DAIF policy remain architecture-owned;
+  the single generic secondary entry requires completed local setup. A
+  secondary timer IRQ resolves the executing logical CPU, touches only that
+  CPU's GICC/timer/queue state, completes EOI, and may perform a local handoff.
 - Every CPU scheduler context owns its current thread, idle thread, ready queue,
   and initialized/online state. CPU-local preemption state is separate fixed
   storage so acquiring a shared `SpinLock` never needs the scheduler lock. A thread's
   immutable home CPU owns its ready membership and wakeup destination. A remote
   completion publishes into a bounded ingress for that CPU, and only the owner
-  drains it into the local ready queue. Parked secondary contexts remain
-  offline; there is no migration, IPI notification, or secondary scheduling.
+  drains it into the local ready queue. Every initialized CPU owns exactly one
+  local idle/current `Running` thread, and online implies initialized. Every
+  online current keeps a local RR deadline when no peer exists so late
+  remote-ready work is picked up within one RR quantum. This is not immediate
+  notification: Issue #7 owns the IPI replacement. There is no migration, work
+  stealing, remote timer insertion, or userspace secondary scheduling.
 - Every logical CPU owns one bounded deadline queue and one architected physical
   timer. Timed events carry that owner. Only the owner CPU inserts events and
   programs the timer; no time lock is retained across direct scheduler dispatch.
@@ -127,11 +133,14 @@ Changes that invalidate one require architecture review and an ADR.
   schedulable identity.
 - Scheduler lifecycle state, slot generation, current identity, and ready-queue
   membership change only through the scheduler transition layer. A non-idle
-  `Ready` thread has exactly one current-generation queue entry, and the sole
-  `Running` thread is exactly `current`.
+  `Ready` thread has exactly one current-generation queue entry, and every
+  initialized CPU has exactly one `Running` thread equal to local `current`.
 - A free thread slot owns no `Thread`, `SavedContext`, or active wait. It parks
   the preallocated kernel stack and next wait sequence; an occupied `Thread`
   owns the stack, context, active wait, join/exit state, and optional user stack.
+  An exiting current thread remains occupied in the owner CPU's single retired
+  slot until a later scheduler entry runs on the replacement stack; only then
+  may its stack and slot be published for reuse.
 - Every blocking episode has one exact `WaitToken` containing a generation-aware
   `ThreadId`, immutable home `CpuId`, and checked per-slot sequence. The
   sequence allocator survives slot reuse; stale generation or sequence

@@ -25,10 +25,9 @@ explicit acceptance criteria.
      hard upper bound;
    - retain allocation-free bounded handlers.
 4. **Secondary CPU activation**
-   - initialize secondary scheduler idle/current state now that local
-     exceptions, GICC/PPI, physical timers, and generic time queues are ready;
-   - add IPI acknowledgement and remote wake notification on top of ADR-0036
-     shared-state synchronization and ADR-0038 secondary bring-up;
+   - Issue #7: add IPI acknowledgement and immediate remote wake notification
+     to replace the one-RR-quantum idle polling fallback, on top of ADR-0036
+     shared-state synchronization and ADR-0040 scheduler activation;
    - add an IPI-backed remote timer command for prompt insertion into another
      CPU's existing per-CPU deadline queue;
    - define userspace TLB shootdown ownership before executing EL0 on another

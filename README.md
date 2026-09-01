@@ -5,9 +5,9 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-black.svg)](LICENSE)
 
 genrt is an experimental hard real-time operating system written primarily in
-Rust. The active platform is AArch64 QEMU `virt`; CPU0 runs the kernel and
-userspace while DTB-described secondary CPUs complete high-half bring-up and
-remain interrupt-ready in a scheduler-offline parked state. The project uses
+Rust. The active platform is AArch64 QEMU `virt`; CPU0 runs userspace while
+DTB-described secondary CPUs complete high-half bring-up and run permanent
+kernel idle contexts plus explicitly pinned kernel threads. The project uses
 that environment to make boot, scheduling, userspace, testing, and release
 invariants explicit before expanding runtime SMP scope.
 
@@ -24,8 +24,8 @@ a production-ready or latency-certified operating system.
 - DTB-driven RAM/platform discovery, physical frame allocation, runtime TTBR1
   mappings, and a fixed bootstrap heap.
 - Bounded PSCI bring-up of secondary CPUs into unique high-half bootstrap
-  stacks with architecture-owned per-CPU exception/timer setup and offline
-  schedulers.
+  stacks with architecture-owned per-CPU exception/timer setup and active
+  scheduler idle contexts.
 - Preemptive IRQ-return scheduler with one-shot deadlines, bounded kernel
   threads, sleep, and mailbox IPC.
 - Process-owned TTBR0 address spaces, static AArch64 ELF loading, lower-EL fault
@@ -137,11 +137,13 @@ and [docs/releases.md](docs/releases.md).
 
 ## Current boundaries
 
-- Scheduling, device IRQs, and userspace remain CPU0-only; secondary CPUs
-  service only their local physical timer while parked, with no IPI activation,
-  migration, or TLB shootdown.
-- Shared runtime state has SMP synchronization, but runtime SMP scheduling and
-  latency certification are not implemented.
+- Device IRQs and userspace remain CPU0-only. Secondary CPUs run only permanent
+  idle contexts and explicitly pinned kernel threads; there is no IPI
+  activation, migration, work stealing, remote timer insertion, or TLB
+  shootdown.
+- Shared runtime state and pinned kernel scheduling are SMP-capable, but remote
+  IPI notification, migration, userspace SMP, and latency certification are not
+  implemented.
 - No FP/SIMD context ownership; kernel Rust uses the soft-float target.
 - No ASIDs, copy-on-write, demand paging, signals, or recoverable usercopy
   faults.
