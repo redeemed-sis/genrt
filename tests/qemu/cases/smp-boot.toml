@@ -12,7 +12,22 @@ step_timeout_secs = 15
 [[steps]]
 action = "expect_case"
 producer = "kernel"
-subject = "per-cpu-interrupt-state"
+subject = "per-cpu-scheduler-state"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "parallel-pinned-workers"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "cpu1-timer-round-robin"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "late-remote-ready"
 
 [[steps]]
 action = "expect_case"
