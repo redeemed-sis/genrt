@@ -492,6 +492,7 @@ impl CpuScheduler<'_> {
         arg: ThreadArg,
         attrs: ThreadAttrs,
     ) -> core::result::Result<ThreadId, SpawnError> {
+        self.transition_finalize_retired();
         let target_cpu = self.resolve_affinity(attrs.affinity)?;
         let Some(id) = self.take_free_slot() else {
             return Err(SpawnError::NoThreadSlots);
@@ -581,6 +582,7 @@ impl CpuScheduler<'_> {
     }
 
     fn exit_current(&mut self, context: &mut ActiveContext<'_>, code: usize) {
+        self.transition_finalize_retired();
         let SwitchOutcome::Switch {
             from: exited,
             to: next,
@@ -600,6 +602,7 @@ impl CpuScheduler<'_> {
         target: ThreadId,
         output: &mut SchedCallWaitOutput,
     ) {
+        self.transition_finalize_retired();
         let current = self
             .running_thread()
             .unwrap_or_else(|| panic!("thread: join without running thread"));
@@ -640,7 +643,8 @@ impl CpuScheduler<'_> {
             return;
         }
 
-        if self.thread_state(target_slot) == ThreadState::Exited {
+        if self.thread_state(target_slot) == ThreadState::Exited && !self.thread_is_retiring(target)
+        {
             let code = self
                 .thread_exit_code(target_slot)
                 .unwrap_or_else(|| panic!("thread: exited thread without exit code"));

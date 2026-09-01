@@ -534,49 +534,21 @@ pub fn on_timer_interrupt(context: &mut ActiveContext<'_>) {
     });
 }
 
-/// Arm the first local physical-timer interrupt in the SMP QEMU probe.
-///
-/// # Returns
-///
-/// Returns after programming a short owner-local deadline. The function is
-/// allocation-free and leaves IRQ state unchanged.
-///
-/// # Panics
-///
-/// Panics if the executing CPU is unregistered, its bounded time queue is not
-/// initialized/empty, or its probe was already started.
-#[cfg(feature = "qemu-test-smp-boot")]
-pub(crate) fn arm_local_timer_probe_for_test() {
-    let cpu = current_cpu();
-    if with_time(cpu, |time| time.queue.next_deadline().is_some()) {
-        panic!("time test: CPU{} probe found queued deadline", cpu.index());
-    }
-    if TIMER_PROBE_COMPLETIONS[cpu.index()].load(Ordering::Acquire) != 0 {
-        panic!("time test: CPU{} probe started twice", cpu.index());
-    }
-    let deadline = now_counter().saturating_add(us_to_counts(1_000).max(1));
-    program_timer_deadline(Some(deadline));
-}
-
 /// Record one fully acknowledged and EOI-completed local timer probe IRQ.
 ///
-/// The AArch64 dispatcher calls this only after writing GICC_EOIR. Completion
-/// of the first interrupt arms a second deadline, so observing two completions
-/// proves that the executing CPU can accept another local PPI after EOI.
+/// The AArch64 dispatcher calls this only after writing GICC_EOIR. Scheduler
+/// idle quanta supply the recurring owner-local deadlines, so observing two or
+/// more completions proves that the executing CPU can accept another local PPI
+/// after EOI without a test-only timer command.
 ///
 /// # Returns
 ///
-/// Returns after one bounded atomic update and optional owner-local timer
-/// programming. The IRQ-context path allocates nothing and does not enter the
-/// scheduler.
+/// Returns after one bounded atomic update. The IRQ-context path allocates
+/// nothing and does not enter the scheduler.
 #[cfg(feature = "qemu-test-smp-boot")]
 pub fn on_local_timer_probe_eoi_for_test() {
     let cpu = current_cpu();
-    let previous = TIMER_PROBE_COMPLETIONS[cpu.index()].fetch_add(1, Ordering::AcqRel);
-    if previous == 0 {
-        let deadline = now_counter().saturating_add(us_to_counts(1_000).max(1));
-        program_timer_deadline(Some(deadline));
-    }
+    TIMER_PROBE_COMPLETIONS[cpu.index()].fetch_add(1, Ordering::AcqRel);
 }
 
 /// Test whether every expected CPU completed two local timer probe IRQs.
@@ -587,14 +559,14 @@ pub fn on_local_timer_probe_eoi_for_test() {
 ///
 /// # Returns
 ///
-/// Returns `true` only when each expected CPU reports exactly two completed
+/// Returns `true` only when each expected CPU reports at least two completed
 /// acknowledge/EOI cycles. The bounded query allocates nothing.
 #[cfg(feature = "qemu-test-smp-boot")]
 pub(crate) fn local_timer_probes_complete_for_test(cpu_count: usize) -> bool {
     cpu_count <= KERNEL_CPU_CAPACITY
         && TIMER_PROBE_COMPLETIONS[..cpu_count]
             .iter()
-            .all(|count| count.load(Ordering::Acquire) == 2)
+            .all(|count| count.load(Ordering::Acquire) >= 2)
 }
 
 #[inline(always)]

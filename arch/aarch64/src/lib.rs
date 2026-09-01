@@ -101,7 +101,7 @@ pub extern "C" fn rust_entry(boot_mmu_params_pa: usize, bootstrap_slot: usize) -
     kernel::kernel_main(bootinfo)
 }
 
-/// Enter generic parked-secondary startup after architecture MMU bring-up.
+/// Complete architecture-local secondary setup and enter the generic kernel.
 ///
 /// # Arguments
 ///
@@ -111,9 +111,9 @@ pub extern "C" fn rust_entry(boot_mmu_params_pa: usize, bootstrap_slot: usize) -
 ///
 /// # Returns
 ///
-/// This function never returns. It performs only CPU-local vector/interrupt
-/// setup before delegating registration and parked-state ownership to the
-/// generic kernel.
+/// This function never returns. It completes CPU-local vector, interrupt, and
+/// timer setup before delegating registration, scheduler initialization, and
+/// first saved-context entry to one generic kernel entry point.
 ///
 /// # Safety
 ///
@@ -123,8 +123,8 @@ pub extern "C" fn rust_entry(boot_mmu_params_pa: usize, bootstrap_slot: usize) -
 #[unsafe(no_mangle)]
 pub extern "C" fn secondary_rust_entry(_boot_mmu_params_pa: usize, bootstrap_slot: usize) -> ! {
     // SAFETY: the secondary owns its DAIF, VBAR_EL1, and TTBR0_EL1 registers.
-    // IRQ remains masked until generic registration and the complete local
-    // interrupt/timer initialization sequence have both succeeded.
+    // IRQ remains masked until the complete architecture-local setup and
+    // subsequent generic scheduler initialization have both succeeded.
     unsafe {
         asm!(
             "msr daifset, #0xf",
@@ -134,17 +134,11 @@ pub extern "C" fn secondary_rust_entry(_boot_mmu_params_pa: usize, bootstrap_slo
         install_vectors();
         clear_local_ttbr0();
     }
-    if !kernel::kernel_prepare_secondary_cpu(bootstrap_slot) {
-        hard_park_current_cpu()
-    }
     if !init_current_cpu_interrupt_state() {
         kernel::kernel_fail_secondary_cpu_startup();
         hard_park_current_cpu()
     }
-    if !kernel::kernel_complete_secondary_cpu_startup(bootstrap_slot) {
-        hard_park_current_cpu()
-    }
-    park_current_cpu_with_irq()
+    kernel::kernel_secondary_main(bootstrap_slot)
 }
 
 /// Initialize CPU-local GIC, PPI, and physical timer state.
@@ -443,28 +437,6 @@ pub extern "C" fn arch_hard_fault() -> ! {
         unsafe {
             asm!("wfe", options(nomem, nostack, preserves_flags));
         }
-    }
-}
-
-/// Park an initialized secondary in an IRQ-enabled architecture idle loop.
-fn park_current_cpu_with_irq() -> ! {
-    // SAFETY: this path is reached only after architecture-local interrupt
-    // setup and generic readiness publication both succeeded.
-    unsafe {
-        asm!(
-            "msr daifset, #0xf",
-            "isb",
-            options(nomem, nostack, preserves_flags)
-        );
-        asm!(
-            "msr daifclr, #2",
-            "isb",
-            options(nomem, nostack, preserves_flags)
-        );
-    }
-    loop {
-        // SAFETY: the CPU owns its bootstrap stack and all local IRQ state.
-        unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
     }
 }
 

@@ -283,7 +283,7 @@ pub(crate) fn request_reschedule() {
 /// Request a checkpoint on one explicitly selected CPU-local state.
 pub(crate) fn request_reschedule_on(cpu: CpuId) {
     // A remote wake publishes ready membership under scheduler synchronization,
-    // but parked secondary CPUs have no IPI-backed scheduler activation yet.
+    // but no IPI-backed immediate notification exists yet.
     // Never mutate another CPU's local preemption state as a notification
     // substitute.
     if current_cpu() != cpu {

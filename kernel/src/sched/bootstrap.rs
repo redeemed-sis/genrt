@@ -1,6 +1,8 @@
 use super::{
     Result, SchedError, Scheduler, THREAD_STACK_SIZE, current_cpu, scheduler_slot_mut, thread,
+    try_scheduler_mut,
 };
+use crate::{cpu, sync::LocalIrqGuard};
 
 #[derive(Copy, Clone)]
 /// Immutable entry descriptor for a kernel thread created during bootstrap.
@@ -54,7 +56,7 @@ impl StaticThread {
 ///
 /// Returns [`SchedError::AlreadyBootstrapped`] when scheduler state already
 /// exists or [`SchedError::ThreadCapacityTooSmall`] when capacity cannot hold
-/// idle plus every static thread.
+/// one idle thread for every expected CPU plus every static thread.
 ///
 /// # Panics
 ///
@@ -87,6 +89,51 @@ pub(crate) fn bootstrap(
     Ok(())
 }
 
+/// Initialize the executing registered secondary CPU's scheduler context.
+///
+/// CPU0 must already have published the shared scheduler table, preallocated a
+/// free slot for every expected CPU idle thread, and published this CPU's time
+/// queue. The transition consumes exactly one free slot, publishes a permanent
+/// nonjoinable idle thread with immutable local affinity, selects it as the
+/// initial current thread, and leaves the context offline until first entry.
+/// The operation is bounded, allocation-free, and does not enable IRQs.
+///
+/// # Arguments
+///
+/// * `idle_entry` - Permanent idle-thread entry for the executing CPU.
+/// * `idle_arg` - Value passed to `idle_entry` on first execution.
+///
+/// # Returns
+///
+/// Returns `true` after the current registered secondary owns initialized
+/// idle/current scheduler state. Returns `false` when scheduler state is not
+/// published, the CPU is already initialized, or the preallocated free-slot
+/// reserve was exhausted.
+///
+/// # Panics
+///
+/// Panics when current-CPU resolution, local preemption state, or scheduler
+/// ownership violates the secondary entry contract.
+pub(crate) fn initialize_current_cpu(
+    idle_entry: thread::ThreadEntry,
+    idle_arg: thread::ThreadArg,
+) -> bool {
+    let cpu = current_cpu();
+    if cpu.index() == 0 || !cpu::is_registered(cpu) {
+        return false;
+    }
+    crate::sync::preempt::assert_pre_scheduler_state_quiescent(cpu);
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    let Some(mut scheduler) = try_scheduler_mut() else {
+        return false;
+    };
+
+    scheduler
+        .on_cpu(cpu)
+        .transition_initialize_idle_current(idle_entry, idle_arg)
+        .is_ok()
+}
+
 impl Scheduler {
     fn bootstrap_new(
         cpu: crate::cpu::CpuId,
@@ -96,7 +143,8 @@ impl Scheduler {
         rr_quantum_ms: u64,
         thread_capacity: usize,
     ) -> Result<Self> {
-        let bootstrap_thread_count = threads.len() + 1;
+        let bootstrap_thread_count =
+            required_bootstrap_slots(threads.len(), cpu::expected_count())?;
         if thread_capacity < bootstrap_thread_count {
             return Err(SchedError::ThreadCapacityTooSmall);
         }
@@ -123,5 +171,33 @@ impl Scheduler {
             scheduler.rr_quantum_ms
         );
         Ok(scheduler)
+    }
+}
+
+fn required_bootstrap_slots(
+    static_thread_count: usize,
+    expected_cpu_count: usize,
+) -> Result<usize> {
+    static_thread_count
+        .checked_add(expected_cpu_count)
+        .ok_or(SchedError::ThreadCapacityTooSmall)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_capacity_reserves_an_idle_slot_for_each_expected_cpu() {
+        assert_eq!(required_bootstrap_slots(1, 4), Ok(5));
+        assert_eq!(required_bootstrap_slots(8, 4), Ok(12));
+    }
+
+    #[test]
+    fn bootstrap_capacity_rejects_overflow() {
+        assert_eq!(
+            required_bootstrap_slots(usize::MAX, 1),
+            Err(SchedError::ThreadCapacityTooSmall)
+        );
     }
 }

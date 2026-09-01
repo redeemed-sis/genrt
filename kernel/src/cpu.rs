@@ -1,5 +1,5 @@
-//! Logical CPU identity, boot-time hardware registration, and parked-secondary
-//! readiness.
+//! Logical CPU identity, boot-time hardware registration, and scheduler-online
+//! startup coordination.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -93,7 +93,7 @@ pub(crate) enum CpuRegistrationError {
     ArchitectureStartFailed,
     /// A started CPU reported a registration or identity failure.
     SecondaryStartupFailed,
-    /// A started CPU did not publish parked readiness after architecture-local
+    /// A started CPU did not enter its scheduler context after architecture-local
     /// setup before the boot deadline.
     SecondaryStartupTimeout,
     /// The executing hardware CPU has no logical registration.
@@ -105,7 +105,6 @@ struct CpuRecord {
     hardware: HardwareCpuId,
     bootstrap_slot: usize,
     current_id_verified: bool,
-    parked: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -154,7 +153,6 @@ impl CpuRegistry {
             hardware,
             bootstrap_slot,
             current_id_verified: false,
-            parked: false,
         });
         self.count += 1;
         Ok(id)
@@ -306,18 +304,19 @@ pub(crate) fn register_secondary_cpu(logical_index: usize) -> Result<CpuId, CpuR
     Ok(id)
 }
 
-/// Start every platform-described secondary CPU and wait for parked readiness.
+/// Start every platform-described secondary CPU and wait for scheduler entry.
 ///
 /// CPU0 invokes PSCI sequentially so logical registration order is stable and
 /// each started CPU either completes its architecture-owned local setup and
-/// publishes its exact parked state or terminates global boot with a controlled
-/// error. This path allocates nothing and does not enter any scheduler context.
+/// enters its exact scheduler context or terminates global boot with a
+/// controlled error. This path allocates nothing and does not enter a CPU0
+/// scheduler context.
 ///
 /// # Returns
 ///
 /// Returns after every expected secondary CPU has registered, verified its
-/// runtime identity, and published parked state after local architecture
-/// setup. A single-core topology returns immediately.
+/// runtime identity, and published scheduler-online state through first saved
+/// context entry. A single-core topology returns immediately.
 ///
 /// # Errors
 ///
@@ -325,7 +324,7 @@ pub(crate) fn register_secondary_cpu(logical_index: usize) -> Result<CpuId, CpuR
 /// CPU_ON, [`CpuRegistrationError::SecondaryStartupFailed`] after a secondary
 /// reports failure, or [`CpuRegistrationError::SecondaryStartupTimeout`] when
 /// readiness misses the bounded deadline.
-pub(crate) fn start_and_park_secondaries() -> Result<(), CpuRegistrationError> {
+pub(crate) fn start_and_wait_scheduler_online_secondaries() -> Result<(), CpuRegistrationError> {
     let expected = EXPECTED_COUNT.load(Ordering::Acquire);
     if expected == 0 {
         return Err(CpuRegistrationError::ExpectedCountNotConfigured);
@@ -341,15 +340,9 @@ pub(crate) fn start_and_park_secondaries() -> Result<(), CpuRegistrationError> {
             if STARTUP_FAILED.load(Ordering::Acquire) != 0 {
                 return Err(CpuRegistrationError::SecondaryStartupFailed);
             }
-            let parked = {
-                let registry = REGISTRY.lock();
-                registry
-                    .records
-                    .get(logical_index)
-                    .and_then(Option::as_ref)
-                    .is_some_and(|record| record.parked)
-            };
-            if parked {
+            let cpu =
+                CpuId::from_index(logical_index).ok_or(CpuRegistrationError::UnexpectedCpu)?;
+            if crate::sched::scheduler_online(cpu) {
                 break;
             }
             if crate::time::uptime_ms() >= deadline {
@@ -358,40 +351,6 @@ pub(crate) fn start_and_park_secondaries() -> Result<(), CpuRegistrationError> {
             core::hint::spin_loop();
         }
     }
-    Ok(())
-}
-
-/// Publish that the executing secondary CPU reached its terminal parked boundary.
-///
-/// Architecture entry code may call this only after completing all CPU-local
-/// exception, interrupt-controller, and timer initialization. The process-wide
-/// registry deliberately stores no duplicate architecture-readiness flag: this
-/// transition is the generic publication point for successful local setup.
-///
-/// # Arguments
-///
-/// * `id` - Logical ID returned by [`register_secondary_cpu`].
-///
-/// # Returns
-///
-/// Returns after a bounded Release-visible registry update.
-///
-/// # Errors
-///
-/// Returns [`CpuRegistrationError::UnknownCurrentCpu`] if `id` is not the
-/// executing registered CPU or its record is unavailable.
-pub(crate) fn mark_secondary_parked(id: CpuId) -> Result<(), CpuRegistrationError> {
-    if current_id()? != id || id.index() == 0 {
-        return Err(CpuRegistrationError::UnknownCurrentCpu);
-    }
-    let mut registry = REGISTRY.lock();
-    let record = registry
-        .record_mut(id)
-        .ok_or(CpuRegistrationError::UnknownCurrentCpu)?;
-    if !record.current_id_verified {
-        return Err(CpuRegistrationError::UnknownCurrentCpu);
-    }
-    record.parked = true;
     Ok(())
 }
 
@@ -448,6 +407,17 @@ pub(crate) fn is_registered(cpu: CpuId) -> bool {
     cpu.index() < REGISTERED_COUNT.load(Ordering::Acquire)
 }
 
+/// Return the immutable expected CPU count selected during bootstrap.
+///
+/// # Returns
+///
+/// Returns the topology count published by CPU0, or zero before topology
+/// configuration. The atomic query allocates nothing and does not alter IRQ
+/// state.
+pub(crate) fn expected_count() -> usize {
+    EXPECTED_COUNT.load(Ordering::Acquire)
+}
+
 /// Return the number of registered logical CPUs.
 ///
 /// # Returns
@@ -459,13 +429,13 @@ pub(crate) fn registered_count() -> usize {
     REGISTERED_COUNT.load(Ordering::Acquire)
 }
 
-/// Return whether every platform-described secondary completed architecture
-/// setup and entered its terminal park transition.
+/// Return whether every platform-described secondary has registered.
 ///
 /// # Returns
 ///
-/// Returns `true` only when startup has not failed, the registry count matches
-/// the expected topology and every non-boot record has published parked state.
+/// Returns `true` only when startup has not failed and the registry count
+/// matches the expected topology. Scheduler entry is validated separately by
+/// the scheduler-owned online-context test seam.
 /// The bounded query allocates nothing and does not block the scheduler.
 #[cfg(feature = "qemu-test-smp-boot")]
 pub(crate) fn secondary_boot_complete() -> bool {
@@ -473,21 +443,17 @@ pub(crate) fn secondary_boot_complete() -> bool {
         return false;
     }
     let registry = REGISTRY.lock();
-    registry.expected > 1
-        && registry.count == registry.expected
-        && registry.records[1..registry.count]
-            .iter()
-            .flatten()
-            .all(|record| record.parked)
+    registry.expected > 1 && registry.count == registry.expected
 }
 
-/// Validate the complete parked-secondary boot contract for QEMU.
+/// Validate the complete secondary registration contract for QEMU.
 ///
 /// # Returns
 ///
 /// Returns after checking expected/registered counts, unique registry-owned
-/// hardware and bootstrap-stack identities, per-CPU current-ID validation, and
-/// parked state. The bounded check allocates nothing.
+/// hardware and bootstrap-stack identities, and per-CPU current-ID validation.
+/// The scheduler owns online-state validation separately. The bounded check
+/// allocates nothing.
 ///
 /// # Panics
 ///
@@ -507,8 +473,8 @@ pub(crate) fn validate_smp_boot_for_test() {
     for index in 0..registry.count {
         let record = registry.records[index]
             .unwrap_or_else(|| panic!("cpu test: missing registered CPU record"));
-        if !record.current_id_verified || (index != 0 && !record.parked) {
-            panic!("cpu test: CPU did not verify identity and reach its target state");
+        if !record.current_id_verified {
+            panic!("cpu test: CPU did not verify its logical identity");
         }
         for prior in registry.records[..index].iter().flatten() {
             if prior.hardware == record.hardware || prior.bootstrap_slot == record.bootstrap_slot {

@@ -22,7 +22,7 @@ pub(crate) use self::preempt::validate_invariants_for_test;
 #[cfg(feature = "qemu-test-kernel-runtime")]
 pub(crate) use self::wait::on_test_wait_sync;
 pub(crate) use self::{
-    bootstrap::{StaticThread, bootstrap},
+    bootstrap::{StaticThread, bootstrap, initialize_current_cpu},
     preempt::{
         enter_running_thread, finish_timer_interrupt, on_preempt_checkpoint, on_quantum_expired,
         on_wait_deadline,
@@ -205,6 +205,10 @@ impl DerefMut for CpuScheduler<'_> {
 struct CpuSchedulerState {
     current: Option<ThreadId>,
     idle: Option<ThreadId>,
+    // The outgoing thread still owns the stack used by the exception return
+    // path after logical current selection changes. Only the next scheduler
+    // entry on this CPU may finalize and publish that slot for reuse.
+    retired: Option<ThreadId>,
     ready_queue: VecDeque<ThreadId>,
     initialized: bool,
     online: bool,
@@ -217,6 +221,7 @@ impl CpuSchedulerState {
         Self {
             current: None,
             idle: None,
+            retired: None,
             ready_queue,
             initialized: false,
             online: false,
@@ -291,7 +296,7 @@ pub(crate) fn validate_cpu_context_for_test() {
     scheduler_mut().validate_cpu_context_for_test(cpu);
 }
 
-/// Validate that registered secondary CPU scheduler contexts remain offline.
+/// Validate that every registered CPU owns an online scheduler context.
 ///
 /// # Arguments
 ///
@@ -304,13 +309,34 @@ pub(crate) fn validate_cpu_context_for_test() {
 ///
 /// # Panics
 ///
-/// Panics when CPU0 is not the sole initialized/online context, a secondary
-/// owns current/idle/ready state, or any thread is assigned away from CPU0.
+/// Panics when a registered context is not initialized and online, its
+/// current/idle threads do not have local affinity, or an unregistered context
+/// owns scheduler state.
 #[cfg(feature = "qemu-test-smp-boot")]
-pub(crate) fn validate_secondary_contexts_offline_for_test(registered_cpus: usize) {
+pub(crate) fn validate_registered_contexts_online_for_test(registered_cpus: usize) {
     let cpu = current_cpu();
     let _irq_guard = crate::sync::LocalIrqGuard::save_and_disable();
-    scheduler_mut().validate_secondary_contexts_offline_for_test(cpu, registered_cpus);
+    scheduler_mut().validate_registered_contexts_online_for_test(cpu, registered_cpus);
+}
+
+/// Validate that the executing scheduler current thread has local home affinity.
+///
+/// The test-only query takes local IRQ exclusion and shared scheduler ownership,
+/// but performs no allocation, blocking, or scheduler transition.
+///
+/// # Returns
+///
+/// Returns after validating the executing current thread's immutable home CPU.
+///
+/// # Panics
+///
+/// Panics when the current CPU has no running thread or its current thread does
+/// not have that CPU as immutable home affinity.
+#[cfg(feature = "qemu-test-smp-boot")]
+pub(crate) fn validate_current_home_cpu_for_test() {
+    let cpu = current_cpu();
+    let _irq_guard = crate::sync::LocalIrqGuard::save_and_disable();
+    scheduler_mut().validate_current_home_cpu_for_test(cpu);
 }
 
 /// Generation-checked scheduler-thread handle.

@@ -161,6 +161,7 @@ pub(crate) fn on_preempt_checkpoint(context: &mut ActiveContext<'_>) {
 
 impl CpuScheduler<'_> {
     pub(super) fn finish_timer_interrupt(&mut self, context: &mut ActiveContext<'_>, now: u64) {
+        self.transition_finalize_retired();
         if !self.state().online {
             return;
         }
@@ -197,6 +198,7 @@ impl CpuScheduler<'_> {
     }
 
     fn preempt_checkpoint(&mut self, context: &mut ActiveContext<'_>) {
+        self.transition_finalize_retired();
         // Safe point: the private EL1 sched-call checkpoint owns the optional
         // thread-context handoff. It acknowledges only an existing request.
         let online = self.state().online;
@@ -254,6 +256,7 @@ impl CpuScheduler<'_> {
     }
 
     pub(super) fn note_quantum_expired(&mut self, thread: ThreadId) {
+        self.transition_finalize_retired();
         if self.running_thread() == Some(thread) {
             crate::sync::preempt::request_reschedule_on(self.cpu());
             crate::trace!("sched: quantum expired thread {thread}");
@@ -294,11 +297,9 @@ impl CpuScheduler<'_> {
         };
 
         let event = TimedEvent::quantum_expired(self.cpu(), current);
-        if !self.has_runnable_peer() {
-            crate::time::cancel_event(event);
-            return;
-        }
-
+        // Until Issue #7 adds IPI notification, every online current keeps a
+        // periodic owner-local checkpoint. Otherwise late remote ingress could
+        // starve forever behind a sole non-yielding non-idle thread.
         if crate::time::event_pending(event) {
             return;
         }

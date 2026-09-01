@@ -14,7 +14,6 @@ pub(crate) const KERNEL_THREAD_CAPACITY: usize = 12;
 
 /// Maximum logical CPUs represented by fixed kernel execution-local storage.
 ///
-/// CPU0 may register secondary CPUs up to this capacity. Secondary scheduler
-/// contexts remain offline until a later SMP milestone explicitly activates
-/// them.
+/// CPU0 may register secondary CPUs up to this capacity. Each registered CPU
+/// consumes one scheduler-owned idle slot during activation.
 pub(crate) const KERNEL_CPU_CAPACITY: usize = 4;

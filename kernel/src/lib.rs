@@ -49,9 +49,10 @@ const PRODUCTION_THREADS: [sched::StaticThread; 1] = [sched::StaticThread::new(
 ///
 /// The boot CPU registers itself, validates the platform CPU count, initializes
 /// memory and initramfs, publishes bounded scheduler and per-CPU time state,
-/// starts architecture-initialized parked secondaries, and then enters the sole
-/// online scheduler context. CPU0-local interrupt setup is complete before the
-/// architecture calls this entry.
+/// starts architecture-initialized secondary scheduler contexts, waits for each
+/// to become online, and then enters CPU0's selected scheduler context.
+/// CPU0-local interrupt setup is complete before the architecture calls this
+/// entry.
 ///
 /// # Arguments
 ///
@@ -123,7 +124,7 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
     }
     time::init_cpu_states(boot.cpu_count as usize)
         .unwrap_or_else(|err| panic!("time: failed to initialize CPU states: {err:?}"));
-    cpu::start_and_park_secondaries()
+    cpu::start_and_wait_scheduler_online_secondaries()
         .unwrap_or_else(|err| panic!("cpu: secondary startup failed: {err:?}"));
 
     log_bootstrap_stack_usage("before first thread");
@@ -155,13 +156,13 @@ fn static_threads() -> &'static [sched::StaticThread] {
     }
 }
 
-/// Prepare generic state for one architecture-started secondary CPU.
+/// Register an architecture-ready secondary CPU and enter its scheduler.
 ///
-/// This is the first generic stage of secondary startup. It registers the
-/// executing CPU's hardware identity and logical bootstrap slot, then verifies
-/// that no scheduler context is online for the secondary. Architecture code
-/// retains ownership of exception-vector, interrupt-controller, timer, and
-/// parking setup before and after this call.
+/// Architecture code calls this entry only after completing all CPU-local MMU,
+/// exception-vector, interrupt-controller, and timer setup with asynchronous
+/// exceptions masked. This function then owns the complete generic startup
+/// transaction: logical registration, scheduler initialization, and first
+/// saved-context entry.
 ///
 /// # Arguments
 ///
@@ -170,64 +171,37 @@ fn static_threads() -> &'static [sched::StaticThread] {
 ///
 /// # Returns
 ///
-/// Returns `true` when generic registration succeeds. Returns `false` after
-/// publishing a secondary-startup failure when the logical identity is stale,
-/// duplicated, out of order, or already owns an online scheduler context.
+/// This function never returns. On success, the saved idle context restores
+/// the architecture IRQ state and leaves the bootstrap stack. On failure, it
+/// publishes the startup failure and panics before any scheduler context is
+/// made online.
 ///
-/// The function is bounded and allocation-free. It does not enable IRQ,
-/// initialize architecture state, or enter the scheduler.
+/// # Panics
+///
+/// Panics when registration fails, the logical identity does not match
+/// `logical_index`, the CPU already owns an online scheduler context, the
+/// preallocated idle slot cannot be claimed, or saved-context entry fails.
+///
+/// The startup transaction is bounded and allocation-free before the terminal
+/// panic path. IRQ must remain masked when architecture code calls it.
 #[unsafe(no_mangle)]
-pub extern "C" fn kernel_prepare_secondary_cpu(logical_index: usize) -> bool {
+pub extern "C" fn kernel_secondary_main(logical_index: usize) -> ! {
     let result = cpu::register_secondary_cpu(logical_index).and_then(|id| {
-        if sched::scheduler_online(id) {
-            Err(cpu::CpuRegistrationError::UnexpectedCpu)
-        } else {
-            Ok(())
-        }
-    });
-    if result.is_err() {
-        cpu::record_secondary_startup_failure();
-    }
-    result.is_ok()
-}
-
-/// Publish completion of architecture-owned secondary CPU initialization.
-///
-/// Architecture code calls this only after local exception vectors, GIC CPU
-/// interface, timer PPI, and physical timer state are ready. The function
-/// verifies the registered logical identity, optionally arms the SMP contract
-/// timer probe, and publishes the terminal parked boundary observed by CPU0.
-/// No architecture-ready flag is stored: successful completion is the single
-/// generic publication that architecture-local setup has finished.
-///
-/// # Arguments
-///
-/// * `logical_index` - Logical bootstrap slot previously accepted by
-///   [`kernel_prepare_secondary_cpu`].
-///
-/// # Returns
-///
-/// Returns `true` when completion is published. Returns `false` after
-/// recording a startup failure when the executing CPU does not match
-/// `logical_index`, unexpectedly owns an online scheduler context, or cannot
-/// publish its parked state.
-///
-/// The function is bounded and allocation-free. IRQ must remain masked while
-/// it runs; architecture code chooses the subsequent parked state.
-#[unsafe(no_mangle)]
-pub extern "C" fn kernel_complete_secondary_cpu_startup(logical_index: usize) -> bool {
-    let result = cpu::current_id().and_then(|id| {
         if id.index() != logical_index || sched::scheduler_online(id) {
-            return Err(cpu::CpuRegistrationError::UnexpectedCpu);
+            Err(cpu::CpuRegistrationError::UnexpectedCpu)
+        } else if sched::initialize_current_cpu(idle_thread, sched::ThreadArg::empty()) {
+            Ok(())
+        } else {
+            Err(cpu::CpuRegistrationError::SecondaryStartupFailed)
         }
-        #[cfg(feature = "qemu-test-smp-boot")]
-        time::arm_local_timer_probe_for_test();
-        cpu::mark_secondary_parked(id)
     });
-    if result.is_err() {
+
+    if let Err(err) = result {
         cpu::record_secondary_startup_failure();
+        panic!("cpu: secondary generic startup failed: {err:?}");
     }
-    result.is_ok()
+
+    sched::enter_running_thread()
 }
 
 /// Publish failure of architecture-owned secondary CPU initialization.

@@ -212,6 +212,22 @@ impl Scheduler {
 }
 
 impl CpuScheduler<'_> {
+    pub(super) fn transition_initialize_idle_current(
+        &mut self,
+        entry: thread::ThreadEntry,
+        arg: thread::ThreadArg,
+    ) -> super::Result<()> {
+        if self.state().initialized || self.state().current.is_some() || self.state().idle.is_some()
+        {
+            return Err(super::SchedError::InvalidThreadId);
+        }
+        let Some(id) = self.take_free_slot() else {
+            return Err(super::SchedError::ThreadCapacityTooSmall);
+        };
+        self.transition_publish_bootstrap(id, entry, arg, true);
+        self.transition_initial_dispatch()
+    }
+
     pub(super) fn transition_append_bootstrap(
         &mut self,
         entry: thread::ThreadEntry,
@@ -489,6 +505,39 @@ impl Scheduler {
 }
 
 impl CpuScheduler<'_> {
+    pub(super) fn transition_finalize_retired(&mut self) {
+        let Some(exited) = self.state_mut().retired.take() else {
+            return;
+        };
+        if self.state().current == Some(exited)
+            || !self.thread_matches(exited)
+            || self.thread_state(exited.index()) != ThreadState::Exited
+            || self.thread_home_cpu(exited.index()) != self.cpu()
+        {
+            panic!("thread: invalid CPU-local retired thread {exited}");
+        }
+
+        let joinable = self.thread(exited.index()).joinable;
+        let joiner = self.thread_mut(exited.index()).joiner.take();
+        if let Some(joiner) = joiner {
+            let code = self
+                .thread_exit_code(exited.index())
+                .unwrap_or_else(|| panic!("thread: retired thread without exit code"));
+            self.complete_joiner(exited, joiner, code);
+            let resources = self.reap_exited(exited);
+            self.set_reaped_user(joiner.thread(), resources);
+        } else if !joinable {
+            if let Some(resources) = self.reap_exited(exited) {
+                // Detached userspace threads are rejected at spawn. Do not run
+                // frame cleanup while scheduler ownership and IRQ exclusion are
+                // held if that invariant is ever violated.
+                core::mem::forget(resources);
+                panic!("thread: detached retired thread retained user resources");
+            }
+        }
+        self.validate_after_transition();
+    }
+
     pub(super) fn transition_exit_current(&mut self, code: usize) -> SwitchOutcome {
         let from = self
             .state()
@@ -498,24 +547,12 @@ impl CpuScheduler<'_> {
         if from == self.idle_thread() {
             panic!("thread: idle thread cannot exit");
         }
-        let joinable = self.thread(from.index()).joinable;
-        let joiner = self.thread_mut(from.index()).joiner.take();
+        if self.state().retired.is_some() {
+            panic!("thread: CPU-local retired slot was not finalized");
+        }
         self.thread_mut(from.index()).exit_code = Some(code);
-        if let Some(joiner) = joiner {
-            // Publish the lifecycle result and complete the exact join wait
-            // while `from` is still the current Running thread. Completion runs
-            // the transition validator, so exposing an intermediate
-            // current-but-Exited state here would violate the scheduler table
-            // invariant before mandatory exit selection is committed.
-            self.complete_joiner(from, joiner, code);
-        }
         self.thread_mut(from.index()).state = ThreadState::Exited;
-        if let Some(joiner) = joiner {
-            let resources = self.reap_exited(from);
-            self.set_reaped_user(joiner.thread(), resources);
-        } else if !joinable {
-            let _ = self.reap_exited(from);
-        }
+        self.state_mut().retired = Some(from);
         let to = self.ready_pop_front().unwrap_or_else(|| self.idle_thread());
         self.make_running(to);
         self.validate_after_transition();
@@ -529,6 +566,7 @@ impl Scheduler {
             || !self.thread_matches(id)
             || self.cpu_state_for(self.thread_home_cpu(id.index())).idle == Some(id)
             || self.cpu_state_for(self.thread_home_cpu(id.index())).current == Some(id)
+            || self.thread_is_retiring(id)
             || self.thread(id.index()).state != ThreadState::Exited
         {
             panic!("thread: reclaim requires a non-current exited thread");
@@ -548,6 +586,11 @@ impl Scheduler {
 
     fn reap_exited(&mut self, id: ThreadId) -> Option<UserThreadResources> {
         self.lifecycle.release(id)
+    }
+
+    pub(super) fn thread_is_retiring(&self, id: ThreadId) -> bool {
+        self.thread_matches(id)
+            && self.cpu_state_for(self.thread_home_cpu(id.index())).retired == Some(id)
     }
 
     fn complete_joiner(&mut self, target: ThreadId, joiner: WaitToken, code: usize) {
@@ -812,6 +855,17 @@ impl Scheduler {
             if state.online && !state.initialized {
                 panic!("sched: online CPU context is not initialized");
             }
+            if let Some(retired) = state.retired {
+                let owner = CpuId::from_index(cpu_index)
+                    .unwrap_or_else(|| panic!("sched: invalid retired CPU index"));
+                if !self.thread_matches(retired)
+                    || self.thread_home_cpu(retired.index()) != owner
+                    || self.thread_state(retired.index()) != ThreadState::Exited
+                    || state.current == Some(retired)
+                {
+                    panic!("sched: invalid CPU-local retired thread {retired}");
+                }
+            }
         }
         let mut running = 0usize;
         for (index, slot) in self.lifecycle.slots.iter().enumerate() {
@@ -903,17 +957,36 @@ impl Scheduler {
                 }
             }
         }
-        let active = self
-            .cpus
-            .iter()
-            .filter(|state| state.current.is_some())
-            .count();
-        if active == 0 {
-            if running != 0 {
-                panic!("sched: running thread exists before initial dispatch");
+        let initialized = self.cpus.iter().filter(|state| state.initialized).count();
+        for (cpu_index, state) in self.cpus.iter().enumerate() {
+            let cpu = CpuId::from_index(cpu_index)
+                .unwrap_or_else(|| panic!("sched: invalid CPU context index {cpu_index}"));
+            if state.online && !state.initialized {
+                panic!("sched: online CPU context is not initialized");
             }
-        } else if active != 1 || running != 1 {
-            panic!("sched: expected exactly one running thread on one active CPU");
+            if state.initialized {
+                let current = state.current.unwrap_or_else(|| {
+                    panic!(
+                        "sched: initialized CPU{} has no current thread",
+                        cpu.index()
+                    )
+                });
+                let idle = state.idle.unwrap_or_else(|| {
+                    panic!("sched: initialized CPU{} has no idle thread", cpu.index())
+                });
+                if self.thread_home_cpu(current.index()) != cpu
+                    || self.thread_home_cpu(idle.index()) != cpu
+                    || self.thread_state(current.index()) != ThreadState::Running
+                {
+                    panic!(
+                        "sched: initialized CPU{} has invalid local current/idle state",
+                        cpu.index()
+                    );
+                }
+            }
+        }
+        if running != initialized {
+            panic!("sched: expected one running thread per initialized CPU");
         }
     }
 
@@ -952,7 +1025,7 @@ impl Scheduler {
     }
 
     #[cfg(feature = "qemu-test-smp-boot")]
-    pub(super) fn validate_secondary_contexts_offline_for_test(
+    pub(super) fn validate_registered_contexts_online_for_test(
         &self,
         boot_cpu: CpuId,
         registered_cpus: usize,
@@ -960,25 +1033,52 @@ impl Scheduler {
         if boot_cpu.index() != 0 || registered_cpus <= 1 || registered_cpus > self.cpus.len() {
             panic!("sched test: invalid SMP boot topology");
         }
-        let cpu0 = self.cpu_state_for(boot_cpu);
-        if !cpu0.initialized || !cpu0.online || cpu0.current.is_none() || cpu0.idle.is_none() {
-            panic!("sched test: CPU0 context is not active");
+        for cpu_index in 0..registered_cpus {
+            let cpu = CpuId::from_index(cpu_index)
+                .unwrap_or_else(|| panic!("sched test: invalid registered CPU index"));
+            let state = self.cpu_state_for(cpu);
+            let current = state
+                .current
+                .unwrap_or_else(|| panic!("sched test: CPU{} has no current thread", cpu.index()));
+            let idle = state
+                .idle
+                .unwrap_or_else(|| panic!("sched test: CPU{} has no idle thread", cpu.index()));
+            if !state.initialized
+                || !state.online
+                || self.thread_home_cpu(current.index()) != cpu
+                || self.thread_home_cpu(idle.index()) != cpu
+                || self.thread_state(current.index()) != ThreadState::Running
+            {
+                panic!(
+                    "sched test: CPU{} lacks online local scheduler ownership",
+                    cpu.index()
+                );
+            }
         }
-        if self.cpus[1..registered_cpus].iter().any(|state| {
+        if self.cpus[registered_cpus..].iter().any(|state| {
             state.initialized
                 || state.online
                 || state.current.is_some()
                 || state.idle.is_some()
-                || !state.ready_queue.is_empty()
+                || state.retired.is_some()
         }) {
-            panic!("sched test: registered secondary scheduler context became active");
+            panic!("sched test: unregistered CPU scheduler context became active");
         }
-        if self.lifecycle.slots.iter().any(|slot| {
-            slot.thread
-                .as_ref()
-                .is_some_and(|thread| thread.home_cpu != boot_cpu)
-        }) {
-            panic!("sched test: a thread was published away from CPU0");
+    }
+
+    #[cfg(feature = "qemu-test-smp-boot")]
+    pub(super) fn validate_current_home_cpu_for_test(&self, cpu: CpuId) {
+        let current = self
+            .cpu_state_for(cpu)
+            .current
+            .unwrap_or_else(|| panic!("sched test: CPU{} has no current thread", cpu.index()));
+        if self.thread_home_cpu(current.index()) != cpu
+            || self.thread_state(current.index()) != ThreadState::Running
+        {
+            panic!(
+                "sched test: CPU{} current thread has invalid home affinity",
+                cpu.index()
+            );
         }
     }
 }
@@ -1006,7 +1106,10 @@ mod tests {
         let cpu1 = CpuId::from_index(1).unwrap();
         let mut scheduler = Scheduler::transition_new(2, 1);
         scheduler.transition_fill_free_slots(2);
-        scheduler.cpus[cpu1.index()].initialized = true;
+        scheduler
+            .on_cpu(cpu1)
+            .transition_initialize_idle_current(|_| 0, thread::ThreadArg::empty())
+            .unwrap();
         scheduler.cpus[cpu1.index()].online = true;
         let slot = scheduler.take_free_slot().unwrap();
         let context = SavedContext::kernel_entry(scheduler.stack_top(slot), 0, 0, 0);
@@ -1022,6 +1125,60 @@ mod tests {
             scheduler.cpus[cpu1.index()].ready_queue.front(),
             Some(&thread)
         );
+    }
+
+    #[test]
+    fn secondary_initialization_claims_one_preallocated_idle_slot() {
+        let cpu1 = CpuId::from_index(1).unwrap();
+        let mut scheduler = Scheduler::transition_new(2, 1);
+        scheduler.transition_fill_free_slots(2);
+
+        scheduler
+            .on_cpu(cpu1)
+            .transition_initialize_idle_current(|_| 0, thread::ThreadArg::empty())
+            .unwrap();
+
+        let state = scheduler.cpu_state_for(cpu1);
+        let idle = state.idle.expect("secondary idle thread");
+        assert!(state.initialized);
+        assert!(!state.online);
+        assert_eq!(state.current, Some(idle));
+        assert_eq!(scheduler.thread_home_cpu(idle.index()), cpu1);
+        assert_eq!(scheduler.thread_state(idle.index()), ThreadState::Running);
+        assert_eq!(scheduler.lifecycle.free_slots.len(), 1);
+    }
+
+    #[test]
+    fn exiting_stack_is_reused_only_after_the_next_cpu_entry() {
+        let cpu0 = CpuId::from_index(0).unwrap();
+        let mut scheduler = Scheduler::transition_new(3, 1);
+        scheduler
+            .on_cpu(cpu0)
+            .transition_append_bootstrap(|_| 0, thread::ThreadArg::empty(), true);
+        let exiting = scheduler.on_cpu(cpu0).transition_append_bootstrap(
+            |_| 0,
+            thread::ThreadArg::empty(),
+            false,
+        );
+        scheduler.transition_fill_free_slots(3);
+        scheduler
+            .on_cpu(cpu0)
+            .transition_initial_dispatch()
+            .unwrap();
+        let exiting = scheduler.thread_id(exiting);
+        let free_before_exit = scheduler.lifecycle.free_slots.len();
+
+        scheduler.on_cpu(cpu0).transition_exit_current(0);
+
+        assert!(scheduler.thread_matches(exiting));
+        assert_eq!(scheduler.cpus[cpu0.index()].retired, Some(exiting));
+        assert_eq!(scheduler.lifecycle.free_slots.len(), free_before_exit);
+
+        scheduler.on_cpu(cpu0).transition_finalize_retired();
+
+        assert!(!scheduler.thread_matches(exiting));
+        assert!(scheduler.cpus[cpu0.index()].retired.is_none());
+        assert_eq!(scheduler.lifecycle.free_slots.len(), free_before_exit + 1);
     }
 
     #[test]
