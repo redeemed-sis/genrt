@@ -52,3 +52,8 @@ subject = "remote-fault-reap"
 action = "expect_case"
 producer = "smp-api-supervisor"
 subject = "affinity-validation"
+
+[[steps]]
+action = "expect_case"
+producer = "smp-api-supervisor"
+subject = "taskset-placement"

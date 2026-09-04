@@ -203,7 +203,33 @@ static void affinity_validation(void) {
     gtrt_pass(producer, name);
 }
 
+static void taskset_placement(void) {
+    const char *name = "taskset-placement";
+    char *argv[] = {"taskset", "1", "/init", "--taskset-probe", "1",
+                    "alpha", "beta", NULL};
+
+    gtrt_case_start(producer, name);
+    pid_t child = fork();
+    if (child < 0) {
+        gtrt_fail(producer, name, "FORK");
+    }
+    if (child == 0) {
+        execve("/bin/taskset", argv, NULL);
+        exit(126);
+    }
+    if (!wait_for_exit(child, 0)) {
+        gtrt_fail(producer, name, "CHILD_STATUS");
+    }
+    gtrt_pass(producer, name);
+}
+
 int main(int argc, char **argv) {
+    if (argc == 5 && string_equal(argv[0], "/init")
+        && string_equal(argv[1], "--taskset-probe")
+        && string_equal(argv[2], "1") && string_equal(argv[3], "alpha")
+        && string_equal(argv[4], "beta")) {
+        return gtrt_affinity_is_only(0, 1) ? 0 : 73;
+    }
     if (argc == 3 && string_equal(argv[1], "--affinity-probe")) {
         if (argv[2][0] < '0' || argv[2][0] > '3' || argv[2][1] != '\0') {
             return 71;
@@ -223,5 +249,6 @@ int main(int argc, char **argv) {
     exec_preserves_affinity();
     remote_fault_reap();
     affinity_validation();
+    taskset_placement();
     gtrt_done(producer, "smp-userspace-contract");
 }

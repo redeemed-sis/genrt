@@ -3,6 +3,7 @@
 #include "syscall.h"
 
 #define DIRENT64_HEADER_SIZE 19
+#define TASKSET_LARGE_ARG_BYTES 62000
 
 static int string_equal(const char *lhs, const char *rhs) {
     size_t index = 0;
@@ -174,7 +175,39 @@ static int process_affinity_validation(void) {
     return 0;
 }
 
+static int taskset_probe(int argc, char **argv) {
+    if (argc != 4
+        || !string_equal(argv[0], "/.__genrt_test__/bin/api-case")
+        || !string_equal(argv[2], "alpha")
+        || !string_equal(argv[3], "beta")) {
+        return 1;
+    }
+    return gtrt_affinity_is_only(0, 0) ? 0 : 2;
+}
+
+static int taskset_large_probe(int argc, char **argv) {
+    if (argc != 3
+        || !string_equal(argv[0], "/.__genrt_test__/bin/api-case")) {
+        return 1;
+    }
+    for (size_t index = 0; index < TASKSET_LARGE_ARG_BYTES; index++) {
+        if (argv[2][index] != 'x') {
+            return 2;
+        }
+    }
+    if (argv[2][TASKSET_LARGE_ARG_BYTES] != '\0') {
+        return 3;
+    }
+    return gtrt_affinity_is_only(0, 0) ? 0 : 4;
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 2 && string_equal(argv[1], "taskset-probe")) {
+        return taskset_probe(argc, argv);
+    }
+    if (argc >= 2 && string_equal(argv[1], "taskset-large-probe")) {
+        return taskset_large_probe(argc, argv);
+    }
     if (argc != 2) {
         return 64;
     }
