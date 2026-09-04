@@ -845,6 +845,13 @@ const USER_PROGRAMS: &[UserProgram] = &[
         test_artifact: true,
     },
     UserProgram {
+        name: "test_smp_api_supervisor",
+        source: "tests/qemu/user/smp_api_supervisor.c",
+        checked: false,
+        defines: &[],
+        test_artifact: true,
+    },
+    UserProgram {
         name: "test_shell_supervisor",
         source: "tests/qemu/user/shell_supervisor.c",
         checked: false,

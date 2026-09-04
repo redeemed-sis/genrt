@@ -10,6 +10,11 @@ step_timeout_secs = 20
 [[steps]]
 action = "expect_case"
 producer = "api-supervisor"
+subject = "init-affinity"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
 subject = "file-io"
 
 [[steps]]
@@ -26,6 +31,16 @@ subject = "cwd-paths"
 action = "expect_case"
 producer = "api-supervisor"
 subject = "process-control"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
+subject = "fork-affinity-validation"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
+subject = "process-affinity-validation"
 
 [[steps]]
 action = "expect_case"

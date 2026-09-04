@@ -267,6 +267,7 @@ fn prepare_test_initramfs(
         cases::InitImage::KernelContract => "kernel-contract",
         cases::InitImage::UserFault => "user-fault",
         cases::InitImage::UserspaceContract => "userspace-contract",
+        cases::InitImage::SmpUserspaceContract => "smp-userspace-contract",
         cases::InitImage::ShellContract => "shell-contract",
     });
     if root.exists() {
@@ -292,6 +293,14 @@ fn prepare_test_initramfs(
             provenance.mark_prefix("init", crate::initramfs::Origin::TestSupervisor)?;
             workflow::build_user_program(profile, "test_api_supervisor", true)?
         }
+        cases::InitImage::SmpUserspaceContract => {
+            let test_dir = test_namespace.join("bin");
+            fs::create_dir_all(&test_dir)?;
+            let fault = workflow::build_user_program(profile, "fault_null", true)?;
+            fs::copy(fault, test_dir.join("fault-null"))?;
+            provenance.mark_prefix("init", crate::initramfs::Origin::TestSupervisor)?;
+            workflow::build_user_program(profile, "test_smp_api_supervisor", true)?
+        }
         cases::InitImage::ShellContract => {
             copy_tree(
                 PathBuf::from("tests/qemu/fixtures/initramfs/fixtures").as_path(),
@@ -308,7 +317,9 @@ fn prepare_test_initramfs(
     };
     if !matches!(
         image,
-        cases::InitImage::UserspaceContract | cases::InitImage::ShellContract
+        cases::InitImage::UserspaceContract
+            | cases::InitImage::SmpUserspaceContract
+            | cases::InitImage::ShellContract
     ) {
         provenance.mark_prefix("init", crate::initramfs::Origin::TestFixture)?;
     }

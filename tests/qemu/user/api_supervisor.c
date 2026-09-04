@@ -1,7 +1,17 @@
+#include "affinity.h"
 #include "protocol.h"
 #include "product_contracts.h"
 
 static const char *producer = "api-supervisor";
+
+static void init_affinity(void) {
+    const char *name = "init-affinity";
+    gtrt_case_start(producer, name);
+    if (!gtrt_affinity_is_only(0, 0)) {
+        gtrt_fail(producer, name, "MASK");
+    }
+    gtrt_pass(producer, name);
+}
 
 static void run_case(const char *name) {
     gtrt_case_start(producer, name);
@@ -42,10 +52,13 @@ static void run_program(const struct gtrt_program_contract *contract) {
 
 int main(void) {
     gtrt_ready(producer, "userspace-contract");
+    init_affinity();
     run_case("file-io");
     run_case("directory-io");
     run_case("cwd-paths");
     run_case("process-control");
+    run_case("fork-affinity-validation");
+    run_case("process-affinity-validation");
     for (size_t index = 0; index < GTRT_PROGRAM_CONTRACT_COUNT; index++) {
         run_program(&GTRT_PROGRAM_CONTRACTS[index]);
     }

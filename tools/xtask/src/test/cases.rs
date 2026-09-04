@@ -11,6 +11,7 @@ pub(super) enum InitImage {
     KernelContract,
     UserFault,
     UserspaceContract,
+    SmpUserspaceContract,
     ShellContract,
 }
 

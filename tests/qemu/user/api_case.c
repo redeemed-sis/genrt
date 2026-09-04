@@ -1,4 +1,5 @@
 #include "artifact_marker.h"
+#include "affinity.h"
 #include "syscall.h"
 
 #define DIRENT64_HEADER_SIZE 19
@@ -108,11 +109,69 @@ static int process_control(void) {
         execve("/bin/echo", argv, NULL);
         exit(127);
     }
+    if (!gtrt_affinity_is_only(child, 0)) {
+        return 2;
+    }
+    long malformed_pid = (1L << 34) | (unsigned int)child;
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    if (genrt_syscall3(SYS_SCHED_GETAFFINITY,
+                       malformed_pid,
+                       sizeof(mask),
+                       (long)&mask)
+        != -GTRT_ESRCH) {
+        return 3;
+    }
     int status = 0;
-    return waitpid(child, &status, 0) == child && WIFEXITED(status)
-                   && WEXITSTATUS(status) == 0
-               ? 0
-               : 2;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)
+        || WEXITSTATUS(status) != 0) {
+        return 4;
+    }
+
+    CPU_ZERO(&mask);
+    return sched_getaffinity(child, sizeof(mask), &mask) == -GTRT_ESRCH ? 0 : 5;
+}
+
+static int fork_affinity_validation(void) {
+    if (sched_setforkaffinity(1) >= 0) {
+        return 1;
+    }
+    if (sched_setforkaffinity(-2) >= 0) {
+        return 2;
+    }
+    return sched_setforkaffinity(-1) == 0 ? 0 : 3;
+}
+
+static int process_affinity_validation(void) {
+    struct {
+        cpu_set_t mask;
+        unsigned long canary;
+    } extended;
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(3, &mask);
+    if (!CPU_ISSET(3, &mask)) {
+        return 1;
+    }
+    CPU_CLR(3, &mask);
+    if (CPU_ISSET(3, &mask) || !gtrt_affinity_is_only(0, 0)) {
+        return 2;
+    }
+    extended.canary = 0x5a5aa5a5UL;
+    if (sched_getaffinity(0, sizeof(extended), &extended.mask) != 0
+        || extended.canary != 0x5a5aa5a5UL) {
+        return 3;
+    }
+    if (sched_getaffinity(0, sizeof(mask) - 1, &mask) != -GTRT_EINVAL) {
+        return 4;
+    }
+    if (sched_getaffinity(0, sizeof(mask), (cpu_set_t *)1) != -GTRT_EFAULT) {
+        return 5;
+    }
+    if (sched_getaffinity(0x7fffffff, sizeof(mask), &mask) != -GTRT_ESRCH) {
+        return 6;
+    }
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -130,6 +189,12 @@ int main(int argc, char **argv) {
     }
     if (string_equal(argv[1], "process-control")) {
         return process_control();
+    }
+    if (string_equal(argv[1], "fork-affinity-validation")) {
+        return fork_affinity_validation();
+    }
+    if (string_equal(argv[1], "process-affinity-validation")) {
+        return process_affinity_validation();
     }
     return 65;
 }
