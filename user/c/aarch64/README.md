@@ -3,7 +3,8 @@
 This directory contains the AArch64-specific freestanding C runtime pieces:
 
 - `crt0.S`: process entry stub;
-- `include/syscall.h`: raw syscall wrappers and AArch64 syscall numbers.
+- `include/syscall.h`: raw syscall wrappers and AArch64 syscall numbers;
+- `include/sched.h`: process-affinity API and fixed userspace CPU sets.
 
 ## `execve` initial stack
 
@@ -64,3 +65,45 @@ The initial process cwd is `/`. Forked children inherit the parent's stable cwd
 directory identity, and successful `execve` preserves it. Relative `open`,
 `chdir`, and `execve` paths are canonicalized against cwd. The pathname ABI is
 bounded by `GENRT_PATH_MAX = 4096` bytes excluding NUL.
+
+## Fork placement extension
+
+`sched_setforkaffinity(int cpu)` is a genrt extension using syscall number 11:
+
+```text
+x0 = logical CPU index, or -1 to reset
+x8 = SYS_SCHED_SETFORKAFFINITY
+return = 0 on success, negative errno on error
+```
+
+A nonnegative CPU must be registered and scheduler-online. The setting replaces
+any earlier value and applies only to the next successfully published child of
+the calling process. `-1` restores deterministic default placement; values
+below `-1` are invalid. A failed pre-publication `fork()` preserves the setting,
+the child does not inherit it, and neither this syscall nor `execve()` changes
+the calling process's immutable CPU owner.
+
+## Process affinity query
+
+`sched_getaffinity(pid, cpusetsize, mask)` uses syscall number 12 and reports
+the process's actual immutable CPU owner:
+
+```text
+x0 = 0 for the current process, or a positive generation-bearing PID
+x1 = userspace CPU-set storage size in bytes
+x2 = writable cpu_set_t pointer
+x8 = SYS_SCHED_GETAFFINITY
+return = 0 on success, negative errno on error
+```
+
+`<sched.h>` defines a stable 1024-bit `cpu_set_t`, `CPU_SETSIZE`, `CPU_ZERO`,
+`CPU_SET`, `CPU_CLR`, and `CPU_ISSET`. This ABI capacity is independent of the
+kernel's configured CPU capacity. `cpusetsize` must be at least
+`sizeof(cpu_set_t)`; larger buffers are accepted, but the kernel writes exactly
+one `cpu_set_t`. The result contains exactly one bit because process migration
+and multi-CPU address spaces are unsupported.
+
+PID `0` selects the caller. A positive PID may identify another live or zombie
+process that has not been reaped. Invalid, stale, absent, or negative PIDs fail
+with `-ESRCH`; a short mask fails with `-EINVAL`, and an invalid writable range
+fails with `-EFAULT`. The API exposes no mutable `sched_setaffinity()` operation.

@@ -46,6 +46,7 @@ does not set the userspace PC.
 - Errors are negative errno values.
 - Pathnames, argv/envp, I/O, and directory buffers are bounded.
 - `fork` eagerly copies process memory; `execve` replaces it from ramfs.
+- `<sched.h>` exposes fixed CPU sets and immutable process-affinity queries.
 - Shell line editing and command policy are userspace responsibilities.
 
 Do not add libc assumptions or raw flat-binary loading paths. Syscall changes

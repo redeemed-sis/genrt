@@ -5,11 +5,11 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-black.svg)](LICENSE)
 
 genrt is an experimental hard real-time operating system written primarily in
-Rust. The active platform is AArch64 QEMU `virt`; CPU0 runs userspace while
-DTB-described secondary CPUs complete high-half bring-up and run permanent
-kernel idle contexts plus explicitly pinned kernel threads. The project uses
-that environment to make boot, scheduling, userspace, testing, and release
-invariants explicit before expanding runtime SMP scope.
+Rust. The active platform is AArch64 QEMU `virt`; DTB-described CPUs complete
+high-half bring-up, run independent scheduler contexts, and may own independent
+single-threaded userspace processes. CPU0 retains global initialization and
+device IRQ ownership. The project uses that environment to make boot,
+scheduling, userspace, testing, and release invariants explicit.
 
 genrt is aimed at operating-system and embedded developers who want a compact,
 inspectable codebase for studying deterministic kernel mechanisms. Its focus is
@@ -137,13 +137,11 @@ and [docs/releases.md](docs/releases.md).
 
 ## Current boundaries
 
-- Device IRQs and userspace remain CPU0-only. Secondary CPUs run only permanent
-  idle contexts and explicitly pinned kernel threads. Targeted scheduler SGIs
-  wake a thread's immutable home CPU; migration, work stealing, remote timer
-  insertion, and TLB shootdown are not implemented.
-- Shared runtime state, pinned kernel scheduling, and remote scheduler wakeup
-  are SMP-capable, but migration, userspace SMP, and latency certification are
-  not implemented.
+- Device IRQ routing remains CPU0-only. Independent processes may execute on
+  immutable owner CPUs selected for child creation; one address space never
+  spans CPUs. Targeted scheduler SGIs wake a thread's home CPU.
+- Migration, work stealing, remote timer insertion, shared userspace address
+  spaces, general TLB shootdown, and latency certification are not implemented.
 - No FP/SIMD context ownership; kernel Rust uses the soft-float target.
 - No ASIDs, copy-on-write, demand paging, signals, or recoverable usercopy
   faults.

@@ -27,8 +27,8 @@ explicit acceptance criteria.
 4. **Secondary CPU activation**
    - add an IPI-backed remote timer command for prompt insertion into another
      CPU's existing per-CPU deadline queue;
-   - define userspace TLB shootdown ownership before executing EL0 on another
-     CPU.
+   - define ASID and TLB-shootdown ownership before migration, shared userspace
+     address spaces, or multiple user threads can span CPUs.
 
 ## Boundary cleanup
 

@@ -110,6 +110,12 @@ swapping process and current-thread resources; process exit/fault wakes its
 registered waiter and then uses ordinary thread exit/join/reap. Reap releases
 the user stack before the process destroys its ELF frames and address space.
 
+Each process, main thread, and published TTBR0 root share one immutable logical
+CPU owner. Fork may select a one-shot child CPU before publication; exec keeps
+the existing owner. The scheduler sees only `ThreadId`, `home_cpu`, and an
+owner-bearing `AddressSpaceId`, while the process layer binds its reverse index
+before runnable publication.
+
 Lower-EL faults become `ProcessExitStatus::Faulted` when ownership is known.
 Kernel/current-EL faults remain fatal. User pointers are accessed only through
 the user-copy layer.

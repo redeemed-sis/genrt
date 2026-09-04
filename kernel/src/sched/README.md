@@ -23,9 +23,9 @@ wakeups publish into a bounded per-target ingress that only the target CPU
 drains into its local ready queue after a targeted scheduler SGI. One protected
 per-target bit coalesces notifications without replacing ingress as the source
 of truth. A sole current or idle thread has no polling quantum; RR deadlines are
-armed only while a local runnable peer exists. There is no migration, work
-stealing, remote timer insertion, or userspace secondary execution in the
-active target.
+armed only while a local runnable peer exists. Independent single-threaded
+processes may run on secondary CPUs, but there is no migration, work stealing,
+remote timer insertion, or address-space sharing across CPUs.
 
 Current-CPU entry points resolve `CpuId` once and bind a short-lived
 `CpuScheduler` view. Local transition, wait, and preemption methods use the
@@ -103,6 +103,10 @@ handle and validates both handle generations plus `main_thread` on lookup.
 This keeps current-process resolution O(1) without storing process metadata in
 scheduler state. The process layer reaps the main thread before destroying its
 address space.
+
+For a user thread, `AddressSpaceId::owner_cpu()` must equal immutable
+`home_cpu`. Scheduler publication checks this before runnable visibility;
+scheduler handoff and the VM facade reject activation from another CPU.
 
 ## Preemption and time
 
@@ -182,8 +186,9 @@ own finite static-thread arrays without changing round-robin behavior.
 
 ## Constraints
 
-- Device IRQs and userspace remain CPU0-only. Registered secondary CPUs run
-  permanent idle threads and explicitly pinned kernel threads.
+- Device IRQs remain CPU0-only. Registered secondary CPUs may run permanent
+  idle threads, explicitly pinned kernel threads, and independently owned user
+  processes.
 - Local IRQ exclusion is not SMP synchronization; shared owners use explicit
   cross-CPU locks.
 - No heap allocation or unbounded work in scheduling, timer, or frame-handoff

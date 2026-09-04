@@ -24,6 +24,9 @@ stores complete evidence below `target/test-results/`.
   local timer deadlines without a polling quantum.
 - `userspace-contract`: production kernel plus test supervisor and exact
   production-program invocations.
+- `smp-userspace-contract`: four-CPU production kernel plus a test supervisor
+  covering one-shot fork placement, exact affinity masks, affinity preservation
+  across exec, and remote process lifecycle.
 - `shell-contract`: production kernel and shell plus test-only helpers and a
   host nonce challenge for UART input and command behavior.
 

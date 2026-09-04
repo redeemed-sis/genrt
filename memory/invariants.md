@@ -57,13 +57,20 @@ Changes that invalidate one require architecture review and an ADR.
   the allocator guard.
 - TTBR1 owns kernel high-half mappings; a process-owned TTBR0 root owns its EL0
   mappings.
-- `OwnedUserAddressSpace` is the sole TTBR0 page-table owner. Scheduler state may
-  retain only its non-owning `AddressSpaceId`, and the owner outlives every
-  thread carrying that ID.
+- `StagedUserAddressSpace` is the only mutable TTBR0 mapping capability. Owner
+  assignment consumes it and publishes one immutable
+  `OwnedUserAddressSpace`; scheduler state may retain only its non-owning
+  `AddressSpaceId`, and the owner outlives every thread carrying that ID.
+- Every live process owner, main-thread `home_cpu`, and address-space owner are
+  the same `CpuId`. A published TTBR0 root is immutable, may be active only on
+  that CPU, and cannot be destroyed while any CPU records it as active.
 - Each user thread owns exactly one `OwnedUserStack`; the process table does not
   own user-stack frames.
 - Boot-owned page tables are never reclaimed through the runtime frame
   allocator.
+- Staged TTBR0 mappings need no invalidation. Owner-only activation and clear
+  perform local userspace invalidation; this single-owner rule replaces a
+  general userspace TLB-shootdown protocol for the current milestone.
 - Generic kernel VM entry points serialize runtime TTBR1 writers. AArch64 owns
   descriptor replacement, break-before-make where needed, inner-shareable
   TLBI, and barriers; table frames are not reclaimed before invalidation
@@ -75,10 +82,10 @@ Changes that invalidate one require architecture review and an ADR.
 
 ## Scheduling and lifecycle
 
-- CPU0 is the sole global-init, device-IRQ, and userspace execution owner.
-  Registered secondary CPUs execute bounded boot, local timer IRQ, permanent
-  idle, and explicitly pinned kernel-thread paths; local IRQ exclusion is never
-  an SMP lock.
+- CPU0 is the sole global-init and device-SPI owner. Registered secondary CPUs
+  execute bounded boot, local timer/SGI IRQ, permanent idle, pinned kernel
+  threads, and independently owned userspace processes; local IRQ exclusion is
+  never an SMP lock.
 - Logical `CpuId` is the only generic-kernel CPU identity. AArch64-normalized
   hardware IDs are boot-registration keys and PSCI targets, never scheduler
   indexes. CPU0 remains logical CPU0; each registered CPU receives an
@@ -121,8 +128,8 @@ Changes that invalidate one require architecture review and an ADR.
   ready membership. Every initialized CPU owns exactly one local idle/current
   `Running` thread, and online implies initialized. A sole current or idle
   thread has no polling quantum; targeted scheduler SGIs provide remote wakeup.
-  There is no migration, work stealing, remote timer insertion, or userspace
-  secondary scheduling.
+  There is no migration, work stealing, remote timer insertion, or one
+  userspace address space spanning multiple CPUs.
 - Every logical CPU owns one bounded deadline queue and one architected physical
   timer. Timed events carry that owner. Only the owner CPU inserts events and
   programs the timer; no time lock is retained across direct scheduler dispatch.
@@ -179,6 +186,17 @@ Changes that invalidate one require architecture review and an ADR.
   slots, generations, global table access, and the reverse index; scheduler
   code does not import process policy. Process address spaces/images remain
   process-owned, while user stacks remain thread-owned.
+- A process owner is selected before its main thread becomes runnable. Process
+  code holds table ownership across a bounded scheduler pre-ready hook that
+  binds the exact generation-bearing thread and validates process, thread, and
+  address-space CPU ownership before local or remote ready publication.
+- Pending fork affinity is process-owned creation policy, not mutable runtime
+  affinity. It is replaced/reset explicitly, consumed only by successful child
+  publication, preserved by earlier failure, and absent in the child. Exec
+  preserves the existing owner.
+- A process affinity query returns exactly the immutable process owner recorded
+  by the process/thread/address-space ownership triple. The fixed userspace
+  `cpu_set_t` ABI does not expose kernel CPU capacity or permit migration.
 - Terminal thread and process status is single-consumer where a join/wait API
   promises one waiter.
 - Wake paths make runnable work visible to the ready queue and rearm scheduling

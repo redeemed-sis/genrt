@@ -66,6 +66,11 @@ diagnostics; generic kernel code does not own platform constants.
 - TTBR1 provides high-half RAM and Device mappings.
 - After physical memory initialization, allocator-owned runtime TTBR1 tables
   replace boot tables and TTBR0 is cleared.
+- Published TTBR0 roots have one immutable logical CPU owner. Activation and
+  clear use local `VMALLE1`; staged roots are mapped before first activation and
+  need no invalidation. There are no ASIDs or cross-CPU userspace shootdowns.
+- Runtime TTBR1 mappings remain shared across CPUs and retain inner-shareable
+  broadcast invalidation.
 - The generic VM layer requests architecture operations through narrow C ABI
   hooks; descriptor and system-register details stay here.
 

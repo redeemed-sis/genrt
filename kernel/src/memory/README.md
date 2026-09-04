@@ -37,10 +37,12 @@ broadcast invalidation, and only reclaims table frames after invalidation.
 
 ## User address spaces
 
-Each process owns a non-copyable `OwnedUserAddressSpace` backed by an
-allocator-owned TTBR0 root. Mapping code borrows that owner. Scheduler handoff
-stores only a copyable, non-owning `AddressSpaceId`, which can activate the
-selected root but cannot destroy it.
+Address-space construction begins as a non-copyable
+`StagedUserAddressSpace`. ELF and stack mapping APIs accept only this unpublished
+mutable stage. Assigning a future logical CPU consumes it and yields the
+process-owned `OwnedUserAddressSpace`; published roots are immutable. Scheduler
+handoff stores only a copyable, non-owning `AddressSpaceId` containing the same
+owner, which can activate the root but cannot map or destroy it.
 
 User ELF segments and stacks use 4 KiB mappings with descriptor-derived user,
 write, and execute permissions. ELF frames remain process-owned. Each user
@@ -53,11 +55,19 @@ The current one-thread-per-process lifetime is:
 
 ```text
 Process owns OwnedUserAddressSpace
+  -> Process, AddressSpaceId, and main Thread agree on one CPU owner
   -> Thread borrows identity as AddressSpaceId and owns OwnedUserStack
   -> Thread exits and is reaped
   -> OwnedUserStack frames are released
   -> ELF frames and OwnedUserAddressSpace are released
 ```
+
+Only the immutable owner CPU may activate a published TTBR0 root. The generic
+VM layer tracks each CPU's active root and rejects destruction while any CPU
+still records it. AArch64 performs local invalidation on TTBR0 activation and
+clear; staged mappings need no invalidation because they have never been
+active. Runtime TTBR1 mappings remain shared, mutable, and use their existing
+inner-shareable broadcast invalidation protocol.
 
 ## User copies
 

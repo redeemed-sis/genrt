@@ -8,9 +8,9 @@ accepted ADRs remain authoritative when details differ.
 - Architecture: AArch64.
 - Rust target: `aarch64-unknown-none-softfloat`.
 - Machine: QEMU `virt` with GICv2.
-- Execution model: CPU0-owned global initialization and userspace plus bounded
-  high-half bring-up of registered secondary CPUs into active kernel scheduler
-  contexts.
+- Execution model: CPU0-owned global initialization and device IRQs plus
+  bounded high-half bring-up of every registered CPU into an active scheduler
+  context. Independent userspace processes may have any online CPU as owner.
 - Kernel image: low physical load with a high-half virtual runtime mapping.
 
 ## Boot and platform
@@ -58,9 +58,15 @@ accepted ADRs remain authoritative when details differ.
   AArch64 reads live TTBR roots from registers, performs break-before-make and
   inner-shareable TLBI, and defers table-frame reclaim until invalidation
   completes.
-- Each user process owns an allocator-backed `OwnedUserAddressSpace`. ELF
-  segments and thread-owned user stacks use 4 KiB mappings with user-specific
+- User address spaces are mapped through an unpublished
+  `StagedUserAddressSpace`, then frozen into a process-owned
+  `OwnedUserAddressSpace` with one immutable logical CPU owner. ELF segments
+  and thread-owned user stacks use 4 KiB mappings with user-specific
   permissions.
+- A published TTBR0 root is immutable and activates only on its owner CPU.
+  Per-CPU active-root tracking prevents destruction before clear. AArch64 uses
+  local invalidation for TTBR0 activation/clear while shared runtime TTBR1
+  mutation retains inner-shareable broadcast invalidation.
 - `copy_from_user` and `copy_to_user` validate the active user address space;
   fault recovery during the actual copy is not implemented yet.
 
@@ -154,6 +160,10 @@ accepted ADRs remain authoritative when details differ.
 - The bounded process table owns process state, TTBR0 address spaces, loaded
   ELF segments, cwd, file descriptors, relationships, exit/fault status, and
   `main_thread: ThreadId`.
+- Every live process, its main thread, and its `AddressSpaceId` share one
+  immutable `CpuId`. Process binding occurs in a bounded pre-ready publication
+  hook before the scheduler exposes the exact thread ID in a ready queue or
+  remote ingress.
 - Each process-table slot contains a generation and one identity-independent
   `Process` aggregate. `ProcessResources` groups its address-space/image bundle
   with `ProcessFileState`; operation modules remain separate without changing
@@ -163,17 +173,24 @@ accepted ADRs remain authoritative when details differ.
   the process table resolves the current process in O(1) through a fixed
   thread-slot reverse index that validates `ThreadId`, `ProcessId`, and
   `main_thread` generations.
-- `fork` eagerly clones the user address space and process resources.
-- `execve` loads a static AArch64 ELF from ramfs, replaces the current user
-  image and thread-owned stack, and builds bounded `argc`, `argv`, and `envp`.
+- `fork` eagerly clones the user address space and process resources. By
+  default the child keeps the parent's owner; `sched_setforkaffinity` may set,
+  replace, or reset a process-owned one-shot CPU for the next successfully
+  published child. Failed staging preserves it and children never inherit it.
+- `sched_getaffinity` reports that immutable owner as exactly one bit in a
+  fixed 1024-bit userspace `cpu_set_t`. PID `0` selects the caller; positive
+  generation-bearing PIDs may select another unreaped process.
+- `execve` loads a static AArch64 ELF from ramfs, preserves the process owner,
+  replaces the current user image and thread-owned stack, and builds bounded
+  `argc`, `argv`, and `envp`.
 - `process_join` and `waitpid` consume process-owned status, then use ordinary
   thread join/reap before releasing stack, ELF, and address-space resources.
   `waitpid` supports a specific positive child PID with options `0`.
 - Lower-EL faults terminate the attributed user process and remain joinable;
   current-EL kernel faults stay fatal.
 - The syscall ABI supports `open`, `read`, `write`, `close`, `getdents64`,
-  `chdir`, `getcwd`, `fork`, `execve`, `waitpid`, and `exit` with negative errno
-  returns.
+  `chdir`, `getcwd`, `fork`, `execve`, `waitpid`, `sched_setforkaffinity`,
+  `sched_getaffinity`, and `exit` with negative errno returns.
 
 ## Filesystem and console
 
@@ -205,12 +222,13 @@ accepted ADRs remain authoritative when details differ.
 
 ## Current boundaries
 
-- Secondary CPUs execute permanent idle and explicitly pinned kernel threads,
-  and can acknowledge/EOI their local physical-timer PPI. They perform no
-  device-IRQ or userspace execution.
-- No IPI/remote reschedule or remote timer-insertion notification, migration,
-  CPU hotplug, or userspace TLB shootdown. Shared runtime owners are already
-  cross-CPU locked.
+- Secondary CPUs execute permanent idle, explicitly pinned kernel threads, and
+  independently owned user processes. They acknowledge/EOI local timer and
+  targeted scheduler SGI interrupts; device SPIs remain CPU0-owned.
+- There is no migration, CPU hotplug, remote timer insertion, shared userspace
+  address space, ASID support, or userspace TLB shootdown. Shared runtime owners
+  are cross-CPU locked and remote-ready publication uses targeted scheduler
+  IPIs.
 - No FP/SIMD context ownership; the soft-float target is intentional.
 - No ASIDs, copy-on-write, demand paging, recoverable usercopy faults, signals,
   or multiple user threads within one process.
