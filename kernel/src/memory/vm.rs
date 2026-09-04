@@ -1,7 +1,16 @@
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use super::{PAGE_SIZE, PhysAddr, PhysRange, VirtAddr};
-use crate::sync::SpinLock;
+use crate::{
+    config::KERNEL_CPU_CAPACITY,
+    cpu::{self, CpuId},
+    sync::SpinLock,
+};
 
 static KERNEL_VM_LOCK: SpinLock<()> = SpinLock::new(());
+const NO_ACTIVE_USER_ROOT: PhysAddr = PhysAddr::MAX;
+static ACTIVE_USER_ADDRESS_SPACES: [AtomicUsize; KERNEL_CPU_CAPACITY] =
+    [const { AtomicUsize::new(NO_ACTIVE_USER_ROOT) }; KERNEL_CPU_CAPACITY];
 
 unsafe extern "C" {
     fn arch_phys_to_virt(pa: usize) -> usize;
@@ -82,24 +91,87 @@ impl UserMapFlags {
 /// mapping queries. It cannot destroy page tables; only
 /// [`OwnedUserAddressSpace`] owns that capability. Copying this identity does
 /// not allocate, block, alter IRQ state, or extend the lifetime of the root.
-#[repr(transparent)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct AddressSpaceId {
     root_pa: PhysAddr,
+    owner_cpu: CpuId,
 }
 
 impl AddressSpaceId {
     const fn root_pa(self) -> PhysAddr {
         self.root_pa
     }
+
+    /// Return the immutable CPU that exclusively owns this TTBR0 root.
+    ///
+    /// # Returns
+    ///
+    /// Returns the logical CPU selected before process publication. This
+    /// copy-only query does not allocate, block, or alter IRQ state.
+    pub(crate) const fn owner_cpu(self) -> CpuId {
+        self.owner_cpu
+    }
+
+    #[cfg(test)]
+    /// Build a synthetic identity for host-only ownership tests.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_cpu` - Immutable owner encoded in the synthetic identity.
+    ///
+    /// # Returns
+    ///
+    /// Returns a non-live test value without allocation, blocking, or IRQ
+    /// state changes. Production code cannot call this helper.
+    pub(crate) const fn for_test(owner_cpu: CpuId) -> Self {
+        Self {
+            root_pa: 1,
+            owner_cpu,
+        }
+    }
 }
 
-/// Exclusive owner of allocator-backed TTBR0 page tables.
+/// Unpublished, mutable owner of allocator-backed TTBR0 page tables.
 ///
-/// Mapping and loading borrow this value; activation and query APIs accept its
-/// copyable [`AddressSpaceId`]. The root physical address remains encapsulated.
-/// Ownership must be consumed by [`destroy_user_address_space`] after every
-/// failed staging path; this type has no implicit `Drop` cleanup.
+/// ELF loading, stack construction, and mapping APIs borrow this value. It has
+/// no copyable identity, so no scheduler or active context can reference it.
+/// Assigning an immutable future owner consumes it and produces an
+/// [`OwnedUserAddressSpace`]. This type has no implicit `Drop` cleanup.
+pub(crate) struct StagedUserAddressSpace {
+    root_pa: PhysAddr,
+}
+
+impl StagedUserAddressSpace {
+    /// Assign the immutable future owner and freeze this staged TTBR0 root.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_cpu` - Registered future CPU that will own every thread and
+    ///   activation of the completed address space.
+    ///
+    /// # Returns
+    ///
+    /// Returns the unique published owner and its copyable identity. This
+    /// consumes the staged mapping capability without allocation, blocking, or
+    /// IRQ-state changes. After this call, no mutable mapping API accepts the
+    /// root.
+    pub(crate) const fn assign_owner(self, owner_cpu: CpuId) -> OwnedUserAddressSpace {
+        OwnedUserAddressSpace {
+            id: AddressSpaceId {
+                root_pa: self.root_pa,
+                owner_cpu,
+            },
+        }
+    }
+}
+
+/// Exclusive owner of an immutable, published TTBR0 address space.
+///
+/// Scheduler state may retain its copyable [`AddressSpaceId`] only after the
+/// root is assigned to one immutable logical CPU. The root physical address
+/// remains encapsulated. Ownership must be consumed by the VM destruction API
+/// after every failed or completed lifecycle; this type has no implicit `Drop`
+/// cleanup.
 pub struct OwnedUserAddressSpace {
     id: AddressSpaceId,
 }
@@ -115,10 +187,19 @@ impl OwnedUserAddressSpace {
         self.id
     }
 
-    const fn from_root_pa(root_pa: PhysAddr) -> Self {
-        Self {
-            id: AddressSpaceId { root_pa },
-        }
+    #[cfg(test)]
+    /// Wrap a synthetic test identity in a unique owner.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Host-only synthetic address-space identity.
+    ///
+    /// # Returns
+    ///
+    /// Returns a host-test owner without allocating, touching page tables, or
+    /// altering IRQ state. Production code cannot call this helper.
+    pub(crate) const fn for_test(id: AddressSpaceId) -> Self {
+        Self { id }
     }
 }
 
@@ -141,6 +222,10 @@ pub enum VmError {
     AlreadyMapped,
     MissingMapping,
     OutOfFrames,
+    /// A root was active during destruction or already active on another CPU.
+    ActiveAddressSpace,
+    /// The executing CPU does not own the requested TTBR0 root.
+    WrongCpu,
     Unsupported,
 }
 
@@ -207,26 +292,51 @@ pub fn initramfs_load_range() -> PhysRange {
     }
 }
 
-/// Create an owned, empty TTBR0 user address space.
+/// Create an unpublished, empty TTBR0 user address space.
 ///
 /// This delegates page-table-root allocation to the architecture VM backend.
 /// It may allocate frames and must not run in an IRQ or scheduler fast path.
 ///
 /// # Returns
 ///
-/// Returns the unique root owner. The caller must either transfer it to a
-/// process lifecycle path or consume it with [`destroy_user_address_space`].
+/// Returns the unique mutable root owner. The caller must finish ELF/stack
+/// construction, assign its future [`CpuId`] with
+/// [`StagedUserAddressSpace::assign_owner`], or consume the stage with
+/// [`destroy_staged_user_address_space`].
 ///
 /// # Errors
 ///
 /// Returns backend initialization, frame-allocation, or unsupported-operation
 /// errors as [`VmError`].
-pub fn create_user_address_space() -> Result<OwnedUserAddressSpace, VmError> {
+pub(crate) fn create_user_address_space() -> Result<StagedUserAddressSpace, VmError> {
     let mut root_pa = 0usize;
     match unsafe { arch_create_user_address_space(&mut root_pa as *mut usize) } {
-        0 => Ok(OwnedUserAddressSpace::from_root_pa(root_pa)),
+        0 => Ok(StagedUserAddressSpace { root_pa }),
         code => Err(vm_error_from_code(code)),
     }
+}
+
+/// Destroy an unpublished staged TTBR0 root and its page-table frames.
+///
+/// The operation consumes `aspace`, may return frames to the allocator, and
+/// must not run in an IRQ or scheduler fast path.
+///
+/// # Arguments
+///
+/// * `aspace` - Unique unpublished root owner being permanently destroyed.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after the architecture backend released the root.
+///
+/// # Errors
+///
+/// Returns backend teardown failures as [`VmError`]. On error, ownership has
+/// still been consumed and callers must not reuse the staged root.
+pub(crate) fn destroy_staged_user_address_space(
+    aspace: StagedUserAddressSpace,
+) -> Result<(), VmError> {
+    vm_result(unsafe { arch_destroy_user_address_space(aspace.root_pa) })
 }
 
 /// Destroy an owned TTBR0 root and its page-table frames.
@@ -249,13 +359,22 @@ pub fn create_user_address_space() -> Result<OwnedUserAddressSpace, VmError> {
 ///
 /// # Safety
 ///
-/// The caller must ensure no active CPU, scheduler thread, mapping operation,
-/// or retained architecture context can still reference this address space.
-pub unsafe fn destroy_user_address_space(aspace: OwnedUserAddressSpace) -> Result<(), VmError> {
+/// The caller must ensure no scheduler thread, mapping operation, or retained
+/// architecture context can still reference this address space. The generic VM
+/// layer rejects destruction while any CPU records the root as active.
+pub(crate) unsafe fn destroy_user_address_space(
+    aspace: OwnedUserAddressSpace,
+) -> Result<(), VmError> {
+    if ACTIVE_USER_ADDRESS_SPACES
+        .iter()
+        .any(|active| active.load(Ordering::Acquire) == aspace.id.root_pa())
+    {
+        return Err(VmError::ActiveAddressSpace);
+    }
     vm_result(unsafe { arch_destroy_user_address_space(aspace.id.root_pa()) })
 }
 
-/// Map one user page into an owned TTBR0 root.
+/// Map one user page into an unpublished staged TTBR0 root.
 ///
 /// The architecture backend may allocate intermediate page tables; this path
 /// does not block and must stay outside IRQ and scheduler fast paths.
@@ -281,16 +400,16 @@ pub unsafe fn destroy_user_address_space(aspace: OwnedUserAddressSpace) -> Resul
 /// The caller must own the physical frame's lifetime, provide a valid user
 /// page range, and ensure that publishing this mapping cannot violate an
 /// active address-space or aliasing invariant.
-pub unsafe fn map_user_page(
-    aspace: &OwnedUserAddressSpace,
+pub(crate) unsafe fn map_user_page(
+    aspace: &StagedUserAddressSpace,
     va: VirtAddr,
     pa: PhysAddr,
     flags: UserMapFlags,
 ) -> Result<(), VmError> {
-    vm_result(unsafe { arch_map_user_page(aspace.id.root_pa(), va, pa, flags.bits()) })
+    vm_result(unsafe { arch_map_user_page(aspace.root_pa, va, pa, flags.bits()) })
 }
 
-/// Map a contiguous range of user pages into an owned TTBR0 root.
+/// Map a contiguous range of user pages into an unpublished staged TTBR0 root.
 ///
 /// This validates alignment and arithmetic before mapping each page. The
 /// backend may allocate intermediate page tables; it does not block and must
@@ -314,8 +433,8 @@ pub unsafe fn map_user_page(
 /// Returns [`VmError::NotAligned`] for unaligned inputs,
 /// [`VmError::InvalidRange`] for overflow, or backend mapping errors. Earlier
 /// pages remain mapped if a later backend call fails.
-pub fn map_user_page_range(
-    aspace: &OwnedUserAddressSpace,
+pub(crate) fn map_user_page_range(
+    aspace: &StagedUserAddressSpace,
     va: VirtAddr,
     pa: PhysAddr,
     size: usize,
@@ -407,14 +526,31 @@ pub fn query_user_mapping(aspace: AddressSpaceId, va: VirtAddr) -> Option<UserMa
 ///
 /// # Errors
 ///
-/// Returns backend activation failures as [`VmError`].
+/// Returns [`VmError::WrongCpu`] when the executing CPU is not the immutable
+/// owner, [`VmError::ActiveAddressSpace`] if another CPU already records this
+/// root, or backend activation failures as [`VmError`].
 ///
 /// # Safety
 ///
 /// The caller must ensure `aspace` names a live owner and that replacing the
 /// current TTBR0 is valid for the active saved/live context.
-pub unsafe fn activate_user_address_space(aspace: AddressSpaceId) -> Result<(), VmError> {
-    vm_result(unsafe { arch_activate_user_address_space(aspace.root_pa()) })
+pub(crate) unsafe fn activate_user_address_space(aspace: AddressSpaceId) -> Result<(), VmError> {
+    let current_cpu = cpu::current_id().map_err(|_| VmError::WrongCpu)?;
+    if current_cpu != aspace.owner_cpu() {
+        return Err(VmError::WrongCpu);
+    }
+    if ACTIVE_USER_ADDRESS_SPACES
+        .iter()
+        .enumerate()
+        .any(|(index, root)| {
+            index != current_cpu.index() && root.load(Ordering::Acquire) == aspace.root_pa()
+        })
+    {
+        return Err(VmError::ActiveAddressSpace);
+    }
+    vm_result(unsafe { arch_activate_user_address_space(aspace.root_pa()) })?;
+    ACTIVE_USER_ADDRESS_SPACES[current_cpu.index()].store(aspace.root_pa(), Ordering::Release);
+    Ok(())
 }
 
 /// Clear the current user TTBR0 root for kernel-thread execution.
@@ -428,14 +564,18 @@ pub unsafe fn activate_user_address_space(aspace: AddressSpaceId) -> Result<(), 
 ///
 /// # Errors
 ///
-/// Returns backend clearing failures as [`VmError`].
+/// Returns [`VmError::WrongCpu`] before CPU registration or backend clearing
+/// failures as [`VmError`].
 ///
 /// # Safety
 ///
 /// The caller must ensure the active context will not resume userspace until a
 /// valid user address space is activated again.
-pub unsafe fn clear_user_address_space() -> Result<(), VmError> {
-    vm_result(unsafe { arch_clear_user_address_space() })
+pub(crate) unsafe fn clear_user_address_space() -> Result<(), VmError> {
+    let current_cpu = cpu::current_id().map_err(|_| VmError::WrongCpu)?;
+    vm_result(unsafe { arch_clear_user_address_space() })?;
+    ACTIVE_USER_ADDRESS_SPACES[current_cpu.index()].store(NO_ACTIVE_USER_ROOT, Ordering::Release);
+    Ok(())
 }
 
 fn vm_result(code: u64) -> Result<(), VmError> {

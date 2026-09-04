@@ -15,6 +15,8 @@
 #define SYS_GETDENTS64 8
 #define SYS_CHDIR 9
 #define SYS_GETCWD 10
+#define SYS_SCHED_SETFORKAFFINITY 11
+#define SYS_SCHED_GETAFFINITY 12
 
 #define GENRT_PATH_MAX 4096
 #define PATH_MAX GENRT_PATH_MAX
@@ -105,6 +107,10 @@ static inline int close(int fd) {
 
 static inline pid_t fork(void) {
     return (pid_t)genrt_syscall0(SYS_FORK);
+}
+
+static inline int sched_setforkaffinity(int cpu) {
+    return (int)genrt_syscall1(SYS_SCHED_SETFORKAFFINITY, cpu);
 }
 
 static inline int execve(const char *path, char *const argv[], char *const envp[]) {

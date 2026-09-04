@@ -16,7 +16,7 @@ use super::{
     id::ProcessId,
     image::{ExecArgs, build_initial_user_stack, copy_exec_args_from_user as copy_args},
     resources::{ProcessImageResources, cleanup_process_image_resources},
-    table::{current_process_id, table_mut},
+    table::{current_process_id, process_owner_cpu, table_mut},
 };
 
 struct StagedProcessImage {
@@ -65,7 +65,8 @@ pub(crate) fn execve_current(
     args: ExecArgs,
 ) -> Result<(), errno::Errno> {
     let pid = current_process_id().ok_or(errno::EINVAL)?;
-    let staged = stage_exec_image(&path, &args)?;
+    let owner_cpu = process_owner_cpu(pid).ok_or(errno::EINVAL)?;
+    let staged = stage_exec_image(&path, &args, owner_cpu)?;
     let (old, old_stack) = commit_exec_image(pid, staged, context);
     drop(old_stack);
     cleanup_process_image_resources(pid, old);
@@ -75,17 +76,18 @@ pub(crate) fn execve_current(
 fn stage_exec_image(
     path: &path::ResolvedPath,
     args: &ExecArgs,
+    owner_cpu: crate::cpu::CpuId,
 ) -> Result<StagedProcessImage, errno::Errno> {
     let file_index = match path.node {
         path::ResolvedNode::File { file_index } => file_index,
         path::ResolvedNode::Directory { .. } => return Err(errno::EACCES),
     };
     let image = ramfs::data(file_index).ok_or(errno::ENOENT)?;
-    let mut address_space = Some(vm::create_user_address_space().map_err(exec_vm_errno)?);
+    let mut staged_address_space = Some(vm::create_user_address_space().map_err(exec_vm_errno)?);
     let mut stack = None;
     let mut user_image = None;
     let result = (|| {
-        let aspace = address_space.as_mut().ok_or(errno::ENOMEM)?;
+        let aspace = staged_address_space.as_mut().ok_or(errno::ENOMEM)?;
         let loaded = elf::load_user_elf(image, aspace).map_err(exec_elf_errno)?;
         let entry = loaded.entry;
         user_image = Some(loaded);
@@ -93,7 +95,10 @@ fn stage_exec_image(
         let initial_sp = build_initial_user_stack(stack.as_ref().ok_or(errno::ENOMEM)?, args)
             .ok_or(errno::E2BIG)?;
         Ok(StagedProcessImage {
-            address_space: address_space.take().ok_or(errno::ENOMEM)?,
+            address_space: staged_address_space
+                .take()
+                .ok_or(errno::ENOMEM)?
+                .assign_owner(owner_cpu),
             user_image: user_image.take().ok_or(errno::ENOMEM)?,
             stack: stack.take().ok_or(errno::ENOMEM)?,
             entry,
@@ -106,8 +111,8 @@ fn stage_exec_image(
         }
         drop(stack);
         // SAFETY: staged exec was never published, so no thread can reference this root.
-        if let Some(address_space) = address_space {
-            let _ = unsafe { vm::destroy_user_address_space(address_space) };
+        if let Some(address_space) = staged_address_space {
+            let _ = vm::destroy_staged_user_address_space(address_space);
         }
     }
     result

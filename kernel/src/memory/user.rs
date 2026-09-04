@@ -15,7 +15,7 @@ pub use crate::config::GENRT_PATH_MAX;
 
 use super::{
     FrameRange, PAGE_SIZE, VirtAddr, align_down,
-    vm::{self, OwnedUserAddressSpace, UserMapFlags, UserMappingInfo},
+    vm::{self, StagedUserAddressSpace, UserMapFlags, UserMappingInfo},
 };
 
 pub const USER_TEXT_BASE: VirtAddr = 0x0000_0040_0000_0000;
@@ -59,7 +59,7 @@ impl OwnedUserStack {
     /// Returns [`vm::VmError::OutOfFrames`] when frame allocation fails and
     /// propagates invalid-range, alignment, or mapping errors.
     pub(crate) fn allocate(
-        address_space: &OwnedUserAddressSpace,
+        address_space: &StagedUserAddressSpace,
         size: usize,
     ) -> Result<Self, vm::VmError> {
         if size == 0 || size & (PAGE_SIZE - 1) != 0 || size > USER_STACK_TOP {
@@ -116,7 +116,7 @@ impl OwnedUserStack {
     /// allocate and must not run in an IRQ or scheduler fast path.
     pub(crate) fn clone_into(
         &self,
-        address_space: &OwnedUserAddressSpace,
+        address_space: &StagedUserAddressSpace,
     ) -> Result<Self, vm::VmError> {
         let frames = super::clone_frame_range(self.frames).map_err(|error| match error {
             super::FrameRangeCloneError::InvalidRange => vm::VmError::InvalidRange,

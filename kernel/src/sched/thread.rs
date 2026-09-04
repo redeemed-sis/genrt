@@ -308,6 +308,9 @@ pub(crate) unsafe fn current_user_stack_ptr() -> Option<*const OwnedUserStack> {
 /// * `user_sp` - Initial EL0 stack pointer within `stack`.
 /// * `arg0` - Initial EL0 argument register value.
 /// * `attrs` - Joinability selected for the new thread.
+/// * `on_pre_ready` - Infallible process-owner binding performed after the
+///   exact thread ID and home CPU exist but before ready publication. It must
+///   not call scheduler APIs.
 ///
 /// # Returns
 ///
@@ -320,23 +323,33 @@ pub(crate) unsafe fn current_user_stack_ptr() -> Option<*const OwnedUserStack> {
 /// [`SpawnError::SchedulerNotInitialized`] before bootstrap publication.
 /// [`SpawnError::UserThreadMustBeJoinable`] rejects detached userspace because
 /// its non-Copy stack must be released by generic join/reap.
-pub(crate) fn thread_spawn_user(
+pub(crate) fn thread_spawn_user<F>(
     address_space: AddressSpaceId,
     stack: OwnedUserStack,
     user_entry: usize,
     user_sp: usize,
     arg0: usize,
     attrs: ThreadAttrs,
-) -> core::result::Result<ThreadId, (SpawnError, OwnedUserStack)> {
+    on_pre_ready: F,
+) -> core::result::Result<ThreadId, (SpawnError, OwnedUserStack)>
+where
+    F: FnOnce(ThreadId, CpuId, AddressSpaceId),
+{
     let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let Some(mut scheduler) = try_scheduler_mut() else {
         return Err((SpawnError::SchedulerNotInitialized, stack));
     };
 
-    scheduler
-        .on_cpu(cpu)
-        .spawn_user_thread(address_space, stack, user_entry, user_sp, arg0, attrs)
+    scheduler.on_cpu(cpu).spawn_user_thread(
+        address_space,
+        stack,
+        user_entry,
+        user_sp,
+        arg0,
+        attrs,
+        on_pre_ready,
+    )
 }
 
 /// Spawn a user thread by cloning a live userspace context.
@@ -352,6 +365,8 @@ pub(crate) fn thread_spawn_user(
 /// * `stack` - Child mapped user stack consumed only when publication succeeds.
 /// * `context` - Exclusive live parent context used only as the clone source.
 /// * `attrs` - Joinability attributes for the new scheduler thread.
+/// * `on_pre_ready` - Infallible process-owner binding performed before ready
+///   publication. It must not call scheduler APIs.
 ///
 /// # Returns
 ///
@@ -363,21 +378,29 @@ pub(crate) fn thread_spawn_user(
 /// Returns [`SpawnError::SchedulerNotInitialized`] when scheduler state is not
 /// published, [`SpawnError::NoThreadSlots`] when bounded capacity is full, or
 /// [`SpawnError::UserThreadMustBeJoinable`] for detached userspace.
-pub(crate) fn thread_spawn_user_from_context(
+pub(crate) fn thread_spawn_user_from_context<F>(
     address_space: AddressSpaceId,
     stack: OwnedUserStack,
     context: &mut ActiveContext<'_>,
     attrs: ThreadAttrs,
-) -> core::result::Result<ThreadId, (SpawnError, OwnedUserStack)> {
+    on_pre_ready: F,
+) -> core::result::Result<ThreadId, (SpawnError, OwnedUserStack)>
+where
+    F: FnOnce(ThreadId, CpuId, AddressSpaceId),
+{
     let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let Some(mut scheduler) = try_scheduler_mut() else {
         return Err((SpawnError::SchedulerNotInitialized, stack));
     };
 
-    scheduler
-        .on_cpu(cpu)
-        .spawn_user_thread_from_context(address_space, stack, context, attrs)
+    scheduler.on_cpu(cpu).spawn_user_thread_from_context(
+        address_space,
+        stack,
+        context,
+        attrs,
+        on_pre_ready,
+    )
 }
 
 /// Activate and replace the current user thread's owned userspace resources.
@@ -515,7 +538,7 @@ impl CpuScheduler<'_> {
         Ok(thread_id)
     }
 
-    fn spawn_user_thread(
+    fn spawn_user_thread<F>(
         &mut self,
         address_space: AddressSpaceId,
         stack: OwnedUserStack,
@@ -523,7 +546,11 @@ impl CpuScheduler<'_> {
         user_sp: usize,
         arg0: usize,
         attrs: ThreadAttrs,
-    ) -> core::result::Result<ThreadId, (SpawnError, OwnedUserStack)> {
+        on_pre_ready: F,
+    ) -> core::result::Result<ThreadId, (SpawnError, OwnedUserStack)>
+    where
+        F: FnOnce(ThreadId, CpuId, AddressSpaceId),
+    {
         let target_cpu = match self.resolve_affinity(attrs.affinity) {
             Ok(cpu) => cpu,
             Err(error) => return Err((error, stack)),
@@ -536,12 +563,13 @@ impl CpuScheduler<'_> {
         };
         let context = SavedContext::user_entry(user_entry, user_sp, self.stack_top(id), arg0);
 
-        let thread_id = self.transition_publish_runtime(
+        let thread_id = self.transition_publish_runtime_with_pre_ready(
             target_cpu,
             id,
             context,
             Some(UserThreadResources::new(address_space, stack)),
             attrs.joinable,
+            on_pre_ready,
         );
 
         crate::debug!(
@@ -550,13 +578,17 @@ impl CpuScheduler<'_> {
         Ok(thread_id)
     }
 
-    fn spawn_user_thread_from_context(
+    fn spawn_user_thread_from_context<F>(
         &mut self,
         address_space: AddressSpaceId,
         stack: OwnedUserStack,
         context: &mut ActiveContext<'_>,
         attrs: ThreadAttrs,
-    ) -> core::result::Result<ThreadId, (SpawnError, OwnedUserStack)> {
+        on_pre_ready: F,
+    ) -> core::result::Result<ThreadId, (SpawnError, OwnedUserStack)>
+    where
+        F: FnOnce(ThreadId, CpuId, AddressSpaceId),
+    {
         let target_cpu = match self.resolve_affinity(attrs.affinity) {
             Ok(cpu) => cpu,
             Err(error) => return Err((error, stack)),
@@ -569,12 +601,13 @@ impl CpuScheduler<'_> {
         };
         let child_context = SavedContext::fork_child(context, self.stack_top(id));
 
-        let thread_id = self.transition_publish_runtime(
+        let thread_id = self.transition_publish_runtime_with_pre_ready(
             target_cpu,
             id,
             child_context,
             Some(UserThreadResources::new(address_space, stack)),
             attrs.joinable,
+            on_pre_ready,
         );
 
         crate::debug!("thread: forked user id={thread_id}",);
@@ -699,6 +732,9 @@ impl CpuScheduler<'_> {
             return Err(((), stack));
         };
         if self.thread_address_space(current.index()).is_none() {
+            return Err(((), stack));
+        }
+        if address_space.owner_cpu() != self.thread_home_cpu(current.index()) {
             return Err(((), stack));
         }
 

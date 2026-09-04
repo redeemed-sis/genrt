@@ -538,7 +538,7 @@ pub(super) unsafe fn destroy_user_address_space(root_pa: PhysAddr) -> Result<(),
     }
 
     if ttbr0_l0_pa() == root_pa {
-        unsafe { clear_user_address_space()? };
+        return Err(VmError::InvalidRange);
     }
 
     let l0 = MappedPageTable::from_pa(root_pa);
@@ -591,7 +591,6 @@ pub(super) unsafe fn map_user_page(
     }
 
     l3.write(index, user_page_desc(pa, flags));
-    unsafe { flush_tlb_all() };
     Ok(())
 }
 
@@ -613,7 +612,7 @@ pub(super) unsafe fn activate_user_address_space(root_pa: PhysAddr) -> Result<()
     unsafe {
         dsb_sy();
         set_ttbr0(root_pa);
-        flush_tlb_all();
+        flush_tlb_local();
     }
     Ok(())
 }
@@ -623,7 +622,7 @@ pub(super) unsafe fn clear_user_address_space() -> Result<(), VmError> {
     unsafe {
         dsb_sy();
         clear_ttbr0();
-        flush_tlb_all();
+        flush_tlb_local();
     }
     Ok(())
 }
@@ -1284,6 +1283,25 @@ unsafe fn flush_tlb_all() {
         core::arch::asm!(
             "dsb sy",
             "tlbi vmalle1is",
+            "dsb sy",
+            "isb",
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Local TLB invalidation for one CPU-owned TTBR0 root.
+///
+/// TTBR0 roots never migrate and every published root has exactly one owner
+/// CPU, so activation and clear require only this PE's invalidation. Staged
+/// roots are never active and therefore need no invalidation while mappings
+/// are constructed. TTBR1 mutations retain `flush_tlb_all()` because their
+/// mappings are shared across every CPU in the inner-shareable domain.
+unsafe fn flush_tlb_local() {
+    unsafe {
+        core::arch::asm!(
+            "dsb sy",
+            "tlbi vmalle1",
             "dsb sy",
             "isb",
             options(nostack, preserves_flags)

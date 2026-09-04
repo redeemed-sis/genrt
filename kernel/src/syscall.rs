@@ -27,6 +27,16 @@ pub const SYS_GETDENTS64: usize = 8;
 pub const SYS_CHDIR: usize = 9;
 /// Copy the current user process canonical working directory to userspace.
 pub const SYS_GETCWD: usize = 10;
+/// Set the current process's one-shot child CPU affinity for `fork`.
+pub const SYS_SCHED_SETFORKAFFINITY: usize = 11;
+/// Return the immutable CPU affinity mask of one process.
+pub const SYS_SCHED_GETAFFINITY: usize = 12;
+
+// Stable userspace ABI capacity, independent of bounded kernel CPU storage.
+const USER_CPU_SET_BITS: usize = 1024;
+const USER_CPU_SET_BYTES: usize = USER_CPU_SET_BITS / 8;
+const _: () = assert!(USER_CPU_SET_BITS % 8 == 0);
+const _: () = assert!(USER_CPU_SET_BYTES <= user::MAX_USER_COPY);
 
 const O_RDONLY: usize = 0;
 const O_WRONLY: usize = 1;
@@ -135,6 +145,14 @@ pub fn dispatch(
         }
         SYS_GETCWD => {
             sys_getcwd(context, request);
+            Ok(())
+        }
+        SYS_SCHED_SETFORKAFFINITY => {
+            sys_sched_setforkaffinity(context, request);
+            Ok(())
+        }
+        SYS_SCHED_GETAFFINITY => {
+            sys_sched_getaffinity(context, request);
             Ok(())
         }
         _ => Err(DispatchError::UnknownSyscall(nr)),
@@ -287,6 +305,36 @@ fn sys_exit(context: &mut ActiveContext<'_>, request: SyscallRequest) {
 
 fn sys_fork(context: &mut ActiveContext<'_>) {
     let result = process::fork_current(context);
+    context.set_syscall_result(errno::syscall_ret(result));
+}
+
+fn sys_sched_setforkaffinity(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    let result = process::set_fork_affinity_current(request.arg(0) as isize);
+    context.set_syscall_result(errno::syscall_ret(result.map(|()| 0)));
+}
+
+fn sys_sched_getaffinity(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    let raw_pid = request.arg(0) as isize;
+    let cpusetsize = request.arg(1);
+    let mask_ptr = request.arg(2);
+
+    let result = (|| {
+        if cpusetsize < USER_CPU_SET_BYTES {
+            return Err(errno::EINVAL);
+        }
+
+        let owner = process::process_affinity(raw_pid)?;
+        let cpu = owner.index();
+        if cpu >= USER_CPU_SET_BITS {
+            panic!("syscall: process owner exceeds userspace CPU set ABI");
+        }
+
+        let mut mask = [0u8; USER_CPU_SET_BYTES];
+        mask[cpu / 8] = 1 << (cpu % 8);
+        user::copy_to_user(mask_ptr, &mask).map_err(user_copy_errno)?;
+        Ok(0)
+    })();
+
     context.set_syscall_result(errno::syscall_ret(result));
 }
 

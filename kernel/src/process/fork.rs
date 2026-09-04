@@ -7,7 +7,7 @@ use crate::{
     memory::{
         self,
         user::OwnedUserStack,
-        vm::{self, OwnedUserAddressSpace},
+        vm::{self, StagedUserAddressSpace},
     },
     sched::{self, ThreadAttrs},
     sync::LocalIrqGuard,
@@ -17,10 +17,46 @@ use super::{
     error::{fork_errno, fork_vm_errno, spawn_errno},
     id::ProcessId,
     table::{
-        allocate_process_slot, attach_process_main_thread, attach_process_resources,
-        current_process_id, free_process_slot, table_mut, take_process_image_resources,
+        allocate_process_slot, attach_process_resources, bind_published_user_thread,
+        consume_pending_fork_cpu, current_process_id, free_process_slot,
+        set_current_pending_fork_cpu, table_mut, take_process_image_resources,
     },
 };
+
+/// Set or reset the current process's one-shot child CPU placement.
+///
+/// # Arguments
+///
+/// * `raw_cpu` - Nonnegative registered, online logical CPU index, or `-1` to
+///   reset the next-fork override.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after replacing the pending policy. The next successfully
+/// published child consumes it; failed pre-publication fork staging leaves it
+/// unchanged. This operation takes only short process/scheduler ownership and
+/// does not allocate or block.
+///
+/// # Errors
+///
+/// Returns `EINVAL` for an invalid negative value, unregistered/offline CPU,
+/// or when no current process owns the request.
+pub(crate) fn set_fork_affinity_current(raw_cpu: isize) -> Result<(), errno::Errno> {
+    let pending = match raw_cpu {
+        -1 => None,
+        value if value < -1 => return Err(errno::EINVAL),
+        value => {
+            let cpu = crate::cpu::CpuId::from_index(value as usize).ok_or(errno::EINVAL)?;
+            if !crate::cpu::is_registered(cpu) || !sched::scheduler_online(cpu) {
+                return Err(errno::EINVAL);
+            }
+            Some(cpu)
+        }
+    };
+    set_current_pending_fork_cpu(pending)
+        .then_some(())
+        .ok_or(errno::EINVAL)
+}
 
 /// Eagerly clone the current process and live userspace resume context.
 ///
@@ -49,38 +85,65 @@ use super::{
 /// that would violate process-table lock ownership and slot reservation.
 pub(crate) fn fork_current(context: &mut ActiveContext<'_>) -> Result<usize, errno::Errno> {
     let snapshot = fork_snapshot_current()?;
-    let child_pid =
-        allocate_process_slot(Some(snapshot.parent_pid), snapshot.fds, snapshot.cwd_dir)
-            .map_err(fork_errno)?;
-    let mut address_space = None;
+    let child_pid = allocate_process_slot(
+        Some(snapshot.parent_pid),
+        snapshot.fds,
+        snapshot.cwd_dir,
+        snapshot.child_owner_cpu,
+    )
+    .map_err(fork_errno)?;
+    let mut staged_address_space = None;
     let mut user_image = None;
     let mut stack = None;
     let result = (|| {
-        address_space = Some(vm::create_user_address_space().map_err(fork_vm_errno)?);
-        let child_aspace = address_space.as_ref().ok_or(errno::ENOMEM)?;
+        staged_address_space = Some(vm::create_user_address_space().map_err(fork_vm_errno)?);
+        let child_aspace = staged_address_space.as_ref().ok_or(errno::ENOMEM)?;
         user_image = Some(clone_user_image(snapshot.user_image(), child_aspace)?);
         // SAFETY: the current parent thread cannot be reaped while it synchronously clones its stack.
         stack =
             Some(unsafe { (&*snapshot.stack).clone_into(child_aspace) }.map_err(fork_vm_errno)?);
-        let child_aspace_id = child_aspace.id();
         attach_process_resources(
             child_pid,
-            address_space.take().ok_or(errno::ENOMEM)?,
+            staged_address_space
+                .take()
+                .ok_or(errno::ENOMEM)?
+                .assign_owner(snapshot.child_owner_cpu),
             user_image.take().ok_or(errno::ENOMEM)?,
         );
         {
             let _irq_guard = LocalIrqGuard::save_and_disable();
+            let mut table = table_mut();
+            let child_aspace_id = table
+                .slot(child_pid)
+                .ok_or(errno::ENOMEM)?
+                .process
+                .resources
+                .image
+                .address_space
+                .as_ref()
+                .ok_or(errno::ENOMEM)?
+                .id();
             let child_thread = sched::thread_spawn_user_from_context(
                 child_aspace_id,
                 stack.take().ok_or(errno::ENOMEM)?,
                 context,
-                ThreadAttrs::joinable(),
+                ThreadAttrs::joinable().with_affinity(snapshot.child_owner_cpu),
+                |thread, home_cpu, address_space| {
+                    bind_published_user_thread(
+                        &mut table,
+                        child_pid,
+                        thread,
+                        home_cpu,
+                        address_space,
+                    );
+                    consume_pending_fork_cpu(&mut table, snapshot.parent_pid);
+                },
             )
             .map_err(|(error, returned_stack)| {
                 stack = Some(returned_stack);
                 spawn_errno(error)
             })?;
-            attach_process_main_thread(child_pid, child_thread);
+            let _ = child_thread;
         }
         Ok(child_pid.as_raw())
     })();
@@ -92,9 +155,11 @@ pub(crate) fn fork_current(context: &mut ActiveContext<'_>) -> Result<usize, err
             elf::free_loaded_segments(&image);
         }
         drop(stack);
-        if let Some(aspace) = attached.address_space.or(address_space) {
+        if let Some(aspace) = attached.address_space {
             // SAFETY: failed fork did not publish a runnable child using this root.
             let _ = unsafe { vm::destroy_user_address_space(aspace) };
+        } else if let Some(aspace) = staged_address_space {
+            let _ = vm::destroy_staged_user_address_space(aspace);
         }
         free_process_slot(child_pid);
     }
@@ -107,6 +172,7 @@ struct ForkSnapshot {
     stack: *const OwnedUserStack,
     fds: crate::fs::fd::FdTable,
     cwd_dir: usize,
+    child_owner_cpu: crate::cpu::CpuId,
 }
 
 impl ForkSnapshot {
@@ -118,6 +184,9 @@ impl ForkSnapshot {
 
 fn fork_snapshot_current() -> Result<ForkSnapshot, errno::Errno> {
     let parent_pid = current_process_id().ok_or(errno::EINVAL)?;
+    // SAFETY: synchronous fork cannot reap its currently running parent before
+    // clone consumes this pointer.
+    let stack = unsafe { sched::current_user_stack_ptr() }.ok_or(errno::EINVAL)?;
     let _irq_guard = LocalIrqGuard::save_and_disable();
     let mut table = table_mut();
     let slot = table.slot_mut(parent_pid).ok_or(errno::EINVAL)?;
@@ -133,16 +202,16 @@ fn fork_snapshot_current() -> Result<ForkSnapshot, errno::Errno> {
     Ok(ForkSnapshot {
         parent_pid,
         user_image,
-        // SAFETY: synchronous fork cannot reap its currently running parent before clone consumes this pointer.
-        stack: unsafe { sched::current_user_stack_ptr() }.ok_or(errno::EINVAL)?,
+        stack,
         fds,
         cwd_dir,
+        child_owner_cpu: slot.process.next_child_cpu(),
     })
 }
 
 fn clone_user_image(
     src: &UserElfImage,
-    dst_aspace: &OwnedUserAddressSpace,
+    dst_aspace: &StagedUserAddressSpace,
 ) -> Result<UserElfImage, errno::Errno> {
     let mut segments = Vec::new();
     segments
@@ -162,7 +231,7 @@ fn clone_user_image(
 
 fn clone_user_segment(
     segment: UserElfSegment,
-    dst_aspace: &OwnedUserAddressSpace,
+    dst_aspace: &StagedUserAddressSpace,
 ) -> Result<UserElfSegment, errno::Errno> {
     let frames = memory::clone_frame_range(segment.frames).map_err(|err| match err {
         memory::FrameRangeCloneError::InvalidRange => errno::EINVAL,

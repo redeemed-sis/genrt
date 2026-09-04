@@ -20,7 +20,7 @@ use crate::{
     memory::{
         self, FrameRange, PAGE_SIZE, VirtAddr,
         user::{USER_STACK_TOP, USER_TEXT_BASE},
-        vm::{self, OwnedUserAddressSpace, UserMapFlags, VmError},
+        vm::{self, StagedUserAddressSpace, UserMapFlags, VmError},
     },
 };
 
@@ -83,9 +83,32 @@ pub enum ElfLoadError {
     MappingFailed,
 }
 
-pub fn load_user_elf(
+/// Validate and load a static AArch64 ELF image into an unpublished TTBR0 root.
+///
+/// This operation may allocate frames, mutate `address_space`, and copy image
+/// bytes. It must run in ordinary thread context, outside IRQ and scheduler
+/// fast paths.
+///
+/// # Arguments
+///
+/// * `image` - Complete immutable ELF file bytes from the initramfs.
+/// * `address_space` - Unpublished staged root receiving validated `PT_LOAD`
+///   mappings.
+///
+/// # Returns
+///
+/// Returns the loaded image and its process-owned frame ranges. On failure,
+/// this function releases every frame allocated for already-loaded segments;
+/// the caller retains and must later destroy the staged root.
+///
+/// # Errors
+///
+/// Returns [`ElfLoadError`] for malformed or unsupported ELF metadata,
+/// invalid user mappings, frame allocation failure, or architecture mapping
+/// failure.
+pub(crate) fn load_user_elf(
     image: &[u8],
-    address_space: &mut OwnedUserAddressSpace,
+    address_space: &mut StagedUserAddressSpace,
 ) -> Result<UserElfImage, ElfLoadError> {
     let file = ElfBytes::<AnyEndian>::minimal_parse(image).map_err(|_| ElfLoadError::Parse)?;
     validate_header(&file)?;
@@ -118,7 +141,7 @@ pub fn free_loaded_segments(image: &UserElfImage) {
 fn load_segments(
     image: &[u8],
     file: &ElfBytes<'_, AnyEndian>,
-    address_space: &OwnedUserAddressSpace,
+    address_space: &StagedUserAddressSpace,
     loaded: &mut UserElfImage,
 ) -> Result<(), ElfLoadError> {
     let segments = file.segments().ok_or(ElfLoadError::InvalidProgramHeader)?;
@@ -145,7 +168,7 @@ fn load_segments(
 
 fn load_segment(
     image: &[u8],
-    address_space: &OwnedUserAddressSpace,
+    address_space: &StagedUserAddressSpace,
     ph: ProgramHeader,
     loaded: &mut UserElfImage,
 ) -> Result<(), ElfLoadError> {

@@ -5,6 +5,7 @@
 //! does not depend on this subsystem.
 
 mod access;
+mod affinity;
 mod error;
 mod exec;
 mod fault;
@@ -35,9 +36,10 @@ pub(crate) use access::{
     current_cwd_path, current_fd_dir_entry_at, current_fd_is_open, current_fd_read_slice,
     open_current_ram_dir, open_current_ram_file, set_current_cwd,
 };
+pub(crate) use affinity::process_affinity;
 pub(crate) use error::ProcessPathError;
 pub(crate) use exec::{copy_exec_args_from_user, execve_current};
-pub(crate) use fork::fork_current;
+pub(crate) use fork::{fork_current, set_fork_affinity_current};
 pub(crate) use lifecycle::{process_exit_current, process_join};
 pub(crate) use spawn::spawn_first_user_process;
 pub(crate) use wait::{WaitPidAction, waitpid_current};

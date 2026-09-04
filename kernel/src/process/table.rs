@@ -1,8 +1,9 @@
 use crate::{
     config::KERNEL_THREAD_CAPACITY,
+    cpu::CpuId,
     fs::fd::FdTable,
     loader::elf::UserElfImage,
-    memory::vm::OwnedUserAddressSpace,
+    memory::vm::{AddressSpaceId, OwnedUserAddressSpace},
     sched::{self, ThreadId},
     sync::{IrqSpinLock, LocalIrqGuard},
 };
@@ -72,7 +73,13 @@ impl ProcessTable {
         Some(pid)
     }
 
-    pub(super) fn bind_main_thread(&mut self, pid: ProcessId, thread: ThreadId) {
+    pub(super) fn bind_main_thread(
+        &mut self,
+        pid: ProcessId,
+        thread: ThreadId,
+        home_cpu: CpuId,
+        address_space: AddressSpaceId,
+    ) {
         if thread.index() >= self.thread_owners.len() {
             panic!("process: main thread index outside reverse owner table: {thread}");
         }
@@ -82,6 +89,22 @@ impl ProcessTable {
         let slot = self
             .slot_mut(pid)
             .unwrap_or_else(|| panic!("process: published thread lost slot {pid}"));
+        validate_user_ownership(
+            slot.process.owner_cpu(),
+            home_cpu,
+            address_space.owner_cpu(),
+        );
+        if slot
+            .process
+            .resources
+            .image
+            .address_space
+            .as_ref()
+            .map(OwnedUserAddressSpace::id)
+            != Some(address_space)
+        {
+            panic!("process: published address space does not match process owner");
+        }
         if slot.process.main_thread.is_some() {
             panic!("process: pid={pid} already has a main thread");
         }
@@ -145,6 +168,7 @@ pub(super) fn allocate_process_slot(
     parent: Option<ProcessId>,
     fds: FdTable,
     cwd_dir: usize,
+    owner_cpu: CpuId,
 ) -> Result<ProcessId, ProcessError> {
     if crate::fs::ramfs::dir_path(cwd_dir).is_none() {
         return Err(ProcessError::InvalidProcess);
@@ -162,7 +186,7 @@ pub(super) fn allocate_process_slot(
     let generation = next_generation(table.slots[index].generation);
     table.slots[index] = ProcessSlot {
         generation,
-        process: Process::running(parent, fds, cwd_dir),
+        process: Process::running(parent, fds, cwd_dir, owner_cpu),
     };
     let pid = ProcessId::new(index, generation);
     crate::debug!("process: allocated slot pid={pid}");
@@ -179,16 +203,48 @@ pub(super) fn attach_process_resources(
     let slot = table
         .slot_mut(pid)
         .unwrap_or_else(|| panic!("process: reserved slot disappeared before resource attach"));
+    if address_space.id().owner_cpu() != slot.process.owner_cpu() {
+        panic!("process: attached address space has a different owner CPU");
+    }
     slot.process.resources.image.address_space = Some(address_space);
     slot.process.resources.image.user_image = Some(user_image);
     slot.process.state = ProcessState::Running;
     crate::debug!("process: pid={pid} resources ready");
 }
 
-pub(super) fn attach_process_main_thread(pid: ProcessId, main_thread: ThreadId) {
+pub(super) fn bind_published_user_thread(
+    table: &mut ProcessTable,
+    pid: ProcessId,
+    main_thread: ThreadId,
+    home_cpu: CpuId,
+    address_space: AddressSpaceId,
+) {
+    table.bind_main_thread(pid, main_thread, home_cpu, address_space);
+}
+
+pub(super) fn process_owner_cpu(pid: ProcessId) -> Option<CpuId> {
     let _irq_guard = LocalIrqGuard::save_and_disable();
-    table_mut().bind_main_thread(pid, main_thread);
-    crate::debug!("process: pid={pid} running main={main_thread}");
+    table_mut().slot(pid).map(|slot| slot.process.owner_cpu())
+}
+
+pub(super) fn set_current_pending_fork_cpu(cpu: Option<CpuId>) -> bool {
+    let Some(pid) = current_process_id() else {
+        return false;
+    };
+    let _irq_guard = LocalIrqGuard::save_and_disable();
+    let mut table = table_mut();
+    let Some(slot) = table.slot_mut(pid) else {
+        return false;
+    };
+    slot.process.set_pending_fork_cpu(cpu);
+    true
+}
+
+pub(super) fn consume_pending_fork_cpu(table: &mut ProcessTable, pid: ProcessId) {
+    let slot = table
+        .slot_mut(pid)
+        .unwrap_or_else(|| panic!("process: parent disappeared during child publication {pid}"));
+    slot.process.consume_pending_fork_cpu();
 }
 
 pub(super) fn take_process_image_resources(pid: ProcessId) -> ProcessImageResources {
@@ -224,6 +280,17 @@ pub(super) fn table_mut() -> crate::sync::IrqSpinLockGuard<'static, ProcessTable
     PROCESS_TABLE.lock()
 }
 
+fn validate_user_ownership(process_owner: CpuId, thread_home: CpuId, address_owner: CpuId) {
+    if process_owner != thread_home || thread_home != address_owner {
+        panic!(
+            "process: ownership mismatch process=CPU{} thread=CPU{} address=CPU{}",
+            process_owner.index(),
+            thread_home.index(),
+            address_owner.index()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,10 +299,7 @@ mod tests {
         let pid = ProcessId::new(index, generation);
         table.slots[index] = ProcessSlot {
             generation,
-            process: Process {
-                state: ProcessState::Running,
-                ..Process::free()
-            },
+            process: Process::running(None, FdTable::new(), 0, CpuId::from_index(0).unwrap()),
         };
         pid
     }
@@ -245,7 +309,16 @@ mod tests {
         let mut table = ProcessTable::new();
         let old_pid = occupy_process_slot(&mut table, 0, INITIAL_PROCESS_GENERATION);
         let old_thread = ThreadId::new(KERNEL_THREAD_CAPACITY - 1, 7);
-        table.bind_main_thread(old_pid, old_thread);
+        // This reverse-index test predates user publication and exercises the
+        // index directly, so install a matching synthetic address-space owner.
+        let cpu = CpuId::from_index(0).unwrap();
+        let address_space = AddressSpaceId::for_test(cpu);
+        table.slots[old_pid.index()]
+            .process
+            .resources
+            .image
+            .address_space = Some(OwnedUserAddressSpace::for_test(address_space));
+        table.bind_main_thread(old_pid, old_thread, cpu, address_space);
         assert_eq!(table.process_for_thread(old_thread), Some(old_pid));
         assert_eq!(
             table.process_for_thread(ThreadId::new(old_thread.index() - 1, 7)),
@@ -255,8 +328,59 @@ mod tests {
         assert_eq!(table.process_for_thread(old_thread), None);
         let new_pid = occupy_process_slot(&mut table, 1, INITIAL_PROCESS_GENERATION);
         let new_thread = ThreadId::new(old_thread.index(), old_thread.generation() + 1);
-        table.bind_main_thread(new_pid, new_thread);
+        table.slots[new_pid.index()]
+            .process
+            .resources
+            .image
+            .address_space = Some(OwnedUserAddressSpace::for_test(address_space));
+        table.bind_main_thread(new_pid, new_thread, cpu, address_space);
         table.release_slot(old_pid, next_generation(old_pid.generation()));
         assert_eq!(table.process_for_thread(new_thread), Some(new_pid));
+    }
+
+    #[test]
+    fn pending_fork_cpu_is_consumed_only_by_publication() {
+        let mut table = ProcessTable::new();
+        let pid = occupy_process_slot(&mut table, 0, INITIAL_PROCESS_GENERATION);
+        let cpu0 = CpuId::from_index(0).unwrap();
+        let cpu1 = CpuId::from_index(1).unwrap();
+        let process = &mut table.slot_mut(pid).unwrap().process;
+
+        assert_eq!(process.next_child_cpu(), cpu0);
+        process.set_pending_fork_cpu(Some(cpu1));
+        assert_eq!(process.next_child_cpu(), cpu1);
+
+        // Staging and every failure before publication only read the policy.
+        assert_eq!(process.next_child_cpu(), cpu1);
+        consume_pending_fork_cpu(&mut table, pid);
+        assert_eq!(table.slot(pid).unwrap().process.next_child_cpu(), cpu0);
+    }
+
+    #[test]
+    fn pending_fork_cpu_can_be_replaced_or_reset_and_is_not_inherited() {
+        let mut parent = Process::running(None, FdTable::new(), 0, CpuId::from_index(0).unwrap());
+        let cpu1 = CpuId::from_index(1).unwrap();
+        let cpu2 = CpuId::from_index(2).unwrap();
+
+        parent.set_pending_fork_cpu(Some(cpu1));
+        parent.set_pending_fork_cpu(Some(cpu2));
+        assert_eq!(parent.next_child_cpu(), cpu2);
+        parent.set_pending_fork_cpu(None);
+        assert_eq!(parent.next_child_cpu(), parent.owner_cpu());
+
+        parent.set_pending_fork_cpu(Some(cpu2));
+        let child = Process::running(None, FdTable::new(), 0, parent.next_child_cpu());
+        assert_eq!(child.owner_cpu(), cpu2);
+        assert_eq!(child.pending_fork_cpu, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "ownership mismatch")]
+    fn publication_rejects_mismatched_ownership() {
+        validate_user_ownership(
+            CpuId::from_index(0).unwrap(),
+            CpuId::from_index(1).unwrap(),
+            CpuId::from_index(1).unwrap(),
+        );
     }
 }

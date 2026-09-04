@@ -275,6 +275,7 @@ impl CpuScheduler<'_> {
             INITIAL_THREAD_GENERATION,
             true,
             idle,
+            |_, _, _| {},
         );
     }
 
@@ -288,7 +289,57 @@ impl CpuScheduler<'_> {
     ) -> ThreadId {
         let generation = next_generation(self.lifecycle.slots[id].generation);
         self.publish(
-            home_cpu, id, context, user, joinable, generation, false, false,
+            home_cpu,
+            id,
+            context,
+            user,
+            joinable,
+            generation,
+            false,
+            false,
+            |_, _, _| {},
+        );
+        self.thread_id(id)
+    }
+
+    /// Publish a user thread after binding its exact immutable ownership.
+    ///
+    /// `on_pre_ready` runs with scheduler ownership held after the slot has a
+    /// generation-bearing ID and before the thread becomes visible in a local
+    /// ready queue or remote ingress. It must be infallible, bounded, and may
+    /// only mutate an owner lock already held by the caller; it must not call
+    /// back into the scheduler.
+    pub(super) fn transition_publish_runtime_with_pre_ready<F>(
+        &mut self,
+        home_cpu: CpuId,
+        id: usize,
+        context: SavedContext,
+        user: Option<UserThreadResources>,
+        joinable: bool,
+        on_pre_ready: F,
+    ) -> ThreadId
+    where
+        F: FnOnce(ThreadId, CpuId, AddressSpaceId),
+    {
+        let generation = next_generation(self.lifecycle.slots[id].generation);
+        self.publish(
+            home_cpu,
+            id,
+            context,
+            user,
+            joinable,
+            generation,
+            false,
+            false,
+            |thread, home, address_space| {
+                on_pre_ready(
+                    thread,
+                    home,
+                    address_space.unwrap_or_else(|| {
+                        panic!("sched: pre-ready publication callback requires a user thread")
+                    }),
+                )
+            },
         );
         self.thread_id(id)
     }
@@ -303,6 +354,7 @@ impl CpuScheduler<'_> {
         generation: u32,
         bootstrap: bool,
         idle: bool,
+        on_pre_ready: impl FnOnce(ThreadId, CpuId, Option<AddressSpaceId>),
     ) {
         if idle && home_cpu != self.cpu() {
             panic!("sched: remote idle publication");
@@ -329,8 +381,18 @@ impl CpuScheduler<'_> {
             stack,
             context,
         });
+        let thread_id = self.thread_id(id);
+        if let Some(address_space) = self.thread_address_space(id) {
+            if address_space.owner_cpu() != home_cpu {
+                panic!(
+                    "sched: user address-space owner CPU{} differs from thread home CPU{}",
+                    address_space.owner_cpu().index(),
+                    home_cpu.index()
+                );
+            }
+        }
+        on_pre_ready(thread_id, home_cpu, self.thread_address_space(id));
         if idle {
-            let thread_id = self.thread_id(id);
             let state = self.state_mut();
             if state.idle.replace(thread_id).is_some() {
                 panic!(
@@ -340,13 +402,12 @@ impl CpuScheduler<'_> {
             }
         } else if home_cpu == self.cpu() {
             let was_empty = self.state().ready_queue.is_empty();
-            self.ready_push_back(self.thread_id(id));
+            self.ready_push_back(thread_id);
             if !bootstrap && was_empty {
                 self.note_ready_peer();
             }
         } else {
-            self.scheduler
-                .publish_remote_ready(self.thread_id(id), home_cpu);
+            self.scheduler.publish_remote_ready(thread_id, home_cpu);
         }
         self.validate_after_transition();
     }
@@ -935,6 +996,13 @@ impl Scheduler {
             }
             if slot.stack.is_some() {
                 panic!("sched: occupied thread {id} does not own its kernel stack");
+            }
+            if let Some(address_space) =
+                thread.user.as_ref().map(UserThreadResources::address_space)
+            {
+                if address_space.owner_cpu() != cpu {
+                    panic!("sched: user thread {id} address-space/home CPU mismatch");
+                }
             }
             match thread.state {
                 ThreadState::Ready => {

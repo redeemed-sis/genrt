@@ -32,7 +32,11 @@ impl ProcessId {
             return None;
         }
         let index = raw & PROCESS_ID_INDEX_MASK;
-        let generation = (raw >> PROCESS_ID_INDEX_BITS) as u32;
+        let raw_generation = raw >> PROCESS_ID_INDEX_BITS;
+        if raw_generation > u32::MAX as usize {
+            return None;
+        }
+        let generation = raw_generation as u32;
         if index >= MAX_PROCESSES || generation == 0 {
             return None;
         }
@@ -63,4 +67,21 @@ const fn process_id_index_bits(slots: usize) -> usize {
         capacity <<= 1;
     }
     bits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PROCESS_ID_INDEX_BITS, ProcessId};
+
+    #[test]
+    fn raw_pid_rejects_discarded_generation_bits() {
+        let pid = ProcessId::new(0, 1);
+        let discarded_bit = (u32::MAX as usize)
+            .checked_add(1)
+            .and_then(|generation| generation.checked_shl(PROCESS_ID_INDEX_BITS as u32));
+
+        if let Some(discarded_bit) = discarded_bit {
+            assert_eq!(ProcessId::from_raw(pid.as_raw() | discarded_bit), None);
+        }
+    }
 }
