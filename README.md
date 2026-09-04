@@ -138,12 +138,12 @@ and [docs/releases.md](docs/releases.md).
 ## Current boundaries
 
 - Device IRQs and userspace remain CPU0-only. Secondary CPUs run only permanent
-  idle contexts and explicitly pinned kernel threads; there is no IPI
-  activation, migration, work stealing, remote timer insertion, or TLB
-  shootdown.
-- Shared runtime state and pinned kernel scheduling are SMP-capable, but remote
-  IPI notification, migration, userspace SMP, and latency certification are not
-  implemented.
+  idle contexts and explicitly pinned kernel threads. Targeted scheduler SGIs
+  wake a thread's immutable home CPU; migration, work stealing, remote timer
+  insertion, and TLB shootdown are not implemented.
+- Shared runtime state, pinned kernel scheduling, and remote scheduler wakeup
+  are SMP-capable, but migration, userspace SMP, and latency certification are
+  not implemented.
 - No FP/SIMD context ownership; kernel Rust uses the soft-float target.
 - No ASIDs, copy-on-write, demand paging, signals, or recoverable usercopy
   faults.

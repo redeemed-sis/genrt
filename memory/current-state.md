@@ -115,11 +115,12 @@ accepted ADRs remain authoritative when details differ.
 - Kernel thread slots, stacks, per-CPU ready queues, remote-ready ingress, and
   handles are bounded and generation-checked. Each thread has immutable
   `home_cpu` selected from `ThreadAttrs` before publication. A remote wake
-  publishes into the home CPU's ingress, which only that CPU drains into its
-  local ready queue. Every online current retains a local RR deadline with no
-  peer, bounding late remote affinity publication and cross-CPU completion
-  pickup to one RR quantum. This is not immediate notification; Issue #7 owns
-  the IPI path. Migration and remote timer insertion are not implemented.
+  publishes into the home CPU's ingress and raises one coalesced targeted
+  scheduler SGI. Only that CPU drains ingress into its local ready queue and
+  consumes the request through the existing IRQ-return checkpoint. Idle and
+  sole-current contexts do not retain a polling quantum; RR deadlines exist
+  only while a local runnable peer exists. Migration and remote timer insertion
+  are not implemented.
 - `ThreadId { index, generation }` directly indexes an occupied bounded slot;
   free and stale generations are rejected without a second scheduler identity.
 - A free slot parks its preallocated kernel stack and next wait sequence. An
@@ -128,7 +129,8 @@ accepted ADRs remain authoritative when details differ.
 - After exit selection, the outgoing thread remains occupied in one CPU-local
   retired slot until the next scheduler entry proves execution moved to the new
   kernel stack. Only then can join completion or detached reap publish that
-  stack in the free-slot pool.
+  stack in the free-slot pool. A coalesced self-targeted scheduler SGI guarantees
+  that later entry without depending on a timer deadline.
 - The private scheduler transition layer exclusively mutates thread state, slot
   generation, current identity, and ready-queue membership. Ready entries carry
   complete `ThreadId` generations; debug and QEMU-test builds run a bounded

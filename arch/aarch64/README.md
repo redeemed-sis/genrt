@@ -89,9 +89,13 @@ alignment; the assembly restore layout remains unchanged.
 GICv2 initialization follows register ownership. CPU0 alone enables the shared
 distributor and routes device SPIs, including PL011, to CPU0. Each architecture
 entry installs that CPU's vector base, initializes its banked GICC interface,
-enables the physical-timer PPI, and resets its `CNTP_*` state before local IRQ
-delivery. Generic scheduler initialization occurs only after this sequence; the
-CPU registry retains identity/topology only and does not duplicate readiness.
+enables the physical-timer PPI and reserved scheduler SGI, and resets its
+`CNTP_*` state before local IRQ delivery. During generic logical registration,
+the architecture reads the executing interface's banked `GICD_ITARGETSR`
+identity and publishes a unique one-hot logical-to-GIC target binding. Generic
+code never interprets GIC CPU-target encoding. Generic scheduler initialization
+occurs only after this sequence; the CPU registry retains identity/topology only
+and does not duplicate readiness.
 
 Each PE owns its physical timer registers; generic time state therefore keeps
 one bounded queue per logical CPU and only the executing owner programs that
@@ -100,6 +104,14 @@ EOIs through the executing CPU's GICC interface, and dispatches only that CPU's
 queue. The secondary first entry restores its scheduler-owned frame and timer
 IRQs can then perform normal local scheduler handoff. UART IRQ remains on CPU0
 and wakes stdin waiters without allocation.
+
+Cross-CPU runnable publication uses SGI 1 as a scheduler-only notification.
+The architecture translates the logical destination through its immutable GIC
+target binding, orders published scheduler state before `GICD_SGIR`, and sends
+to exactly one interface. IRQ entry acknowledges the full IAR, lets the generic
+scheduler drain target-owned ingress and update the existing return context,
+then EOIs that same IAR. The SGI carries no payload and is not a general-purpose
+IPI channel.
 
 ## Build invariants
 
@@ -116,5 +128,5 @@ and wakes stdin waiters without allocation.
   with Release/Acquire ordering before secondary use.
 
 Related decisions: ADR-0002 through ADR-0004, ADR-0008, ADR-0015, ADR-0027,
-ADR-0028, ADR-0038 through ADR-0040 in
+ADR-0028, ADR-0038 through ADR-0041 in
 [`memory/decisions/`](../../memory/decisions/README.md).

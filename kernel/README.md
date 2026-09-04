@@ -59,6 +59,15 @@ thread identity and per-slot sequence. Condition owners in time, IPC, process,
 or console code publish and later complete that token; the scheduler owns only
 wait lifecycle, runnable state, and ready-queue visibility.
 
+When a transition makes a thread runnable away from its immutable home CPU, it
+publishes the thread to that CPU's bounded `remote_ready` ingress and requests
+one coalesced architecture notification under the same scheduler lock. The
+target scheduler IPI drains the ingress, requests local preemption, and uses the
+normal IRQ-return handoff. A local post-exit notification provides the later
+safe point that finalizes a retired stack after execution has moved away from
+it. Scheduler quanta exist only while a local runnable peer exists; idle and
+sole-current contexts do not poll for remote work.
+
 The private scheduler transition layer is the sole writer of lifecycle state,
 slot generation, current-thread identity, and ready-queue membership. It returns
 context-free switch outcomes; architecture-neutral handoff code separately

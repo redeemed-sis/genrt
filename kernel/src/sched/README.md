@@ -20,12 +20,12 @@ published by CPU0 before secondary startup. Architecture entry code owns each
 CPU's local interrupt readiness.
 Local wakeups enter that CPU's ready queue. Remote
 wakeups publish into a bounded per-target ingress that only the target CPU
-drains into its local ready queue. Every online current thread retains a local
-RR quantum even with no peer, so late remote-ready ingress is drained and runs
-within one RR quantum. This is a bounded no-IPI fallback, not immediate
-notification; Issue #7 owns the future IPI notification path. There is no
-migration, work stealing, remote timer insertion, or userspace secondary
-execution in the active target.
+drains into its local ready queue after a targeted scheduler SGI. One protected
+per-target bit coalesces notifications without replacing ingress as the source
+of truth. A sole current or idle thread has no polling quantum; RR deadlines are
+armed only while a local runnable peer exists. There is no migration, work
+stealing, remote timer insertion, or userspace secondary execution in the
+active target.
 
 Current-CPU entry points resolve `CpuId` once and bind a short-lived
 `CpuScheduler` view. Local transition, wait, and preemption methods use the
@@ -38,8 +38,9 @@ cross-CPU IRQ-safe scheduler lock so publication and lifecycle transitions stay
 atomic. CPU contexts remain owner-local: mutable `current`, `idle`, ready-queue,
 and online-state access is rejected from another CPU. Fixed preemption storage
 performs the same current-CPU ownership check independently. Explicit affinity
-to an unregistered or offline CPU is rejected. The existing remote ingress
-does not program a remote timer or mutate remote preemption state.
+to an unregistered or offline CPU is rejected. Remote ingress publication
+requests an architecture scheduler notification but does not program a remote
+timer or mutate remote preemption state directly.
 
 ## Thread table and states
 
@@ -118,13 +119,17 @@ the interrupt path.
 
 Cross-CPU cancellation may remove an exact event without touching the remote
 physical timer; at worst the old deadline causes one harmless early interrupt.
-Prompt remote insertion is rejected until a later activation milestone
-provides an IPI command path and enables the target scheduler context.
+Prompt remote insertion remains rejected because the scheduler SGI is a
+payload-free runnable-work notification, not a remote timer command channel.
 
 Ready insertion requests scheduling when a runnable peer appears, so idle
-cannot remain selected indefinitely. A quantum switch is committed only at the
-frame-handoff boundary. Handoff code saves/restores `SavedContext`, activates
-the selected `AddressSpaceId` or clears TTBR0, and never resolves a process.
+cannot remain selected indefinitely. Remote publication and its coalescing bit
+change under shared scheduler ownership before a targeted SGI is issued. The
+target IRQ drains all ingress, clears the bit in that same ownership domain,
+and requests its normal local checkpoint; duplicate SGIs are harmless. A
+quantum or IPI switch is committed only at the frame-handoff boundary. Handoff
+code saves/restores `SavedContext`, activates the selected `AddressSpaceId` or
+clears TTBR0, and never resolves a process.
 
 Thread preemption exclusion is nested and IRQ-enabled. Quantum expiration and
 deadline wakeups continue bounded IRQ bookkeeping while a guard is active, but
@@ -168,7 +173,8 @@ Exit first records the outgoing thread in one CPU-local retired slot. The
 thread remains occupied while exception return still uses its kernel stack;
 only the next scheduler entry on that CPU may finalize join completion and
 publish the stack for reuse. This prevents another CPU from reusing a live
-handoff stack.
+handoff stack. Exit requests a coalesced local scheduler SGI so that this next
+entry occurs on the replacement stack even when no timer deadline is pending.
 
 Production bootstrap publishes the permanent idle thread and one static init
 thread, which launches userspace `/init`. Dedicated QEMU features select their
@@ -190,4 +196,4 @@ own finite static-thread arrays without changing round-robin behavior.
   process/address space remain future work.
 
 Related decisions: ADR-0003, ADR-0005, ADR-0006, ADR-0011 through ADR-0014,
-ADR-0020, ADR-0027 through ADR-0033, and ADR-0035 through ADR-0039.
+ADR-0020, ADR-0027 through ADR-0033, and ADR-0035 through ADR-0041.

@@ -100,6 +100,11 @@ Changes that invalidate one require architecture review and an ADR.
   Every CPU owns its VBAR, banked GICC/SGI/PPI state, physical timer registers,
   and generic deadline queue. Local IRQ cannot be unmasked until logical
   identity and every CPU-local IRQ dependency are published.
+- Generic `CpuId` values are never interpreted as GIC target bits. AArch64
+  derives one unique target bit from each executing CPU interface's banked
+  `GICD_ITARGETSR` state, orders remote scheduler publication before a targeted
+  `GICD_SGIR` write, and retains full-IAR acknowledge/EOI ownership. Scheduler
+  SGIs carry notification only; `remote_ready` retains thread identity.
 - CPU registry identity/topology and scheduler-online state have separate
   owners. Local interrupt setup and DAIF policy remain architecture-owned;
   the single generic secondary entry requires completed local setup. A
@@ -109,13 +114,15 @@ Changes that invalidate one require architecture review and an ADR.
   and initialized/online state. CPU-local preemption state is separate fixed
   storage so acquiring a shared `SpinLock` never needs the scheduler lock. A thread's
   immutable home CPU owns its ready membership and wakeup destination. A remote
-  completion publishes into a bounded ingress for that CPU, and only the owner
-  drains it into the local ready queue. Every initialized CPU owns exactly one
-  local idle/current `Running` thread, and online implies initialized. Every
-  online current keeps a local RR deadline when no peer exists so late
-  remote-ready work is picked up within one RR quantum. This is not immediate
-  notification: Issue #7 owns the IPI replacement. There is no migration, work
-  stealing, remote timer insertion, or userspace secondary scheduling.
+  completion publishes into a bounded ingress for that CPU and transitions one
+  scheduler-owned coalescing bit before architecture notification. Only the
+  owner CPU drains ingress into the local ready queue and clears that bit under
+  the same scheduler lock, so no notification can be lost or create duplicate
+  ready membership. Every initialized CPU owns exactly one local idle/current
+  `Running` thread, and online implies initialized. A sole current or idle
+  thread has no polling quantum; targeted scheduler SGIs provide remote wakeup.
+  There is no migration, work stealing, remote timer insertion, or userspace
+  secondary scheduling.
 - Every logical CPU owns one bounded deadline queue and one architected physical
   timer. Timed events carry that owner. Only the owner CPU inserts events and
   programs the timer; no time lock is retained across direct scheduler dispatch.
@@ -140,7 +147,9 @@ Changes that invalidate one require architecture review and an ADR.
   owns the stack, context, active wait, join/exit state, and optional user stack.
   An exiting current thread remains occupied in the owner CPU's single retired
   slot until a later scheduler entry runs on the replacement stack; only then
-  may its stack and slot be published for reuse.
+  may its stack and slot be published for reuse. Exit requests a coalesced local
+  scheduler SGI to guarantee that post-handoff entry when no other deadline is
+  pending.
 - Every blocking episode has one exact `WaitToken` containing a generation-aware
   `ThreadId`, immutable home `CpuId`, and checked per-slot sequence. The
   sequence allocator survives slot reuse; stale generation or sequence
