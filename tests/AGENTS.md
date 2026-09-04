@@ -11,3 +11,6 @@
   runner/infrastructure failure.
 - Update `tests/qemu/README.md`, case TOML, and program invocation contracts
   together. Run the changed case before the full suite.
+- Declare new test-kernel scenarios through `kernel::test_support::scenario` so
+  the shared runner owns `CASE_START`, `PASS`, and suite lifecycle records.
+  Existing coordinators may migrate separately when their scenarios change.

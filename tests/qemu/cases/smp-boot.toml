@@ -27,9 +27,24 @@ subject = "cpu1-timer-round-robin"
 [[steps]]
 action = "expect_case"
 producer = "kernel"
-subject = "late-remote-ready"
+subject = "remote-ipi-busy"
 
 [[steps]]
 action = "expect_case"
 producer = "kernel"
-subject = "per-cpu-timer-irqs"
+subject = "remote-ipi-idle"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "remote-ipi-coalescing"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "cross-cpu-mailbox-wake"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
+subject = "per-cpu-timer-deadlines"

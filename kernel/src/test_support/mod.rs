@@ -1,6 +1,8 @@
 //! Test-only QEMU coordinators and machine-readable protocol support.
 
 pub(crate) mod protocol;
+#[cfg(feature = "qemu-test-smp-boot")]
+pub(crate) mod scenario;
 
 #[cfg(feature = "qemu-test-kernel-runtime")]
 pub(crate) mod kernel_runtime;

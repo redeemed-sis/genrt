@@ -44,9 +44,11 @@ starts each secondary through PSCI; the coordinator validates unique hardware
 identities and bootstrap stacks, stable logical bindings, CPU0-only device
   routing, all registered scheduler contexts online with local idle ownership,
   pinned CPU1/CPU2 barrier workers, timer round-robin of two non-yielding CPU1
-  workers, late remote-ready pickup on CPU3, cross-CPU joins, and at least two
-  local physical-timer acknowledge/EOI cycles per CPU. It does not claim normal
-  device IRQ or userspace participation on secondary CPUs.
+  workers, targeted scheduler-IPI preemption of a busy CPU and wake from CPU3
+  idle, a controlled single-edge coalescing batch, cross-CPU mailbox/join
+  completion, routing isolation, absence of polling quanta, and explicit local
+  timer deadlines on every CPU. It does not claim normal device IRQ or
+  userspace participation on secondary CPUs.
 
 `userspace-contract` and `shell-contract` use the production kernel with a
 test-only initramfs. `/init` is a supervisor that performs
@@ -89,6 +91,14 @@ evaluation.
 TOML steps send input, expect structured records, or issue a nonce challenge.
 Every case automatically waits for supervisor `READY` before its steps and for
 terminal `DONE PASS` afterward.
+
+Inside test kernels, new cases use the declarative
+`kernel::test_support::scenario` runner. A suite macro maps stable protocol IDs
+to ordinary rustdoc-documented scenario functions and generates the coordinator
+thread. Returning `Ok(())` emits `PASS`; returning a stable error reason emits
+`FAIL`. Scenario code therefore does not emit lifecycle records or manually
+invoke each case. `smp-boot` uses this pattern now; existing coordinators remain
+on their current form until separately migrated.
 
 ## Runner behavior
 

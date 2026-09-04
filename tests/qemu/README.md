@@ -17,10 +17,11 @@ stores complete evidence below `target/test-results/`.
   process and verifies exact fault classification.
 - `smp-boot`: four-CPU test kernel that validates PSCI secondary high-half
   entry, unique logical/hardware/stack ownership, architecture-owned per-CPU
-  exception/GICC/PPI setup, two local timer acknowledge/EOI cycles, CPU0-only
-  device routing, online secondary scheduler contexts, pinned kernel workers,
-  timer round-robin, late remote-ready pickup, and recurring local timer
-  progress.
+  exception/GICC/PPI/SGI setup, CPU0-only device routing, online secondary
+  scheduler contexts, pinned kernel workers, timer round-robin, targeted busy
+  preemption and idle wakeup, scheduler-IPI routing isolation, a controlled
+  single-edge coalescing batch, cross-CPU mailbox/join completion, and explicit
+  local timer deadlines without a polling quantum.
 - `userspace-contract`: production kernel plus test supervisor and exact
   production-program invocations.
 - `shell-contract`: production kernel and shell plus test-only helpers and a
@@ -67,6 +68,14 @@ test markers/provenance, and are rejected by production artifact policy.
 5. Run the targeted case and inspect its `serial.log`, `qemu-stderr.log`, and
    `result.json`.
 6. Run `cargo xtask ci` for cross-cutting protocol or artifact changes.
+
+Test-kernel suites declare their ordered cases through the reusable
+`kernel::test_support::scenario` layer. Each scenario is an ordinary
+rustdoc-documented `fn() -> ScenarioResult`; returning `Ok(())` reports `PASS`,
+while a stable `Err(reason)` reports `FAIL`. The suite macro owns the coordinator
+thread and all `READY`, `CASE_START`, `PASS`, and `DONE` records. New kernel
+scenarios must use this pattern. `smp-boot` is the first converted suite;
+migration of the older coordinators is intentionally separate work.
 
 The runner uses bounded UART channels and failure tails, applies step/case/suite
 deadlines, drains output to EOF, reparses the complete serial log, and always
