@@ -35,3 +35,10 @@ source = "user/c/pwd.c"
 install = "bin/pwd"
 contract = "userspace"
 contract_case = "production-pwd-exec-smoke"
+
+[[program]]
+name = "taskset"
+source = "user/c/taskset.c"
+install = "bin/taskset"
+contract = "userspace"
+contract_case = "production-taskset-exec-smoke"

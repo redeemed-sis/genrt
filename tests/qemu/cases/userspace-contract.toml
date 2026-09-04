@@ -61,3 +61,8 @@ subject = "production-ls-exec-smoke"
 action = "expect_case"
 producer = "api-supervisor"
 subject = "production-pwd-exec-smoke"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
+subject = "production-taskset-exec-smoke"

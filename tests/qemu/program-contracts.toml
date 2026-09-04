@@ -34,3 +34,10 @@ case = "production-pwd-exec-smoke"
 path = "/bin/pwd"
 args = ["pwd"]
 expected_exit = 0
+
+[[invocation]]
+program = "taskset"
+case = "production-taskset-exec-smoke"
+path = "/bin/taskset"
+args = ["taskset", "0", "echo", "contract", "arguments"]
+expected_exit = 0
