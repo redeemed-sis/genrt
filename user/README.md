@@ -11,9 +11,16 @@ declares source, initramfs install path, contract role, and dynamic case. `xtask
 uses it for compilation, contract staging, release staging, identity checks, and
 coverage reporting.
 
-Current products are the shell and `/bin/echo`, `/bin/cat`, `/bin/ls`, and
-`/bin/pwd`. Other example C files may be buildable without entering production
-composition.
+Current products are the shell and `/bin/echo`, `/bin/cat`, `/bin/ls`,
+`/bin/pwd`, and `/bin/taskset`. Other example C files may be buildable without
+entering production composition.
+
+`taskset <cpu> <program> [args...]` launches one new process on a decimal
+logical CPU. A program containing `/` is passed to `execve` unchanged;
+otherwise `taskset` uses `/bin/<program>`. Unlike Linux `taskset`, this utility
+does not accept masks or modify an existing process: it applies the existing
+one-shot fork placement policy, and the child's affinity becomes immutable at
+publication.
 
 To add a production binary:
 

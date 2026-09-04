@@ -83,6 +83,13 @@ below `-1` are invalid. A failed pre-publication `fork()` preserves the setting,
 the child does not inherit it, and neither this syscall nor `execve()` changes
 the calling process's immutable CPU owner.
 
+The production `/bin/taskset` utility exposes this policy as
+`taskset <cpu> <program> [args...]`. It sets placement for its next child,
+forks, executes either the supplied path or `/bin/<program>`, waits for that
+exact child, and propagates a normal child exit status. This is a launch-only,
+single-numeric-CPU interface; it does not implement Linux masks, migration, or
+runtime affinity changes.
+
 ## Process affinity query
 
 `sched_getaffinity(pid, cpusetsize, mask)` uses syscall number 12 and reports

@@ -54,7 +54,7 @@ cargo xtask run-aarch64
 
 The default image boots the production kernel and initramfs shell. QEMU uses
 the terminal as PL011 UART input; enter `ls`, `pwd`, `cat /etc/banner`,
-`echo hello`, or `exit`. Use `Ctrl-c` to stop QEMU.
+`echo hello`, `taskset 0 echo hello`, or `exit`. Use `Ctrl-c` to stop QEMU.
 
 ![Representative genrt shell session](docs/assets/genrt-shell.svg)
 

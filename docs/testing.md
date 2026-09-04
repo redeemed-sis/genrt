@@ -61,8 +61,9 @@ and command execution without depending on prompts or human-readable output.
 and a dedicated supervisor. It checks one-shot child placement, replacement and
 reset, preservation across bounded fork exhaustion, exact self and child
 affinity masks, affinity preservation across exec, remote exec, remote fault,
-and cross-CPU wait/reap. The single-core `userspace-contract` checks `/init` on
-CPU0 plus invalid mask sizes, pointers, PIDs, and unavailable CPU values.
+cross-CPU wait/reap, and production `taskset` placement. The single-core
+`userspace-contract` checks `/init` on CPU0, invalid affinity arguments,
+`taskset` parsing and lifecycle failures, and exact product invocations.
 
 Dynamic production-program checks are declared in
 `tests/qemu/program-contracts.toml`. xtask validates a one-to-one mapping to

@@ -22,11 +22,13 @@ stores complete evidence below `target/test-results/`.
   preemption and idle wakeup, scheduler-IPI routing isolation, a controlled
   single-edge coalescing batch, cross-CPU mailbox/join completion, and explicit
   local timer deadlines without a polling quantum.
-- `userspace-contract`: production kernel plus test supervisor and exact
-  production-program invocations.
+- `userspace-contract`: production kernel plus test supervisor, exact
+  production-program invocations, and production `taskset` argument, failure,
+  status propagation, and child-reaping checks.
 - `smp-userspace-contract`: four-CPU production kernel plus a test supervisor
   covering one-shot fork placement, exact affinity masks, affinity preservation
-  across exec, and remote process lifecycle.
+  across exec, remote process lifecycle, and production `taskset` placement on
+  a secondary CPU.
 - `shell-contract`: production kernel and shell plus test-only helpers and a
   host nonce challenge for UART input and command behavior.
 
