@@ -160,6 +160,7 @@ fn init_current_cpu_interrupt_state() -> bool {
         timer::init_current_cpu()
     } && gic::init_current_cpu_interface()
         && gic::enable_current_cpu_private_irq(timer::TIMER_IRQ_ID_PHYS, 0x40)
+        && gic::init_current_cpu_scheduler_ipi()
         && vectors_installed();
 
     ready
@@ -334,10 +335,14 @@ pub extern "C" fn arch_current_cpu_hardware_id() -> u64 {
 ///
 /// # Returns
 ///
-/// Returns nothing. The index is stored in `TPIDR_EL1` as `logical_index + 1`,
-/// reserving zero for an unbound CPU. The operation is register-only,
-/// allocation-free, non-blocking, and leaves IRQ state unchanged.
-pub extern "C" fn arch_bind_current_cpu_logical_id(logical_index: usize) {
+/// Returns `true` after publishing both the logical identity and its unique
+/// GICv2 target binding, or `false` when the local GIC target cannot be bound.
+/// The index is stored in `TPIDR_EL1` as `logical_index + 1`, reserving zero for
+/// an unbound CPU. The operation is allocation-free and non-blocking.
+pub extern "C" fn arch_bind_current_cpu_logical_id(logical_index: usize) -> bool {
+    if !gic::bind_current_cpu_target(logical_index) {
+        return false;
+    }
     let encoded = logical_index
         .checked_add(1)
         .expect("cpu: logical ID encoding overflow");
@@ -350,6 +355,23 @@ pub extern "C" fn arch_bind_current_cpu_logical_id(logical_index: usize) {
             options(nomem, nostack, preserves_flags)
         );
     }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// Send a scheduler notification to one logical CPU through GICv2 SGI.
+///
+/// # Arguments
+///
+/// * `logical_index` - Registered logical destination selected by generic
+///   scheduler policy.
+///
+/// # Returns
+///
+/// Returns `true` after one targeted, bounded, allocation-free SGI write, or
+/// `false` when the logical CPU has no architecture target binding.
+pub extern "C" fn arch_send_scheduler_ipi(logical_index: usize) -> bool {
+    gic::send_scheduler_ipi(logical_index)
 }
 
 #[unsafe(no_mangle)]
@@ -462,6 +484,40 @@ fn hard_park_current_cpu() -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn arch_smp_device_routing_ready_for_test() -> bool {
     gic::spi_targets_cpu0(platform::qemu::UART0_IRQ_ID)
+}
+
+/// Return delivered scheduler SGIs for one logical CPU in the SMP contract.
+///
+/// # Arguments
+///
+/// * `logical_index` - Logical CPU whose architecture receive counter is read.
+///
+/// # Returns
+///
+/// Returns the monotonic delivered-SGI count, or zero for an index outside
+/// fixed architecture storage. The query is bounded and allocation-free.
+#[cfg(feature = "qemu-test-smp-boot")]
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_scheduler_ipi_received_count_for_test(logical_index: usize) -> usize {
+    gic::scheduler_ipi_received_count_for_test(logical_index)
+}
+
+/// Return successful scheduler-SGI sends to one CPU in the SMP contract.
+///
+/// # Arguments
+///
+/// * `logical_index` - Logical destination whose architecture send counter is
+///   read.
+///
+/// # Returns
+///
+/// Returns the monotonic count of successful targeted SGIR writes, or zero for
+/// an index outside fixed architecture storage. The query is bounded and
+/// allocation-free.
+#[cfg(feature = "qemu-test-smp-boot")]
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_scheduler_ipi_sent_count_for_test(logical_index: usize) -> usize {
+    gic::scheduler_ipi_sent_count_for_test(logical_index)
 }
 
 unsafe fn clear_local_ttbr0() {

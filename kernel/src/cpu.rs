@@ -7,14 +7,19 @@ use crate::{config::KERNEL_CPU_CAPACITY, sync::IrqSpinLock};
 
 unsafe extern "C" {
     fn arch_current_cpu_hardware_id() -> u64;
-    fn arch_bind_current_cpu_logical_id(logical_index: usize);
+    fn arch_bind_current_cpu_logical_id(logical_index: usize) -> bool;
     fn arch_current_cpu_logical_id() -> usize;
     fn arch_expected_cpu_count() -> usize;
     fn arch_bootstrap_stack_capacity() -> usize;
     fn arch_secondary_cpu_identity_matches(logical_index: usize) -> bool;
     fn arch_start_secondary_cpu(logical_index: usize) -> i64;
+    fn arch_send_scheduler_ipi(logical_index: usize) -> bool;
     #[cfg(feature = "qemu-test-smp-boot")]
     fn arch_smp_device_routing_ready_for_test() -> bool;
+    #[cfg(feature = "qemu-test-smp-boot")]
+    fn arch_scheduler_ipi_received_count_for_test(logical_index: usize) -> usize;
+    #[cfg(feature = "qemu-test-smp-boot")]
+    fn arch_scheduler_ipi_sent_count_for_test(logical_index: usize) -> usize;
 }
 
 const SECONDARY_START_TIMEOUT_MS: u64 = 5_000;
@@ -161,6 +166,14 @@ impl CpuRegistry {
     fn record_mut(&mut self, id: CpuId) -> Option<&mut CpuRecord> {
         self.records.get_mut(id.index())?.as_mut()
     }
+
+    fn rollback_last_registration(&mut self, id: CpuId) {
+        if self.count != id.index() + 1 || self.records[id.index()].is_none() {
+            panic!("cpu: attempted to roll back a non-latest registration");
+        }
+        self.count -= 1;
+        self.records[id.index()] = None;
+    }
 }
 
 static REGISTRY: IrqSpinLock<CpuRegistry> = IrqSpinLock::new(CpuRegistry::new());
@@ -196,7 +209,10 @@ pub(crate) fn register_boot_cpu() -> Result<CpuId, CpuRegistrationError> {
     let id = registry.register(current_hardware_id(), 0)?;
     // SAFETY: `register` returned a checked logical ID owned by the executing
     // hardware CPU, and boot registration runs before runtime readers exist.
-    unsafe { arch_bind_current_cpu_logical_id(id.index()) };
+    if !unsafe { arch_bind_current_cpu_logical_id(id.index()) } {
+        registry.rollback_last_registration(id);
+        return Err(CpuRegistrationError::UnknownCurrentCpu);
+    }
     REGISTERED_COUNT.store(registry.count, Ordering::Release);
     registry
         .record_mut(id)
@@ -288,7 +304,10 @@ pub(crate) fn register_secondary_cpu(logical_index: usize) -> Result<CpuId, CpuR
         let id = registry.register(current_hardware_id(), logical_index)?;
         // SAFETY: the registry exclusively assigned this checked logical ID to
         // the executing hardware CPU.
-        unsafe { arch_bind_current_cpu_logical_id(id.index()) };
+        if !unsafe { arch_bind_current_cpu_logical_id(id.index()) } {
+            registry.rollback_last_registration(id);
+            return Err(CpuRegistrationError::UnknownCurrentCpu);
+        }
         REGISTERED_COUNT.store(registry.count, Ordering::Release);
         id
     };
@@ -501,6 +520,63 @@ pub(crate) fn validate_smp_device_routing_for_test() {
     if !unsafe { arch_smp_device_routing_ready_for_test() } {
         panic!("cpu test: device interrupt routing is incorrect");
     }
+}
+
+/// Notify one registered CPU that scheduler-owned remote work is available.
+///
+/// # Arguments
+///
+/// * `cpu` - Logical CPU whose architecture target binding receives the
+///   scheduler notification.
+///
+/// # Returns
+///
+/// Returns after issuing one bounded, allocation-free architecture
+/// notification. The function does not mutate scheduler lifecycle state.
+///
+/// # Panics
+///
+/// Panics when the architecture cannot target the registered logical CPU.
+pub(crate) fn notify_scheduler(cpu: CpuId) {
+    // SAFETY: `CpuId` is a checked fixed-storage index and architecture binding
+    // is published during registration before scheduler-online state.
+    if !unsafe { arch_send_scheduler_ipi(cpu.index()) } {
+        panic!("cpu: failed to send scheduler IPI to CPU{}", cpu.index());
+    }
+}
+
+/// Return delivered scheduler notifications for one logical CPU in QEMU.
+///
+/// # Arguments
+///
+/// * `cpu` - Logical CPU whose architecture-owned receive counter is queried.
+///
+/// # Returns
+///
+/// Returns the monotonic test-only delivery count. The bounded query allocates
+/// nothing and does not alter IRQ or scheduler state.
+#[cfg(feature = "qemu-test-smp-boot")]
+pub(crate) fn scheduler_ipi_received_count_for_test(cpu: CpuId) -> usize {
+    // SAFETY: the test hook accepts the checked fixed-storage index only and
+    // performs an atomic read.
+    unsafe { arch_scheduler_ipi_received_count_for_test(cpu.index()) }
+}
+
+/// Return successful scheduler notifications sent to one logical CPU.
+///
+/// # Arguments
+///
+/// * `cpu` - Logical destination whose architecture send counter is queried.
+///
+/// # Returns
+///
+/// Returns the monotonic test-only targeted-send count. The bounded query
+/// allocates nothing and does not alter IRQ or scheduler state.
+#[cfg(feature = "qemu-test-smp-boot")]
+pub(crate) fn scheduler_ipi_sent_count_for_test(cpu: CpuId) -> usize {
+    // SAFETY: the test hook accepts the checked fixed-storage index only and
+    // performs an atomic read.
+    unsafe { arch_scheduler_ipi_sent_count_for_test(cpu.index()) }
 }
 
 /// Validate the boot CPU registry contract for the QEMU kernel coordinator.

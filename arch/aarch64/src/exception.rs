@@ -20,6 +20,16 @@ pub extern "C" fn irq_entry(frame: *mut TrapFrame) {
         let timer_irq = irq_id == timer::TIMER_IRQ_ID_PHYS;
         if timer_irq {
             timer::on_timer_irq(&mut active);
+        } else if irq_id == gic::SCHEDULER_IPI_IRQ_ID {
+            #[cfg(feature = "qemu-test-smp-boot")]
+            {
+                let encoded = crate::arch_current_cpu_logical_id();
+                if encoded == 0 {
+                    panic!("gic test: scheduler IPI reached an unbound CPU");
+                }
+                gic::record_scheduler_ipi_for_test(encoded - 1);
+            }
+            kernel::sched::finish_scheduler_ipi(&mut active);
         } else if irq_id == platform::qemu::UART0_IRQ_ID {
             console::on_uart_irq();
         } else {

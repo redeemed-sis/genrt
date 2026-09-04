@@ -257,7 +257,7 @@ impl<T> Mailbox<T> {
     /// # Returns
     ///
     /// Returns the bounded sum of send and receive waiter queue lengths.
-    #[cfg(feature = "qemu-test-kernel-runtime")]
+    #[cfg(any(feature = "qemu-test-kernel-runtime", feature = "qemu-test-smp-boot"))]
     pub(crate) fn waiter_count_for_test(&self) -> usize {
         let control = self.control.lock();
         control.recv_waiters.len() + control.send_waiters.len()

@@ -413,7 +413,7 @@ pub(crate) fn schedule_event(deadline: u64, event: TimedEvent) {
     let cpu = current_cpu();
     if event.cpu() != cpu {
         panic!(
-            "time: remote schedule from CPU{} to CPU{} requires IPI support",
+            "time: remote schedule from CPU{} to CPU{} requires remote timer command support",
             cpu.index(),
             event.cpu().index()
         );

@@ -34,6 +34,32 @@ pub(crate) fn finish_timer_interrupt(context: &mut ActiveContext<'_>, now: u64) 
         .finish_timer_interrupt(context, now);
 }
 
+/// Finish one scheduler IPI and optionally replace its IRQ-return context.
+///
+/// The target CPU consumes its coalesced notification, drains all published
+/// remote-ready work into the owner-local ready queue, and requests one normal
+/// local scheduler checkpoint. Duplicate SGIs are harmless. The operation is
+/// bounded by preallocated thread capacity and does not allocate.
+///
+/// # Arguments
+///
+/// * `context` - Exclusive live scheduler-SGI context available for an
+///   optional existing scheduler handoff.
+///
+/// # Returns
+///
+/// Returns after retaining the interrupted thread or installing the selected
+/// thread's saved context into `context`. GIC EOI remains architecture-owned.
+///
+/// # Panics
+///
+/// Panics if current CPU resolution, scheduler ownership, remote ingress, or a
+/// context-switch invariant is invalid.
+pub fn finish_scheduler_ipi(context: &mut ActiveContext<'_>) {
+    let cpu = current_cpu();
+    scheduler_mut().on_cpu(cpu).finish_scheduler_ipi(context);
+}
+
 /// Complete one time-owned exact wait deadline.
 ///
 /// # Arguments
@@ -159,7 +185,57 @@ pub(crate) fn on_preempt_checkpoint(context: &mut ActiveContext<'_>) {
     scheduler_mut().on_cpu(cpu).preempt_checkpoint(context);
 }
 
+/// Validate that a sole current thread has no polling quantum event.
+///
+/// This QEMU-only check resolves the current CPU, takes bounded scheduler/time
+/// ownership, and confirms that remote-work liveness does not depend on a
+/// periodic scheduler deadline. It does not allocate or change scheduler state.
+///
+/// # Returns
+///
+/// Returns after validating the current thread's quantum-event absence.
+///
+/// # Panics
+///
+/// Panics when no thread is running or a quantum remains armed without a local
+/// runnable peer.
+#[cfg(feature = "qemu-test-smp-boot")]
+pub(crate) fn validate_no_polling_quantum_for_test() {
+    let cpu = current_cpu();
+    let _irq_guard = crate::sync::LocalIrqGuard::save_and_disable();
+    let mut scheduler = scheduler_mut();
+    let local = scheduler.on_cpu(cpu);
+    let current = local
+        .running_thread()
+        .unwrap_or_else(|| panic!("sched test: CPU{} has no current thread", cpu.index()));
+    if local.has_runnable_peer()
+        || crate::time::event_pending(TimedEvent::quantum_expired(cpu, current))
+    {
+        panic!("sched test: sole current thread retains a polling quantum");
+    }
+}
+
 impl CpuScheduler<'_> {
+    fn finish_scheduler_ipi(&mut self, context: &mut ActiveContext<'_>) {
+        self.transition_finalize_retired();
+        if !self.state().online {
+            return;
+        }
+
+        self.consume_scheduler_ipi();
+        self.note_runnable_peer_available();
+        let online = self.state().online;
+        if !crate::sync::preempt::consume_checkpoint_on(self.cpu(), online) {
+            return;
+        }
+
+        let Some(current) = self.running_thread() else {
+            return;
+        };
+        self.handoff_optional(context);
+        self.replace_quantum_event(crate::time::now_counter(), current);
+    }
+
     pub(super) fn finish_timer_interrupt(&mut self, context: &mut ActiveContext<'_>, now: u64) {
         self.transition_finalize_retired();
         if !self.state().online {
@@ -279,8 +355,7 @@ impl CpuScheduler<'_> {
         }
     }
 
-    pub(super) fn has_runnable_peer(&mut self) -> bool {
-        self.drain_remote_ready();
+    pub(super) fn has_runnable_peer(&self) -> bool {
         self.transition_has_ready()
     }
 
@@ -297,9 +372,9 @@ impl CpuScheduler<'_> {
         };
 
         let event = TimedEvent::quantum_expired(self.cpu(), current);
-        // Until Issue #7 adds IPI notification, every online current keeps a
-        // periodic owner-local checkpoint. Otherwise late remote ingress could
-        // starve forever behind a sole non-yielding non-idle thread.
+        if !self.has_runnable_peer() {
+            return;
+        }
         if crate::time::event_pending(event) {
             return;
         }

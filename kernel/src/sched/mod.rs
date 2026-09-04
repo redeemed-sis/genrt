@@ -19,6 +19,8 @@ mod wait;
 
 #[cfg(feature = "qemu-test-kernel-runtime")]
 pub(crate) use self::preempt::validate_invariants_for_test;
+#[cfg(feature = "qemu-test-smp-boot")]
+pub(crate) use self::preempt::validate_no_polling_quantum_for_test;
 #[cfg(feature = "qemu-test-kernel-runtime")]
 pub(crate) use self::wait::on_test_wait_sync;
 pub(crate) use self::{
@@ -39,7 +41,7 @@ pub(crate) use self::{
     },
 };
 pub use self::{
-    preempt::yield_now,
+    preempt::{finish_scheduler_ipi, yield_now},
     sleep::{msleep, sleep_until, sleep_until_counter, usleep},
     thread::{
         JoinError, SpawnError, ThreadAffinity, ThreadArg, ThreadAttrs, ThreadEntry,
@@ -108,6 +110,10 @@ pub(crate) struct Scheduler {
     // Cross-CPU wake publication lands here. The target CPU alone drains this
     // bounded ingress into its owner-only ready queue at a scheduler safe point.
     remote_ready: [VecDeque<ThreadId>; KERNEL_CPU_CAPACITY],
+    // One coalesced architecture notification covers all scheduler work already
+    // published for a CPU. The protected bit and ingress queue change under the
+    // same shared scheduler lock, closing clear-versus-publish lost wakeups.
+    scheduler_ipi_pending: [bool; KERNEL_CPU_CAPACITY],
     rr_quantum_ms: u64,
 }
 

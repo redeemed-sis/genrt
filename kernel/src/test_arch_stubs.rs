@@ -37,8 +37,13 @@ extern "C" fn arch_current_cpu_hardware_id() -> u64 {
     0
 }
 #[unsafe(no_mangle)]
-extern "C" fn arch_bind_current_cpu_logical_id(logical_index: usize) {
+extern "C" fn arch_bind_current_cpu_logical_id(logical_index: usize) -> bool {
     CURRENT_CPU_LOGICAL_ID.store(logical_index + 1, Ordering::Relaxed);
+    true
+}
+#[unsafe(no_mangle)]
+extern "C" fn arch_send_scheduler_ipi(_logical_index: usize) -> bool {
+    true
 }
 #[unsafe(no_mangle)]
 extern "C" fn arch_current_cpu_logical_id() -> usize {

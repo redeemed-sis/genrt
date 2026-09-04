@@ -134,8 +134,9 @@ struct PreemptionCell(UnsafeCell<PreemptionState>);
 
 // SAFETY: each cell is accessed only by its architecture-bound owning CPU.
 // Every access also takes a short LocalIrqGuard, so owner thread and IRQ paths
-// cannot concurrently mutate the same cell. Remote CPUs publish ready work in
-// scheduler storage but do not touch this bookkeeping before IPI support.
+// cannot concurrently mutate the same cell. Remote CPUs publish ready work and
+// send a scheduler notification, but only the target's IPI handler mutates this
+// CPU-local preemption bookkeeping.
 unsafe impl Sync for PreemptionCell {}
 
 static CPU_PREEMPTION: [PreemptionCell; KERNEL_CPU_CAPACITY] =
@@ -282,10 +283,9 @@ pub(crate) fn request_reschedule() {
 
 /// Request a checkpoint on one explicitly selected CPU-local state.
 pub(crate) fn request_reschedule_on(cpu: CpuId) {
-    // A remote wake publishes ready membership under scheduler synchronization,
-    // but no IPI-backed immediate notification exists yet.
-    // Never mutate another CPU's local preemption state as a notification
-    // substitute.
+    // Remote publication sends a scheduler IPI instead of mutating another
+    // CPU's local preemption state. The target-local IPI handler reaches this
+    // function with `current_cpu() == cpu` after draining its ingress.
     if current_cpu() != cpu {
         return;
     }

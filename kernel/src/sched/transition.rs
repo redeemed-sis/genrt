@@ -189,6 +189,7 @@ impl Scheduler {
             lifecycle: ThreadTable::with_capacity(thread_capacity),
             cpus,
             remote_ready,
+            scheduler_ipi_pending: [false; crate::config::KERNEL_CPU_CAPACITY],
             rr_quantum_ms: rr_quantum_ms.max(1),
         }
     }
@@ -466,6 +467,24 @@ impl Scheduler {
             panic!("sched: remote-ready ingress capacity exhausted");
         }
         queue.push_back(id);
+        self.request_scheduler_ipi(cpu);
+    }
+
+    fn request_scheduler_ipi(&mut self, cpu: CpuId) {
+        let pending = self
+            .scheduler_ipi_pending
+            .get_mut(cpu.index())
+            .unwrap_or_else(|| panic!("sched: invalid scheduler IPI CPU"));
+        if *pending {
+            return;
+        }
+        *pending = true;
+
+        // Publication, the coalescing edge, and the architecture notification
+        // remain under one bounded scheduler critical section. The AArch64 hook
+        // is a lock-free command-register write, so the target can never observe
+        // a notification before the corresponding lifecycle/ingress state.
+        crate::cpu::notify_scheduler(cpu);
     }
 
     pub(super) fn transition_finish_wait(
@@ -555,6 +574,10 @@ impl CpuScheduler<'_> {
         self.state_mut().retired = Some(from);
         let to = self.ready_pop_front().unwrap_or_else(|| self.idle_thread());
         self.make_running(to);
+        // The SGI is delivered only after exception return installs `to`'s
+        // stack. Its scheduler entry can then finalize and potentially reuse
+        // `from` without relying on an otherwise unnecessary periodic quantum.
+        self.scheduler.request_scheduler_ipi(self.cpu());
         self.validate_after_transition();
         SwitchOutcome::Switch { from, to }
     }
@@ -641,7 +664,6 @@ impl CpuScheduler<'_> {
     }
 
     fn ready_pop_front(&mut self) -> Option<ThreadId> {
-        self.drain_remote_ready();
         let id = self.state_mut().ready_queue.pop_front()?;
         if !self.thread_matches(id)
             || self.thread(id.index()).state != ThreadState::Ready
@@ -653,7 +675,13 @@ impl CpuScheduler<'_> {
         Some(id)
     }
 
-    pub(super) fn drain_remote_ready(&mut self) {
+    pub(super) fn consume_scheduler_ipi(&mut self) {
+        let pending = &mut self.scheduler.scheduler_ipi_pending[self.cpu().index()];
+        let was_pending = core::mem::replace(pending, false);
+        if !was_pending && !self.scheduler.remote_ready[self.cpu().index()].is_empty() {
+            panic!("sched: remote-ready ingress lost its scheduler notification");
+        }
+
         loop {
             let id = { self.scheduler.remote_ready[self.cpu().index()].pop_front() };
             let Some(id) = id else {
@@ -851,6 +879,9 @@ impl Scheduler {
             }
             if self.remote_ready[cpu_index].len() > self.remote_ready[cpu_index].capacity() {
                 panic!("sched: remote-ready ingress exceeds capacity");
+            }
+            if !self.remote_ready[cpu_index].is_empty() && !self.scheduler_ipi_pending[cpu_index] {
+                panic!("sched: remote-ready ingress lacks a scheduler IPI");
             }
             if state.online && !state.initialized {
                 panic!("sched: online CPU context is not initialized");
@@ -1119,12 +1150,47 @@ mod tests {
 
         assert!(scheduler.cpus[cpu1.index()].ready_queue.is_empty());
         assert_eq!(scheduler.remote_ready[cpu1.index()].front(), Some(&thread));
-        scheduler.on_cpu(cpu1).drain_remote_ready();
+        assert!(scheduler.scheduler_ipi_pending[cpu1.index()]);
+        scheduler.on_cpu(cpu1).consume_scheduler_ipi();
         assert!(scheduler.remote_ready[cpu1.index()].is_empty());
+        assert!(!scheduler.scheduler_ipi_pending[cpu1.index()]);
         assert_eq!(
             scheduler.cpus[cpu1.index()].ready_queue.front(),
             Some(&thread)
         );
+    }
+
+    #[test]
+    fn remote_ready_notifications_coalesce_until_target_consumes_them() {
+        let cpu1 = CpuId::from_index(1).unwrap();
+        let mut scheduler = Scheduler::transition_new(4, 1);
+        scheduler.transition_fill_free_slots(4);
+        scheduler
+            .on_cpu(cpu1)
+            .transition_initialize_idle_current(|_| 0, thread::ThreadArg::empty())
+            .unwrap();
+        scheduler.cpus[cpu1.index()].online = true;
+
+        for _ in 0..2 {
+            let slot = scheduler.take_free_slot().unwrap();
+            let context = SavedContext::kernel_entry(scheduler.stack_top(slot), 0, 0, 0);
+            scheduler
+                .on_cpu(CPU0)
+                .transition_publish_runtime(cpu1, slot, context, None, true);
+        }
+
+        assert_eq!(scheduler.remote_ready[cpu1.index()].len(), 2);
+        assert!(scheduler.scheduler_ipi_pending[cpu1.index()]);
+        scheduler.on_cpu(cpu1).consume_scheduler_ipi();
+        assert_eq!(scheduler.cpus[cpu1.index()].ready_queue.len(), 2);
+        assert!(!scheduler.scheduler_ipi_pending[cpu1.index()]);
+
+        let slot = scheduler.take_free_slot().unwrap();
+        let context = SavedContext::kernel_entry(scheduler.stack_top(slot), 0, 0, 0);
+        scheduler
+            .on_cpu(CPU0)
+            .transition_publish_runtime(cpu1, slot, context, None, true);
+        assert!(scheduler.scheduler_ipi_pending[cpu1.index()]);
     }
 
     #[test]
