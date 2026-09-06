@@ -10,7 +10,7 @@ use crate::{
         self,
         user::{self, UserCopyError},
     },
-    process,
+    power, process,
 };
 
 pub const SYS_READ: usize = 0;
@@ -31,6 +31,8 @@ pub const SYS_GETCWD: usize = 10;
 pub const SYS_SCHED_SETFORKAFFINITY: usize = 11;
 /// Return the immutable CPU affinity mask of one process.
 pub const SYS_SCHED_GETAFFINITY: usize = 12;
+/// Perform a Linux-shaped terminal system restart or power-off request.
+pub const SYS_REBOOT: usize = 13;
 
 // Stable userspace ABI capacity, independent of bounded kernel CPU storage.
 const USER_CPU_SET_BITS: usize = 1024;
@@ -153,6 +155,10 @@ pub fn dispatch(
         }
         SYS_SCHED_GETAFFINITY => {
             sys_sched_getaffinity(context, request);
+            Ok(())
+        }
+        SYS_REBOOT => {
+            sys_reboot(context, request);
             Ok(())
         }
         _ => Err(DispatchError::UnknownSyscall(nr)),
@@ -336,6 +342,18 @@ fn sys_sched_getaffinity(context: &mut ActiveContext<'_>, request: SyscallReques
     })();
 
     context.set_syscall_result(errno::syscall_ret(result));
+}
+
+fn sys_reboot(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    // The Linux-compatible fourth argument is reserved for command-specific
+    // data. The supported restart and power-off commands do not consume it.
+    let _arg = request.arg(3);
+    let result = power::parse_linux_reboot(request.arg(0), request.arg(1), request.arg(2))
+        .and_then(power::request);
+    match result {
+        Ok(never) => match never {},
+        Err(err) => context.set_syscall_result(-err),
+    }
 }
 
 fn sys_execve(context: &mut ActiveContext<'_>, request: SyscallRequest) {

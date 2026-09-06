@@ -13,6 +13,7 @@ use core::{
 
 mod boot_dtb;
 mod cpu;
+pub(crate) mod psci;
 pub(crate) mod qemu;
 
 pub(crate) use self::boot_dtb::{BootDeviceRange, BootPlatformInfo, parse_boot_platform};

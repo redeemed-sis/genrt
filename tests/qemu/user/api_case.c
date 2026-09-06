@@ -4,6 +4,9 @@
 
 #define DIRENT64_HEADER_SIZE 19
 #define TASKSET_LARGE_ARG_BYTES 62000
+#define LINUX_REBOOT_MAGIC1 0xfee1dead
+#define LINUX_REBOOT_MAGIC2 672274793
+#define LINUX_REBOOT_CMD_RESTART 0x01234567
 
 static int string_equal(const char *lhs, const char *rhs) {
     size_t index = 0;
@@ -175,6 +178,33 @@ static int process_affinity_validation(void) {
     return 0;
 }
 
+static int reboot_validation(void) {
+    if (genrt_syscall4(SYS_REBOOT,
+                       0,
+                       LINUX_REBOOT_MAGIC2,
+                       LINUX_REBOOT_CMD_RESTART,
+                       0)
+        != -GTRT_EINVAL) {
+        return 1;
+    }
+    if (genrt_syscall4(SYS_REBOOT,
+                       LINUX_REBOOT_MAGIC1,
+                       0,
+                       LINUX_REBOOT_CMD_RESTART,
+                       0)
+        != -GTRT_EINVAL) {
+        return 2;
+    }
+    return genrt_syscall4(SYS_REBOOT,
+                          LINUX_REBOOT_MAGIC1,
+                          LINUX_REBOOT_MAGIC2,
+                          0,
+                          0)
+                   == -GTRT_EINVAL
+               ? 0
+               : 3;
+}
+
 static int taskset_probe(int argc, char **argv) {
     if (argc != 4
         || !string_equal(argv[0], "/.__genrt_test__/bin/api-case")
@@ -228,6 +258,9 @@ int main(int argc, char **argv) {
     }
     if (string_equal(argv[1], "process-affinity-validation")) {
         return process_affinity_validation();
+    }
+    if (string_equal(argv[1], "reboot-validation")) {
+        return reboot_validation();
     }
     return 65;
 }

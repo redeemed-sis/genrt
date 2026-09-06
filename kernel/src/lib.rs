@@ -24,6 +24,7 @@ pub mod loader;
 pub mod log;
 pub mod memory;
 pub mod panic;
+mod power;
 pub mod process;
 pub mod sched;
 pub mod sync;

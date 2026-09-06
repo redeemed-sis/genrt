@@ -117,6 +117,7 @@ int main(void) {
     run_case("process-control");
     run_case("fork-affinity-validation");
     run_case("process-affinity-validation");
+    run_case("reboot-validation");
     taskset_cli_validation();
     for (size_t index = 0; index < GTRT_PROGRAM_CONTRACT_COUNT; index++) {
         run_program(&GTRT_PROGRAM_CONTRACTS[index]);

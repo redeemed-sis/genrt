@@ -239,23 +239,38 @@ pub extern "C" fn arch_start_secondary_cpu(logical_index: usize) -> i64 {
     unsafe {
         asm!("dsb ishst", options(nostack, preserves_flags));
     }
-    let mut status = function_id;
-    let target = target_hardware;
-    let entry = entry_pa;
-    let context = logical_index;
-    // SAFETY: this follows the PSCI CPU_ON calling convention. The entry is a
-    // low physical `.boot.text` symbol and x3 is returned to it as context_id.
-    unsafe {
-        asm!(
-            "hvc #0",
-            inout("x0") status,
-            inout("x1") target => _,
-            inout("x2") entry => _,
-            inout("x3") context => _,
-            options(nostack)
-        );
-    }
-    status as i64
+    platform::psci::cpu_on(
+        function_id,
+        target_hardware,
+        entry_pa as u64,
+        logical_index as u64,
+    )
+}
+
+/// Request a system-wide restart through the platform PSCI conduit.
+///
+/// # Returns
+///
+/// Success is terminal. If firmware returns, its status is translated to the
+/// generic power-hook error ABI as a controlled failure.
+///
+/// This call is allocation-free, lock-free, and valid on every initialized CPU.
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_system_restart() -> i64 {
+    platform::psci::system_reset()
+}
+
+/// Request a system-wide power off through the platform PSCI conduit.
+///
+/// # Returns
+///
+/// Success is terminal. If firmware returns, its status is translated to the
+/// generic power-hook error ABI as a controlled failure.
+///
+/// This call is allocation-free, lock-free, and valid on every initialized CPU.
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_system_power_off() -> i64 {
+    platform::psci::system_off()
 }
 
 #[unsafe(no_mangle)]

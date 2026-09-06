@@ -17,6 +17,7 @@
 #define SYS_GETCWD 10
 #define SYS_SCHED_SETFORKAFFINITY 11
 #define SYS_SCHED_GETAFFINITY 12
+#define SYS_REBOOT 13
 
 #define GENRT_PATH_MAX 4096
 #define PATH_MAX GENRT_PATH_MAX
@@ -83,6 +84,21 @@ static inline long genrt_syscall3(long nr, long a0, long a1, long a2) {
     __asm__ volatile("svc #0"
                      : "+r"(x0)
                      : "r"(x1), "r"(x2), "r"(x8)
+                     : "memory");
+    return x0;
+}
+
+static inline long genrt_syscall4(long nr, long a0, long a1, long a2,
+                                  long a3) {
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x8 __asm__("x8") = nr;
+
+    __asm__ volatile("svc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x3), "r"(x8)
                      : "memory");
     return x0;
 }

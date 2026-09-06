@@ -28,6 +28,8 @@ pub(crate) enum CpuTopologyError {
     MissingPsci,
     /// The platform requested a conduit not supported by this QEMU target.
     UnsupportedPsciMethod,
+    /// The platform does not advertise the PSCI 0.2 system-call contract.
+    UnsupportedPsciVersion,
 }
 
 #[derive(Copy, Clone)]
@@ -137,6 +139,12 @@ fn parse_cpu_topology(dtb: &[u8], boot_hardware_id: u64) -> Result<CpuTopology, 
     let psci = fdt
         .find_by_path("/psci")
         .ok_or(CpuTopologyError::MissingPsci)?;
+    if !psci
+        .compatibles()
+        .any(|compatible| matches!(compatible, "arm,psci-0.2" | "arm,psci-1.0"))
+    {
+        return Err(CpuTopologyError::UnsupportedPsciVersion);
+    }
     if psci.find_property_str("method") != Some("hvc") {
         return Err(CpuTopologyError::UnsupportedPsciMethod);
     }

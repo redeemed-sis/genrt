@@ -66,6 +66,14 @@ extern "C" fn arch_start_secondary_cpu(_logical_index: usize) -> i64 {
     -1
 }
 #[unsafe(no_mangle)]
+extern "C" fn arch_system_restart() -> i64 {
+    -1
+}
+#[unsafe(no_mangle)]
+extern "C" fn arch_system_power_off() -> i64 {
+    -1
+}
+#[unsafe(no_mangle)]
 extern "C" fn arch_counter_now() -> u64 {
     0
 }

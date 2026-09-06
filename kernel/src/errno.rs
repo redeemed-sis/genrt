@@ -3,6 +3,8 @@ pub type Errno = isize;
 pub const EPERM: Errno = 1;
 pub const ENOENT: Errno = 2;
 pub const ESRCH: Errno = 3;
+/// I/O or device operation failed after the request crossed its backend.
+pub const EIO: Errno = 5;
 pub const E2BIG: Errno = 7;
 pub const ENOEXEC: Errno = 8;
 pub const EBADF: Errno = 9;
