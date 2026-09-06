@@ -114,3 +114,16 @@ PID `0` selects the caller. A positive PID may identify another live or zombie
 process that has not been reaped. Invalid, stale, absent, or negative PIDs fail
 with `-ESRCH`; a short mask fails with `-EINVAL`, and an invalid writable range
 fails with `-EFAULT`. The API exposes no mutable `sched_setaffinity()` operation.
+
+## System power control
+
+`reboot(int operation)` uses syscall number 13 and accepts `RB_AUTOBOOT` or
+`RB_POWER_OFF`. Its public `<sys/reboot.h>` wrapper owns the Linux raw magic
+values and passes the four-argument `reboot(magic, magic2, cmd, arg)` ABI
+through `syscall.h`.
+
+Successful operations never return. Invalid magic or unsupported commands fail
+with `-EINVAL`; a returned architecture rejection is reported as `-ENOTSUP`,
+`-EPERM`, or `-EIO`. The ABI exposes no PSCI details. `/bin/reboot` and
+`/bin/poweroff` use only this wrapper. The current kernel has no credentials,
+so every process may request terminal power control.

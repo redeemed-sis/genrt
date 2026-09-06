@@ -87,9 +87,10 @@ Machine records start with ASCII Record Separator (`0x1e`):
 <RS>GTRT/1|producer|000004|DONE|suite|PASS
 ```
 
-Supported events are `READY`, `CASE_START`, `PASS`, `FAIL`, `DONE`, and
-`ABORT`. Sequence numbers are validated independently per producer. Only the
-configured supervisor may emit `READY` and the single terminal `DONE PASS`.
+Supported events are `READY`, `CASE_START`, `PASS`, `TERMINAL`, `FAIL`, `DONE`,
+and `ABORT`. Sequence numbers are validated independently per producer. Only
+the configured supervisor may emit `READY`, `TERMINAL`, and the single terminal
+`DONE PASS`.
 Malformed records, sequence gaps, unknown versions, `FAIL`, and `ABORT` fail a
 case immediately. Case records follow `unseen -> CASE_START -> PASS`; duplicate
 or reordered records fail unless a future DSL action explicitly declares an
@@ -97,8 +98,10 @@ unordered concurrent group. All ordinary UART lines are ignored by protocol
 evaluation.
 
 TOML steps send input, expect structured records, or issue a nonce challenge.
-Every case automatically waits for supervisor `READY` before its steps and for
-terminal `DONE PASS` afterward.
+Every case automatically waits for supervisor `READY` before its steps.
+Ordinary cases then require terminal `DONE PASS`. Terminal power cases require
+an operation-specific `TERMINAL` record plus natural QEMU poweroff or a fresh
+supervisor epoch after reset; the intent record alone never declares success.
 
 Inside test kernels, new cases use the declarative
 `kernel::test_support::scenario` runner. A suite macro maps stable protocol IDs
@@ -113,9 +116,9 @@ on their current form until separately migrated.
 QEMU uses `-display none -monitor none -nic none -serial stdio`. Serial and
 stderr are drained concurrently; the parser receives serial chunks through a
 bounded channel and handles records split across reads. Step and case deadlines
-plus an aggregate QEMU-runtime budget are enforced, and QEMU is always killed
-and reaped. Compilation and image preparation are intentionally outside this
-runtime budget and remain governed by the outer CI job timeout.
+plus an aggregate QEMU-runtime budget are enforced, and QEMU is always
+terminated and reaped. Compilation and image preparation are intentionally
+outside this runtime budget and remain governed by the outer CI job timeout.
 Setup failures abort the command directly and may occur before a per-case
 `result.json` exists; hosted CI still preserves command output for that class
 of infrastructure failure.

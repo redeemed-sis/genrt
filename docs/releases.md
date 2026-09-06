@@ -12,8 +12,8 @@ cargo xtask dist --tag v0.0.0-test.1 --output-dir /tmp/genrt-dist
 
 `dist` runs the canonical checks and QEMU suites, then builds the production
 release kernel and userspace ELF set once. The exact kernel is dynamically run
-with userspace and shell contract initramfs images. Those images reuse the same
-production ELF files later staged into the release image.
+with userspace, shell, reboot, and power-off contract initramfs images. Those
+images reuse the same production ELF files later staged into the release image.
 
 `user/c/programs.toml` is the sole declaration of release executable names,
 sources, install paths, and contract roles. Build, release staging, contract
@@ -23,9 +23,10 @@ strictly below the repository `user/c` tree; absolute paths, parent traversal,
 and symlink escapes are rejected.
 
 `tests/qemu/program-contracts.toml` binds every dynamic product one-to-one to
-its protocol case, exact contract install path, argv, and expected exit code.
-xtask generates the supervisor C table from this plan, so contract reporting is
-not inferred merely from an ELF being present in the test image.
+its protocol case, exact contract install path, argv, and either an expected
+exit code or a terminal restart/power-off outcome. xtask generates supervisor C
+tables from this plan, so contract reporting is not inferred merely from an ELF
+being present in the test image.
 
 The production initramfs is not driven through a content-specific shell smoke.
 Instead, xtask reopens the newc archive and compares every canonical path,

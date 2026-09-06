@@ -190,7 +190,10 @@ accepted ADRs remain authoritative when details differ.
   current-EL kernel faults stay fatal.
 - The syscall ABI supports `open`, `read`, `write`, `close`, `getdents64`,
   `chdir`, `getcwd`, `fork`, `execve`, `waitpid`, `sched_setforkaffinity`,
-  `sched_getaffinity`, and `exit` with negative errno returns.
+  `sched_getaffinity`, Linux-shaped `reboot`, and `exit` with negative errno
+  returns. Restart and power off cross an allocation-free generic power
+  boundary into AArch64 PSCI and are terminal on success; all processes may
+  currently request them because credentials are not implemented.
 
 ## Filesystem and console
 
@@ -199,7 +202,8 @@ accepted ADRs remain authoritative when details differ.
 - Processes have bounded FD tables, immutable ramfs cwd identities, relative
   path traversal, readonly files, and directory iteration.
 - `/init` is the freestanding shell. Product binaries are declared by
-  `user/c/programs.toml` and installed under `/bin`.
+  `user/c/programs.toml` and installed under `/bin`, including `reboot` and
+  `poweroff`.
 - PL011 RX interrupts feed a bounded kernel stdin ring. `read(0)` blocks and is
   restarted after input; line editing and command policy live in userspace.
   Stdin, mailbox, and process owner state use IRQ-safe SMP locks; completion

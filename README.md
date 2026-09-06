@@ -34,6 +34,7 @@ a production-ready or latency-certified operating system.
   directory iteration, and UART-backed stdin.
 - Freestanding C shell and product programs declared by
   `user/c/programs.toml`.
+- Linux-shaped system restart and power off through AArch64 PSCI.
 - Declarative QEMU contracts using a test-only machine protocol rather than
   human log matching.
 - Deterministic, structurally verified tagged release bundles built by `xtask`.
@@ -54,7 +55,9 @@ cargo xtask run-aarch64
 
 The default image boots the production kernel and initramfs shell. QEMU uses
 the terminal as PL011 UART input; enter `ls`, `pwd`, `cat /etc/banner`,
-`echo hello`, `taskset 0 echo hello`, or `exit`. Use `Ctrl-c` to stop QEMU.
+`echo hello`, `taskset 0 echo hello`, or `exit`. The terminal commands
+`reboot` resets the virtual machine and boots genrt again; `poweroff` exits
+QEMU through PSCI system control. Use `Ctrl-c` to stop QEMU.
 
 ![Representative genrt shell session](docs/assets/genrt-shell.svg)
 

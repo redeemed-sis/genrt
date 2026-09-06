@@ -18,6 +18,7 @@ hooks.
 | `fs` | Initramfs mount, readonly ramfs index, paths, and descriptor tables |
 | `loader` | Static userspace ELF validation and segment loading |
 | `syscall` | Architecture-neutral syscall behavior and errno mapping |
+| `power` | Linux reboot validation and architecture-neutral terminal power policy |
 | `console`, `log` | Allocation-free output and bounded stdin buffering |
 | `arch` | Opaque live/saved context ownership and decoded syscall request facade |
 
@@ -119,6 +120,12 @@ before runnable publication.
 Lower-EL faults become `ProcessExitStatus::Faulted` when ownership is known.
 Kernel/current-EL faults remain fatal. User pointers are accessed only through
 the user-copy layer.
+
+`SYS_REBOOT` validates Linux raw magic and command values before mapping
+restart or power off to a narrow architecture hook. The path allocates nothing,
+acquires no locks, and is valid on any online CPU. A successful backend call is
+terminal; a returned rejection becomes a syscall errno. Until genrt gains
+credentials, this operation is intentionally available to every process.
 
 For active capabilities and limitations, see
 [`memory/current-state.md`](../memory/current-state.md). Kernel changes must

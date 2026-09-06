@@ -31,6 +31,13 @@ stores complete evidence below `target/test-results/`.
   a secondary CPU.
 - `shell-contract`: production kernel and shell plus test-only helpers and a
   host nonce challenge for UART input and command behavior.
+- `poweroff-contract`: executes production `/bin/poweroff`, arms
+  `TERMINAL ... POWER_OFF`, and accepts only natural successful QEMU shutdown.
+- `reboot-contract`: executes production `/bin/reboot`, arms
+  `TERMINAL ... RESTART`, and requires a fresh sequence-one supervisor `READY`
+  epoch in the same QEMU process.
+- `smp-reboot-contract`: repeats restart after production `/bin/taskset` places
+  the rebooting process on CPU1.
 
 Kernel contracts use scenario-specific Cargo features. System contracts use the
 byte-identical production kernel with a controlled test initramfs.
@@ -50,6 +57,11 @@ Sequence numbers are independent per producer. Only the configured supervisor
 may announce readiness and terminal success. Malformed records, unknown
 versions, gaps, duplicates, `FAIL`, or `ABORT` fail the case. Human UART output
 is retained but never evaluated as an assertion.
+
+Terminal power cases add `TERMINAL|case|RESTART` or `POWER_OFF` after
+`CASE_START`. This record only arms the expected host lifecycle transition.
+QEMU runs those cases with reset and shutdown as distinct actions, so a reset
+cannot satisfy poweroff and an exit cannot satisfy reboot.
 
 ## Cases, fixtures, and programs
 

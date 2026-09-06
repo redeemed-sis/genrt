@@ -38,6 +38,12 @@ Generic code never invokes architecture interrupt initialization or selects
 DAIF policy. CPU0 has already preallocated every topology CPU's bounded time
 state and scheduler idle capacity before PSCI startup.
 
+The same architecture-local PSCI HVC helper implements system-wide
+`SYSTEM_RESET` and `SYSTEM_OFF`. The AArch64 layer owns their function IDs and
+maps returned PSCI rejection statuses to the narrow generic power-hook result.
+Either operation may be requested on any online CPU; no migration to CPU0 or
+secondary-CPU shutdown protocol precedes the terminal firmware call.
+
 Main kernel sections have high VMAs and low LMAs through linker `AT(...)`; no
 runtime section copy is required. The address convention is:
 

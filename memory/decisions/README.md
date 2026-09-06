@@ -49,5 +49,6 @@ growth.
 | [0041](ADR-0041-targeted-scheduler-ipi-and-remote-wakeup.md) | Targeted scheduler IPI and remote wakeup | Accepted | AArch64 IPI/scheduler/remote wake | [0040](ADR-0040-per-cpu-scheduler-activation.md) (passive remote pickup and no-peer quantum only) | - |
 | [0042](ADR-0042-smp-userspace-memory-and-fork-affinity.md) | SMP userspace memory and fork affinity | Accepted | Process/VM/scheduler/syscall ownership | [0040](ADR-0040-per-cpu-scheduler-activation.md) (CPU0-only userspace boundary) | - |
 | [0043](ADR-0043-process-affinity-query-abi.md) | Process affinity query ABI | Accepted | Process/syscall/userspace ABI | - | - |
+| [0044](ADR-0044-linux-compatible-reboot-power-control.md) | Linux-compatible reboot power control | Accepted | Syscall/userspace/AArch64 power control | - | - |
 
 Use [`TEMPLATE.md`](TEMPLATE.md) for new decisions.

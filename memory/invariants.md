@@ -210,6 +210,9 @@ Changes that invalidate one require architecture review and an ADR.
 - EL1 sched calls and EL0 syscalls are distinct ABIs even when both use `svc`.
 - Syscall ABI changes require an ADR, userspace header changes, and contract
   tests using the exact production executable.
+- Linux-shaped reboot validation precedes one allocation-free terminal power
+  hook. PSCI and HVC remain architecture-owned; success never returns, and
+  current policy permits requests from every process.
 - Kernel code never directly trusts a user pointer; access goes through the
   bounded user-copy layer.
 - Lower-EL faults are isolated to the attributed process when process ownership
