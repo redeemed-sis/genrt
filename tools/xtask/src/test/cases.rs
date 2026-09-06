@@ -15,6 +15,18 @@ pub(super) enum InitImage {
     ShellContract,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum Termination {
+    /// Require the supervisor's terminal `DONE ... PASS` record.
+    #[default]
+    Protocol,
+    /// Require QEMU to exit successfully after a PSCI system-off request.
+    Poweroff,
+    /// Require a fresh supervisor `READY` epoch after a PSCI reset request.
+    Reboot,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Case {
@@ -30,6 +42,8 @@ pub(super) struct Case {
     #[serde(default = "default_cpu_count")]
     pub(super) cpu_count: usize,
     pub(super) init: InitImage,
+    #[serde(default)]
+    pub(super) termination: Termination,
     #[serde(default = "default_case_timeout")]
     pub(super) timeout_secs: u64,
     #[serde(default = "default_step_timeout")]
@@ -150,6 +164,7 @@ mod tests {
         "#;
         let mut case = toml::from_str::<Case>(source).expect("valid case");
         assert_eq!(case.cpu_count, 1);
+        assert_eq!(case.termination, Termination::Protocol);
         assert!(validate_cpu_count(&case).is_ok());
 
         case.cpu_count = crate::qemu::MAX_CPUS + 1;

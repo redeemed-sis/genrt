@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::{artifacts::Profile, qemu};
 
 use super::{
-    cases::{Case, Step},
+    cases::{Case, Step, Termination},
     protocol::{Event, ProtocolState, Record, StreamParser},
 };
 
@@ -152,7 +152,7 @@ pub(super) fn run_case(
     let (status, exit_reason, failed_step) = match outcome {
         Ok(()) => (
             Status::Passed,
-            "terminal DONE PASS observed".to_owned(),
+            terminal_success_reason(case.termination).to_owned(),
             None,
         ),
         Err(Failure::Timeout { step, expected }) => (
@@ -195,11 +195,15 @@ impl Failure {
 }
 
 struct Execution<'a> {
+    supervisor: &'a str,
+    suite: &'a str,
     serial_rx: &'a Receiver<Vec<u8>>,
     child: &'a mut ChildGuard,
     parser: StreamParser,
     protocol: ProtocolState,
     pending: VecDeque<Record>,
+    termination: Termination,
+    epochs: usize,
     case_deadline: Instant,
     step_timeout: Duration,
 }
@@ -244,21 +248,7 @@ impl Execution<'_> {
         }
         let wait = (deadline - now).min(Duration::from_millis(100));
         match self.serial_rx.recv_timeout(wait) {
-            Ok(chunk) => {
-                for parsed in self.parser.push(&chunk) {
-                    let record = parsed.map_err(|err| Failure::Failed {
-                        step,
-                        reason: format!("malformed test protocol record: {err:#}"),
-                    })?;
-                    self.protocol
-                        .observe(&record)
-                        .map_err(|err| Failure::Failed {
-                            step,
-                            reason: format!("test protocol violation: {err:#}"),
-                        })?;
-                    self.pending.push_back(record);
-                }
-            }
+            Ok(chunk) => self.observe_chunk(step, &chunk)?,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if let Ok(Some(status)) = self.child.child.try_wait() {
                     return Err(Failure::Failed {
@@ -276,6 +266,89 @@ impl Execution<'_> {
         }
         Ok(())
     }
+
+    fn wait_for_qemu_exit(&mut self, step: usize) -> Result<(), Failure> {
+        let expected = "successful QEMU exit after PSCI system off";
+        let deadline = self.case_deadline.min(Instant::now() + self.step_timeout);
+        loop {
+            match self.child.child.try_wait() {
+                Ok(Some(status)) if status.success() => {
+                    self.child.reaped = true;
+                    return Ok(());
+                }
+                Ok(Some(status)) => {
+                    self.child.reaped = true;
+                    return Err(Failure::Failed {
+                        step,
+                        reason: format!("QEMU exited unsuccessfully after system off: {status}"),
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    return Err(Failure::Failed {
+                        step,
+                        reason: format!("failed to query QEMU after system off: {err}"),
+                    });
+                }
+            }
+
+            self.receive_allowing_exit(step, expected, deadline)?;
+        }
+    }
+
+    fn receive_allowing_exit(
+        &mut self,
+        step: usize,
+        expected: &str,
+        deadline: Instant,
+    ) -> Result<(), Failure> {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(Failure::Timeout {
+                step,
+                expected: expected.to_owned(),
+            });
+        }
+        let wait = (deadline - now).min(Duration::from_millis(100));
+        match self.serial_rx.recv_timeout(wait) {
+            Ok(chunk) => self.observe_chunk(step, &chunk),
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+        }
+    }
+
+    fn observe_chunk(&mut self, step: usize, chunk: &[u8]) -> Result<(), Failure> {
+        for parsed in self.parser.push(chunk) {
+            let record = parsed.map_err(|err| Failure::Failed {
+                step,
+                reason: format!("malformed test protocol record: {err:#}"),
+            })?;
+            if self.termination == Termination::Reboot
+                && self.epochs == 1
+                && self.protocol.ready()
+                && record.event == Event::Ready
+                && record.sequence == 1
+                && record.producer == self.supervisor
+                && record.subject == self.suite
+            {
+                self.protocol
+                    .validate_terminal_operation("RESTART")
+                    .map_err(|err| Failure::Failed {
+                        step,
+                        reason: format!("reboot epoch was not armed: {err:#}"),
+                    })?;
+                self.protocol = ProtocolState::new(self.supervisor, self.suite);
+                self.epochs = 2;
+            }
+            self.protocol
+                .observe(&record)
+                .map_err(|err| Failure::Failed {
+                    step,
+                    reason: format!("test protocol violation: {err:#}"),
+                })?;
+            self.pending.push_back(record);
+        }
+        Ok(())
+    }
 }
 
 fn execute_case(
@@ -287,11 +360,15 @@ fn execute_case(
     step_timeout: Duration,
 ) -> Result<(), Failure> {
     let mut execution = Execution {
+        supervisor: &case.supervisor,
+        suite: &case.suite,
         serial_rx,
         child,
         parser: StreamParser::default(),
         protocol: ProtocolState::new(&case.supervisor, &case.suite),
         pending: VecDeque::new(),
+        termination: case.termination,
+        epochs: 1,
         case_deadline,
         step_timeout,
     };
@@ -343,20 +420,57 @@ fn execute_case(
     }
 
     let terminal_step = case.steps.len() + 1;
-    execution.wait_for(
-        terminal_step,
-        &case.supervisor,
-        Event::Done,
-        &case.suite,
-        Some("PASS"),
-    )?;
-    if !execution.protocol.terminal() {
-        return Err(Failure::Failed {
-            step: terminal_step,
-            reason: "terminal protocol state was not reached".to_owned(),
-        });
+    match case.termination {
+        Termination::Protocol => {
+            execution.wait_for(
+                terminal_step,
+                &case.supervisor,
+                Event::Done,
+                &case.suite,
+                Some("PASS"),
+            )?;
+            if !execution.protocol.terminal() {
+                return Err(Failure::Failed {
+                    step: terminal_step,
+                    reason: "terminal protocol state was not reached".to_owned(),
+                });
+            }
+        }
+        Termination::Poweroff => {
+            execution
+                .protocol
+                .validate_terminal_operation("POWER_OFF")
+                .map_err(|err| Failure::Failed {
+                    step: terminal_step,
+                    reason: format!("power-off exit was not armed: {err:#}"),
+                })?;
+            execution.wait_for_qemu_exit(terminal_step)?;
+        }
+        Termination::Reboot => {
+            execution.wait_for(
+                terminal_step,
+                &case.supervisor,
+                Event::Ready,
+                &case.suite,
+                None,
+            )?;
+            if execution.epochs != 2 {
+                return Err(Failure::Failed {
+                    step: terminal_step,
+                    reason: "READY did not begin a fresh reboot epoch".to_owned(),
+                });
+            }
+        }
     }
     Ok(())
+}
+
+fn terminal_success_reason(termination: Termination) -> &'static str {
+    match termination {
+        Termination::Protocol => "terminal DONE PASS observed",
+        Termination::Poweroff => "successful QEMU exit observed after PSCI system off",
+        Termination::Reboot => "fresh supervisor READY epoch observed after PSCI reset",
+    }
 }
 
 fn send_line(
@@ -460,6 +574,7 @@ fn validate_complete_serial(case: &Case, path: &Path) -> Result<()> {
     let mut reader = BufReader::new(file);
     let mut parser = StreamParser::default();
     let mut protocol = ProtocolState::new(&case.supervisor, &case.suite);
+    let mut epochs = 1usize;
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let count = reader
@@ -469,11 +584,29 @@ fn validate_complete_serial(case: &Case, path: &Path) -> Result<()> {
             break;
         }
         for record in parser.push(&buffer[..count]) {
-            protocol.observe(&record?)?;
+            let record = record?;
+            if case.termination == Termination::Reboot
+                && epochs == 1
+                && protocol.ready()
+                && record.event == Event::Ready
+                && record.sequence == 1
+                && record.producer == case.supervisor
+                && record.subject == case.suite
+            {
+                protocol.validate_terminal_operation("RESTART")?;
+                protocol = ProtocolState::new(&case.supervisor, &case.suite);
+                epochs = 2;
+            }
+            protocol.observe(&record)?;
         }
     }
     parser.finish()?;
-    protocol.validate_complete()
+    match case.termination {
+        Termination::Protocol => protocol.validate_complete(),
+        Termination::Poweroff => protocol.validate_terminal_operation("POWER_OFF"),
+        Termination::Reboot if epochs == 2 => protocol.validate_ready(),
+        Termination::Reboot => Err(anyhow!("protocol stream has no post-reset READY epoch")),
+    }
 }
 
 pub(super) fn write_result(path: PathBuf, result: &CaseResult) -> Result<()> {
@@ -552,6 +685,7 @@ mod tests {
             kernel_features: Vec::new(),
             cpu_count: 1,
             init: InitImage::KernelContract,
+            termination: Termination::Protocol,
             timeout_secs: 1,
             step_timeout_secs: 1,
             steps: Vec::new(),
@@ -594,6 +728,40 @@ mod tests {
         )
         .unwrap();
         assert!(validate_complete_serial(&test_case(), &path).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn complete_log_validation_accepts_poweroff_without_done() {
+        let path = temp_path("poweroff.log");
+        let mut case = test_case();
+        case.termination = Termination::Poweroff;
+        fs::write(
+            &path,
+            b"\x1eGTRT/1|sup|000001|READY|suite\n\x1eGTRT/1|sup|000002|CASE_START|poweroff\n\x1eGTRT/1|sup|000003|TERMINAL|poweroff|POWER_OFF\n",
+        )
+        .unwrap();
+        assert!(validate_complete_serial(&case, &path).is_ok());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn complete_log_validation_requires_second_reboot_epoch() {
+        let path = temp_path("reboot.log");
+        let mut case = test_case();
+        case.termination = Termination::Reboot;
+        fs::write(
+            &path,
+            b"\x1eGTRT/1|sup|000001|READY|suite\n\x1eGTRT/1|sup|000002|CASE_START|reboot\n\x1eGTRT/1|sup|000003|TERMINAL|reboot|RESTART\n",
+        )
+        .unwrap();
+        assert!(validate_complete_serial(&case, &path).is_err());
+        fs::write(
+            &path,
+            b"\x1eGTRT/1|sup|000001|READY|suite\n\x1eGTRT/1|sup|000002|CASE_START|reboot\n\x1eGTRT/1|sup|000003|TERMINAL|reboot|RESTART\n\x1eGTRT/1|sup|000001|READY|suite\n",
+        )
+        .unwrap();
+        assert!(validate_complete_serial(&case, &path).is_ok());
         let _ = fs::remove_file(path);
     }
 

@@ -180,7 +180,11 @@ pub(crate) fn run(options: Options) -> Result<()> {
             users,
             built_kernel,
         )?;
-        let config = qemu::Config::from_artifacts(&artifacts, initramfs);
+        let mut config = qemu::Config::from_artifacts(&artifacts, initramfs);
+        config.reset_behavior = match case.termination {
+            cases::Termination::Protocol => qemu::ResetBehavior::Exit,
+            cases::Termination::Poweroff | cases::Termination::Reboot => qemu::ResetBehavior::Reset,
+        };
         let case_dir = options.artifacts_dir.join(&case.name);
         let remaining_runtime = suite_runtime_budget.saturating_sub(suite_runtime_used);
         if remaining_runtime.is_zero() {

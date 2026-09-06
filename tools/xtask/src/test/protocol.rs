@@ -10,6 +10,7 @@ pub(super) enum Event {
     Ready,
     CaseStart,
     Pass,
+    Terminal,
     Fail,
     Done,
     Abort,
@@ -21,6 +22,7 @@ impl Event {
             "READY" => Ok(Self::Ready),
             "CASE_START" => Ok(Self::CaseStart),
             "PASS" => Ok(Self::Pass),
+            "TERMINAL" => Ok(Self::Terminal),
             "FAIL" => Ok(Self::Fail),
             "DONE" => Ok(Self::Done),
             "ABORT" => Ok(Self::Abort),
@@ -91,6 +93,7 @@ impl StreamParser {
 enum CaseLifecycle {
     Started,
     Passed,
+    Terminal,
 }
 
 pub(super) struct ProtocolState {
@@ -100,6 +103,7 @@ pub(super) struct ProtocolState {
     cases: HashMap<(String, String), CaseLifecycle>,
     ready: bool,
     terminal: bool,
+    terminal_operation: Option<String>,
 }
 
 impl ProtocolState {
@@ -111,6 +115,7 @@ impl ProtocolState {
             cases: HashMap::new(),
             ready: false,
             terminal: false,
+            terminal_operation: None,
         }
     }
 
@@ -163,7 +168,7 @@ impl ProtocolState {
             Event::Fail | Event::Abort => {
                 bail!("guest reported {:?}: {record:?}", record.event);
             }
-            Event::CaseStart | Event::Pass if !self.ready => {
+            Event::CaseStart | Event::Pass | Event::Terminal if !self.ready => {
                 bail!("case record observed before READY: {record:?}");
             }
             Event::CaseStart => {
@@ -180,7 +185,31 @@ impl ProtocolState {
                 match self.cases.get_mut(&key) {
                     Some(state @ CaseLifecycle::Started) => *state = CaseLifecycle::Passed,
                     Some(CaseLifecycle::Passed) => bail!("duplicate PASS record: {record:?}"),
+                    Some(CaseLifecycle::Terminal) => {
+                        bail!("PASS observed after TERMINAL: {record:?}")
+                    }
                     None => bail!("PASS observed without CASE_START: {record:?}"),
+                }
+            }
+            Event::Terminal => {
+                if record.producer != self.supervisor {
+                    bail!("only the supervisor may emit TERMINAL: {record:?}");
+                }
+                let Some(operation @ ("RESTART" | "POWER_OFF")) = record.detail.as_deref() else {
+                    bail!("invalid TERMINAL operation: {record:?}");
+                };
+                let key = (record.producer.clone(), record.subject.clone());
+                match self.cases.get_mut(&key) {
+                    Some(state @ CaseLifecycle::Started) => *state = CaseLifecycle::Terminal,
+                    Some(_) => bail!("duplicate or late TERMINAL record: {record:?}"),
+                    None => bail!("TERMINAL observed without CASE_START: {record:?}"),
+                }
+                if self
+                    .terminal_operation
+                    .replace(operation.to_owned())
+                    .is_some()
+                {
+                    bail!("duplicate TERMINAL record: {record:?}");
                 }
             }
         }
@@ -191,10 +220,30 @@ impl ProtocolState {
         self.terminal
     }
 
-    pub(super) fn validate_complete(&self) -> Result<()> {
+    pub(super) fn ready(&self) -> bool {
+        self.ready
+    }
+
+    pub(super) fn validate_ready(&self) -> Result<()> {
         if !self.ready {
             bail!("protocol stream has no READY record");
         }
+        Ok(())
+    }
+
+    pub(super) fn validate_terminal_operation(&self, expected: &str) -> Result<()> {
+        self.validate_ready()?;
+        if self.terminal_operation.as_deref() != Some(expected) {
+            bail!(
+                "protocol stream has no TERMINAL operation {expected:?}; got {:?}",
+                self.terminal_operation
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_complete(&self) -> Result<()> {
+        self.validate_ready()?;
         if !self.terminal {
             bail!("protocol stream has no terminal DONE PASS record");
         }
@@ -293,6 +342,45 @@ mod tests {
         assert!(
             state
                 .observe(&parse_record(b"GTRT/1|sup|000002|FAIL|case|BAD").unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn terminal_operation_requires_an_active_case_and_known_detail() {
+        let mut state = ProtocolState::new("sup", "suite");
+        state
+            .observe(&parse_record(b"GTRT/1|sup|000001|READY|suite").unwrap())
+            .unwrap();
+        assert!(
+            state
+                .observe(&parse_record(b"GTRT/1|sup|000002|TERMINAL|power|RESTART").unwrap())
+                .is_err()
+        );
+
+        let mut state = ProtocolState::new("sup", "suite");
+        state
+            .observe(&parse_record(b"GTRT/1|sup|000001|READY|suite").unwrap())
+            .unwrap();
+        state
+            .observe(&parse_record(b"GTRT/1|sup|000002|CASE_START|power").unwrap())
+            .unwrap();
+        assert!(
+            state
+                .observe(&parse_record(b"GTRT/1|sup|000003|TERMINAL|power|HALT").unwrap())
+                .is_err()
+        );
+
+        let mut state = ProtocolState::new("sup", "suite");
+        state
+            .observe(&parse_record(b"GTRT/1|sup|000001|READY|suite").unwrap())
+            .unwrap();
+        state
+            .observe(&parse_record(b"GTRT/1|worker|000001|CASE_START|power").unwrap())
+            .unwrap();
+        assert!(
+            state
+                .observe(&parse_record(b"GTRT/1|worker|000002|TERMINAL|power|RESTART").unwrap())
                 .is_err()
         );
     }

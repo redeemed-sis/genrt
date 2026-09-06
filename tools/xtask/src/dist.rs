@@ -281,6 +281,7 @@ fn package(
         initramfs: PathBuf::from("initramfs.cpio"),
         cpu_count: 1,
         wait_for_gdb: false,
+        reset_behavior: qemu::ResetBehavior::Reset,
     };
     fs::write(
         staging.join("RUN.md"),

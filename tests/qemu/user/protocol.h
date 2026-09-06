@@ -63,6 +63,11 @@ static inline void gtrt_pass(const char *producer, const char *test_case) {
     gtrt_emit(producer, "PASS", test_case, NULL);
 }
 
+static inline void gtrt_terminal(const char *producer, const char *test_case,
+                                 const char *operation) {
+    gtrt_emit(producer, "TERMINAL", test_case, operation);
+}
+
 __attribute__((noreturn)) static inline void
 gtrt_fail(const char *producer, const char *test_case, const char *reason) {
     gtrt_emit(producer, "FAIL", test_case, reason);
