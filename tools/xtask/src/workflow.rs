@@ -865,6 +865,27 @@ const USER_PROGRAMS: &[UserProgram] = &[
         defines: &[],
         test_artifact: true,
     },
+    UserProgram {
+        name: "test_reboot_supervisor",
+        source: "tests/qemu/user/power_supervisor.c",
+        checked: false,
+        defines: &["GTRT_POWER_REBOOT"],
+        test_artifact: true,
+    },
+    UserProgram {
+        name: "test_poweroff_supervisor",
+        source: "tests/qemu/user/power_supervisor.c",
+        checked: false,
+        defines: &["GTRT_POWER_POWEROFF"],
+        test_artifact: true,
+    },
+    UserProgram {
+        name: "test_smp_reboot_supervisor",
+        source: "tests/qemu/user/power_supervisor.c",
+        checked: false,
+        defines: &["GTRT_POWER_REBOOT", "GTRT_POWER_REMOTE"],
+        test_artifact: true,
+    },
 ];
 
 /// Build one named userspace program from the repository manifest.
@@ -980,6 +1001,8 @@ fn build_aarch64_user_elf(
     let contract_role = match name {
         "test_api_supervisor" => Some("userspace"),
         "test_shell_supervisor" => Some("shell"),
+        "test_reboot_supervisor" | "test_smp_reboot_supervisor" => Some("reboot"),
+        "test_poweroff_supervisor" => Some("poweroff"),
         _ => None,
     };
     if let Some(contract_role) = contract_role {

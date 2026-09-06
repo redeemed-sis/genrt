@@ -10,7 +10,7 @@ use serde::Deserialize;
 use crate::product::{self, Program};
 
 const CONTRACT_MANIFEST: &str = "tests/qemu/program-contracts.toml";
-const CONTRACT_SCHEMA: u32 = 1;
+const CONTRACT_SCHEMA: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,7 +19,18 @@ struct ManifestInvocation {
     case: String,
     path: String,
     args: Vec<String>,
-    expected_exit: u8,
+    expected_exit: Option<u8>,
+    terminal: Option<TerminalOutcome>,
+}
+
+/// Terminal machine outcome expected from a production program invocation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TerminalOutcome {
+    /// The same QEMU process resets and begins a fresh guest boot epoch.
+    Reboot,
+    /// QEMU exits successfully after the guest requests system power off.
+    Poweroff,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,7 +48,8 @@ pub(crate) struct Invocation {
     case: String,
     path: String,
     args: Vec<String>,
-    expected_exit: u8,
+    expected_exit: Option<u8>,
+    terminal: Option<TerminalOutcome>,
 }
 
 impl Invocation {
@@ -83,8 +95,18 @@ impl Invocation {
     /// # Returns
     ///
     /// Returns the bounded status compared after `waitpid`.
-    pub(crate) const fn expected_exit(&self) -> u8 {
+    pub(crate) const fn expected_exit(&self) -> Option<u8> {
         self.expected_exit
+    }
+
+    /// Return the terminal outcome expected instead of a process exit status.
+    ///
+    /// # Returns
+    ///
+    /// Returns restart or power-off for terminal production programs, and
+    /// `None` for ordinary programs that return an exit status.
+    pub(crate) const fn terminal(&self) -> Option<TerminalOutcome> {
+        self.terminal
     }
 }
 
@@ -177,7 +199,7 @@ impl Plan {
                 "    {{\"{}\", \"{}\", gtrt_contract_{index}_argv, {}}},\n",
                 escape_c_string(&invocation.case),
                 escape_c_string(&invocation.path),
-                invocation.expected_exit
+                invocation.expected_exit.map(i16::from).unwrap_or(-1)
             ));
         }
         header.push_str("};\n#define GTRT_PROGRAM_CONTRACT_COUNT ");
@@ -230,6 +252,18 @@ fn validate(programs: Vec<Program>, entries: Vec<ManifestInvocation>) -> Result<
                 program.name()
             );
         }
+        if entry.expected_exit.is_some() == entry.terminal.is_some() {
+            bail!(
+                "contract for {} must declare exactly one of expected_exit or terminal",
+                program.name()
+            );
+        }
+        match (program.contract(), entry.terminal) {
+            ("reboot", Some(TerminalOutcome::Reboot))
+            | ("poweroff", Some(TerminalOutcome::Poweroff))
+            | ("shell" | "userspace", None) => {}
+            _ => bail!("contract outcome mismatch for program {}", program.name()),
+        }
         if entry.args.iter().any(|arg| {
             arg.len() > 256
                 || arg
@@ -248,6 +282,7 @@ fn validate(programs: Vec<Program>, entries: Vec<ManifestInvocation>) -> Result<
             path: entry.path,
             args: entry.args,
             expected_exit: entry.expected_exit,
+            terminal: entry.terminal,
         });
     }
 

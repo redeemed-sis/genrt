@@ -1,4 +1,4 @@
-schema = 1
+schema = 2
 
 [[invocation]]
 program = "shell"
@@ -41,3 +41,17 @@ case = "production-taskset-exec-smoke"
 path = "/bin/taskset"
 args = ["taskset", "0", "echo", "contract", "arguments"]
 expected_exit = 0
+
+[[invocation]]
+program = "reboot"
+case = "production-reboot-terminal"
+path = "/bin/reboot"
+args = ["reboot"]
+terminal = "reboot"
+
+[[invocation]]
+program = "poweroff"
+case = "production-poweroff-terminal"
+path = "/bin/poweroff"
+args = ["poweroff"]
+terminal = "poweroff"

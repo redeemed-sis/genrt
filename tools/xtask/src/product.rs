@@ -118,7 +118,10 @@ fn validate_programs(programs: &mut [Program]) -> Result<()> {
         if program.install == "init" {
             init_count += 1;
         }
-        if !matches!(program.contract(), "shell" | "userspace" | "structural") {
+        if !matches!(
+            program.contract(),
+            "shell" | "userspace" | "reboot" | "poweroff" | "structural"
+        ) {
             bail!(
                 "unsupported contract role {:?} for {}",
                 program.contract,

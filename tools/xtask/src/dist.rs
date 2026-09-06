@@ -89,6 +89,22 @@ pub(crate) fn run(tag: &str, output_dir: &Path) -> Result<()> {
 
     let shell_contract_manifest =
         initramfs::manifest_path(&artifacts.root().join("release-shell-contract.cpio"));
+    let reboot_initramfs = test::prepare_reboot_contract_initramfs(
+        Profile::Release,
+        artifacts.root().join("release-reboot-contract.cpio"),
+        &users,
+    )?;
+    run_prepared_contract("reboot-contract", &artifacts, reboot_initramfs)?;
+    let reboot_contract_manifest =
+        initramfs::manifest_path(&artifacts.root().join("release-reboot-contract.cpio"));
+    let poweroff_initramfs = test::prepare_poweroff_contract_initramfs(
+        Profile::Release,
+        artifacts.root().join("release-poweroff-contract.cpio"),
+        &users,
+    )?;
+    run_prepared_contract("poweroff-contract", &artifacts, poweroff_initramfs)?;
+    let poweroff_contract_manifest =
+        initramfs::manifest_path(&artifacts.root().join("release-poweroff-contract.cpio"));
 
     let release_initramfs =
         workflow::build_initramfs_with_users(Profile::Release, None, None, None, &users)?;
@@ -103,6 +119,8 @@ pub(crate) fn run(tag: &str, output_dir: &Path) -> Result<()> {
         &release_manifest,
         &userspace_contract_manifest,
         &shell_contract_manifest,
+        &reboot_contract_manifest,
+        &poweroff_contract_manifest,
     )?;
     let prepared = PreparedArtifacts {
         artifacts: artifacts.clone(),
@@ -119,6 +137,8 @@ fn verify_userspace_identity(
     release: &Path,
     userspace_contract: &Path,
     shell_contract: &Path,
+    reboot_contract: &Path,
+    poweroff_contract: &Path,
 ) -> Result<()> {
     let invocation_plan = crate::product_contract::Plan::load()?;
     for program in users.programs() {
@@ -143,6 +163,8 @@ fn verify_userspace_identity(
         let contract_manifest = match program.contract() {
             "shell" => shell_contract,
             "userspace" => userspace_contract,
+            "reboot" => reboot_contract,
+            "poweroff" => poweroff_contract,
             other => bail!("unsupported product contract role {other:?}"),
         };
         let tested_hash = initramfs::entry_sha256(contract_manifest, program.contract_install())?
@@ -164,12 +186,13 @@ fn verify_userspace_identity(
             anyhow::anyhow!("missing invocation for dynamic program {}", program.name())
         })?;
         println!(
-            "release coverage: {} present_in_contract_image=true invocation_declared=true invocation_executed=true contract_passed=true structural_only=false role={} case={} path={} expected_exit={}",
+            "release coverage: {} present_in_contract_image=true invocation_declared=true invocation_executed=true contract_passed=true structural_only=false role={} case={} path={} expected_exit={:?} terminal={:?}",
             program.name(),
             program.contract(),
             invocation.case(),
             invocation.path(),
-            invocation.expected_exit()
+            invocation.expected_exit(),
+            invocation.terminal()
         );
     }
     Ok(())

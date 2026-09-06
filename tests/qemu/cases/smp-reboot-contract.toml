@@ -1,0 +1,27 @@
+name = "smp-reboot-contract"
+suite = "reboot-contract"
+supervisor = "reboot-supervisor"
+profile = "debug"
+log_level = "info"
+cpu_count = 4
+init = "smp-reboot-contract"
+termination = "reboot"
+timeout_secs = 30
+step_timeout_secs = 15
+
+[[steps]]
+action = "send_line"
+value = "go"
+
+[[steps]]
+action = "expect"
+producer = "reboot-supervisor"
+event = "CASE_START"
+subject = "production-reboot-terminal"
+
+[[steps]]
+action = "expect"
+producer = "reboot-supervisor"
+event = "TERMINAL"
+subject = "production-reboot-terminal"
+detail = "RESTART"

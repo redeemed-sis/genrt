@@ -1,0 +1,26 @@
+name = "poweroff-contract"
+suite = "poweroff-contract"
+supervisor = "poweroff-supervisor"
+profile = "debug"
+log_level = "info"
+init = "poweroff-contract"
+termination = "poweroff"
+timeout_secs = 30
+step_timeout_secs = 15
+
+[[steps]]
+action = "send_line"
+value = "go"
+
+[[steps]]
+action = "expect"
+producer = "poweroff-supervisor"
+event = "CASE_START"
+subject = "production-poweroff-terminal"
+
+[[steps]]
+action = "expect"
+producer = "poweroff-supervisor"
+event = "TERMINAL"
+subject = "production-poweroff-terminal"
+detail = "POWER_OFF"

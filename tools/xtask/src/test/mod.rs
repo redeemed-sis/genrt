@@ -273,6 +273,9 @@ fn prepare_test_initramfs(
         cases::InitImage::UserspaceContract => "userspace-contract",
         cases::InitImage::SmpUserspaceContract => "smp-userspace-contract",
         cases::InitImage::ShellContract => "shell-contract",
+        cases::InitImage::RebootContract => "reboot-contract",
+        cases::InitImage::PoweroffContract => "poweroff-contract",
+        cases::InitImage::SmpRebootContract => "smp-reboot-contract",
     });
     if root.exists() {
         fs::remove_dir_all(&root)?;
@@ -318,12 +321,27 @@ fn prepare_test_initramfs(
             provenance.mark_prefix("init", crate::initramfs::Origin::TestSupervisor)?;
             workflow::build_user_program(profile, "test_shell_supervisor", true)?
         }
+        cases::InitImage::RebootContract => {
+            provenance.mark_prefix("init", crate::initramfs::Origin::TestSupervisor)?;
+            workflow::build_user_program(profile, "test_reboot_supervisor", true)?
+        }
+        cases::InitImage::PoweroffContract => {
+            provenance.mark_prefix("init", crate::initramfs::Origin::TestSupervisor)?;
+            workflow::build_user_program(profile, "test_poweroff_supervisor", true)?
+        }
+        cases::InitImage::SmpRebootContract => {
+            provenance.mark_prefix("init", crate::initramfs::Origin::TestSupervisor)?;
+            workflow::build_user_program(profile, "test_smp_reboot_supervisor", true)?
+        }
     };
     if !matches!(
         image,
         cases::InitImage::UserspaceContract
             | cases::InitImage::SmpUserspaceContract
             | cases::InitImage::ShellContract
+            | cases::InitImage::RebootContract
+            | cases::InitImage::PoweroffContract
+            | cases::InitImage::SmpRebootContract
     ) {
         provenance.mark_prefix("init", crate::initramfs::Origin::TestFixture)?;
     }
@@ -383,6 +401,52 @@ pub(crate) fn prepare_shell_contract_initramfs(
     prepare_test_initramfs(profile, &cases::InitImage::ShellContract, output, users)
 }
 
+/// Build a reboot contract image from the exact production reboot ELF.
+///
+/// # Arguments
+///
+/// * `profile` - Artifact profile used by test-only programs.
+/// * `output` - Destination CPIO path.
+/// * `users` - Previously built production userspace artifacts.
+///
+/// # Returns
+///
+/// Returns the verified test initramfs path.
+///
+/// # Errors
+///
+/// Returns an error for supervisor compilation, staging, or archive failures.
+pub(crate) fn prepare_reboot_contract_initramfs(
+    profile: Profile,
+    output: PathBuf,
+    users: &workflow::ProductionUserArtifacts,
+) -> Result<PathBuf> {
+    prepare_test_initramfs(profile, &cases::InitImage::RebootContract, output, users)
+}
+
+/// Build a power-off contract image from the exact production poweroff ELF.
+///
+/// # Arguments
+///
+/// * `profile` - Artifact profile used by test-only programs.
+/// * `output` - Destination CPIO path.
+/// * `users` - Previously built production userspace artifacts.
+///
+/// # Returns
+///
+/// Returns the verified test initramfs path.
+///
+/// # Errors
+///
+/// Returns an error for supervisor compilation, staging, or archive failures.
+pub(crate) fn prepare_poweroff_contract_initramfs(
+    profile: Profile,
+    output: PathBuf,
+    users: &workflow::ProductionUserArtifacts,
+) -> Result<PathBuf> {
+    prepare_test_initramfs(profile, &cases::InitImage::PoweroffContract, output, users)
+}
+
 /// Verify that every dynamic product role is asserted by its declarative case.
 ///
 /// # Arguments
@@ -421,8 +485,27 @@ pub(crate) fn verify_product_contract_coverage(
         {
             bail!("invocation plan does not match product {}", program.name());
         }
+        let outcome_matches = matches!(
+            (invocation.terminal(), case.termination),
+            (None, cases::Termination::Protocol)
+                | (
+                    Some(crate::product_contract::TerminalOutcome::Poweroff),
+                    cases::Termination::Poweroff,
+                )
+                | (
+                    Some(crate::product_contract::TerminalOutcome::Reboot),
+                    cases::Termination::Reboot,
+                )
+        );
+        if !outcome_matches {
+            bail!("invocation outcome does not match case {}", case.name);
+        }
         let subject = invocation.case();
-        if !steps_cover_case(&case.steps, subject) {
+        if !steps_cover_case(
+            &case.steps,
+            subject,
+            case.termination != cases::Termination::Protocol,
+        ) {
             bail!(
                 "product program {} is not covered by {} in {}",
                 program.name(),
@@ -434,7 +517,7 @@ pub(crate) fn verify_product_contract_coverage(
     Ok(())
 }
 
-fn steps_cover_case(steps: &[cases::Step], subject: &str) -> bool {
+fn steps_cover_case(steps: &[cases::Step], subject: &str, terminal: bool) -> bool {
     if steps.iter().any(|step| {
         matches!(
             step,
@@ -456,6 +539,9 @@ fn steps_cover_case(steps: &[cases::Step], subject: &str) -> bool {
             } if event == "CASE_START" && candidate == subject
         )
     });
+    if terminal {
+        return started;
+    }
     let passed = steps.iter().any(|step| {
         matches!(
             step,

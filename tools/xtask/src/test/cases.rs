@@ -13,6 +13,9 @@ pub(super) enum InitImage {
     UserspaceContract,
     SmpUserspaceContract,
     ShellContract,
+    RebootContract,
+    PoweroffContract,
+    SmpRebootContract,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
