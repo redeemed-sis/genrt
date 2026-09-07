@@ -55,6 +55,11 @@ subject = "taskset-cli-validation"
 [[steps]]
 action = "expect_case"
 producer = "api-supervisor"
+subject = "sleep-cli-validation"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
 subject = "production-echo-exec-smoke"
 
 [[steps]]
@@ -76,3 +81,8 @@ subject = "production-pwd-exec-smoke"
 action = "expect_case"
 producer = "api-supervisor"
 subject = "production-taskset-exec-smoke"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
+subject = "production-sleep-exec-smoke"

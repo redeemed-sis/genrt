@@ -43,6 +43,13 @@ args = ["taskset", "0", "echo", "contract", "arguments"]
 expected_exit = 0
 
 [[invocation]]
+program = "sleep"
+case = "production-sleep-exec-smoke"
+path = "/bin/sleep"
+args = ["sleep", "0"]
+expected_exit = 0
+
+[[invocation]]
 program = "reboot"
 case = "production-reboot-terminal"
 path = "/bin/reboot"

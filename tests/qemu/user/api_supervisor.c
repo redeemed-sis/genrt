@@ -108,6 +108,31 @@ static void taskset_cli_validation(void) {
     gtrt_pass(producer, name);
 }
 
+static void sleep_cli_validation(void) {
+    const char *name = "sleep-cli-validation";
+    char *zero[] = {"sleep", "0", NULL};
+    char *one[] = {"sleep", "1", NULL};
+    char *missing[] = {"sleep", NULL};
+    char *extra[] = {"sleep", "0", "extra", NULL};
+    char *negative[] = {"sleep", "-1", NULL};
+    char *fractional[] = {"sleep", "1.5", NULL};
+    char *non_decimal[] = {"sleep", "one", NULL};
+    char *overflow[] = {"sleep", "4294967296", NULL};
+
+    gtrt_case_start(producer, name);
+    if (!exec_and_wait("/bin/sleep", zero, 0)
+        || !exec_and_wait("/bin/sleep", one, 0)
+        || !exec_and_wait("/bin/sleep", missing, 2)
+        || !exec_and_wait("/bin/sleep", extra, 2)
+        || !exec_and_wait("/bin/sleep", negative, 2)
+        || !exec_and_wait("/bin/sleep", fractional, 2)
+        || !exec_and_wait("/bin/sleep", non_decimal, 2)
+        || !exec_and_wait("/bin/sleep", overflow, 2)) {
+        gtrt_fail(producer, name, "RESULT");
+    }
+    gtrt_pass(producer, name);
+}
+
 int main(void) {
     gtrt_ready(producer, "userspace-contract");
     init_affinity();
@@ -119,6 +144,7 @@ int main(void) {
     run_case("process-affinity-validation");
     run_case("reboot-validation");
     taskset_cli_validation();
+    sleep_cli_validation();
     for (size_t index = 0; index < GTRT_PROGRAM_CONTRACT_COUNT; index++) {
         run_program(&GTRT_PROGRAM_CONTRACTS[index]);
     }
