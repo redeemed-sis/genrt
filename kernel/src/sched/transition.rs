@@ -483,6 +483,24 @@ impl CpuScheduler<'_> {
         self.validate_after_transition();
         prepared
     }
+
+    pub(super) fn transition_prepare_automatic_wait(&mut self) -> PreparedWait {
+        crate::sync::preempt::assert_preemption_enabled_on(
+            self.cpu(),
+            "scheduler automatic wait preparation",
+        );
+        let current = self.state().current.unwrap_or_else(|| {
+            panic!("sched: automatic wait preparation without a running thread")
+        });
+        self.assert_current_running(current, "automatic wait preparation");
+        let cpu = self.cpu();
+        let prepared = self
+            .thread_mut(current.index())
+            .wait
+            .prepare_automatic(current, cpu);
+        self.validate_after_transition();
+        prepared
+    }
 }
 
 impl Scheduler {

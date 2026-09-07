@@ -29,7 +29,7 @@ pub(crate) use self::{
         enter_running_thread, finish_timer_interrupt, on_preempt_checkpoint, on_quantum_expired,
         on_wait_deadline,
     },
-    sleep::on_sleep_sync,
+    sleep::{on_sleep_sync, sleep_user_until_counter},
     thread::{
         current_user_address_space, current_user_stack_ptr, on_thread_exit_sync,
         on_thread_join_sync, replace_current_user_resources, thread_spawn_user,
@@ -37,7 +37,7 @@ pub(crate) use self::{
     },
     wait::{
         CommitResult, CompletionResult, FinishError, PreparedWait, WaitCause, WaitToken,
-        cancel_wait, commit_wait, complete_wait, finish_wait, prepare_wait,
+        cancel_wait, commit_wait, complete_wait, finish_wait, prepare_automatic_wait, prepare_wait,
     },
 };
 pub use self::{

@@ -80,6 +80,7 @@ pub(crate) enum WaitCause {
 #[must_use = "a prepared wait must be committed or cancelled"]
 pub(crate) struct PreparedWait {
     token: WaitToken,
+    consumption: WaitConsumption,
 }
 
 impl PreparedWait {
@@ -152,9 +153,24 @@ pub(super) struct WaitMetadata {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum WaitState {
     None,
-    Prepared { token: WaitToken },
-    Blocked { token: WaitToken },
-    Completed { token: WaitToken, cause: WaitCause },
+    Prepared {
+        token: WaitToken,
+        consumption: WaitConsumption,
+    },
+    Blocked {
+        token: WaitToken,
+        consumption: WaitConsumption,
+    },
+    Completed {
+        token: WaitToken,
+        cause: WaitCause,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum WaitConsumption {
+    Explicit,
+    Automatic,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -177,6 +193,19 @@ impl WaitMetadata {
     }
 
     pub(super) fn prepare(&mut self, thread: ThreadId, cpu: CpuId) -> PreparedWait {
+        self.prepare_with_consumption(thread, cpu, WaitConsumption::Explicit)
+    }
+
+    pub(super) fn prepare_automatic(&mut self, thread: ThreadId, cpu: CpuId) -> PreparedWait {
+        self.prepare_with_consumption(thread, cpu, WaitConsumption::Automatic)
+    }
+
+    fn prepare_with_consumption(
+        &mut self,
+        thread: ThreadId,
+        cpu: CpuId,
+        consumption: WaitConsumption,
+    ) -> PreparedWait {
         if self.state != WaitState::None {
             panic!("sched: new wait before prior completion is consumed");
         }
@@ -189,14 +218,16 @@ impl WaitMetadata {
             cpu,
             sequence: WaitSequence(self.next_sequence),
         };
-        self.state = WaitState::Prepared { token };
-        PreparedWait { token }
+        self.state = WaitState::Prepared { token, consumption };
+        PreparedWait { token, consumption }
     }
 
     pub(super) fn commit(&mut self, prepared: PreparedWait) -> CommitState {
         match self.state {
-            WaitState::Prepared { token } if token == prepared.token => {
-                self.state = WaitState::Blocked { token };
+            WaitState::Prepared { token, consumption }
+                if token == prepared.token && consumption == prepared.consumption =>
+            {
+                self.state = WaitState::Blocked { token, consumption };
                 CommitState::Block(token)
             }
             WaitState::Completed { token, cause, .. } if token == prepared.token => {
@@ -209,12 +240,21 @@ impl WaitMetadata {
 
     pub(super) fn complete(&mut self, token: WaitToken, cause: WaitCause) -> CompletionResult {
         match self.state {
-            WaitState::Prepared { token: active } if active == token => {
+            WaitState::Prepared {
+                token: active,
+                consumption: _,
+            } if active == token => {
                 self.state = WaitState::Completed { token, cause };
                 CompletionResult::CompletedPrepared
             }
-            WaitState::Blocked { token: active } if active == token => {
-                self.state = WaitState::Completed { token, cause };
+            WaitState::Blocked {
+                token: active,
+                consumption,
+            } if active == token => {
+                self.state = match consumption {
+                    WaitConsumption::Explicit => WaitState::Completed { token, cause },
+                    WaitConsumption::Automatic => WaitState::None,
+                };
                 CompletionResult::WokeBlocked
             }
             WaitState::Completed { token: active, .. } if active == token => {
@@ -267,14 +307,17 @@ impl WaitMetadata {
         matches!(self.state, WaitState::None)
     }
 
+    #[cfg(any(debug_assertions, feature = "qemu-test"))]
     pub(super) const fn is_prepared(&self) -> bool {
         matches!(self.state, WaitState::Prepared { .. })
     }
 
+    #[cfg(any(debug_assertions, feature = "qemu-test"))]
     pub(super) const fn is_blocked(&self) -> bool {
         matches!(self.state, WaitState::Blocked { .. })
     }
 
+    #[cfg(any(debug_assertions, feature = "qemu-test"))]
     pub(super) const fn is_completed(&self) -> bool {
         matches!(self.state, WaitState::Completed { .. })
     }
@@ -304,6 +347,31 @@ impl WaitMetadata {
 pub(crate) fn prepare_wait() -> PreparedWait {
     let cpu = super::current_cpu();
     scheduler_mut().on_cpu(cpu).transition_prepare_wait()
+}
+
+/// Prepare a wait whose completion needs no owner-side result consumption.
+///
+/// This variant supports blocking EL0 syscalls that resume directly in
+/// userspace rather than through a kernel-stack continuation. A completion of
+/// an already blocked thread clears the inline wait metadata while making the
+/// thread ready. Publication-time completion is still consumed by
+/// [`commit_wait`].
+///
+/// # Returns
+///
+/// Returns a non-copyable preparation for the current running thread. The
+/// operation is bounded, allocation-free, non-blocking, and uses the same short
+/// scheduler critical section as [`prepare_wait`].
+///
+/// # Panics
+///
+/// Panics when no current thread is running, a prior wait is unfinished, or the
+/// per-slot sequence would overflow.
+pub(crate) fn prepare_automatic_wait() -> PreparedWait {
+    let cpu = super::current_cpu();
+    scheduler_mut()
+        .on_cpu(cpu)
+        .transition_prepare_automatic_wait()
 }
 
 /// Commit a published wait registration and apply its mandatory handoff.
@@ -540,6 +608,24 @@ mod tests {
             CommitState::Early(WaitCause::Timeout)
         );
         assert!(wait.is_none());
+    }
+
+    #[test]
+    fn automatic_wait_clears_on_blocked_completion() {
+        let mut wait = WaitMetadata::with_next_sequence(0);
+        let prepared = wait.prepare_automatic(THREAD, cpu0());
+        let token = prepared.token();
+        assert_eq!(wait.commit(prepared), CommitState::Block(token));
+        assert_eq!(
+            wait.complete(token, WaitCause::Timeout),
+            CompletionResult::WokeBlocked
+        );
+        assert!(wait.is_none());
+        assert_eq!(
+            wait.complete(token, WaitCause::Timeout),
+            CompletionResult::Stale
+        );
+        let _next = wait.prepare(THREAD, cpu0());
     }
 
     #[test]

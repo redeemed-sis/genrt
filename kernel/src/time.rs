@@ -39,6 +39,25 @@ pub(crate) enum TimeInitError {
     OutOfMemory,
 }
 
+/// Errors from converting between the architecture counter and civil units.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TimeConversionError {
+    /// The architecture reported a zero counter frequency.
+    InvalidFrequency,
+    /// The requested duration or absolute timestamp does not fit in `u64`
+    /// counter units.
+    Overflow,
+}
+
+/// Normalized monotonic timestamp used at the syscall boundary.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MonotonicTime {
+    /// Whole seconds since the unspecified monotonic epoch.
+    pub(crate) seconds: u64,
+    /// Fractional nanoseconds in the range `0..1_000_000_000`.
+    pub(crate) nanoseconds: u32,
+}
+
 /// Exact deadline identity stored in one logical CPU's bounded time queue.
 ///
 /// Event construction and comparison are copy-only. Queue mutation and timer
@@ -315,6 +334,105 @@ pub fn now_counter() -> u64 {
 pub fn counter_freq_hz() -> u64 {
     // SAFETY: the architecture layer exposes the architected timer frequency.
     unsafe { arch_counter_freq_hz() }
+}
+
+/// Convert an architecture counter observation to normalized monotonic time.
+///
+/// # Arguments
+///
+/// * `counter` - Absolute observation in the architecture counter domain.
+///
+/// # Returns
+///
+/// Returns whole seconds and normalized fractional nanoseconds. Conversion is
+/// bounded, allocation-free, non-blocking, and leaves IRQ state unchanged.
+///
+/// # Errors
+///
+/// Returns [`TimeConversionError::InvalidFrequency`] if the architecture
+/// reports a zero frequency.
+pub(crate) fn counter_to_monotonic_time(
+    counter: u64,
+) -> Result<MonotonicTime, TimeConversionError> {
+    counter_to_monotonic_time_at_frequency(counter, counter_freq_hz())
+}
+
+/// Convert a normalized monotonic timestamp to an absolute counter deadline.
+///
+/// The conversion rounds upward so a timer programmed with the result cannot
+/// expire before the requested timestamp.
+///
+/// # Arguments
+///
+/// * `seconds` - Whole non-negative seconds since the monotonic epoch.
+/// * `nanoseconds` - Fractional nanoseconds, which must be below one billion.
+///
+/// # Returns
+///
+/// Returns the first counter value at or after the requested timestamp. The
+/// conversion is bounded, allocation-free, non-blocking, and leaves IRQ state
+/// unchanged.
+///
+/// # Errors
+///
+/// Returns [`TimeConversionError::InvalidFrequency`] for a zero architecture
+/// frequency and [`TimeConversionError::Overflow`] for invalid nanoseconds or
+/// a timestamp beyond the `u64` counter domain.
+pub(crate) fn monotonic_time_to_counter(
+    seconds: u64,
+    nanoseconds: u32,
+) -> Result<u64, TimeConversionError> {
+    monotonic_time_to_counter_at_frequency(seconds, nanoseconds, counter_freq_hz())
+}
+
+/// Convert a relative duration to counter ticks, rounding upward.
+///
+/// # Arguments
+///
+/// * `seconds` - Whole non-negative duration seconds.
+/// * `nanoseconds` - Fractional duration nanoseconds below one billion.
+///
+/// # Returns
+///
+/// Returns the smallest counter duration that is not shorter than the input.
+/// Zero maps to zero. The conversion does not allocate, block, or alter IRQ
+/// state.
+///
+/// # Errors
+///
+/// Returns [`TimeConversionError::InvalidFrequency`] for a zero architecture
+/// frequency and [`TimeConversionError::Overflow`] for invalid nanoseconds or
+/// a duration beyond the `u64` counter domain.
+pub(crate) fn monotonic_duration_to_counts(
+    seconds: u64,
+    nanoseconds: u32,
+) -> Result<u64, TimeConversionError> {
+    monotonic_time_to_counter(seconds, nanoseconds)
+}
+
+/// Return the effective nanosecond resolution of the monotonic counter.
+///
+/// # Returns
+///
+/// Returns a non-zero normalized duration derived from one architecture
+/// counter tick. Sub-nanosecond counters report one nanosecond because that is
+/// the finest value representable by the userspace ABI. The query is bounded,
+/// allocation-free, non-blocking, and leaves IRQ state unchanged.
+///
+/// # Errors
+///
+/// Returns [`TimeConversionError::InvalidFrequency`] if the architecture
+/// reports a zero frequency.
+pub(crate) fn monotonic_resolution() -> Result<MonotonicTime, TimeConversionError> {
+    let frequency = counter_freq_hz();
+    if frequency == 0 {
+        return Err(TimeConversionError::InvalidFrequency);
+    }
+    let nanoseconds = div_ceil(1_000_000_000u128, frequency as u128).max(1);
+    Ok(MonotonicTime {
+        seconds: (nanoseconds / 1_000_000_000) as u64,
+        nanoseconds: (nanoseconds % 1_000_000_000) as u32,
+    })
 }
 
 #[inline(always)]
@@ -646,6 +764,42 @@ fn scale_to_counts(units: u64, denom_per_second: u64) -> u64 {
     counts.max(1).min(u64::MAX as u128) as u64
 }
 
+fn counter_to_monotonic_time_at_frequency(
+    counter: u64,
+    frequency: u64,
+) -> Result<MonotonicTime, TimeConversionError> {
+    if frequency == 0 {
+        return Err(TimeConversionError::InvalidFrequency);
+    }
+    let seconds = counter / frequency;
+    let remainder = counter % frequency;
+    let nanoseconds = ((remainder as u128) * 1_000_000_000u128 / frequency as u128) as u32;
+    Ok(MonotonicTime {
+        seconds,
+        nanoseconds,
+    })
+}
+
+fn monotonic_time_to_counter_at_frequency(
+    seconds: u64,
+    nanoseconds: u32,
+    frequency: u64,
+) -> Result<u64, TimeConversionError> {
+    if frequency == 0 {
+        return Err(TimeConversionError::InvalidFrequency);
+    }
+    if nanoseconds >= 1_000_000_000 {
+        return Err(TimeConversionError::Overflow);
+    }
+
+    let whole = (seconds as u128) * frequency as u128;
+    let fractional = div_ceil((nanoseconds as u128) * frequency as u128, 1_000_000_000);
+    let counter = whole
+        .checked_add(fractional)
+        .ok_or(TimeConversionError::Overflow)?;
+    u64::try_from(counter).map_err(|_| TimeConversionError::Overflow)
+}
+
 #[inline(always)]
 fn div_ceil(numerator: u128, denominator: u128) -> u128 {
     numerator.div_ceil(denominator)
@@ -689,5 +843,36 @@ mod tests {
         assert!(!queue0.event_pending(event1));
         assert!(queue1.event_pending(event1));
         assert!(!queue1.event_pending(event0));
+    }
+
+    #[test]
+    fn counter_time_conversion_is_normalized_and_rounds_deadlines_up() {
+        assert_eq!(
+            counter_to_monotonic_time_at_frequency(1_500_001, 1_000_000),
+            Ok(MonotonicTime {
+                seconds: 1,
+                nanoseconds: 500_001_000,
+            })
+        );
+        assert_eq!(
+            monotonic_time_to_counter_at_frequency(1, 1, 1_000_000),
+            Ok(1_000_001)
+        );
+    }
+
+    #[test]
+    fn checked_time_conversion_rejects_invalid_or_unrepresentable_values() {
+        assert_eq!(
+            counter_to_monotonic_time_at_frequency(1, 0),
+            Err(TimeConversionError::InvalidFrequency)
+        );
+        assert_eq!(
+            monotonic_time_to_counter_at_frequency(0, 1_000_000_000, 1),
+            Err(TimeConversionError::Overflow)
+        );
+        assert_eq!(
+            monotonic_time_to_counter_at_frequency(u64::MAX, 0, 2),
+            Err(TimeConversionError::Overflow)
+        );
     }
 }

@@ -10,7 +10,7 @@ use crate::{
         self,
         user::{self, UserCopyError},
     },
-    power, process,
+    power, process, sched, time,
 };
 
 pub const SYS_READ: usize = 0;
@@ -33,6 +33,18 @@ pub const SYS_SCHED_SETFORKAFFINITY: usize = 11;
 pub const SYS_SCHED_GETAFFINITY: usize = 12;
 /// Perform a Linux-shaped terminal system restart or power-off request.
 pub const SYS_REBOOT: usize = 13;
+/// Read the current value of a supported POSIX-like clock.
+pub const SYS_CLOCK_GETTIME: usize = 14;
+/// Read the effective resolution of a supported POSIX-like clock.
+pub const SYS_CLOCK_GETRES: usize = 15;
+/// Block until a relative or absolute POSIX-like clock deadline.
+pub const SYS_CLOCK_NANOSLEEP: usize = 16;
+
+const CLOCK_MONOTONIC: isize = 1;
+const TIMER_ABSTIME: usize = 1;
+const NANOSECONDS_PER_SECOND: i64 = 1_000_000_000;
+const USER_TIMESPEC_FIELD_SIZE: usize = core::mem::size_of::<i64>();
+const USER_TIMESPEC_SIZE: usize = USER_TIMESPEC_FIELD_SIZE * 2;
 
 // Stable userspace ABI capacity, independent of bounded kernel CPU storage.
 const USER_CPU_SET_BITS: usize = 1024;
@@ -159,6 +171,18 @@ pub fn dispatch(
         }
         SYS_REBOOT => {
             sys_reboot(context, request);
+            Ok(())
+        }
+        SYS_CLOCK_GETTIME => {
+            sys_clock_gettime(context, request);
+            Ok(())
+        }
+        SYS_CLOCK_GETRES => {
+            sys_clock_getres(context, request);
+            Ok(())
+        }
+        SYS_CLOCK_NANOSLEEP => {
+            sys_clock_nanosleep(context, request);
             Ok(())
         }
         _ => Err(DispatchError::UnknownSyscall(nr)),
@@ -353,6 +377,122 @@ fn sys_reboot(context: &mut ActiveContext<'_>, request: SyscallRequest) {
     match result {
         Ok(never) => match never {},
         Err(err) => context.set_syscall_result(-err),
+    }
+}
+
+fn sys_clock_gettime(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    let result = (|| {
+        validate_clock_id(request.arg(0) as isize)?;
+        let now = time::counter_to_monotonic_time(time::now_counter()).map_err(time_errno)?;
+        copy_timespec_to_user(request.arg(1), now)?;
+        Ok(0)
+    })();
+    context.set_syscall_result(errno::syscall_ret(result));
+}
+
+fn sys_clock_getres(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    let result = (|| {
+        validate_clock_id(request.arg(0) as isize)?;
+        let result_ptr = request.arg(1);
+        if result_ptr != 0 {
+            let resolution = time::monotonic_resolution().map_err(time_errno)?;
+            copy_timespec_to_user(result_ptr, resolution)?;
+        }
+        Ok(0)
+    })();
+    context.set_syscall_result(errno::syscall_ret(result));
+}
+
+fn sys_clock_nanosleep(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    // `rem` stays in the ABI for future signal interruption. Without signals,
+    // successful sleeps cannot report a remainder, so the pointer is neither
+    // read nor validated yet.
+    let _remaining_ptr = request.arg(3);
+    let result = (|| {
+        validate_clock_id(request.arg(0) as isize)?;
+        let flags = request.arg(1);
+        if flags & !TIMER_ABSTIME != 0 {
+            return Err(errno::EINVAL);
+        }
+
+        let requested = copy_timespec_from_user(request.arg(2))?;
+        let seconds = u64::try_from(requested.seconds).map_err(|_| errno::EINVAL)?;
+        let nanoseconds = u32::try_from(requested.nanoseconds).map_err(|_| errno::EINVAL)?;
+        if requested.nanoseconds >= NANOSECONDS_PER_SECOND {
+            return Err(errno::EINVAL);
+        }
+
+        let deadline = if flags == TIMER_ABSTIME {
+            time::monotonic_time_to_counter(seconds, nanoseconds).map_err(time_errno)?
+        } else {
+            let duration =
+                time::monotonic_duration_to_counts(seconds, nanoseconds).map_err(time_errno)?;
+            if duration == 0 {
+                return Ok(None);
+            }
+            time::now_counter()
+                .checked_add(duration)
+                .ok_or(errno::EOVERFLOW)?
+        };
+
+        if deadline <= time::now_counter() {
+            return Ok(None);
+        }
+        Ok(Some(deadline))
+    })();
+
+    match result {
+        Ok(Some(deadline)) => {
+            // The blocked frame resumes directly in EL0 after this SVC. Store
+            // success before scheduler handoff; automatic wait consumption
+            // clears the exact token when the deadline completes.
+            context.set_syscall_result(0);
+            let _ = sched::sleep_user_until_counter(context, deadline);
+        }
+        Ok(None) => context.set_syscall_result(0),
+        Err(err) => context.set_syscall_result(-err),
+    }
+}
+
+#[derive(Copy, Clone)]
+struct UserTimespec {
+    seconds: i64,
+    nanoseconds: i64,
+}
+
+fn validate_clock_id(clock_id: isize) -> Result<(), errno::Errno> {
+    if clock_id == CLOCK_MONOTONIC {
+        Ok(())
+    } else {
+        Err(errno::EINVAL)
+    }
+}
+
+fn copy_timespec_from_user(ptr: usize) -> Result<UserTimespec, errno::Errno> {
+    let mut bytes = [0u8; USER_TIMESPEC_SIZE];
+    user::copy_from_user(&mut bytes, ptr).map_err(user_copy_errno)?;
+    let seconds = i64::from_ne_bytes(core::array::from_fn(|index| bytes[index]));
+    let nanoseconds = i64::from_ne_bytes(core::array::from_fn(|index| {
+        bytes[USER_TIMESPEC_FIELD_SIZE + index]
+    }));
+    Ok(UserTimespec {
+        seconds,
+        nanoseconds,
+    })
+}
+
+fn copy_timespec_to_user(ptr: usize, value: time::MonotonicTime) -> Result<(), errno::Errno> {
+    let seconds = i64::try_from(value.seconds).map_err(|_| errno::EOVERFLOW)?;
+    let mut bytes = [0u8; USER_TIMESPEC_SIZE];
+    bytes[..USER_TIMESPEC_FIELD_SIZE].copy_from_slice(&seconds.to_ne_bytes());
+    bytes[USER_TIMESPEC_FIELD_SIZE..].copy_from_slice(&(value.nanoseconds as i64).to_ne_bytes());
+    user::copy_to_user(ptr, &bytes).map_err(user_copy_errno)
+}
+
+fn time_errno(err: time::TimeConversionError) -> errno::Errno {
+    match err {
+        time::TimeConversionError::InvalidFrequency => errno::EINVAL,
+        time::TimeConversionError::Overflow => errno::EOVERFLOW,
     }
 }
 

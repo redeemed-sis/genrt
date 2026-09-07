@@ -21,6 +21,8 @@ pub const EROFS: Errno = 30;
 pub const ERANGE: Errno = 34;
 pub const ENAMETOOLONG: Errno = 36;
 pub const ENOSYS: Errno = 38;
+/// A checked arithmetic conversion cannot be represented by the target type.
+pub const EOVERFLOW: Errno = 75;
 pub const ENOTSUP: Errno = 95;
 
 pub fn syscall_ret(result: Result<usize, Errno>) -> isize {
