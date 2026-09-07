@@ -57,3 +57,8 @@ subject = "affinity-validation"
 action = "expect_case"
 producer = "smp-api-supervisor"
 subject = "taskset-placement"
+
+[[steps]]
+action = "expect_case"
+producer = "smp-api-supervisor"
+subject = "secondary-monotonic-sleep"

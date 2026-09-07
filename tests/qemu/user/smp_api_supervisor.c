@@ -1,5 +1,6 @@
 #include "affinity.h"
 #include "protocol.h"
+#include <time.h>
 
 #define CHILD_EXIT_CODE 41
 #define MAX_EXHAUSTION_CHILDREN 31
@@ -29,6 +30,21 @@ static int string_equal(const char *lhs, const char *rhs) {
         index++;
     }
     return lhs[index] == rhs[index];
+}
+
+static int timespec_before(const struct timespec *lhs,
+                           const struct timespec *rhs) {
+    return lhs->tv_sec < rhs->tv_sec
+           || (lhs->tv_sec == rhs->tv_sec && lhs->tv_nsec < rhs->tv_nsec);
+}
+
+static struct timespec timespec_add_ns(struct timespec value, long ns) {
+    value.tv_nsec += ns;
+    if (value.tv_nsec >= 1000000000L) {
+        value.tv_sec++;
+        value.tv_nsec -= 1000000000L;
+    }
+    return value;
 }
 
 static void explicit_placement(void) {
@@ -223,6 +239,46 @@ static void taskset_placement(void) {
     gtrt_pass(producer, name);
 }
 
+static void secondary_monotonic_sleep(void) {
+    const char *name = "secondary-monotonic-sleep";
+    struct timespec parent_before;
+    struct timespec parent_after;
+
+    gtrt_case_start(producer, name);
+    if (clock_gettime(CLOCK_MONOTONIC, &parent_before) != 0
+        || sched_setforkaffinity(2) != 0) {
+        gtrt_fail(producer, name, "SETUP");
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        gtrt_fail(producer, name, "FORK");
+    }
+    if (child == 0) {
+        struct timespec deadline;
+        struct timespec actual;
+        if (!gtrt_affinity_is_only(0, 2)
+            || clock_gettime(CLOCK_MONOTONIC, &deadline) != 0
+            || timespec_before(&deadline, &parent_before)) {
+            exit(80);
+        }
+        deadline = timespec_add_ns(deadline, 5000000L);
+        if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL)
+                != 0
+            || clock_gettime(CLOCK_MONOTONIC, &actual) != 0
+            || timespec_before(&actual, &deadline)
+            || !gtrt_affinity_is_only(0, 2)) {
+            exit(81);
+        }
+        exit(0);
+    }
+    if (!wait_for_exit(child, 0)
+        || clock_gettime(CLOCK_MONOTONIC, &parent_after) != 0
+        || timespec_before(&parent_after, &parent_before)) {
+        gtrt_fail(producer, name, "CHILD");
+    }
+    gtrt_pass(producer, name);
+}
+
 int main(int argc, char **argv) {
     if (argc == 5 && string_equal(argv[0], "/init")
         && string_equal(argv[1], "--taskset-probe")
@@ -250,5 +306,6 @@ int main(int argc, char **argv) {
     remote_fault_reap();
     affinity_validation();
     taskset_placement();
+    secondary_monotonic_sleep();
     gtrt_done(producer, "smp-userspace-contract");
 }

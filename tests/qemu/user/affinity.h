@@ -5,6 +5,7 @@
 #define GTRT_ESRCH 3
 #define GTRT_EFAULT 14
 #define GTRT_EINVAL 22
+#define GTRT_EOVERFLOW 75
 
 static inline int gtrt_affinity_is_only(pid_t pid, size_t expected_cpu) {
     if (expected_cpu >= CPU_SETSIZE) {

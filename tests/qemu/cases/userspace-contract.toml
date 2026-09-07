@@ -50,6 +50,11 @@ subject = "reboot-validation"
 [[steps]]
 action = "expect_case"
 producer = "api-supervisor"
+subject = "time-api"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
 subject = "taskset-cli-validation"
 
 [[steps]]

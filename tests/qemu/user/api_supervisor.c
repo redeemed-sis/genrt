@@ -143,6 +143,7 @@ int main(void) {
     run_case("fork-affinity-validation");
     run_case("process-affinity-validation");
     run_case("reboot-validation");
+    run_case("time-api");
     taskset_cli_validation();
     sleep_cli_validation();
     for (size_t index = 0; index < GTRT_PROGRAM_CONTRACT_COUNT; index++) {

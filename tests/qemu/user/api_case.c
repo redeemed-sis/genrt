@@ -1,6 +1,8 @@
 #include "artifact_marker.h"
 #include "affinity.h"
 #include "syscall.h"
+#include <time.h>
+#include <unistd.h>
 
 #define DIRENT64_HEADER_SIZE 19
 #define TASKSET_LARGE_ARG_BYTES 62000
@@ -205,6 +207,138 @@ static int reboot_validation(void) {
                : 3;
 }
 
+static int timespec_before(const struct timespec *lhs,
+                           const struct timespec *rhs) {
+    return lhs->tv_sec < rhs->tv_sec
+           || (lhs->tv_sec == rhs->tv_sec && lhs->tv_nsec < rhs->tv_nsec);
+}
+
+static struct timespec timespec_add_ns(struct timespec value, long ns) {
+    value.tv_nsec += ns;
+    if (value.tv_nsec >= 1000000000L) {
+        value.tv_sec++;
+        value.tv_nsec -= 1000000000L;
+    }
+    return value;
+}
+
+static int time_api(void) {
+    struct timespec resolution;
+    struct timespec start;
+    struct timespec end;
+    if (clock_getres(CLOCK_MONOTONIC, &resolution) != 0
+        || resolution.tv_sec < 0 || resolution.tv_nsec < 0
+        || resolution.tv_nsec >= 1000000000L
+        || (resolution.tv_sec == 0 && resolution.tv_nsec == 0)) {
+        return 1;
+    }
+    if (clock_getres(CLOCK_MONOTONIC, NULL) != 0
+        || clock_getres(77, &resolution) != -GTRT_EINVAL
+        || clock_getres(CLOCK_MONOTONIC, (struct timespec *)1)
+               != -GTRT_EFAULT) {
+        return 2;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0
+        || clock_gettime(CLOCK_MONOTONIC, &end) != 0
+        || timespec_before(&end, &start) || start.tv_nsec < 0
+        || start.tv_nsec >= 1000000000L
+        || clock_gettime(77, &end) != -GTRT_EINVAL
+        || clock_gettime(CLOCK_MONOTONIC, (struct timespec *)1)
+               != -GTRT_EFAULT) {
+        return 3;
+    }
+
+    const struct timespec relative = {.tv_sec = 0, .tv_nsec = 2000000L};
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0
+        || clock_nanosleep(CLOCK_MONOTONIC, 0, &relative, NULL) != 0
+        || clock_gettime(CLOCK_MONOTONIC, &end) != 0) {
+        return 4;
+    }
+    struct timespec minimum = timespec_add_ns(start, relative.tv_nsec);
+    if (timespec_before(&end, &minimum)) {
+        return 5;
+    }
+
+    const struct timespec short_sleep = {.tv_sec = 0, .tv_nsec = 1000000L};
+    const struct timespec zero = {.tv_sec = 0, .tv_nsec = 0};
+    const struct timespec bad_nsec = {.tv_sec = 0, .tv_nsec = 1000000000L};
+    const struct timespec negative = {.tv_sec = -1, .tv_nsec = 0};
+    const struct timespec overflow = {
+        .tv_sec = 0x7fffffffffffffffL,
+        .tv_nsec = 0,
+    };
+    if (nanosleep(&short_sleep, NULL) != 0 || usleep(1500) != 0
+        || sleep(0) != 0
+        || clock_nanosleep(CLOCK_MONOTONIC, 0, &zero,
+                           (struct timespec *)1)
+               != 0
+        || clock_nanosleep(CLOCK_MONOTONIC, 2, &zero, NULL)
+               != -GTRT_EINVAL
+        || clock_nanosleep(CLOCK_MONOTONIC, 0, &bad_nsec, NULL)
+               != -GTRT_EINVAL
+        || clock_nanosleep(CLOCK_MONOTONIC, 0, &negative, NULL)
+               != -GTRT_EINVAL
+        || clock_nanosleep(CLOCK_MONOTONIC, 0, &overflow, NULL)
+               != -GTRT_EOVERFLOW
+        || clock_nanosleep(CLOCK_MONOTONIC, 0,
+                           (const struct timespec *)1, NULL)
+               != -GTRT_EFAULT) {
+        return 6;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        return 7;
+    }
+    struct timespec past = start;
+    if (past.tv_nsec > 0) {
+        past.tv_nsec--;
+    } else if (past.tv_sec > 0) {
+        past.tv_sec--;
+        past.tv_nsec = 999999999L;
+    }
+    if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &past, NULL) != 0) {
+        return 8;
+    }
+
+    struct timespec next = start;
+    for (int iteration = 0; iteration < 3; iteration++) {
+        next = timespec_add_ns(next, 2000000L);
+        if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL) != 0
+            || clock_gettime(CLOCK_MONOTONIC, &end) != 0
+            || timespec_before(&end, &next)) {
+            return 9;
+        }
+    }
+
+    pid_t child = fork();
+    if (child < 0) {
+        return 10;
+    }
+    if (child == 0) {
+        const struct timespec child_sleep = {
+            .tv_sec = 0,
+            .tv_nsec = 20000000L,
+        };
+        exit(nanosleep(&child_sleep, NULL) == 0 ? 0 : 1);
+    }
+    struct timespec progress_deadline = timespec_add_ns(end, 5000000L);
+    do {
+        if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+            return 11;
+        }
+    } while (timespec_before(&start, &progress_deadline));
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)
+        || WEXITSTATUS(status) != 0) {
+        return 12;
+    }
+
+    if (sleep(1) != 0) {
+        return 13;
+    }
+    return 0;
+}
+
 static int taskset_probe(int argc, char **argv) {
     if (argc != 4
         || !string_equal(argv[0], "/.__genrt_test__/bin/api-case")
@@ -261,6 +395,9 @@ int main(int argc, char **argv) {
     }
     if (string_equal(argv[1], "reboot-validation")) {
         return reboot_validation();
+    }
+    if (string_equal(argv[1], "time-api")) {
+        return time_api();
     }
     return 65;
 }
