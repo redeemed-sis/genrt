@@ -4,7 +4,9 @@ This directory contains the AArch64-specific freestanding C runtime pieces:
 
 - `crt0.S`: process entry stub;
 - `include/syscall.h`: raw syscall wrappers and AArch64 syscall numbers;
-- `include/sched.h`: process-affinity API and fixed userspace CPU sets.
+- `include/sched.h`: process-affinity API and fixed userspace CPU sets;
+- `include/time.h`: POSIX-like monotonic clock and nanosecond sleep APIs;
+- `include/unistd.h`: conventional second and microsecond sleep wrappers.
 
 ## `execve` initial stack
 
@@ -127,3 +129,26 @@ with `-EINVAL`; a returned architecture rejection is reported as `-ENOTSUP`,
 `-EPERM`, or `-EIO`. The ABI exposes no PSCI details. `/bin/reboot` and
 `/bin/poweroff` use only this wrapper. The current kernel has no credentials,
 so every process may request terminal power control.
+
+## Monotonic time and sleep
+
+`clock_gettime`, `clock_getres`, and `clock_nanosleep` use syscall numbers 14,
+15, and 16. `<time.h>` exposes only `CLOCK_MONOTONIC`; its epoch is unspecified,
+and all CPUs observe the same architecture counter domain. `struct timespec`
+uses signed 64-bit `time_t`/`long` fields and successful observations are
+normalized to `0 <= tv_nsec < 1000000000`.
+
+`clock_nanosleep` accepts relative mode or `TIMER_ABSTIME`. Both forms use the
+existing blocking owner-local deadline path and round counter conversion upward.
+Absolute timestamps must come from the same monotonic clock. Past and zero
+deadlines return immediately. `nanosleep` delegates to relative
+`clock_nanosleep`; `sleep` and `usleep` are userspace-only wrappers and add no
+kernel syscall.
+
+The freestanding runtime returns negative errno values directly instead of
+setting libc `errno`. Unsupported clocks, flags, or malformed timespec values
+return `-EINVAL`; invalid user pointers return `-EFAULT`; unrepresentable time
+conversion returns `-EOVERFLOW`. `clock_getres` accepts a null result pointer.
+The nullable `rem` argument is preserved but not written because genrt has no
+userspace signal interruption yet. `/bin/sleep` accepts one bounded decimal
+whole-second operand and uses the public `sleep()` wrapper.

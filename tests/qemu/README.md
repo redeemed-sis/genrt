@@ -24,11 +24,12 @@ stores complete evidence below `target/test-results/`.
   local timer deadlines without a polling quantum.
 - `userspace-contract`: production kernel plus test supervisor, exact
   production-program invocations, and production `taskset` argument, failure,
-  status propagation, and child-reaping checks.
+  status propagation, child-reaping, monotonic time, relative/absolute sleep,
+  and production `/bin/sleep` checks.
 - `smp-userspace-contract`: four-CPU production kernel plus a test supervisor
   covering one-shot fork placement, exact affinity masks, affinity preservation
-  across exec, remote process lifecycle, and production `taskset` placement on
-  a secondary CPU.
+  across exec, remote process lifecycle, production `taskset` placement, and
+  owner-local absolute sleep on a secondary CPU.
 - `shell-contract`: production kernel and shell plus test-only helpers and a
   host nonce challenge for UART input and command behavior.
 - `poweroff-contract`: executes production `/bin/poweroff`, arms

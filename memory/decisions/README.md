@@ -50,5 +50,6 @@ growth.
 | [0042](ADR-0042-smp-userspace-memory-and-fork-affinity.md) | SMP userspace memory and fork affinity | Accepted | Process/VM/scheduler/syscall ownership | [0040](ADR-0040-per-cpu-scheduler-activation.md) (CPU0-only userspace boundary) | - |
 | [0043](ADR-0043-process-affinity-query-abi.md) | Process affinity query ABI | Accepted | Process/syscall/userspace ABI | - | - |
 | [0044](ADR-0044-linux-compatible-reboot-power-control.md) | Linux-compatible reboot power control | Accepted | Syscall/userspace/AArch64 power control | - | - |
+| [0045](ADR-0045-posix-monotonic-time-and-sleep-abi.md) | POSIX monotonic time and sleep ABI | Accepted | Time/scheduler/syscall/userspace ABI | - | - |
 
 Use [`TEMPLATE.md`](TEMPLATE.md) for new decisions.

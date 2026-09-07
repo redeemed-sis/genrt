@@ -60,6 +60,12 @@ thread identity and per-slot sequence. Condition owners in time, IPC, process,
 or console code publish and later complete that token; the scheduler owns only
 wait lifecycle, runnable state, and ready-queue visibility.
 
+Userspace `clock_nanosleep` uses the same time-owned absolute counter deadlines.
+Its exact wait is consumed automatically when a blocked EL0 frame becomes
+runnable because syscall return resumes directly in userspace and has no
+kernel-stack continuation. Kernel sched-call waits and condition-owner waits
+retain explicit completion consumption.
+
 When a transition makes a thread runnable away from its immutable home CPU, it
 publishes the thread to that CPU's bounded `remote_ready` ingress and requests
 one coalesced architecture notification under the same scheduler lock. The
@@ -126,6 +132,12 @@ restart or power off to a narrow architecture hook. The path allocates nothing,
 acquires no locks, and is valid on any online CPU. A successful backend call is
 terminal; a returned rejection becomes a syscall errno. Until genrt gains
 credentials, this operation is intentionally available to every process.
+
+`SYS_CLOCK_GETTIME`, `SYS_CLOCK_GETRES`, and `SYS_CLOCK_NANOSLEEP` expose only
+`CLOCK_MONOTONIC`. Checked conversion keeps observations and absolute deadlines
+in the architecture counter domain, rounds sleep deadlines upward, and reports
+overflow instead of saturating. Relative and absolute sleeps block through the
+existing owner-local scheduler deadline path.
 
 For active capabilities and limitations, see
 [`memory/current-state.md`](../memory/current-state.md). Kernel changes must

@@ -121,6 +121,12 @@ scheduler facade to complete tokens, account quantum expiration, and perform
 IRQ-return handoff. No callback table, allocation, or queue growth occurs in
 the interrupt path.
 
+The same architecture counter backs userspace `CLOCK_MONOTONIC` observation,
+resolution, relative sleeps, and `TIMER_ABSTIME` deadlines. Checked conversion
+rounds requested deadlines upward, so successful sleeps cannot finish before
+their requested time. A sleeping userspace thread keeps its immutable home CPU
+and publishes its deadline only to that CPU's queue.
+
 Cross-CPU cancellation may remove an exact event without touching the remote
 physical timer; at worst the old deadline causes one harmless early interrupt.
 Prompt remote insertion remains rejected because the scheduler SGI is a
@@ -155,6 +161,12 @@ Completion before commit records the cause and leaves the caller running;
 completion after commit performs `Blocked -> Ready`. The first exact
 completion wins. Duplicate and stale generation/sequence completions cannot
 change cause or ready membership.
+
+Most waits retain `Completed` metadata until their owner consumes the winning
+cause. A userspace sleep has no kernel-stack continuation after wake and needs
+no interruption result yet, so its blocked completion atomically clears the
+metadata while making the thread ready. An early completion is still consumed
+during commit. This automatic mode carries no device-specific scheduler reason.
 
 Mailbox queues, thread/process lifecycle, console, and time retain their own
 payloads and cleanup policy. Scheduler wait metadata contains only exact token,

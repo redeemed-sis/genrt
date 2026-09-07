@@ -63,7 +63,11 @@ reset, preservation across bounded fork exhaustion, exact self and child
 affinity masks, affinity preservation across exec, remote exec, remote fault,
 cross-CPU wait/reap, and production `taskset` placement. The single-core
 `userspace-contract` checks `/init` on CPU0, invalid affinity arguments,
-`taskset` parsing and lifecycle failures, and exact product invocations.
+`taskset` parsing and lifecycle failures, and exact product invocations. It
+also verifies normalized monotonic observation and resolution, relative and
+absolute sleeps, conversion errors, peer progress, and `/bin/sleep` argument
+handling. The SMP suite executes an absolute sleep on CPU2 and checks that
+wakeup preserves affinity.
 
 Dynamic production-program checks are declared in
 `tests/qemu/program-contracts.toml`. xtask validates a one-to-one mapping to

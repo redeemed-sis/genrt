@@ -135,6 +135,9 @@ Changes that invalidate one require architecture review and an ADR.
   programs the timer; no time lock is retained across direct scheduler dispatch.
   Remote cancellation may leave an early interrupt, but cannot delay a remaining
   deadline. Remote insertion requires a future IPI command path.
+- Userspace `CLOCK_MONOTONIC` observation and absolute sleep use that same
+  coherent architecture counter domain. Conversion rounds deadlines upward and
+  rejects overflow; a sleeping thread remains on its immutable home CPU.
 - One local scheduler operation binds one stable `CpuId` through a
   `CpuScheduler` view. Target/home-CPU operations select their destination
   explicitly and must not silently substitute the executing CPU.
@@ -164,6 +167,10 @@ Changes that invalidate one require architecture review and an ADR.
 - A thread is scheduler-blocked exactly when its inline wait metadata is
   `Blocked`. `Prepared` belongs only to the current running thread; `Completed`
   retains one first-wins cause until exact consumption.
+- A blocked EL0 clock sleep is the sole automatic-consumption wait: completion
+  clears its metadata while publishing readiness because no signal result or
+  kernel-stack continuation remains to consume it. Early completion is still
+  consumed at commit.
 - Condition owners publish tokens before scheduler commit and claim them before
   completion. No mailbox, process, thread, console, or time-owner lock crosses
   scheduler commit/completion, and the scheduler never calls back into those
@@ -213,6 +220,9 @@ Changes that invalidate one require architecture review and an ADR.
 - Linux-shaped reboot validation precedes one allocation-free terminal power
   hook. PSCI and HVC remain architecture-owned; success never returns, and
   current policy permits requests from every process.
+- POSIX-like time ABI exposes only `CLOCK_MONOTONIC`; `sleep` and `usleep` are
+  userspace wrappers, and the nullable remaining-time ABI stays reserved until
+  userspace signal interruption exists.
 - Kernel code never directly trusts a user pointer; access goes through the
   bounded user-copy layer.
 - Lower-EL faults are isolated to the attributed process when process ownership

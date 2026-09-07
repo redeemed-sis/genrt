@@ -29,20 +29,25 @@ explicit acceptance criteria.
      CPU's existing per-CPU deadline queue;
    - define ASID and TLB-shootdown ownership before migration, shared userspace
      address spaces, or multiple user threads can span CPUs.
+5. **Userspace real-time measurement**
+   - build latency, jitter, and deadline-miss tooling from `CLOCK_MONOTONIC` and
+     absolute `clock_nanosleep` without adding test-only timing syscalls;
+   - define interruption and remaining-time semantics together with a future
+     userspace signal model.
 
 ## Boundary cleanup
 
-5. Evolve the current console-owned stdin ring and wait registration into TTY
+6. Evolve the current console-owned stdin ring and wait registration into TTY
    semantics without moving line discipline into the scheduler or changing fd
    semantics prematurely.
-6. Consolidate trap-frame initialization and remove interfaces no longer used by
+7. Consolidate trap-frame initialization and remove interfaces no longer used by
    the established EL1/EL0 restore model.
 
 ## Maintainability
 
-7. Audit cross-module helper duplication and move only genuinely generic
+8. Audit cross-module helper duplication and move only genuinely generic
    primitives to their owning layer.
-8. Make userspace program compilation scale beyond one command-shaped build
+9. Make userspace program compilation scale beyond one command-shaped build
    path while retaining `user/c/programs.toml` as product composition truth.
 
 Every hardening change needs focused regression evidence and must preserve the

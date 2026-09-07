@@ -34,6 +34,8 @@ a production-ready or latency-certified operating system.
   directory iteration, and UART-backed stdin.
 - Freestanding C shell and product programs declared by
   `user/c/programs.toml`.
+- POSIX-like monotonic clock observation and relative/absolute sleep APIs,
+  including `/bin/sleep`.
 - Linux-shaped system restart and power off through AArch64 PSCI.
 - Declarative QEMU contracts using a test-only machine protocol rather than
   human log matching.
@@ -55,7 +57,7 @@ cargo xtask run-aarch64
 
 The default image boots the production kernel and initramfs shell. QEMU uses
 the terminal as PL011 UART input; enter `ls`, `pwd`, `cat /etc/banner`,
-`echo hello`, `taskset 0 echo hello`, or `exit`. The terminal commands
+`echo hello`, `sleep 1`, `taskset 0 echo hello`, or `exit`. The terminal commands
 `reboot` resets the virtual machine and boots genrt again; `poweroff` exits
 QEMU through PSCI system control. Use `Ctrl-c` to stop QEMU.
 

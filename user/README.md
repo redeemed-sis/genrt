@@ -12,8 +12,8 @@ uses it for compilation, contract staging, release staging, identity checks, and
 coverage reporting.
 
 Current products are the shell and `/bin/echo`, `/bin/cat`, `/bin/ls`,
-`/bin/pwd`, `/bin/taskset`, `/bin/reboot`, and `/bin/poweroff`. Other example C
-files may be buildable without entering production composition.
+`/bin/pwd`, `/bin/taskset`, `/bin/sleep`, `/bin/reboot`, and `/bin/poweroff`.
+Other example C files may be buildable without entering production composition.
 
 `taskset <cpu> <program> [args...]` launches one new process on a decimal
 logical CPU. A program containing `/` is passed to `execve` unchanged;
@@ -56,6 +56,8 @@ does not set the userspace PC.
 - `<sched.h>` exposes fixed CPU sets and immutable process-affinity queries.
 - `<sys/reboot.h>` exposes Linux-compatible restart and power-off operations;
   the wrapper hides raw reboot magic values.
+- `<time.h>` and `<unistd.h>` expose monotonic clock observation, relative and
+  absolute sleeps, and conventional `sleep`/`usleep` wrappers.
 - Shell line editing and command policy are userspace responsibilities.
 
 Do not add libc assumptions or raw flat-binary loading paths. Syscall changes

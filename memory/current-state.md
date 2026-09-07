@@ -100,6 +100,10 @@ accepted ADRs remain authoritative when details differ.
   and assembly entry boundary. Context switching remains bounded and
   allocation-free.
 - The architected timer runs in per-CPU one-shot nearest-deadline mode.
+- The same architecture counter is the userspace `CLOCK_MONOTONIC` domain.
+  Checked nanosecond conversion provides normalized observation and resolution,
+  relative sleeps, and drift-free `TIMER_ABSTIME` deadlines without a second
+  time source.
 - `kernel::time` owns one preallocated, IRQ-safe deadline queue per logical
   CPU for exact wait deadlines and scheduler quantum expiration. Timed events
   carry their CPU owner; only that CPU inserts events and programs its physical
@@ -154,6 +158,9 @@ accepted ADRs remain authoritative when details differ.
   and complete exact tokens through one prepare/publish/commit protocol. They
   retain condition payload and cleanup ownership; the scheduler owns only wait
   lifecycle and runnable visibility.
+- Blocking userspace clock sleeps use automatic completion consumption because
+  EL0 resumes directly after `svc`; other waits retain explicit owner-side
+  completion consumption.
 
 ## Processes and userspace
 
@@ -190,8 +197,9 @@ accepted ADRs remain authoritative when details differ.
   current-EL kernel faults stay fatal.
 - The syscall ABI supports `open`, `read`, `write`, `close`, `getdents64`,
   `chdir`, `getcwd`, `fork`, `execve`, `waitpid`, `sched_setforkaffinity`,
-  `sched_getaffinity`, Linux-shaped `reboot`, and `exit` with negative errno
-  returns. Restart and power off cross an allocation-free generic power
+  `sched_getaffinity`, `clock_gettime`, `clock_getres`, `clock_nanosleep`,
+  Linux-shaped `reboot`, and `exit` with negative errno returns. Restart and
+  power off cross an allocation-free generic power
   boundary into AArch64 PSCI and are terminal on success; all processes may
   currently request them because credentials are not implemented.
 
@@ -202,8 +210,8 @@ accepted ADRs remain authoritative when details differ.
 - Processes have bounded FD tables, immutable ramfs cwd identities, relative
   path traversal, readonly files, and directory iteration.
 - `/init` is the freestanding shell. Product binaries are declared by
-  `user/c/programs.toml` and installed under `/bin`, including `reboot` and
-  `poweroff`.
+  `user/c/programs.toml` and installed under `/bin`, including `sleep`,
+  `reboot`, and `poweroff`.
 - PL011 RX interrupts feed a bounded kernel stdin ring. `read(0)` blocks and is
   restarted after input; line editing and command policy live in userspace.
   Stdin, mailbox, and process owner state use IRQ-safe SMP locks; completion
