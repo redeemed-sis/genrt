@@ -2,50 +2,25 @@
 
 #include "artifact_marker.h"
 #include "syscall.h"
+#include <unistd.h>
+#include <stdio.h>
 
 #define GTRT_PROTOCOL_BUFFER 256
 
 static unsigned long gtrt_sequence = 1;
 
-static inline size_t gtrt_append(char *out, size_t used, const char *text) {
-    while (*text != '\0' && used < GTRT_PROTOCOL_BUFFER) {
-        out[used++] = *text++;
-    }
-    return used;
-}
-
-static inline size_t gtrt_append_sequence(char *out, size_t used,
-                                          unsigned long sequence) {
-    unsigned long divisor = 100000;
-    while (divisor != 0 && used < GTRT_PROTOCOL_BUFFER) {
-        out[used++] = (char)('0' + ((sequence / divisor) % 10));
-        divisor /= 10;
-    }
-    return used;
-}
-
 static inline void gtrt_emit(const char *producer, const char *event,
                              const char *subject, const char *detail) {
     char record[GTRT_PROTOCOL_BUFFER];
-    size_t used = 0;
-    record[used++] = 0x1e;
-    used = gtrt_append(record, used, "GTRT/1|");
-    used = gtrt_append(record, used, producer);
-    used = gtrt_append(record, used, "|");
-    used = gtrt_append_sequence(record, used, gtrt_sequence++);
-    used = gtrt_append(record, used, "|");
-    used = gtrt_append(record, used, event);
-    used = gtrt_append(record, used, "|");
-    used = gtrt_append(record, used, subject);
-    if (detail != NULL) {
-        used = gtrt_append(record, used, "|");
-        used = gtrt_append(record, used, detail);
-    }
-    if (used >= GTRT_PROTOCOL_BUFFER) {
+    if (gtrt_sequence > 999999) {
         exit(125);
     }
-    record[used++] = '\n';
-    if (write(1, record, used) != (ssize_t)used) {
+    int used = snprintf(record, sizeof(record), "\036GTRT/1|%s|%06lu|%s|%s%s%s\n",
+                        producer, gtrt_sequence++, event, subject,
+                        detail != NULL ? "|" : "", detail != NULL ? detail : "");
+    // Keep protocol records whole; fd formatting may split long messages.
+    if (used < 0 || (size_t)used >= sizeof(record)
+        || write(STDOUT_FILENO, record, (size_t)used) != (ssize_t)used) {
         exit(125);
     }
 }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sys/types.h>
+
 #ifndef NULL
 #define NULL ((void *)0)
 #endif
@@ -24,11 +26,6 @@
 
 #define GENRT_PATH_MAX 4096
 #define PATH_MAX GENRT_PATH_MAX
-
-typedef long ssize_t;
-typedef unsigned long size_t;
-typedef unsigned int mode_t;
-typedef int pid_t;
 
 #define O_RDONLY 0
 #define O_WRONLY 1
@@ -114,10 +111,6 @@ static inline int genrt_open3(const char *pathname, int flags, mode_t mode) {
 
 static inline ssize_t read(int fd, void *buf, size_t count) {
     return genrt_syscall3(SYS_READ, fd, (long)buf, (long)count);
-}
-
-static inline ssize_t write(int fd, const void *buf, size_t len) {
-    return genrt_syscall3(SYS_WRITE, fd, (long)buf, (long)len);
 }
 
 static inline int close(int fd) {

@@ -1,16 +1,15 @@
 #include "syscall.h"
+#include <unistd.h>
+#include <stdio.h>
+#include <string.h>
 
 #define LS_BUF_SIZE 512
 #define DIRENT64_HEADER_SIZE 19
 
-static void write_lit(const char *s, size_t len) {
-    write(1, s, len);
-}
-
 static int list_path(const char *path) {
     int fd = open(path, O_RDONLY | O_DIRECTORY);
     if (fd < 0) {
-        write_lit("ls: cannot open\n", 16);
+        printf("ls: cannot open\n");
         return 1;
     }
 
@@ -18,7 +17,7 @@ static int list_path(const char *path) {
     for (;;) {
         long n = getdents64(fd, buf, sizeof(buf));
         if (n < 0) {
-            write_lit("ls: cannot read\n", 16);
+            printf("ls: cannot read\n");
             close(fd);
             return 1;
         }
@@ -32,18 +31,15 @@ static int list_path(const char *path) {
             struct genrt_dirent64 *entry = (struct genrt_dirent64 *)(buf + offset);
             if (entry->d_reclen < DIRENT64_HEADER_SIZE ||
                 offset + entry->d_reclen > (size_t)n) {
-                write_lit("ls: bad dirent\n", 15);
+                printf("ls: bad dirent\n");
                 close(fd);
                 return 1;
             }
 
-            size_t name_len = 0;
-            while (name_len + DIRENT64_HEADER_SIZE < entry->d_reclen &&
-                   entry->d_name[name_len] != '\0') {
-                name_len++;
-            }
-            write(1, entry->d_name, name_len);
-            write_lit("\n", 1);
+            size_t name_len = strnlen(entry->d_name,
+                                      entry->d_reclen - DIRENT64_HEADER_SIZE);
+            write(STDOUT_FILENO, entry->d_name, name_len);
+            printf("\n");
             offset += entry->d_reclen;
         }
     }

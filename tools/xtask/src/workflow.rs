@@ -1,7 +1,9 @@
 use std::{
+    collections::BTreeSet,
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::{Mutex, OnceLock},
 };
 
 use anyhow::{Context, Result, bail};
@@ -15,6 +17,10 @@ use crate::{
 const AARCH64_INITRAMFS_IMAGE_MAX_SIZE: u64 = 4 * 1024 * 1024;
 const AARCH64_USER_CRT0: &str = "user/c/aarch64/crt0.S";
 const AARCH64_USER_INCLUDE_DIR: &str = "user/c/aarch64/include";
+const USER_COMMON_INCLUDE_DIR: &str = "user/c/include";
+const USER_SUPPORT_SOURCES: [&str; 6] = ["string", "stdio", "getopt", "parse", "unistd", "write"];
+// Host tests omit syscall-backed modules and interpose write at link time.
+const USER_SUPPORT_HOST_TEST_SOURCES: [&str; 4] = ["string", "stdio", "getopt", "parse"];
 const DEFAULT_INITRAMFS_ROOT: &str = "user/initramfs";
 
 /// Dispatch one parsed xtask command.
@@ -129,6 +135,7 @@ fn doctor() -> Result<()> {
         "fdtput",
         "clang",
         "ld.lld",
+        "llvm-ar",
         "llvm-objdump",
         "readelf",
     ];
@@ -207,6 +214,7 @@ pub(crate) fn check() -> Result<()> {
         "xtask clippy",
     )?;
 
+    check_user_support()?;
     let artifacts = build_aarch64(Profile::Debug, Some(LogLevel::Info), &[])?;
     crate::artifacts::verify_production_kernel(&artifacts.kernel_elf())?;
     let users = build_all_production_user_programs(Profile::Debug, true)?;
@@ -218,6 +226,38 @@ pub(crate) fn check() -> Result<()> {
 fn ci() -> Result<()> {
     check()?;
     crate::test::run(crate::test::Options::ci_default())
+}
+
+fn check_user_support() -> Result<()> {
+    let directory = Path::new("target/user-support-host");
+    fs::create_dir_all(directory)?;
+    let executable = directory.join("support-test");
+    let mut compiler = Command::new("clang");
+    compiler.args([
+        "-std=c11",
+        "-ffreestanding",
+        "-fno-builtin",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-Wl,--wrap=write",
+        "-I",
+        USER_COMMON_INCLUDE_DIR,
+        "tests/user/support.c",
+    ]);
+    for name in USER_SUPPORT_HOST_TEST_SOURCES {
+        compiler.arg(format!("user/c/common/{name}.c"));
+    }
+    run_checked(
+        compiler.arg("-o").arg(&executable),
+        "userspace support host build",
+    )?;
+    run_checked(
+        &mut Command::new(executable),
+        "userspace support host tests",
+    )?;
+    println!("userspace support host tests passed");
+    Ok(())
 }
 
 fn repo_tree() -> Result<()> {
@@ -967,6 +1007,7 @@ fn build_aarch64_user_elf(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("user ELF path has no parent: {}", elf.display()))?;
     fs::create_dir_all(parent).context("failed to create user ELF output directory")?;
+    let support = build_user_support(parent)?;
 
     let crt_obj = parent.join(format!("{name}.crt0.o"));
     let obj = parent.join(format!("{name}.o"));
@@ -1037,6 +1078,7 @@ fn build_aarch64_user_elf(
         .arg(&elf)
         .arg(&crt_obj)
         .arg(&obj)
+        .arg(&support)
         .status()
         .with_context(|| format!("failed to invoke ld.lld for AArch64 user program {name}"))?;
     if !status.success() {
@@ -1077,7 +1119,47 @@ fn validate_initramfs_payload(path: &Path) -> Result<u64> {
     Ok(size)
 }
 
-fn aarch64_user_compile_args() -> [&'static str; 13] {
+// Rebuild once per output directory in each xtask invocation, never reuse an
+// on-disk archive from an earlier invocation with potentially stale inputs.
+fn build_user_support(parent: &Path) -> Result<PathBuf> {
+    static BUILT: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+    let mut built = BUILT.get_or_init(Mutex::default).lock().unwrap();
+    let directory = parent.join("support");
+    let archive = directory.join("libgenrt.a");
+    if built.contains(parent) {
+        return Ok(archive);
+    }
+    fs::create_dir_all(&directory)?;
+    let mut objects = Vec::new();
+    for name in USER_SUPPORT_SOURCES {
+        let source = PathBuf::from(format!("user/c/common/{name}.c"));
+        let object = directory.join(format!("{name}.o"));
+        run_checked(
+            Command::new("clang")
+                .args(aarch64_user_compile_args())
+                .args(["-Werror", "-c"])
+                .arg(source)
+                .arg("-o")
+                .arg(&object),
+            "userspace support compilation",
+        )?;
+        objects.push(object);
+    }
+    if archive.exists() {
+        fs::remove_file(&archive)?;
+    }
+    run_checked(
+        Command::new("llvm-ar")
+            .arg("rcsD")
+            .arg(&archive)
+            .args(objects),
+        "userspace support archive",
+    )?;
+    built.insert(parent.to_path_buf());
+    Ok(archive)
+}
+
+fn aarch64_user_compile_args() -> [&'static str; 15] {
     [
         "--target=aarch64-none-elf",
         "-ffreestanding",
@@ -1090,6 +1172,8 @@ fn aarch64_user_compile_args() -> [&'static str; 13] {
         "-nostdlib",
         "-I",
         AARCH64_USER_INCLUDE_DIR,
+        "-I",
+        USER_COMMON_INCLUDE_DIR,
         "-Wall",
         "-Wextra",
     ]

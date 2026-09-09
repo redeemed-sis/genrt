@@ -1,8 +1,7 @@
 #include "syscall.h"
+#include <unistd.h>
 
-static void write_lit(const char *s, size_t len) {
-    write(1, s, len);
-}
+#include <stdio.h>
 
 static int copy_fd_to_stdout(int fd) {
     char buf[128];
@@ -10,13 +9,13 @@ static int copy_fd_to_stdout(int fd) {
     for (;;) {
         ssize_t n = read(fd, buf, sizeof(buf));
         if (n < 0) {
-            write_lit("cat: read failed\n", 17);
+            printf("cat: read failed\n");
             return 1;
         }
         if (n == 0) {
             return 0;
         }
-        if (write(1, buf, (size_t)n) < 0) {
+        if (write(STDOUT_FILENO, buf, (size_t)n) < 0) {
             return 1;
         }
     }
@@ -24,14 +23,14 @@ static int copy_fd_to_stdout(int fd) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        return copy_fd_to_stdout(0);
+        return copy_fd_to_stdout(STDIN_FILENO);
     }
 
     int failed = 0;
     for (int i = 1; i < argc; i++) {
         int fd = open(argv[i], O_RDONLY);
         if (fd < 0) {
-            write_lit("cat: cannot open\n", 17);
+            printf("cat: cannot open\n");
             failed = 1;
             continue;
         }

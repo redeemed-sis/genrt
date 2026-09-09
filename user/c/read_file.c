@@ -1,9 +1,11 @@
 #include "syscall.h"
+#include <unistd.h>
+#include <stdio.h>
 
 int main(void) {
     int fd = open("/hello.txt", O_RDONLY);
     if (fd < 0) {
-        write(1, "open failed\n", 12);
+        printf("open failed\n");
         return 1;
     }
 
@@ -11,14 +13,14 @@ int main(void) {
     for (;;) {
         ssize_t n = read(fd, buf, sizeof(buf));
         if (n < 0) {
-            write(1, "read failed\n", 12);
+            printf("read failed\n");
             close(fd);
             return 2;
         }
         if (n == 0) {
             break;
         }
-        write(1, buf, (size_t)n);
+        write(STDOUT_FILENO, buf, (size_t)n);
     }
 
     close(fd);

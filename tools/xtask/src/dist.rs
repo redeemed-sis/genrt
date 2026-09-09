@@ -33,6 +33,7 @@ struct Manifest {
     cargo_version: String,
     qemu_version: String,
     clang_version: String,
+    llvm_ar_version: String,
     lld_version: String,
     files: Vec<ManifestFile>,
 }
@@ -326,6 +327,7 @@ fn package(
         cargo_version: command_line(Command::new("cargo").arg("--version"))?,
         qemu_version: command_first_line(Command::new("qemu-system-aarch64").arg("--version"))?,
         clang_version: command_first_line(Command::new("clang").arg("--version"))?,
+        llvm_ar_version: command_first_line(Command::new("llvm-ar").arg("--version"))?,
         lld_version: command_first_line(Command::new("ld.lld").arg("--version"))?,
         files: files
             .iter()
@@ -454,6 +456,7 @@ mod tests {
             cargo_version: "cargo".to_owned(),
             qemu_version: "qemu".to_owned(),
             clang_version: "clang".to_owned(),
+            llvm_ar_version: "llvm-ar".to_owned(),
             lld_version: "lld".to_owned(),
             files: vec![ManifestFile {
                 path: "LICENSE".to_owned(),
@@ -463,6 +466,7 @@ mod tests {
         let json = serde_json::to_string(&manifest).unwrap();
         assert!(json.contains("\"tag\":\"v1.0.0\""));
         assert!(json.contains("\"path\":\"LICENSE\""));
+        assert!(json.contains("\"llvm_ar_version\":\"llvm-ar\""));
         assert_eq!(
             format!("{}  {}\n", "00", "archive.tar.gz"),
             "00  archive.tar.gz\n"
