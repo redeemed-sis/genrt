@@ -1,8 +1,9 @@
 # Freestanding userspace
 
 genrt userspace consists of statically linked freestanding AArch64 C programs.
-There is no libc, dynamic linker, TLS runtime, ELF interpreter, or hosted process
-startup environment.
+Programs share a small freestanding support library, not a full libc. There is
+no dynamic linker, TLS runtime, ELF interpreter, or hosted process startup
+environment.
 
 ## Product programs
 
@@ -37,8 +38,17 @@ with static `PT_LOAD` segments. `user/c/aarch64/crt0.S` reads the kernel-built
 initial stack, calls `main(argc, argv)`, and exits through the syscall ABI.
 
 The initial stack and syscall conventions are documented in
-[`user/c/aarch64/README.md`](c/aarch64/README.md). AArch64 wrappers and syscall
-numbers stay under `user/c/aarch64/include/`.
+[`user/c/aarch64/README.md`](c/aarch64/README.md). Raw syscall transport and
+numbers stay in `user/c/aarch64/include/syscall.h`. Public headers, including
+`sched.h`, `time.h`, `unistd.h`, and `sys/reboot.h`, live in `user/c/include/`
+and use the architecture adapter through the configured include paths.
+
+Common [string/memory, formatting, and parsing code](c/common/README.md) is
+statically linked into every production, example, and QEMU userspace ELF.
+Products and tests use the same implementations; protocol emitters remain
+test-only. See [ADR-0046](../memory/decisions/ADR-0046-shared-freestanding-userspace-library.md)
+for the library and architecture boundary. Existing build commands require no
+per-program library configuration.
 
 ## Initramfs
 

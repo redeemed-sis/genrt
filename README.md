@@ -118,7 +118,7 @@ and [docs/releases.md](docs/releases.md).
 | `arch/aarch64/` | AArch64 boot, MMU, exceptions, IRQ, timer, GIC, and UART |
 | `kernel/` | Architecture-neutral kernel policy and mechanisms |
 | `crates/bootinfo/` | Early boot handoff types |
-| `user/` | Freestanding userspace and initramfs product data |
+| `user/` | Freestanding programs, shared support library, and initramfs data |
 | `tools/xtask/` | Canonical build, QEMU, test, and release workflows |
 | `tests/qemu/` | QEMU system contracts and test-only fixtures |
 | `memory/` | Current state, durable invariants, and ADRs |

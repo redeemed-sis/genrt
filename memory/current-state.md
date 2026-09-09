@@ -164,6 +164,11 @@ accepted ADRs remain authoritative when details differ.
 
 ## Processes and userspace
 
+- All userspace ELF programs statically link the common freestanding support
+  library. Generic string/memory, integer formatting, short-option parsing,
+  and checked decimal conversion are shared by products and tests; the write
+  syscall adapter remains architecture-owned. This adds no kernel syscall,
+  heap runtime, TLS, file streams, or dynamic linker.
 - The bounded process table owns process state, TTBR0 address spaces, loaded
   ELF segments, cwd, file descriptors, relationships, exit/fault status, and
   `main_thread: ThreadId`.

@@ -25,7 +25,7 @@ stores complete evidence below `target/test-results/`.
 - `userspace-contract`: production kernel plus test supervisor, exact
   production-program invocations, and production `taskset` argument, failure,
   status propagation, child-reaping, monotonic time, relative/absolute sleep,
-  and production `/bin/sleep` checks.
+  production `/bin/sleep`, and shared support-library boundary checks.
 - `smp-userspace-contract`: four-CPU production kernel plus a test supervisor
   covering one-shot fork placement, exact affinity masks, affinity preservation
   across exec, remote process lifecycle, production `taskset` placement, and

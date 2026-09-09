@@ -214,6 +214,9 @@ Changes that invalidate one require architecture review and an ADR.
 
 ## Userspace and ABI
 
+- Shared freestanding userspace code stays separate from architecture syscall
+  adapters and from test protocol implementation. Static library linkage adds
+  no hosted runtime or implicit heap/TLS dependency.
 - EL1 sched calls and EL0 syscalls are distinct ABIs even when both use `svc`.
 - Syscall ABI changes require an ADR, userspace header changes, and contract
   tests using the exact production executable.

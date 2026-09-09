@@ -24,6 +24,8 @@ AArch64 artifacts live below
 
 - `genrt-aarch64.elf` and QEMU `virt` DTB;
 - freestanding userspace ELF files declared by `user/c/programs.toml`;
+- a deterministic static userspace support archive built with `llvm-ar` and
+  linked by the common production/example/test ELF build path;
 - deterministic production and contract initramfs archives plus manifests;
 - QEMU result logs below `target/test-results/`;
 - verified release bundles in the requested output directory.
@@ -31,6 +33,16 @@ AArch64 artifacts live below
 Product source paths are canonicalized and must stay below `user/c`. Production
 program identity, install path, contract role, and exact invocation coverage are
 manifest-driven.
+
+The support archive is built from production userspace sources, without test
+defines, marker includes, or generated invocation headers. Test programs receive
+their own marker at compilation, outside the archive. Release identity checks
+cover the resulting statically linked program bytes.
+
+The host support test links portable library modules with `--wrap=write` to
+inject output behavior. Guest builds instead link the common public `write()`
+wrapper using architecture syscall transport and the sleep wrappers; test linker
+options never enter production ELF builds.
 
 ## QEMU configuration
 

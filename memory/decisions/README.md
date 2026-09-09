@@ -51,5 +51,6 @@ growth.
 | [0043](ADR-0043-process-affinity-query-abi.md) | Process affinity query ABI | Accepted | Process/syscall/userspace ABI | - | - |
 | [0044](ADR-0044-linux-compatible-reboot-power-control.md) | Linux-compatible reboot power control | Accepted | Syscall/userspace/AArch64 power control | - | - |
 | [0045](ADR-0045-posix-monotonic-time-and-sleep-abi.md) | POSIX monotonic time and sleep ABI | Accepted | Time/scheduler/syscall/userspace ABI | - | - |
+| [0046](ADR-0046-shared-freestanding-userspace-library.md) | Shared freestanding userspace support library | Accepted | Userspace/library/build ownership | - | - |
 
 Use [`TEMPLATE.md`](TEMPLATE.md) for new decisions.

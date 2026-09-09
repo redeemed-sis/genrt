@@ -69,6 +69,13 @@ absolute sleeps, conversion errors, peer progress, and `/bin/sleep` argument
 handling. The SMP suite executes an absolute sleep on CPU2 and checks that
 wakeup preserves affinity.
 
+The `support-library` API case exercises the shared freestanding string/memory,
+formatting, option parsing, and decimal conversion interfaces in a child ELF.
+The supervisor accepts its result only after wait/reap. Host checks also inject
+short, zero-progress, and failed writes to test output behavior independently
+of UART timing. Protocol formatting uses the shared implementation, but the
+protocol and markers themselves are never part of the production archive.
+
 Dynamic production-program checks are declared in
 `tests/qemu/program-contracts.toml`. xtask validates a one-to-one mapping to
 `user/c/programs.toml` and generates the exact case/path/argv/exit table

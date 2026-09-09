@@ -54,6 +54,9 @@ build-essential git qemu-system-arm device-tree-compiler clang lld llvm
 binutils ca-certificates
 ```
 
+The LLVM packages provide `llvm-ar`, used to build the deterministic static
+userspace support archive, as well as the existing LLVM inspection tools.
+
 It likewise adds `rustup` only when needed. If `universe` is unavailable after
 the initial update, the backend announces this, installs
 `software-properties-common` from main, runs `add-apt-repository universe`,

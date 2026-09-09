@@ -3,10 +3,17 @@
 This directory contains the AArch64-specific freestanding C runtime pieces:
 
 - `crt0.S`: process entry stub;
-- `include/syscall.h`: raw syscall wrappers and AArch64 syscall numbers;
-- `include/sched.h`: process-affinity API and fixed userspace CPU sets;
-- `include/time.h`: POSIX-like monotonic clock and nanosecond sleep APIs;
-- `include/unistd.h`: conventional second and microsecond sleep wrappers.
+- `include/syscall.h`: raw syscall wrappers and AArch64 syscall numbers.
+
+Architecture-neutral [support APIs](../common/README.md) live in
+`../include/` and `../common/`. xtask supplies both include directories and
+statically links the common archive; architecture wrappers keep ownership of
+the syscall ABI.
+
+The public `sched.h`, `time.h`, `unistd.h`, and `sys/reboot.h` headers live in
+`../include/`. They define architecture-neutral interfaces. `unistd.h` contains
+declarations only; other inline syscall wrappers delegate transport to
+`syscall.h`, selected through the architecture include path.
 
 ## `execve` initial stack
 
