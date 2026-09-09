@@ -3,6 +3,7 @@
 #include "syscall.h"
 #include <time.h>
 #include <unistd.h>
+#include "support_case.h"
 
 #define DIRENT64_HEADER_SIZE 19
 #define TASKSET_LARGE_ARG_BYTES 62000
@@ -10,25 +11,7 @@
 #define LINUX_REBOOT_MAGIC2 672274793
 #define LINUX_REBOOT_CMD_RESTART 0x01234567
 
-static int string_equal(const char *lhs, const char *rhs) {
-    size_t index = 0;
-    while (lhs[index] != '\0' && rhs[index] != '\0') {
-        if (lhs[index] != rhs[index]) {
-            return 0;
-        }
-        index++;
-    }
-    return lhs[index] == rhs[index];
-}
-
-static int bytes_equal(const char *lhs, const char *rhs, size_t len) {
-    for (size_t index = 0; index < len; index++) {
-        if (lhs[index] != rhs[index]) {
-            return 0;
-        }
-    }
-    return 1;
-}
+#include <string.h>
 
 static int file_io(void) {
     static const char expected[] = "fixture-content-41\n";
@@ -39,7 +22,7 @@ static int file_io(void) {
     }
     ssize_t count = read(fd, data, sizeof(data));
     if (count != (ssize_t)(sizeof(expected) - 1)
-        || !bytes_equal(data, expected, sizeof(expected) - 1)) {
+        || memcmp(data, expected, sizeof(expected) - 1) != 0) {
         return 2;
     }
     if (read(fd, data, sizeof(data)) != 0 || close(fd) != 0) {
@@ -71,9 +54,9 @@ static int directory_io(void) {
                 || offset + entry->d_reclen > (size_t)count) {
                 return 3;
             }
-            unsigned bit = string_equal(entry->d_name, "a")
+            unsigned bit = (strcmp(entry->d_name, "a") == 0)
                                ? 1u
-                               : (string_equal(entry->d_name, "b") ? 2u : 0u);
+                               : ((strcmp(entry->d_name, "b") == 0) ? 2u : 0u);
             if (bit == 0 || (found & bit) != 0) {
                 return 4;
             }
@@ -89,7 +72,7 @@ static int cwd_paths(void) {
     char cwd[64];
     if (chdir("/.__genrt_test__/fixtures/directory") != 0
         || getcwd(cwd, sizeof(cwd)) == NULL
-        || !string_equal(cwd, "/.__genrt_test__/fixtures/directory")) {
+        || (strcmp(cwd, "/.__genrt_test__/fixtures/directory") != 0)) {
         return 1;
     }
     int fd = open("a", O_RDONLY);
@@ -341,9 +324,9 @@ static int time_api(void) {
 
 static int taskset_probe(int argc, char **argv) {
     if (argc != 4
-        || !string_equal(argv[0], "/.__genrt_test__/bin/api-case")
-        || !string_equal(argv[2], "alpha")
-        || !string_equal(argv[3], "beta")) {
+        || (strcmp(argv[0], "/.__genrt_test__/bin/api-case") != 0)
+        || (strcmp(argv[2], "alpha") != 0)
+        || (strcmp(argv[3], "beta") != 0)) {
         return 1;
     }
     return gtrt_affinity_is_only(0, 0) ? 0 : 2;
@@ -351,7 +334,7 @@ static int taskset_probe(int argc, char **argv) {
 
 static int taskset_large_probe(int argc, char **argv) {
     if (argc != 3
-        || !string_equal(argv[0], "/.__genrt_test__/bin/api-case")) {
+        || (strcmp(argv[0], "/.__genrt_test__/bin/api-case") != 0)) {
         return 1;
     }
     for (size_t index = 0; index < TASKSET_LARGE_ARG_BYTES; index++) {
@@ -366,37 +349,42 @@ static int taskset_large_probe(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
-    if (argc >= 2 && string_equal(argv[1], "taskset-probe")) {
+    if (argc >= 2 && (strcmp(argv[1], "taskset-probe") == 0)) {
         return taskset_probe(argc, argv);
     }
-    if (argc >= 2 && string_equal(argv[1], "taskset-large-probe")) {
+    if (argc >= 2 && (strcmp(argv[1], "taskset-large-probe") == 0)) {
         return taskset_large_probe(argc, argv);
     }
     if (argc != 2) {
         return 64;
     }
-    if (string_equal(argv[1], "file-io")) {
+    if (strcmp(argv[1], "support-library") == 0) {
+        int line = support_library();
+        if (line != 0) dprintf(STDERR_FILENO, "support library failed at line %d\n", line);
+        return line != 0;
+    }
+    if ((strcmp(argv[1], "file-io") == 0)) {
         return file_io();
     }
-    if (string_equal(argv[1], "directory-io")) {
+    if ((strcmp(argv[1], "directory-io") == 0)) {
         return directory_io();
     }
-    if (string_equal(argv[1], "cwd-paths")) {
+    if ((strcmp(argv[1], "cwd-paths") == 0)) {
         return cwd_paths();
     }
-    if (string_equal(argv[1], "process-control")) {
+    if ((strcmp(argv[1], "process-control") == 0)) {
         return process_control();
     }
-    if (string_equal(argv[1], "fork-affinity-validation")) {
+    if ((strcmp(argv[1], "fork-affinity-validation") == 0)) {
         return fork_affinity_validation();
     }
-    if (string_equal(argv[1], "process-affinity-validation")) {
+    if ((strcmp(argv[1], "process-affinity-validation") == 0)) {
         return process_affinity_validation();
     }
-    if (string_equal(argv[1], "reboot-validation")) {
+    if ((strcmp(argv[1], "reboot-validation") == 0)) {
         return reboot_validation();
     }
-    if (string_equal(argv[1], "time-api")) {
+    if ((strcmp(argv[1], "time-api") == 0)) {
         return time_api();
     }
     return 65;

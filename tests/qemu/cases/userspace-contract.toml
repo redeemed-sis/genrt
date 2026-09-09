@@ -15,6 +15,11 @@ subject = "init-affinity"
 [[steps]]
 action = "expect_case"
 producer = "api-supervisor"
+subject = "support-library"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
 subject = "file-io"
 
 [[steps]]

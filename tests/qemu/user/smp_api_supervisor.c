@@ -21,16 +21,7 @@ static pid_t fork_exit_child(size_t expected_cpu) {
     return child;
 }
 
-static int string_equal(const char *lhs, const char *rhs) {
-    size_t index = 0;
-    while (lhs[index] != '\0' && rhs[index] != '\0') {
-        if (lhs[index] != rhs[index]) {
-            return 0;
-        }
-        index++;
-    }
-    return lhs[index] == rhs[index];
-}
+#include <string.h>
 
 static int timespec_before(const struct timespec *lhs,
                            const struct timespec *rhs) {
@@ -280,13 +271,13 @@ static void secondary_monotonic_sleep(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc == 5 && string_equal(argv[0], "/init")
-        && string_equal(argv[1], "--taskset-probe")
-        && string_equal(argv[2], "1") && string_equal(argv[3], "alpha")
-        && string_equal(argv[4], "beta")) {
+    if (argc == 5 && (strcmp(argv[0], "/init") == 0)
+        && (strcmp(argv[1], "--taskset-probe") == 0)
+        && (strcmp(argv[2], "1") == 0) && (strcmp(argv[3], "alpha") == 0)
+        && (strcmp(argv[4], "beta") == 0)) {
         return gtrt_affinity_is_only(0, 1) ? 0 : 73;
     }
-    if (argc == 3 && string_equal(argv[1], "--affinity-probe")) {
+    if (argc == 3 && (strcmp(argv[1], "--affinity-probe") == 0)) {
         if (argv[2][0] < '0' || argv[2][0] > '3' || argv[2][1] != '\0') {
             return 71;
         }

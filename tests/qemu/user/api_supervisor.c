@@ -1,6 +1,7 @@
 #include "affinity.h"
 #include "protocol.h"
 #include "product_contracts.h"
+#include <string.h>
 
 #define TASKSET_LARGE_ARG_BYTES 62000
 
@@ -91,9 +92,7 @@ static void taskset_cli_validation(void) {
         gtrt_fail(producer, name, "RESULT");
     }
 
-    for (size_t index = 0; index < TASKSET_LARGE_ARG_BYTES; index++) {
-        taskset_large_arg[index] = 'x';
-    }
+    memset(taskset_large_arg, 'x', TASKSET_LARGE_ARG_BYTES);
     taskset_large_arg[TASKSET_LARGE_ARG_BYTES] = '\0';
     if (!exec_and_wait("/bin/taskset", large_argv, 0)) {
         gtrt_fail(producer, name, "LARGE_ARGV");
@@ -136,6 +135,7 @@ static void sleep_cli_validation(void) {
 int main(void) {
     gtrt_ready(producer, "userspace-contract");
     init_affinity();
+    run_case("support-library");
     run_case("file-io");
     run_case("directory-io");
     run_case("cwd-paths");

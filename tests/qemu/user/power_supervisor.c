@@ -20,7 +20,7 @@ static int await_host_trigger(void) {
     char input[3];
     size_t used = 0;
     while (used < sizeof(input)) {
-        ssize_t count = read(0, &input[used], 1);
+        ssize_t count = read(STDIN_FILENO, &input[used], 1);
         if (count != 1) {
             return 0;
         }
