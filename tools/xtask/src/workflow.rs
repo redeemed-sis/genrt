@@ -231,7 +231,15 @@ fn ci() -> Result<()> {
 fn check_user_support() -> Result<()> {
     let directory = Path::new("target/user-support-host");
     fs::create_dir_all(directory)?;
-    let executable = directory.join("support-test");
+    for (name, wrap_write) in [("support", true), ("shell_input", false)] {
+        check_user_host_program(directory, name, wrap_write)?;
+    }
+    println!("userspace support and shell input host tests passed");
+    Ok(())
+}
+
+fn check_user_host_program(directory: &Path, name: &str, wrap_write: bool) -> Result<()> {
+    let executable = directory.join(format!("{name}-test"));
     let mut compiler = Command::new("clang");
     compiler.args([
         "-std=c11",
@@ -240,11 +248,13 @@ fn check_user_support() -> Result<()> {
         "-Wall",
         "-Wextra",
         "-Werror",
-        "-Wl,--wrap=write",
         "-I",
         USER_COMMON_INCLUDE_DIR,
-        "tests/user/support.c",
     ]);
+    if wrap_write {
+        compiler.arg("-Wl,--wrap=write");
+    }
+    compiler.arg(format!("tests/user/{name}.c"));
     for name in USER_SUPPORT_HOST_TEST_SOURCES {
         compiler.arg(format!("user/c/common/{name}.c"));
     }
@@ -256,7 +266,6 @@ fn check_user_support() -> Result<()> {
         &mut Command::new(executable),
         "userspace support host tests",
     )?;
-    println!("userspace support host tests passed");
     Ok(())
 }
 
