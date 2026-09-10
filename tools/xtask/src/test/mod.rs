@@ -316,8 +316,25 @@ fn prepare_test_initramfs(
             let test_dir = test_namespace.join("bin");
             fs::create_dir_all(&test_dir)?;
             let probe = workflow::build_user_program(profile, "test_shell_probe", true)?;
-            fs::copy(probe, test_dir.join("p"))?;
+            fs::copy(&probe, test_dir.join("p"))?;
             workflow::stage_contract_programs(&root, "shell", users)?;
+            // Only this controlled test image adds /bin completion fixtures.
+            // Exact provenance keeps these aliases out of production archives.
+            for name in ["gtrt-one", "gtrt-pair-a", "gtrt-pair-b", "cd"] {
+                fs::copy(&probe, root.join("bin").join(name))?;
+                provenance.mark_prefix(
+                    &format!("bin/{name}"),
+                    crate::initramfs::Origin::TestFixture,
+                )?;
+            }
+            fs::create_dir_all(root.join("bin/gtrt-other"))?;
+            fs::copy(
+                test_namespace.join("fixtures/known-content"),
+                root.join("bin/gtrt-object"),
+            )?;
+            for path in ["bin/gtrt-other", "bin/gtrt-object"] {
+                provenance.mark_prefix(path, crate::initramfs::Origin::TestFixture)?;
+            }
             provenance.mark_prefix("init", crate::initramfs::Origin::TestSupervisor)?;
             workflow::build_user_program(profile, "test_shell_supervisor", true)?
         }

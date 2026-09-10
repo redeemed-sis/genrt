@@ -7,6 +7,16 @@ init = "shell-contract"
 timeout_secs = 60
 step_timeout_secs = 15
 
+# The /init supervisor starts the production shell and checks its final status.
+# Each send_line types value followed by Enter; expect_case waits for the
+# probe's CASE_START/PASS records. Escape bytes are keystrokes, not argv text:
+# ESC[A / ESC[B = Up / Down, ESC O A = SS3 Up, \t = Tab, \b = Backspace.
+# Probe argument layouts are documented in ../user/shell_probe.c.
+
+# Stage 1: establish argv/cwd behavior, then challenge UART RX with a fresh
+# hex token appended by the runner to "../../bin/p nonce". exit-seven returns
+# 7 and "x" fails exec; the recovered probe must still execute afterward.
+
 [[steps]]
 action = "expect"
 producer = "shell-supervisor"
@@ -69,7 +79,303 @@ subject = "recovered"
 
 [[steps]]
 action = "send_line"
-value = "exit"
+# Stage 2: silent record seeds populate history. Up recalls the alpha seed;
+# appending " history-edit alpha" yields five argv entries for the assertion.
+value = "../../bin/p record start"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record alpha"
+
+[[steps]]
+action = "send_line"
+value = "\u001b[A history-edit alpha"
+
+[[steps]]
+action = "expect_case"
+producer = "history-edit"
+subject = "history-edit"
+
+[[steps]]
+action = "send_line"
+# Skip the edited invocation and recall the original, unmodified alpha seed.
+value = "\u001b[A\u001b[A history-stored alpha"
+
+[[steps]]
+action = "expect_case"
+producer = "history-stored"
+subject = "history-stored"
+
+[[steps]]
+action = "send_line"
+# Type a draft without Enter, browse Up, then Down restores that exact draft.
+value = "../../bin/p record draft\u001b[A\u001b[B history-draft draft"
+
+[[steps]]
+action = "expect_case"
+producer = "history-draft"
+subject = "history-draft"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record older"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record newer"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record newer"
+
+[[steps]]
+action = "send_line"
+# Consecutive newer seeds occupy one history entry, so two Ups reach older.
+value = "\u001b[A\u001b[A history-duplicates older"
+
+[[steps]]
+action = "expect_case"
+producer = "history-duplicates"
+subject = "history-duplicates"
+
+# Stage 3: submit 18 seeds to overflow the 16-entry ring. Only 2..17 remain;
+# twenty Ups below must clamp at 2 before appending " history-overflow 2".
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 0"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 1"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 2"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 3"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 4"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 5"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 6"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 7"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 8"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 9"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 10"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 11"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 12"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 13"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 14"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 15"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 16"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record 17"
+
+[[steps]]
+action = "send_line"
+value = "\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A\u001b[A history-overflow 2"
+
+[[steps]]
+action = "expect_case"
+producer = "history-overflow"
+subject = "history-overflow"
+
+[[steps]]
+action = "send_line"
+# Stage 4: repeat recall with SS3 Up rather than CSI Up.
+value = "../../bin/p record ss3"
+
+[[steps]]
+action = "send_line"
+value = "\u001bOA history-ss3 ss3"
+
+[[steps]]
+action = "expect_case"
+producer = "history-ss3"
+subject = "history-ss3"
+
+[[steps]]
+action = "send_line"
+# Unsupported key, Right, parameterized Up, charset designation, and OSC title
+# must contribute no input bytes: argv[2] must remain "intact".
+value = "../../bin/p record intact\u001b[9~\u001b[C\u001b[777A\u001b(B\u001b]0;ignored\u0007 history-escape intact"
+
+[[steps]]
+action = "expect_case"
+producer = "history-escape"
+subject = "history-escape"
+
+[[steps]]
+action = "send_line"
+# Enter must terminate input even while an incomplete CSI is pending.
+value = "../../bin/p record intact history-incomplete intact\u001b["
+
+[[steps]]
+action = "expect_case"
+producer = "history-incomplete"
+subject = "history-incomplete"
+
+# Stage 5: reject a word containing 260 x bytes, then reject 18 argv entries
+# (p, rejected, and 16 arg words). Neither may exec the rejection sentinel.
+# The limits probe afterward confirms command processing remains usable.
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p rejected xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p rejected arg arg arg arg arg arg arg arg arg arg arg arg arg arg arg arg"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record limits history-limits limits"
+
+[[steps]]
+action = "expect_case"
+producer = "history-limits"
+subject = "history-limits"
+
+[[steps]]
+action = "send_line"
+# Stage 6: Tab expands gtrt-o to "gtrt-one ", ignoring directory/text decoys.
+# All completion probes receive [COMMAND, completion, CASE_ID, EXPECTED].
+value = "gtrt-o\tcompletion tab-single gtrt-one"
+
+[[steps]]
+action = "expect_case"
+producer = "tab-single"
+subject = "tab-single"
+
+[[steps]]
+action = "send_line"
+# Tab inserts the common prefix gtrt-pair-; typing a selects gtrt-pair-a.
+value = "gtrt-p\ta completion tab-prefix gtrt-pair-a"
+
+[[steps]]
+action = "expect_case"
+producer = "tab-prefix"
+subject = "tab-prefix"
+
+[[steps]]
+action = "send_line"
+# The second Tab lists candidates without changing the prefix; b selects one.
+value = "gtrt-p\t\tb completion tab-list gtrt-pair-b"
+
+[[steps]]
+action = "expect_case"
+producer = "tab-list"
+subject = "tab-list"
+
+[[steps]]
+action = "send_line"
+# No match: leave input intact, erase it, then type a known command. The extra
+# Backspace after the ten-character token must be harmless on an empty line.
+value = "zz-no-match\t\b\b\b\b\b\b\b\b\b\b\bgtrt-one completion tab-no-match gtrt-one"
+
+[[steps]]
+action = "expect_case"
+producer = "tab-no-match"
+subject = "tab-no-match"
+
+[[steps]]
+action = "send_line"
+# Tab after the first token is a no-op: arguments are not completed.
+value = "gtrt-one completion tab-arguments\t gtrt-one"
+
+[[steps]]
+action = "expect_case"
+producer = "tab-arguments"
+subject = "tab-arguments"
+
+[[steps]]
+action = "send_line"
+# Tab inside a path is also a no-op; the explicitly typed e finishes the name.
+value = "/bin/gtrt-on\te completion tab-path /bin/gtrt-one"
+
+[[steps]]
+action = "expect_case"
+producer = "tab-path"
+subject = "tab-path"
+
+# Forty Tabs on empty input repeatedly list candidates. The following command
+# must still execute, including when scans would expose leaked directory FDs.
+
+[[steps]]
+action = "send_line"
+value = "\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\tgtrt-one completion tab-repeated gtrt-one"
+
+[[steps]]
+action = "expect_case"
+producer = "tab-repeated"
+subject = "tab-repeated"
+
+[[steps]]
+action = "send_line"
+# Stage 7: cd is one builtin candidate even with a same-named /bin/cd fixture.
+# Tab must add a space, allowing cd to change cwd before the directory probe.
+value = "cd /"
+
+[[steps]]
+action = "send_line"
+value = "cd\t/.__genrt_test__/fixtures/directory"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p directory tab-builtin"
+
+[[steps]]
+action = "expect_case"
+producer = "tab-builtin"
+subject = "tab-builtin"
+
+[[steps]]
+action = "send_line"
+# Complete to "exit ". The supervisor checks shell exit status and emits
+# PASS shell-exit followed by terminal DONE PASS; prompt text is not asserted.
+value = "ex\t"
 
 [[steps]]
 action = "expect"
