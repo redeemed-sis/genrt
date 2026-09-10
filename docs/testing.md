@@ -56,6 +56,13 @@ test-only initramfs. `/init` is a supervisor that performs
 The shell case uses the production shell ELF and test-only helper commands. A
 host-generated nonce verifies UART RX, blocking stdin wakeup, argv propagation,
 and command execution without depending on prompts or human-readable output.
+It also feeds arrow keys, Tab, backspace, and partial/unknown escape sequences
+through paced UART input. Test helpers assert resulting argv/cwd for history
+recall/edit/draft restoration, duplicate suppression, ring overflow, completion,
+and recovery after line/argument overflow. Completion-only `/bin` aliases,
+a directory, and a text file exist solely in the controlled shell image and
+carry explicit test provenance. The product invocation remains the exact
+manifest-declared shell; the fixture names do not become production contracts.
 
 `smp-userspace-contract` also uses the production kernel, with a four-CPU DTB
 and a dedicated supervisor. It checks one-shot child placement, replacement and
@@ -75,6 +82,10 @@ The supervisor accepts its result only after wait/reap. Host checks also inject
 short, zero-progress, and failed writes to test output behavior independently
 of UART timing. Protocol formatting uses the shared implementation, but the
 protocol and markers themselves are never part of the production archive.
+`tests/user/shell_input.c` additionally checks the production editor's pure
+state transitions, exact line/history bounds, CRLF, escape resynchronization,
+completion prefixes and capacity edges, plus deterministic mixed-byte input.
+These host tests run in `cargo xtask check` without AArch64 syscall transport.
 
 Dynamic production-program checks are declared in
 `tests/qemu/program-contracts.toml`. xtask validates a one-to-one mapping to
@@ -143,7 +154,8 @@ Test protocol implementations carry the retained
 `.genrt.test_marker` ELF section; the test kernel linker folds the test-only
 input section into high-linked rodata so production ELF metadata does not name
 the section. Production verification rejects marker payloads/metadata and
-protocol code, and also enforces provenance. Test files live below the reserved
-`/.__genrt_test__/` namespace and carry explicit fixture/supervisor provenance
+protocol code, and also enforces provenance. Test files normally live below the
+reserved `/.__genrt_test__/` namespace; shell completion also needs explicitly
+marked `/bin` fixtures in its test image. All carry fixture/supervisor provenance
 in generated manifests; ordinary names such as `/test` and `/fixtures` remain
 available to products.

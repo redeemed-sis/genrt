@@ -31,7 +31,9 @@ stores complete evidence below `target/test-results/`.
   across exec, remote process lifecycle, production `taskset` placement, and
   owner-local absolute sleep on a secondary CPU.
 - `shell-contract`: production kernel and shell plus test-only helpers and a
-  host nonce challenge for UART input and command behavior.
+  host nonce challenge for UART input and command behavior. Arrow/Tab input
+  exercises the 16-entry history ring, editing and draft restoration,
+  duplicate suppression, overflow, completion, and escape recovery.
 - `poweroff-contract`: executes production `/bin/poweroff`, arms
   `TERMINAL ... POWER_OFF`, and accepts only natural successful QEMU shutdown.
 - `reboot-contract`: executes production `/bin/reboot`, arms
@@ -75,6 +77,11 @@ case. `xtask` generates supervisor invocation tables from that plan.
 Filesystem tests use `tests/qemu/fixtures/initramfs/`, not mutable production
 sample contents. Test helpers and supervisors live in `tests/qemu/user/`, carry
 test markers/provenance, and are rejected by production artifact policy.
+The shell image additionally installs marked probe aliases under `/bin` for
+unique/common-prefix/list completion, plus directory/text decoys and a
+same-named builtin collision. No production sample names or directory listing
+text are assertions: probe argv/cwd records prove the editing outcome.
+Repeated Tab scanning also checks that completion does not exhaust the FD table.
 
 ## Adding or changing a case
 

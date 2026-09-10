@@ -217,6 +217,11 @@ accepted ADRs remain authoritative when details differ.
 - `/init` is the freestanding shell. Product binaries are declared by
   `user/c/programs.toml` and installed under `/bin`, including `sleep`,
   `reboot`, and `poweroff`.
+- The shell has a fixed 16-entry command history with draft restoration and
+  first-token Tab completion for built-ins and `/bin` ELF commands. Editor
+  state and directory scanning use fixed storage; the existing 256-byte line
+  and 16-argument limits remain. Host editor tests and the production-shell
+  QEMU contract cover history, completion, bounds, and escape recovery.
 - PL011 RX interrupts feed a bounded kernel stdin ring. `read(0)` blocks and is
   restarted after input; line editing and command policy live in userspace.
   Stdin, mailbox, and process owner state use IRQ-safe SMP locks; completion

@@ -43,6 +43,9 @@ The host support test links portable library modules with `--wrap=write` to
 inject output behavior. Guest builds instead link the common public `write()`
 wrapper using architecture syscall transport and the sleep wrappers; test linker
 options never enter production ELF builds.
+The same host check builds the shell-private input tests without write
+interposition. Production shell history/completion is exercised separately by
+`shell-contract`, whose `/bin` fixtures are explicitly marked test-only.
 
 ## QEMU configuration
 
