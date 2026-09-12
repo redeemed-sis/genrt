@@ -54,6 +54,39 @@ Do not treat README prose as stronger evidence than source code or tests.
   to those commands instead of reimplementing them.
 - Report only commands that actually ran. State failures and skipped checks.
 
+## GitHub issues
+
+- Before working on an issue, fetch its current title, body, state, and relevant
+  comments from the confirmed repository. Do not rely on an issue number or
+  an earlier conversation alone to identify the requested work.
+- Map acceptance criteria and non-goals to the current source and tests. Keep
+  the user's latest instructions authoritative when they explicitly change
+  the issue scope; disclose remaining acceptance gaps rather than silently
+  treating partial implementation as completion.
+- Implementing, committing, pushing, and closing are distinct actions. Do not
+  infer permission to push or close from a request to implement or commit.
+- Before marking an issue completed, check the applicable verification and
+  identify the exact implementation commits. Distinguish local commits and
+  local test results from published commits, merged changes, and remote CI.
+  If the user explicitly requests closure before publication, state that
+  limitation in the completion report; do not push implicitly.
+- When authorized to close a completed issue, post a concise English summary
+  of the delivered behavior, commit references, checks actually run and their
+  results, and remaining limitations. Then close with reason `completed`.
+  Do not rewrite the issue body or change labels, assignees, or milestones
+  unless requested. Other closure reasons require a matching user decision.
+- Format commit references as explicit Markdown links to the repository's
+  `/commit/<full-sha>` URL with a short SHA as the label. Do not put bare
+  commit hashes in backticks: they are not clickable references on GitHub.
+- Inspect tool schemas before GitHub writes and confirm the repository and
+  issue target. Never substitute an ambiguously targeted PR action or bypass
+  a rejected operation. Complete independently authorized actions and report
+  any blocked comment or state update separately.
+- After a write, verify the returned issue state or refetch it. Before retrying
+  an uncertain comment submission, inspect existing comments to avoid posting
+  duplicates. Report the issue link, confirmed state, comment outcome, and
+  any publication or verification caveats to the user.
+
 ## Commands
 
 Run from the repository root:
