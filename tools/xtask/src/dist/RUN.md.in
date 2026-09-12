@@ -1,0 +1,81 @@
+# Run genrt on QEMU virt
+
+## Requirements and contents
+
+Install QEMU providing `qemu-system-aarch64` on a host with a POSIX `/bin/sh`.
+Use a QEMU version supporting `virt`, GICv2, `cortex-a72`, the generic loader,
+and `-action reboot=reset,shutdown=poweroff`. The build's QEMU version is
+recorded in `manifest.json`. No Rust toolchain, repository, xtask, device-tree
+tools, or network access is required to run this extracted bundle.
+
+The archive contains:
+
+- `run.sh`: executable launcher.
+- `genrt-aarch64.elf`: the production kernel shared by all CPU topologies.
+- `initramfs.cpio`: production userspace, including `/init` and `/bin` programs.
+- `initramfs.manifest.json`: initramfs entry metadata and hashes.
+- @DTB_LIST@: topology-specific device trees.
+- `manifest.json`: version, build tools, features, and payload SHA-256 hashes.
+- `LICENSE`: MIT license; `RUN.md`: this guide.
+
+## Quick start
+
+From the extracted directory:
+
+```sh
+./run.sh
+./run.sh -c @MAX_CPUS@
+./run.sh --help
+```
+
+Run one command at a time. The default is one CPU; `-c N` and `--cpus N`
+accept integers 1 through @MAX_CPUS@. The launcher automatically selects the
+matching DTB and `-smp` count. It can be invoked by path from another working
+directory, including when the extraction directory contains spaces. It uses
+only packaged artifacts and does not generate DTBs at runtime.
+
+Only the listed options are supported; duplicate CPU options, positional
+arguments, and arbitrary QEMU flags are rejected. CPU values must use the
+listed decimal form (no sign or leading zeros).
+
+## Direct QEMU invocation
+
+Without the launcher, change to the extracted directory and run:
+
+```sh
+@DEFAULT_COMMAND@
+```
+
+For @MAX_CPUS@ CPUs, the equivalent command is:
+
+```sh
+@SMP_COMMAND@
+```
+
+Always change both `-smp` and the DTB filename together for other supported
+counts. Do not change loader addresses or add `cpu-num` to the data loaders.
+
+## Console and power control
+
+Boot enters the genrt userspace shell. UART is attached to this terminal with
+`-serial stdio`; display, monitor, and networking are disabled.
+Use guest `reboot` to reset and boot again in the same QEMU process, or
+`poweroff` to shut down QEMU. Shell `exit` only terminates `/init`, not QEMU.
+
+This serial configuration has no multiplexed monitor escape: Ctrl-A X is not
+a quit command. Use Ctrl-C (QEMU's stdio signal handling) to terminate QEMU,
+or send a termination signal from another host terminal. The launcher uses
+`exec`, so QEMU receives signals directly and its exit status is preserved.
+See the [QEMU invocation reference](https://www.qemu.org/docs/master/system/qemu-manpage.html)
+for stdio signal and character-device multiplexing details.
+
+## Troubleshooting
+
+- Missing QEMU: install a package providing `qemu-system-aarch64` and ensure
+  it is in `PATH`. The launcher reports this with exit status 127.
+- Invalid CPU count or malformed option: use `./run.sh --help`; validation
+  fails before QEMU starts, with exit status 2.
+- Missing artifact: re-extract the complete archive and keep `run.sh` beside
+  its kernel, initramfs, and DTBs. Do not copy the launcher alone.
+- Unsupported machine, CPU, or `-action`: use a QEMU version supporting the
+  configuration above, preferably the version recorded in `manifest.json`.

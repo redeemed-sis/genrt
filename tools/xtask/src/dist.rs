@@ -13,12 +13,14 @@ use sha2::{Digest, Sha256};
 use tar::{Builder, Header};
 
 use crate::{
-    artifacts::{AARCH64_TARGET, Profile},
+    artifacts::{AARCH64_TARGET, Aarch64Artifacts, Profile},
     cli::LogLevel,
     initramfs, qemu,
     test::{self, Options, PreparedArtifacts},
     workflow,
 };
+
+mod launcher;
 
 #[derive(Serialize)]
 struct Manifest {
@@ -127,6 +129,15 @@ pub(crate) fn run(tag: &str, output_dir: &Path) -> Result<()> {
         artifacts: artifacts.clone(),
         initramfs: release_initramfs,
     };
+
+    // The kernel and userspace stay byte-identical to the tested artifacts.
+    // Additional topology support needs only sanitized DTBs, not a rebuild.
+    for cpu_count in 2..=qemu::MAX_CPUS {
+        workflow::generate_qemu_virt_dtb(&Aarch64Artifacts::for_cpu_count(
+            Profile::Release,
+            cpu_count,
+        ))?;
+    }
 
     fs::create_dir_all(output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
@@ -287,33 +298,26 @@ fn package(
     fs::create_dir_all(&staging)?;
 
     let initramfs_manifest = initramfs::manifest_path(&prepared.initramfs);
-    let files = [
+    let mut sources = vec![
         ("genrt-aarch64.elf", prepared.artifacts.kernel_elf()),
-        ("qemu-virt.dtb", prepared.artifacts.dtb()),
         ("initramfs.cpio", prepared.initramfs.clone()),
         ("initramfs.manifest.json", initramfs_manifest),
         ("LICENSE", PathBuf::from("LICENSE")),
     ];
-    for (name, source) in &files {
+    // DTB basenames come from the same artifact model used by run/debug.
+    let dtbs = (1..=qemu::MAX_CPUS)
+        .map(|count| Aarch64Artifacts::for_cpu_count(Profile::Release, count).dtb())
+        .collect::<Vec<_>>();
+    for dtb in &dtbs {
+        sources.push((dtb.file_name().unwrap().to_str().unwrap(), dtb.clone()));
+    }
+    for (name, source) in &sources {
         fs::copy(source, staging.join(name))
             .with_context(|| format!("failed to stage release artifact {}", source.display()))?;
     }
 
-    let run_config = qemu::Config {
-        kernel: PathBuf::from("genrt-aarch64.elf"),
-        dtb: PathBuf::from("qemu-virt.dtb"),
-        initramfs: PathBuf::from("initramfs.cpio"),
-        cpu_count: 1,
-        wait_for_gdb: false,
-        reset_behavior: qemu::ResetBehavior::Reset,
-    };
-    fs::write(
-        staging.join("RUN.md"),
-        format!(
-            "# Run genrt on QEMU virt\n\n```bash\n{}\n```\n",
-            run_config.display()
-        ),
-    )?;
+    fs::write(staging.join("run.sh"), launcher::script())?;
+    fs::write(staging.join("RUN.md"), launcher::guide())?;
 
     let manifest = Manifest {
         project: "genrt",
@@ -329,11 +333,12 @@ fn package(
         clang_version: command_first_line(Command::new("clang").arg("--version"))?,
         llvm_ar_version: command_first_line(Command::new("llvm-ar").arg("--version"))?,
         lld_version: command_first_line(Command::new("ld.lld").arg("--version"))?,
-        files: files
+        files: bundle_files()
             .iter()
-            .map(|(name, _)| {
+            .filter(|name| *name != "manifest.json")
+            .map(|name| {
                 Ok(ManifestFile {
-                    path: (*name).to_owned(),
+                    path: name.clone(),
                     sha256: sha256_file(&staging.join(name))?,
                 })
             })
@@ -343,17 +348,71 @@ fn package(
         staging.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
     )?;
+    verify_bundle(&staging, &manifest)?;
 
     let epoch = command_line(Command::new("git").args(["show", "-s", "--format=%ct", "HEAD"]))?
         .parse::<u64>()
         .context("tag commit timestamp is not an integer")?;
     let archive = output_dir.join(format!("{bundle_name}.tar.gz"));
     write_deterministic_archive(&archive, &bundle_name, &staging, epoch)?;
+    let repeated = staging.join("repeat.tar.gz");
+    write_deterministic_archive(&repeated, &bundle_name, &staging, epoch)?;
+    if sha256_file(&archive)? != sha256_file(&repeated)? {
+        bail!("release archive serialization is not deterministic");
+    }
     let archive_name = archive.file_name().unwrap().to_string_lossy();
     let checksum = format!("{}  {archive_name}\n", sha256_file(&archive)?);
     fs::write(output_dir.join("SHA256SUMS"), checksum)?;
     fs::remove_dir_all(output_dir.join(".staging"))?;
     println!("built {}", archive.display());
+    Ok(())
+}
+
+// One sorted inventory owns both manifest coverage and tar membership. The
+// manifest cannot hash itself; SHA256SUMS covers it through the whole archive.
+fn bundle_files() -> Vec<String> {
+    let mut files = [
+        "genrt-aarch64.elf",
+        "initramfs.cpio",
+        "initramfs.manifest.json",
+        "LICENSE",
+        "manifest.json",
+        "RUN.md",
+        "run.sh",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    files.extend(
+        (1..=qemu::MAX_CPUS)
+            .map(|count| launcher::config(count).dtb.to_string_lossy().into_owned()),
+    );
+    files.sort();
+    files
+}
+
+fn verify_bundle(root: &Path, manifest: &Manifest) -> Result<()> {
+    let mut actual = fs::read_dir(root)?
+        .map(|entry| {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                bail!("release entry must be a regular file: {:?}", entry.path());
+            }
+            Ok(entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    actual.sort();
+    if actual != bundle_files() {
+        bail!("release inventory does not match the declared bundle");
+    }
+    let expected = actual.iter().filter(|name| *name != "manifest.json");
+    if !expected.eq(manifest.files.iter().map(|file| &file.path)) {
+        bail!("release manifest does not cover the exact payload");
+    }
+    for file in &manifest.files {
+        if sha256_file(&root.join(&file.path))? != file.sha256 {
+            bail!("release hash mismatch for {}", file.path);
+        }
+    }
     Ok(())
 }
 
@@ -368,21 +427,17 @@ fn write_deterministic_archive(
         .mtime(u32::try_from(epoch).unwrap_or(u32::MAX))
         .write(file, Compression::best());
     let mut tar = Builder::new(encoder);
-    for name in [
-        "genrt-aarch64.elf",
-        "qemu-virt.dtb",
-        "initramfs.cpio",
-        "initramfs.manifest.json",
-        "LICENSE",
-        "manifest.json",
-        "RUN.md",
-    ] {
-        let path = root.join(name);
+    for name in bundle_files() {
+        let path = root.join(&name);
         let mut source = File::open(&path)?;
         let size = source.metadata()?.len();
         let mut header = Header::new_gnu();
         header.set_size(size);
-        header.set_mode(if name.ends_with(".elf") { 0o755 } else { 0o644 });
+        header.set_mode(if name.ends_with(".elf") || name == "run.sh" {
+            0o755
+        } else {
+            0o644
+        });
         header.set_uid(0);
         header.set_gid(0);
         header.set_mtime(epoch);
@@ -433,6 +488,18 @@ fn command_first_line(command: &mut Command) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn temp_dir() -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "genrt-dist-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     #[test]
     fn validates_release_tags() {
@@ -442,9 +509,8 @@ mod tests {
         assert!(parse_release_tag("vnot-semver").is_err());
     }
 
-    #[test]
-    fn manifest_and_checksum_are_stable_json_and_text() {
-        let manifest = Manifest {
+    fn sample_manifest() -> Manifest {
+        Manifest {
             project: "genrt",
             tag: "v1.0.0".to_owned(),
             prerelease: false,
@@ -462,7 +528,12 @@ mod tests {
                 path: "LICENSE".to_owned(),
                 sha256: "00".to_owned(),
             }],
-        };
+        }
+    }
+
+    #[test]
+    fn manifest_and_checksum_are_stable_json_and_text() {
+        let manifest = sample_manifest();
         let json = serde_json::to_string(&manifest).unwrap();
         assert!(json.contains("\"tag\":\"v1.0.0\""));
         assert!(json.contains("\"path\":\"LICENSE\""));
@@ -471,5 +542,83 @@ mod tests {
             format!("{}  {}\n", "00", "archive.tar.gz"),
             "00  archive.tar.gz\n"
         );
+    }
+
+    #[test]
+    fn bundle_round_trip_preserves_inventory_hashes_modes_and_bytes() {
+        let directory = temp_dir();
+        let staging = directory.join("staging");
+        fs::create_dir(&staging).unwrap();
+        for name in bundle_files() {
+            fs::write(staging.join(&name), name.as_bytes()).unwrap();
+        }
+        fs::write(staging.join("run.sh"), launcher::script()).unwrap();
+        fs::write(staging.join("RUN.md"), launcher::guide()).unwrap();
+        let mut manifest = sample_manifest();
+        manifest.files = bundle_files()
+            .into_iter()
+            .filter(|name| name != "manifest.json")
+            .map(|path| ManifestFile {
+                sha256: sha256_file(&staging.join(&path)).unwrap(),
+                path,
+            })
+            .collect();
+        fs::write(
+            staging.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        verify_bundle(&staging, &manifest).unwrap();
+
+        let first = directory.join("first.tar.gz");
+        let second = directory.join("second.tar.gz");
+        write_deterministic_archive(&first, "bundle", &staging, 123).unwrap();
+        write_deterministic_archive(&second, "bundle", &staging, 123).unwrap();
+        assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
+        let mut archive =
+            tar::Archive::new(flate2::read::GzDecoder::new(File::open(&first).unwrap()));
+        let mut names = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap().into_owned();
+            let name = path.strip_prefix("bundle").unwrap().to_str().unwrap();
+            names.push(name.to_owned());
+            assert_eq!(entry.header().uid().unwrap(), 0);
+            assert_eq!(entry.header().gid().unwrap(), 0);
+            assert_eq!(entry.header().mtime().unwrap(), 123);
+            assert_eq!(
+                entry.header().mode().unwrap(),
+                if name == "run.sh" || name.ends_with(".elf") {
+                    0o755
+                } else {
+                    0o644
+                }
+            );
+        }
+        assert_eq!(names, bundle_files());
+        let extracted = directory.join("extracted");
+        tar::Archive::new(flate2::read::GzDecoder::new(File::open(&first).unwrap()))
+            .unpack(&extracted)
+            .unwrap();
+        verify_bundle(&extracted.join("bundle"), &manifest).unwrap();
+        #[cfg(unix)]
+        assert!(
+            Command::new(extracted.join("bundle/run.sh"))
+                .arg("--help")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+
+        fs::write(staging.join("run.sh"), "tampered").unwrap();
+        assert!(verify_bundle(&staging, &manifest).is_err());
+        fs::write(staging.join("run.sh"), launcher::script()).unwrap();
+        let omitted = manifest.files.pop().unwrap();
+        assert!(verify_bundle(&staging, &manifest).is_err());
+        manifest.files.push(omitted);
+        fs::write(staging.join("unexpected"), "extra").unwrap();
+        assert!(verify_bundle(&staging, &manifest).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

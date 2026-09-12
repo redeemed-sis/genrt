@@ -398,7 +398,7 @@ pub(crate) fn build_aarch64_for_cpus(
 ) -> Result<Aarch64Artifacts> {
     validate_qemu_cpu_count(cpu_count)?;
     let artifacts = Aarch64Artifacts::for_cpu_count(profile, cpu_count);
-    let dtb_path = generate_qemu_virt_dtb(&artifacts, cpu_count)?;
+    let dtb_path = generate_qemu_virt_dtb(&artifacts)?;
 
     let mut build = Command::new("cargo");
     build.args([
@@ -1188,7 +1188,24 @@ fn aarch64_user_compile_args() -> [&'static str; 15] {
     ]
 }
 
-fn generate_qemu_virt_dtb(artifacts: &Aarch64Artifacts, cpu_count: usize) -> Result<PathBuf> {
+/// Generate a deterministic topology-specific DTB without rebuilding the kernel.
+///
+/// # Arguments
+///
+/// * `artifacts` - Output paths and the CPU count encoded in the generated DTB.
+///
+/// # Returns
+///
+/// Returns the absolute path of the compacted DTB with random seeds removed.
+/// This host-only operation runs QEMU and device-tree tools and writes files.
+///
+/// # Errors
+///
+/// Returns an error for an unsupported CPU count, failed tool invocation,
+/// invalid DTB header, or filesystem failure.
+pub(crate) fn generate_qemu_virt_dtb(artifacts: &Aarch64Artifacts) -> Result<PathBuf> {
+    let cpu_count = artifacts.cpu_count();
+    validate_qemu_cpu_count(cpu_count)?;
     let dtb_path = env::current_dir()
         .context("failed to query current directory")?
         .join(artifacts.dtb());
