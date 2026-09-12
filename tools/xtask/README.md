@@ -69,6 +69,11 @@ termination, wait, and complete-log validation. See
   provenance, noncanonical paths, invalid executable ELF, and hash mismatch.
 - Release packaging reuses already tested production artifacts and records
   tool versions, commit, features, and SHA-256 identity.
+- Release bundles include an executable `run.sh` and DTBs for all supported
+  CPU counts. The launcher and standalone `RUN.md` commands are generated from
+  `qemu::Config`, with one sorted manifest/archive inventory and repeated
+  tar/gzip serialization. Launcher tests use a QEMU stub to compare exact argv,
+  reject malformed input, and check runtime dependency and artifact failures.
 
 ## Changing xtask
 

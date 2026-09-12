@@ -241,6 +241,10 @@ accepted ADRs remain authoritative when details differ.
 - Release packaging dynamically tests exact production executables in
   controlled contract images, structurally verifies the release initramfs, and
   emits deterministic archives and checksums.
+- Release bundles run without a source checkout through generated `run.sh`:
+  one CPU by default or `-c 1..4` with matching packaged DTBs. Launcher and
+  standalone guide commands share the canonical QEMU configuration. Every
+  payload is hashed; tar metadata includes executable launcher permissions.
 
 ## Current boundaries
 
