@@ -52,5 +52,11 @@ growth.
 | [0044](ADR-0044-linux-compatible-reboot-power-control.md) | Linux-compatible reboot power control | Accepted | Syscall/userspace/AArch64 power control | - | - |
 | [0045](ADR-0045-posix-monotonic-time-and-sleep-abi.md) | POSIX monotonic time and sleep ABI | Accepted | Time/scheduler/syscall/userspace ABI | - | - |
 | [0046](ADR-0046-shared-freestanding-userspace-library.md) | Shared freestanding userspace support library | Accepted | Userspace/library/build ownership | - | - |
+| [0047](ADR-0047-orangepi-zero2w-uart-checkpoint.md) | Isolated Orange Pi Zero 2W UART checkpoint | Superseded | AArch64 hardware boot/UART | - | [0048](ADR-0048-orangepi-shared-boot-and-fit.md) (entry/linker, composition, and packaging), [0052](ADR-0052-retire-hardware-uart-checkpoint.md) (active platform) |
+| [0048](ADR-0048-orangepi-shared-boot-and-fit.md) | Orange Pi shared kernel entry and FIT packaging | Superseded | AArch64 boot/build/DTB ownership | [0047](ADR-0047-orangepi-zero2w-uart-checkpoint.md) (entry/linker, composition, and packaging) | [0052](ADR-0052-retire-hardware-uart-checkpoint.md) (active platform) |
+| [0049](ADR-0049-raspberrypi-uboot-uart-checkpoint.md) | Raspberry Pi 3B+ U-Boot UART checkpoint | Accepted | AArch64 hardware boot/UART/FIT | - | [0050](ADR-0050-raspberrypi-raw-booti-bundle.md) (default upload), [0051](ADR-0051-raspberrypi-runtime-spin-table-and-power.md) (early park/UART boundary) |
+| [0050](ADR-0050-raspberrypi-raw-booti-bundle.md) | Raspberry Pi raw booti bundle | Superseded | Hardware artifact packaging | [0049](ADR-0049-raspberrypi-uboot-uart-checkpoint.md) (default Pi upload) | [0051](ADR-0051-raspberrypi-runtime-spin-table-and-power.md) |
+| [0051](ADR-0051-raspberrypi-runtime-spin-table-and-power.md) | Raspberry Pi runtime, spin-table and power | Accepted | Pi entry/IRQ/CPU/power/FIT ownership | [0049](ADR-0049-raspberrypi-uboot-uart-checkpoint.md) (early park/UART), [0050](ADR-0050-raspberrypi-raw-booti-bundle.md) | - |
+| [0052](ADR-0052-retire-hardware-uart-checkpoint.md) | Retire hardware UART checkpoint | Accepted | AArch64 hardware boot/build/UART | [0047](ADR-0047-orangepi-zero2w-uart-checkpoint.md), [0048](ADR-0048-orangepi-shared-boot-and-fit.md) (active Orange Pi platform) | - |
 
 Use [`TEMPLATE.md`](TEMPLATE.md) for new decisions.

@@ -17,6 +17,21 @@ cargo xtask dist --tag v0.0.0-local.1 --output-dir /tmp/genrt-dist
 
 Use `cargo xtask --help` for the complete current command surface.
 
+`cargo xtask build-raspberrypi-3b-plus` uses the shared hardware builder with
+BCM2837 UART adoption and separate `target/raspberrypi-3b-plus` artifacts.
+With the rebuilt FIT-capable U-Boot, upload `genrt-raspberrypi-3b-plus.itb`
+at `0x01000000`, inspect it with `iminfo 01000000`, then `bootm 01000000`.
+The FIT selects its embedded DTB, loads the kernel at `0x02000000`, and supplies
+the production initramfs at `0x04000000` before firmware relocation.
+Pi FIT components use CRC32 for compatibility with the installed loader;
+the builder recomputes and checks each component. Confirm the installed 64-bit
+U-Boot memory map and spin-table CPU metadata before use.
+See the [Pi bootstrap procedure](../../arch/aarch64/platform/raspberrypi-3b-plus/README.md).
+Pi enters an experimental SMP runtime with
+firmware-inherited UART, CPU-local interrupts, spin-table release and watchdog
+power control. The builder's tests compile real BCM2837 UART/controller/power
+backends against mock MMIO, without requiring a board or AArch64 execution.
+
 ## Build artifacts
 
 AArch64 artifacts live below

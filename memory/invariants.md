@@ -10,6 +10,15 @@ Changes that invalidate one require architecture review and an ADR.
 - Hardware configuration comes from documented architecture behavior, the
   controlled platform protocol, or parsed firmware data. Do not guess it.
 - AArch64 pre-MMU code and every dependency it reaches remain in `.boot.*`.
+- Fixed hardware bring-up assumptions belong only to opt-in architecture
+  platform paths. Raspberry Pi shares the kernel entry/linker with QEMU but
+  uses its own interrupt, spin-table and watchdog backends, never QEMU GIC/PSCI.
+  Pi release words stay firmware-reserved and become visible at PoC before SEV;
+  per-CPU timer/mailbox ownership and generic online acknowledgement remain exact.
+  Its FIT supplies initramfs; the relocated /chosen extent is reserved before
+  allocation. Physical hardware support is not established by emulator tests.
+  Raspberry Pi adopts U-Boot's configured UART without changing its clock or
+  pinmux; a working, stable firmware UART is an explicit boot prerequisite.
 - Rust and assembly trap-frame layouts are one ABI and must change together.
 - Generic kernel live-context APIs use an opaque, non-null, exclusive
   `ActiveContext`; syscall register decoding and live-frame mutation remain in

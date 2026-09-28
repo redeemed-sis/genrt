@@ -5,9 +5,28 @@ This is the active genrt architecture: `aarch64-unknown-none-softfloat` on QEMU
 CPUs start through PSCI and enter generic scheduler-owned idle contexts after
 high-half registration.
 
+The [Raspberry Pi 3B+ bootstrap](platform/raspberrypi-3b-plus/README.md)
+now enters an experimental runtime through 64-bit U-Boot at `0x02000000`.
+One CRC32 FIT contains kernel, board DTB and production initramfs. The shared
+entry handles EL2-to-EL1 and four spin-table CPUs. BCM2837 local timers and
+mailboxes support scheduling/IPIs; CPU0 owns UART RX. Reset/halt uses the Pi
+watchdog/firmware convention, not PSCI. Physical runtime validation is pending.
+
+UART implementations live in `src/platform/uart/`: shared PL011 register
+operations are in `pl011.rs`; QEMU initializes the device, while `bcm2837.rs`
+adopts U-Boot's configured PL011 or mini UART. Pi MMIO bases are translated
+from the bundled DTB's `soc/ranges` and peripheral `reg` entries. See
+[ADR-0051](../../memory/decisions/ADR-0051-raspberrypi-runtime-spin-table-and-power.md).
+
+The feature-specific runtime selection lives in `src/platform/`: it chooses
+the interrupt controller, UART, CPU release and power backends, boot DTB
+completion, and executable-page cache maintenance. Shared MMU, console, and
+interrupt entry code calls those narrow platform operations without selecting
+a board itself. The low DTB completion hook stays in `.boot.text`.
+
 ## Boot sequence
 
-The kernel is loaded at physical `0x4008_0000`. CPU0 enters the low-linked
+On QEMU, the kernel is loaded at physical `0x4008_0000`. CPU0 enters the low-linked
 `_start` trampoline, uses bootstrap stack slot zero, parses the QEMU-loaded DTB,
 builds bootstrap TTBR0/TTBR1 tables, programs EL1 translation state, enables
 the MMU, switches to a high stack alias, and enters high-linked Rust. CPU0 then
@@ -97,10 +116,22 @@ kernel/user/fork entry state, and performs bounded live-to-saved transfers.
 Compile-time checks require the architecture frame to fit with compatible
 alignment; the assembly restore layout remains unchanged.
 
-GICv2 initialization follows register ownership. CPU0 alone enables the shared
-distributor and routes device SPIs, including PL011, to CPU0. Each architecture
-entry installs that CPU's vector base, initializes its banked GICC interface,
-enables the physical-timer PPI and reserved scheduler SGI, and resets its
+`src/interrupts.rs` defines the static interrupt-controller contract used by
+boot and IRQ entry: global/local setup, logical CPU binding, targeted scheduler
+notification, and controller acknowledgement/completion. The shared dispatcher
+handles UART, timer, and scheduler IPI events with at most one checkpoint per IRQ
+return. The QEMU implementation is in `src/platform/virt_interrupts.rs`, with
+GICv2 registers in `src/platform/gic.rs`; the Pi implementation is in
+`src/platform/raspberrypi.rs`. GIC retains full-IAR EOI; Pi clears its mailbox
+before scheduler dispatch and completes local MMIO ordering afterward.
+`PlatformInfo.interrupts` is a selected controller map, not generic GIC
+fields. The fixed low boot handoff carries up to two interrupt MMIO ranges.
+
+On QEMU, GICv2 initialization follows register ownership. CPU0 enables the
+shared distributor and routes device SPIs, including PL011, to CPU0.
+Each architecture entry installs that CPU's vector base and initializes its
+banked GICC interface, enables the physical-timer PPI and reserved scheduler
+SGI, and resets its
 `CNTP_*` state before local IRQ delivery. During generic logical registration,
 the architecture reads the executing interface's banked `GICD_ITARGETSR`
 identity and publishes a unique one-hot logical-to-GIC target binding. Generic

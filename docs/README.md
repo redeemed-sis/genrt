@@ -9,6 +9,7 @@ Use the narrowest document that owns the question:
 | Durable cross-cutting constraints | [`memory/invariants.md`](../memory/invariants.md) |
 | Architecture decisions | [`memory/decisions/README.md`](../memory/decisions/README.md) |
 | AArch64 boot, MMU, exceptions, IRQ | [`arch/aarch64/README.md`](../arch/aarch64/README.md) |
+| Raspberry Pi 3B+ U-Boot/FIT bootstrap | [`platform README`](../arch/aarch64/platform/raspberrypi-3b-plus/README.md) |
 | Generic kernel subsystem map | [`kernel/README.md`](../kernel/README.md) |
 | Memory ownership and VM | [`kernel/src/memory/README.md`](../kernel/src/memory/README.md) |
 | Scheduling, time, threads, IPC | [`kernel/src/sched/README.md`](../kernel/src/sched/README.md) |

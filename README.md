@@ -19,6 +19,9 @@ a production-ready or latency-certified operating system.
 
 ## Status
 
+- [Raspberry Pi 3B+ bootstrap](arch/aarch64/platform/raspberrypi-3b-plus/README.md)
+  runs the shared kernel with a FIT-bundled DTB and initramfs through U-Boot.
+  Physical runtime validation remains pending.
 - High-half EL1 kernel with low-linked pre-MMU bootstrap and post-link autonomy
   verification.
 - DTB-driven RAM/platform discovery, physical frame allocation, runtime TTBR1

@@ -13,6 +13,38 @@ accepted ADRs remain authoritative when details differ.
   context. Independent userspace processes may have any online CPU as owner.
 - Kernel image: low physical load with a high-half virtual runtime mapping.
 
+## Hardware bring-up
+
+- Hardware bring-up also targets Raspberry Pi 3B+ through installed 64-bit
+  U-Boot. The operator reports rebuilding U-Boot with FIT support after the
+  previous loader rejected an intact FIT. The primary documented procedure
+  now uploads `target/raspberrypi-3b-plus/genrt-raspberrypi-3b-plus.itb` at
+  `0x01000000` and uses `bootm`; the linked kernel base is `0x02000000`.
+  `cargo xtask build-raspberrypi-3b-plus` includes production initramfs in
+  the FIT. Reported RAM ends at 0x3b400000, with upper U-Boot reservations
+  starting at 0x39f39000.
+  The allocator is capped below 128 MiB and the first MiB is firmware-reserved.
+- Pi FIT components use CRC32 to avoid requiring SHA-256 in the installed
+  loader; host verification checks both component bytes and CRC32 values.
+  Release SHA-256 checks remain unchanged.
+- The BCM2837 boot mapper takes its peripheral window from DTB `soc/ranges`.
+  The runtime UART resolves GPIO, PL011, AUX and mini-UART `reg` addresses
+  through that window, then adopts enabled GPIO14/15 ALT0 PL011 or ALT5 mini
+  UART without changing firmware clocks, baud divisors, or pinmux.
+  The Pi runtime's shared entry drops EL2 to EL1, initializes CPU0 GPU IRQ
+  routing and per-CPU ARM-local timers/mailbox IPIs,
+  and starts CPU1..3 through DTB-validated spin-table words at e0/e8/f0.
+  Each CPU enters the existing scheduler. Pi reset/halt uses the PM watchdog
+  and firmware halt flag, not PSCI; halt does not remove board power.
+  The kernel consumes the relocated /chosen initramfs extent. Executable page
+  publication performs Pi cache maintenance before local or remote execution.
+  Mock-MMIO tests cover both UARTs, per-CPU IRQ/mailbox routing and PM writes.
+  BCM2837 emulation reached /init, ran taskset on CPU2/3, slept and powered off.
+  Physical runtime, repeated cold boots and firmware reset/halt still require
+  operator checks.
+  See [Pi procedure](../arch/aarch64/platform/raspberrypi-3b-plus/README.md) and
+  [ADR-0051](decisions/ADR-0051-raspberrypi-runtime-spin-table-and-power.md).
+
 ## Boot and platform
 
 - A low-linked `.boot.*` trampoline parses the QEMU-provided DTB, constructs
@@ -109,7 +141,14 @@ accepted ADRs remain authoritative when details differ.
   carry their CPU owner; only that CPU inserts events and programs its physical
   timer. IRQ dispatch drops the queue owner before calling the scheduler facade
   directly.
-- CPU0 alone initializes the shared GIC distributor and routes device SPIs.
+- AArch64 selects one platform interrupt-controller implementation through a
+  static contract, with no IRQ-time dynamic dispatch. The common dispatcher
+  handles UART, timer, and scheduler notifications; QEMU GICv2 and Pi local
+  controllers classify sources and complete their own acknowledgement rules.
+  QEMU register ownership lives in `arch/aarch64/src/platform/gic.rs`.
+  Generic `PlatformInfo` stores a typed controller MMIO map, not GIC fields;
+  the low boot handoff keeps two fixed, controller-neutral range slots.
+- On QEMU, CPU0 alone initializes the shared GIC distributor and routes device SPIs.
   Architecture entry initializes each CPU's vector base, banked GICC interface,
   physical-timer PPI, and local `CNTP_*` state. CPU0 preallocates all generic
   deadline queues before PSCI startup. Generic secondary scheduler
