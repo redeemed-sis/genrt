@@ -1,6 +1,7 @@
 ENTRY(_start)
 
-BOOT_PHYS_BASE = 0x40080000;
+/* QEMU is the default. Hardware builders override only the physical base. */
+BOOT_PHYS_BASE = DEFINED(GENRT_BOOT_PHYS_BASE) ? GENRT_BOOT_PHYS_BASE : 0x40080000;
 KERNEL_HVA_OFFSET = 0xffff000000000000;
 
 SECTIONS
@@ -88,6 +89,10 @@ SECTIONS
     __kernel_virt_end = .;
     __kernel_phys_end = __kernel_virt_end - KERNEL_HVA_OFFSET;
     __kernel_image_phys_end = __kernel_phys_end;
+    __arm64_image_size = __kernel_image_phys_end - __kernel_image_phys_start;
+
+    ASSERT(!DEFINED(GENRT_BOOT_PHYS_BASE) || (BOOT_PHYS_BASE & 0x1fffff) == 0,
+           "ARM64 Image base must be 2 MiB aligned")
 
     /DISCARD/ : {
         *(.comment)

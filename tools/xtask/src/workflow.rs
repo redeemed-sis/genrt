@@ -40,6 +40,7 @@ const DEFAULT_INITRAMFS_ROOT: &str = "user/initramfs";
 pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Doctor => doctor(),
+        Commands::BuildRaspberrypi3bPlus => crate::hardware::build(),
         Commands::Check => check(),
         Commands::TestAarch64 {
             case,
@@ -434,7 +435,7 @@ pub(crate) fn build_aarch64_for_cpus(
 
     let staticlib = locate_staticlib(&artifacts)?;
     let link_status = Command::new("ld.lld")
-        .args(["-T", "arch/aarch64/link/qemu-virt.ld", "-e", "_start", "-o"])
+        .args(["-T", "arch/aarch64/link/kernel.ld", "-e", "_start", "-o"])
         .arg(&final_elf)
         .args(["--whole-archive"])
         .arg(&staticlib)
@@ -1351,7 +1352,22 @@ fn locate_staticlib(artifacts: &Aarch64Artifacts) -> Result<PathBuf> {
     bail!("unable to locate libgenrt_arch_aarch64.a after cargo build")
 }
 
-fn verify_aarch64_boot_text_autonomy(elf: &Path) -> Result<()> {
+/// Check that pre-MMU boot instructions stay inside their low-linked world.
+///
+/// # Arguments
+///
+/// * `elf` - Linked AArch64 ELF containing `.boot.text` and its boot sections.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after host-tool inspection finds no forbidden dependencies.
+/// Allocates host-side inspection buffers; does not run the image.
+///
+/// # Errors
+///
+/// Returns an error on tool/ELF inspection failures or boot relocations,
+/// runtime helpers, high-VA operands, or direct branches outside boot sections.
+pub(crate) fn verify_aarch64_boot_text_autonomy(elf: &Path) -> Result<()> {
     let sections = read_elf_sections(elf)?;
     let allowed_ranges = [".boot.text", ".boot.rodata", ".boot.bss", ".boot_stack"]
         .into_iter()

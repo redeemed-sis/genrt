@@ -65,6 +65,9 @@ pub(crate) enum Commands {
         #[arg(long, default_value_t = 1)]
         cpus: usize,
     },
+    /// Build the Pi 3B+ runtime with kernel, DTB and production initramfs (FIT).
+    #[command(name = "build-raspberrypi-3b-plus")]
+    BuildRaspberrypi3bPlus,
     BuildUserHello,
     BuildUserFault,
     BuildUserReadFile,

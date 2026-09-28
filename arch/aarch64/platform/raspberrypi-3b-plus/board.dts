@@ -1,0 +1,91 @@
+/dts-v1/;
+/memreserve/ 0x00000000 0x00100000;
+
+/*
+ * Minimal genrt runtime tree, not a full Linux peripheral description.
+ * The SoC bus translation matches the BCM2837 firmware tree and is consumed
+ * by genrt's early MMIO mapper and UART discovery.
+ * Only the low 128 MiB is described, avoiding firmware/GPU memory at the top
+ * of RAM. Confirm this interval against bdinfo before uploading. U-Boot may
+ * replace the memory node during bootm; the reservation below retains the cap.
+ */
+/ {
+    model = "Raspberry Pi 3 Model B Plus - genrt runtime";
+    compatible = "raspberrypi,3-model-b-plus", "brcm,bcm2837";
+    #address-cells = <2>;
+    #size-cells = <2>;
+
+    /* U-Boot configures its console. The driver reads GPIO14/15 pinmux to
+     * select the live UART, so this tree does not claim a fixed stdout-path.
+     */
+    chosen {};
+
+    cpus {
+        #address-cells = <1>;
+        #size-cells = <0>;
+        cpu@0 {
+            device_type = "cpu"; compatible = "arm,cortex-a53"; reg = <0>;
+            enable-method = "spin-table"; cpu-release-addr = <0 0xd8>;
+        };
+        cpu@1 {
+            device_type = "cpu"; compatible = "arm,cortex-a53"; reg = <1>;
+            enable-method = "spin-table"; cpu-release-addr = <0 0xe0>;
+        };
+        cpu@2 {
+            device_type = "cpu"; compatible = "arm,cortex-a53"; reg = <2>;
+            enable-method = "spin-table"; cpu-release-addr = <0 0xe8>;
+        };
+        cpu@3 {
+            device_type = "cpu"; compatible = "arm,cortex-a53"; reg = <3>;
+            enable-method = "spin-table"; cpu-release-addr = <0 0xf0>;
+        };
+    };
+
+    /* U-Boot may expand /memory. Keep allocator ownership below 128 MiB;
+     * firmware, parked CPUs, framebuffer and U-Boot storage are not reclaimed.
+     */
+    reserved-memory {
+        #address-cells = <2>;
+        #size-cells = <2>;
+        ranges;
+        firmware@8000000 { reg = <0 0x08000000 0 0x38000000>; };
+    };
+
+    memory@0 {
+        device_type = "memory";
+        reg = <0 0 0 0x08000000>;
+    };
+
+    soc@7e000000 {
+        compatible = "simple-bus";
+        #address-cells = <1>;
+        #size-cells = <1>;
+        ranges = <0x7e000000 0 0x3f000000 0x01000000>;
+
+        gpio@7e200000 {
+            compatible = "brcm,bcm2835-gpio";
+            reg = <0x7e200000 0xb4>;
+        };
+
+        aux@7e215000 {
+            compatible = "brcm,bcm2835-aux";
+            reg = <0x7e215000 0x100>;
+        };
+
+        serial@7e201000 {
+            compatible = "arm,pl011", "arm,primecell";
+            reg = <0x7e201000 0x200>;
+            /* The architecture backend adopts one firmware-configured UART;
+             * these nodes do not request clock or pinmux reconfiguration. */
+            status = "disabled";
+        };
+
+        serial@7e215040 {
+            compatible = "brcm,bcm2835-aux-uart";
+            reg = <0x7e215040 0x40>;
+            reg-shift = <2>;
+            reg-io-width = <4>;
+            status = "disabled";
+        };
+    };
+};

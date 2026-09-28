@@ -1,0 +1,48 @@
+/dts-v1/;
+
+/ {
+    description = "genrt Raspberry Pi 3B+ SMP runtime";
+    #address-cells = <1>;
+
+    images {
+        kernel {
+            description = "genrt kernel";
+            data = /incbin/("genrt-raspberrypi-3b-plus.bin");
+            type = "kernel";
+            arch = "arm64";
+            os = "linux";
+            compression = "none";
+            load = <0x02000000>;
+            entry = <0x02000000>;
+            hash-1 { algo = "crc32"; };
+        };
+        fdt {
+            description = "Raspberry Pi 3B+ spin-table DTB";
+            data = /incbin/("genrt-raspberrypi-3b-plus.dtb");
+            type = "flat_dt";
+            arch = "arm64";
+            compression = "none";
+            hash-1 { algo = "crc32"; };
+        };
+        ramdisk {
+            description = "genrt production initramfs";
+            data = /incbin/("initramfs.cpio");
+            type = "ramdisk";
+            arch = "arm64";
+            os = "linux";
+            compression = "none";
+            load = <0x04000000>;
+            hash-1 { algo = "crc32"; };
+        };
+    };
+
+    configurations {
+        default = "raspberrypi-3b-plus";
+        raspberrypi-3b-plus {
+            description = "Raspberry Pi 3B+ kernel, DTB and initramfs";
+            kernel = "kernel";
+            fdt = "fdt";
+            ramdisk = "ramdisk";
+        };
+    };
+};

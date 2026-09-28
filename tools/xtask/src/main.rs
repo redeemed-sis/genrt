@@ -1,6 +1,7 @@
 mod artifacts;
 mod cli;
 mod dist;
+mod hardware;
 mod initramfs;
 mod product;
 mod product_contract;
