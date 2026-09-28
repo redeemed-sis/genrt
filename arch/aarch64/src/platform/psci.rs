@@ -1,6 +1,13 @@
-//! PSCI calls through the QEMU DTB-selected HVC conduit.
+//! PSCI calls through the firmware DTB-selected conduit; absence is supported.
 
 use core::arch::asm;
+
+/// Firmware-advertised SMCCC transport; never inferred from the board name.
+#[derive(Copy, Clone)]
+pub(super) enum Conduit {
+    Hvc,
+    Smc,
+}
 
 const PSCI_0_2_FN_BASE: u64 = 0x8400_0000;
 const PSCI_SYSTEM_OFF: u64 = PSCI_0_2_FN_BASE + 8;
@@ -11,7 +18,7 @@ const ARCH_POWER_FAILED: i64 = 1;
 const ARCH_POWER_NOT_SUPPORTED: i64 = 2;
 const ARCH_POWER_DENIED: i64 = 3;
 
-/// Invoke PSCI `CPU_ON` through the HVC conduit.
+/// Invoke PSCI `CPU_ON` through the firmware-selected HVC or SMC conduit.
 ///
 /// # Arguments
 ///
@@ -30,7 +37,7 @@ pub(crate) fn cpu_on(function_id: u64, target: u64, entry: u64, context: u64) ->
     call(function_id, target, entry, context)
 }
 
-/// Request a system-wide PSCI reset through the HVC conduit.
+/// Request a system-wide PSCI reset through the firmware-selected conduit.
 ///
 /// # Returns
 ///
@@ -42,7 +49,7 @@ pub(crate) fn system_reset() -> i64 {
     power_result(call(PSCI_SYSTEM_RESET, 0, 0, 0))
 }
 
-/// Request a system-wide PSCI power off through the HVC conduit.
+/// Request a system-wide PSCI power off through the firmware-selected conduit.
 ///
 /// # Returns
 ///
@@ -63,19 +70,32 @@ fn power_result(status: i64) -> i64 {
 }
 
 fn call(function_id: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    let Some(conduit) = super::cpu::psci_conduit() else {
+        return PSCI_NOT_SUPPORTED;
+    };
     let mut status = function_id;
-    // SAFETY: the platform topology parser accepted the HVC conduit. Register
+    // SAFETY: the topology parser accepted this firmware conduit. Register
     // assignment follows the PSCI SMCCC convention, and all clobbered argument
     // registers are explicit outputs.
     unsafe {
-        asm!(
-            "hvc #0",
-            inout("x0") status,
-            inout("x1") arg0 => _,
-            inout("x2") arg1 => _,
-            inout("x3") arg2 => _,
-            options(nostack)
-        );
+        match conduit {
+            Conduit::Hvc => asm!(
+                "hvc #0",
+                inout("x0") status,
+                inout("x1") arg0 => _,
+                inout("x2") arg1 => _,
+                inout("x3") arg2 => _,
+                options(nostack)
+            ),
+            Conduit::Smc => asm!(
+                "smc #0",
+                inout("x0") status,
+                inout("x1") arg0 => _,
+                inout("x2") arg1 => _,
+                inout("x3") arg2 => _,
+                options(nostack)
+            ),
+        }
     }
     status as i64
 }

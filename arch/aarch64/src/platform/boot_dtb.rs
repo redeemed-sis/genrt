@@ -2,8 +2,9 @@
 //!
 //! This parser exists only for MMU bring-up. It runs before the MMU, before the
 //! heap, and before panic/logging are usable, so it deliberately understands only
-//! the small subset needed to build initial mappings: RAM, PL011, and GICv2
-//! `reg` ranges.
+//! the small subset needed to build initial mappings: RAM, GICv2 `reg`
+//! ranges, and the UART MMIO window (a PL011 `reg` range on QEMU or the
+//! translated peripheral-bus `ranges` entry on Raspberry Pi).
 
 const FDT_MAGIC: u32 = 0xd00d_feed;
 const FDT_BEGIN_NODE: u32 = 1;
@@ -29,6 +30,12 @@ static DEVICE_TYPE_MEMORY: [u8; 6] = *b"memory";
 static COMPAT_PL011: [u8; 9] = *b"arm,pl011";
 #[unsafe(link_section = ".boot.rodata")]
 static COMPAT_GICV2: [u8; 18] = *b"arm,cortex-a15-gic";
+#[cfg(feature = "platform-raspberrypi-3b-plus")]
+#[unsafe(link_section = ".boot.rodata")]
+static COMPAT_SIMPLE_BUS: [u8; 10] = *b"simple-bus";
+#[cfg(feature = "platform-raspberrypi-3b-plus")]
+#[unsafe(link_section = ".boot.rodata")]
+static PROP_RANGES: [u8; 6] = *b"ranges";
 
 #[derive(Copy, Clone)]
 pub(crate) struct BootDeviceRange {
@@ -39,18 +46,22 @@ pub(crate) struct BootDeviceRange {
 impl BootDeviceRange {
     #[unsafe(link_section = ".boot.text")]
     pub const fn is_present(self) -> bool {
-        self.start != 0 && self.size != 0
+        self.size != 0
     }
 }
 
+/// Fixed-size pre-MMU platform ranges.
+///
+/// `irq_primary` and `irq_secondary` are interpreted by the selected
+/// controller; they carry no GIC-specific semantics in this shared record.
 #[derive(Copy, Clone)]
 pub(crate) struct BootPlatformInfo {
     pub dtb_pa: usize,
     pub dtb_size: usize,
     pub ram: BootDeviceRange,
     pub uart: BootDeviceRange,
-    pub gic_distributor: BootDeviceRange,
-    pub gic_cpu_interface: BootDeviceRange,
+    pub irq_primary: BootDeviceRange,
+    pub irq_secondary: BootDeviceRange,
 }
 
 impl BootPlatformInfo {
@@ -62,10 +73,10 @@ impl BootPlatformInfo {
         self.ram.size = 0;
         self.uart.start = 0;
         self.uart.size = 0;
-        self.gic_distributor.start = 0;
-        self.gic_distributor.size = 0;
-        self.gic_cpu_interface.start = 0;
-        self.gic_cpu_interface.size = 0;
+        self.irq_primary.start = 0;
+        self.irq_primary.size = 0;
+        self.irq_secondary.start = 0;
+        self.irq_secondary.size = 0;
     }
 }
 
@@ -77,31 +88,21 @@ struct NodeState {
     reg0: BootDeviceRange,
     reg1: BootDeviceRange,
     reg_count: u8,
+    #[cfg(feature = "platform-raspberrypi-3b-plus")]
+    is_soc: bool,
+    #[cfg(feature = "platform-raspberrypi-3b-plus")]
+    child_addr_cells: u32,
+    #[cfg(feature = "platform-raspberrypi-3b-plus")]
+    child_size_cells: u32,
+    #[cfg(feature = "platform-raspberrypi-3b-plus")]
+    ranges: (usize, usize),
 }
 
 impl NodeState {
     #[unsafe(link_section = ".boot.text")]
-    const fn zeroed() -> Self {
-        Self {
-            is_memory: false,
-            is_uart: false,
-            is_gic: false,
-            reg0: BootDeviceRange { start: 0, size: 0 },
-            reg1: BootDeviceRange { start: 0, size: 0 },
-            reg_count: 0,
-        }
-    }
-
-    #[unsafe(link_section = ".boot.text")]
     fn reset(&mut self) {
-        self.is_memory = false;
-        self.is_uart = false;
-        self.is_gic = false;
-        self.reg0.start = 0;
-        self.reg0.size = 0;
-        self.reg1.start = 0;
-        self.reg1.size = 0;
-        self.reg_count = 0;
+        // SAFETY: this is the sole mutable reference to the parser-local slot.
+        unsafe { clear_node_state(self) };
     }
 
     #[unsafe(link_section = ".boot.text")]
@@ -116,6 +117,25 @@ impl NodeState {
             self.reg1 = range;
             self.reg_count = 2;
         }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<NodeState>() % 8 == 0);
+
+#[unsafe(link_section = ".boot.text")]
+unsafe fn clear_node_state(slot: *mut NodeState) {
+    let mut offset = 0usize;
+    while offset < core::mem::size_of::<NodeState>() {
+        // SAFETY: NodeState is 8-byte aligned and its size is a multiple of 8.
+        // Inline stores prevent compiler-generated memset before MMU enable.
+        unsafe {
+            core::arch::asm!(
+                "str xzr, [{address}]",
+                address = in(reg) (slot as usize).wrapping_add(offset),
+                options(nostack, preserves_flags)
+            );
+        }
+        offset = offset.wrapping_add(8);
     }
 }
 
@@ -161,7 +181,13 @@ pub(crate) unsafe fn parse_boot_platform(dtb_pa: usize, out: &mut BootPlatformIn
     let mut cursor = struct_start;
     let mut root_addr_cells = 2u32;
     let mut root_size_cells = 1u32;
-    let mut current = NodeState::zeroed();
+    let mut slot = core::mem::MaybeUninit::<NodeState>::uninit();
+    // SAFETY: all fields have a valid zero representation and the writer
+    // covers the whole parser-local slot before it is used.
+    let mut current = unsafe {
+        clear_node_state(slot.as_mut_ptr());
+        slot.assume_init_mut()
+    };
 
     while can_add_within(cursor, 4, struct_end) {
         let Some(token) = (unsafe { read_be_u32_at(dtb_pa, total_size, cursor) }) else {
@@ -185,6 +211,14 @@ pub(crate) unsafe fn parse_boot_platform(dtb_pa: usize, out: &mut BootPlatformIn
                     return;
                 }
                 if depth == 2 {
+                    #[cfg(feature = "platform-raspberrypi-3b-plus")]
+                    if current.is_soc && !out.uart.is_present() {
+                        if let Some(window) = unsafe {
+                            parse_pi_bus_window(dtb_pa, total_size, root_addr_cells, &current)
+                        } {
+                            out.uart = window;
+                        }
+                    }
                     if current.is_memory && !out.ram.is_present() {
                         out.ram = current.reg0;
                     }
@@ -192,11 +226,11 @@ pub(crate) unsafe fn parse_boot_platform(dtb_pa: usize, out: &mut BootPlatformIn
                         out.uart = current.reg0;
                     }
                     if current.is_gic
-                        && !out.gic_distributor.is_present()
-                        && !out.gic_cpu_interface.is_present()
+                        && !out.irq_primary.is_present()
+                        && !out.irq_secondary.is_present()
                     {
-                        out.gic_distributor = current.reg0;
-                        out.gic_cpu_interface = current.reg1;
+                        out.irq_primary = current.reg0;
+                        out.irq_secondary = current.reg1;
                     }
                 }
                 depth = depth.wrapping_sub(1);
@@ -219,6 +253,21 @@ pub(crate) unsafe fn parse_boot_platform(dtb_pa: usize, out: &mut BootPlatformIn
                 let value_end = value_off.wrapping_add(value_len);
                 if value_end < value_off || value_end > total_size {
                     return;
+                }
+
+                #[cfg(feature = "platform-raspberrypi-3b-plus")]
+                if depth == 2 {
+                    unsafe {
+                        parse_pi_bus_property(
+                            dtb_pa,
+                            total_size,
+                            strings_start,
+                            nameoff as usize,
+                            value_off,
+                            value_len,
+                            &mut current,
+                        );
+                    }
                 }
 
                 if depth == 1
@@ -340,6 +389,84 @@ pub(crate) unsafe fn parse_boot_platform(dtb_pa: usize, out: &mut BootPlatformIn
             _ => return,
         }
     }
+}
+
+#[cfg(feature = "platform-raspberrypi-3b-plus")]
+#[unsafe(link_section = ".boot.text")]
+unsafe fn parse_pi_bus_property(
+    dtb_pa: usize,
+    total_size: usize,
+    strings_start: usize,
+    nameoff: usize,
+    value_off: usize,
+    value_len: usize,
+    node: &mut NodeState,
+) {
+    let name_is = |expected: &[u8]| unsafe {
+        prop_name_eq(
+            dtb_pa,
+            total_size,
+            strings_start,
+            nameoff,
+            expected.as_ptr(),
+            expected.len(),
+        )
+    };
+    if value_len == 4 && name_is(&PROP_ADDRESS_CELLS) {
+        node.child_addr_cells =
+            unsafe { read_be_u32_at(dtb_pa, total_size, value_off) }.unwrap_or(0);
+    } else if value_len == 4 && name_is(&PROP_SIZE_CELLS) {
+        node.child_size_cells =
+            unsafe { read_be_u32_at(dtb_pa, total_size, value_off) }.unwrap_or(0);
+    } else if name_is(&PROP_COMPATIBLE) {
+        node.is_soc = unsafe {
+            compatible_contains(
+                dtb_pa,
+                total_size,
+                value_off,
+                value_len,
+                COMPAT_SIMPLE_BUS.as_ptr(),
+                COMPAT_SIMPLE_BUS.len(),
+            )
+        };
+    } else if name_is(&PROP_RANGES) {
+        node.ranges = (value_off, value_len);
+    }
+}
+
+#[cfg(feature = "platform-raspberrypi-3b-plus")]
+#[unsafe(link_section = ".boot.text")]
+unsafe fn parse_pi_bus_window(
+    dtb_pa: usize,
+    total_size: usize,
+    parent_addr_cells: u32,
+    node: &NodeState,
+) -> Option<BootDeviceRange> {
+    let child_cells = node.child_addr_cells;
+    let size_cells = node.child_size_cells;
+    if !(1..=2).contains(&child_cells)
+        || !(1..=2).contains(&parent_addr_cells)
+        || !(1..=2).contains(&size_cells)
+    {
+        return None;
+    }
+    let stride = (child_cells + parent_addr_cells + size_cells) as usize * 4;
+    let (offset, length) = node.ranges;
+    if length != stride {
+        return None;
+    }
+    let child = unsafe { read_cells(dtb_pa, total_size, offset, child_cells) }?;
+    let parent_offset = offset.checked_add(child_cells as usize * 4)?;
+    let parent = unsafe { read_cells(dtb_pa, total_size, parent_offset, parent_addr_cells) }?;
+    let size_offset = parent_offset.checked_add(parent_addr_cells as usize * 4)?;
+    let size = unsafe { read_cells(dtb_pa, total_size, size_offset, size_cells) }?;
+    if size == 0 || child.checked_add(size).is_none() || parent.checked_add(size).is_none() {
+        return None;
+    }
+    Some(BootDeviceRange {
+        start: usize::try_from(parent).ok()?,
+        size: usize::try_from(size).ok()?,
+    })
 }
 
 #[unsafe(link_section = ".boot.text")]

@@ -13,7 +13,7 @@ use super::hva::{
     TABLE_ENTRIES, l0_index, l1_index, l2_index, save_boot_roots,
 };
 
-use crate::platform::{BootDeviceRange, BootPlatformInfo, parse_boot_platform};
+use crate::platform::{self, BootDeviceRange, BootPlatformInfo};
 
 // MAIR_EL1 encoding:
 // - Device-nGnRnE = 0x00 для MMIO;
@@ -117,7 +117,7 @@ static mut TTBR1_L1: PageTable = PageTable::new();
 #[unsafe(link_section = ".boot.bss.pt")]
 static mut TTBR1_L2_RAM: PageTable = PageTable::new();
 #[unsafe(link_section = ".boot.bss.pt")]
-static mut TTBR1_L2_GIC: PageTable = PageTable::new();
+static mut TTBR1_L2_IRQ: PageTable = PageTable::new();
 #[unsafe(link_section = ".boot.bss.pt")]
 static mut TTBR1_L2_UART: PageTable = PageTable::new();
 
@@ -129,27 +129,35 @@ unsafe extern "C" {
 
 /// Low-linked page-table builder.
 ///
-/// Вызывается из `_start` до включения MMU. Функция должна оставаться пригодной
-/// для исполнения при identity-only addressing:
-/// - не использовать heap/log/format/panic;
-/// - не читать high virtual symbols как память;
-/// - писать только в low `.boot.bss` page tables и `BootMmuParams`.
+/// Called from `_start` before MMU enable. It uses identity-only addressing,
+/// writes low `.boot.bss` tables, and must not reach heap, logging, panic, or
+/// high-linked helpers. The platform parser supplies RAM, UART, and selected
+/// interrupt-controller ranges. TTBR0 temporarily maps the low execution
+/// window; TTBR1 maps RAM and the two Device windows.
 ///
-/// Low parser сразу читает DTB из platform-specific bare-metal слота,
-/// извлекает RAM, UART и GIC `reg` ranges, после чего page tables содержат:
-/// - TTBR0 temporary identity maps для kernel image/DTB execution window;
-/// - TTBR1 high direct-map для RAM;
-/// - TTBR1 high Device mappings для UART/GIC.
+/// # Arguments
+///
+/// * `params` - Writable low-linked boot parameter and page-table handoff.
+/// * `firmware_dtb` - Firmware DTB physical address, used by the Pi path.
+///
+/// # Returns
+///
+/// Returns after constructing the initial tables without allocation.
+///
+/// # Safety
+///
+/// `params` must point to writable low boot storage and the selected DTB
+/// address must be readable before translation is enabled.
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".boot.text")]
-pub unsafe extern "C" fn boot_build_page_tables(params: *mut BootMmuParams) {
+pub unsafe extern "C" fn boot_build_page_tables(params: *mut BootMmuParams, firmware_dtb: usize) {
     let ttbr0_l0 = addr_of_mut!(TTBR0_L0);
     let ttbr0_l1 = addr_of_mut!(TTBR0_L1);
     let ttbr0_l2_ram = addr_of_mut!(TTBR0_L2_RAM);
     let ttbr1_l0 = addr_of_mut!(TTBR1_L0);
     let ttbr1_l1 = addr_of_mut!(TTBR1_L1);
     let ttbr1_l2_ram = addr_of_mut!(TTBR1_L2_RAM);
-    let ttbr1_l2_gic = addr_of_mut!(TTBR1_L2_GIC);
+    let ttbr1_l2_irq = addr_of_mut!(TTBR1_L2_IRQ);
     let ttbr1_l2_uart = addr_of_mut!(TTBR1_L2_UART);
     let image_start = align_down_2m(core::ptr::addr_of!(__kernel_image_phys_start) as usize);
     let image_end = align_up_2m(core::ptr::addr_of!(__kernel_image_phys_end) as usize);
@@ -159,12 +167,9 @@ pub unsafe extern "C" fn boot_build_page_tables(params: *mut BootMmuParams) {
     // SAFETY: zero_boot_platform_info writes every byte of the integer-only
     // BootPlatformInfo layout before this reference is created.
     let platform = unsafe { platform.assume_init_mut() };
-    unsafe { parse_boot_platform(crate::platform::qemu::BOOT_DTB_PA, platform) };
-    if !platform_info_complete(platform) {
-        crate::platform::qemu::apply_fallback_platform_info(platform);
-    }
+    unsafe { platform::prepare_boot_platform(firmware_dtb, platform) };
     let ram_map = aligned_range_or_image(platform.ram, image_start, image_size);
-    let gic_map = cover_ranges(platform.gic_distributor, platform.gic_cpu_interface);
+    let irq_map = cover_ranges(platform.irq_primary, platform.irq_secondary);
     let uart_map = platform.uart;
 
     unsafe {
@@ -177,7 +182,7 @@ pub unsafe extern "C" fn boot_build_page_tables(params: *mut BootMmuParams) {
         PageTable::clear_low(ttbr1_l0);
         PageTable::clear_low(ttbr1_l1);
         PageTable::clear_low(ttbr1_l2_ram);
-        PageTable::clear_low(ttbr1_l2_gic);
+        PageTable::clear_low(ttbr1_l2_irq);
         PageTable::clear_low(ttbr1_l2_uart);
 
         // TTBR0: low identity window. Он нужен только для переходного периода:
@@ -229,21 +234,21 @@ pub unsafe extern "C" fn boot_build_page_tables(params: *mut BootMmuParams) {
             );
         }
 
-        if gic_map.is_present() {
-            let high_gic = boot_phys_to_hva(gic_map.start);
-            let gic_l1_index = l1_index(high_gic);
+        if irq_map.is_present() {
+            let high_irq = boot_phys_to_hva(irq_map.start);
+            let irq_l1_index = l1_index(high_irq);
             let ram_l1_index = l1_index(high_ram);
-            let gic_l2 = if gic_l1_index == ram_l1_index {
+            let irq_l2 = if irq_l1_index == ram_l1_index {
                 ttbr1_l2_ram
             } else {
-                PageTable::install_table_low(ttbr1_l1, gic_l1_index, ttbr1_l2_gic as usize);
-                ttbr1_l2_gic
+                PageTable::install_table_low(ttbr1_l1, irq_l1_index, ttbr1_l2_irq as usize);
+                ttbr1_l2_irq
             };
             PageTable::map_blocks_low(
-                gic_l2,
-                high_gic,
-                gic_map.start,
-                gic_map.size,
+                irq_l2,
+                high_irq,
+                irq_map.start,
+                irq_map.size,
                 ATTR_DEVICE_NG_RN_E,
                 false,
             );
@@ -253,11 +258,11 @@ pub unsafe extern "C" fn boot_build_page_tables(params: *mut BootMmuParams) {
             let high_uart = boot_phys_to_hva(uart_map.start);
             let uart_l1_index = l1_index(high_uart);
             let ram_l1_index = l1_index(high_ram);
-            let gic_l1_index = l1_index(boot_phys_to_hva(gic_map.start));
+            let irq_l1_index = l1_index(boot_phys_to_hva(irq_map.start));
             let uart_l2 = if uart_l1_index == ram_l1_index {
                 ttbr1_l2_ram
-            } else if gic_map.is_present() && uart_l1_index == gic_l1_index {
-                ttbr1_l2_gic
+            } else if irq_map.is_present() && uart_l1_index == irq_l1_index {
+                ttbr1_l2_irq
             } else {
                 PageTable::install_table_low(ttbr1_l1, uart_l1_index, ttbr1_l2_uart as usize);
                 ttbr1_l2_uart
@@ -397,14 +402,6 @@ const fn align_range_2m(range: BootDeviceRange) -> BootDeviceRange {
         start,
         size: end.wrapping_sub(start),
     }
-}
-
-#[unsafe(link_section = ".boot.text")]
-const fn platform_info_complete(info: &BootPlatformInfo) -> bool {
-    info.ram.is_present()
-        && info.uart.is_present()
-        && info.gic_distributor.is_present()
-        && info.gic_cpu_interface.is_present()
 }
 
 /// Минимальная store primitive для low boot path.

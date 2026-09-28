@@ -11,9 +11,6 @@ mod abi;
 mod boot;
 mod hva;
 
-pub use self::{
-    boot::init_from_boot_params,
-    hva::{phys_to_hva, phys_to_hva_const},
-};
+pub use self::{boot::init_from_boot_params, hva::phys_to_hva};
 
 pub(crate) use self::boot::platform_params_from_boot_params;

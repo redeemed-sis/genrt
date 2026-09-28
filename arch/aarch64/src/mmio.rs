@@ -25,16 +25,3 @@ pub(crate) unsafe fn mmio_read32(addr: usize) -> u32 {
     }
     value
 }
-
-#[inline(always)]
-pub(crate) unsafe fn mmio_write8(addr: usize, value: u8) {
-    // SAFETY: Caller guarantees `addr` is a valid MMIO register address.
-    unsafe {
-        core::arch::asm!(
-            "strb {value:w}, [{addr}]",
-            addr = in(reg) addr,
-            value = in(reg) value as u32,
-            options(nostack, preserves_flags)
-        );
-    }
-}

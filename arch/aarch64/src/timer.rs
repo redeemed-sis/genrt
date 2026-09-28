@@ -9,8 +9,6 @@ const CNTP_CTL_ENABLE: u32 = 1 << 0;
 const CNTP_CTL_IMASK: u32 = 1 << 1;
 const CNTP_CTL_ISTATUS: u32 = 1 << 2;
 
-pub const TIMER_IRQ_ID_PHYS: u32 = 30;
-
 #[unsafe(no_mangle)]
 pub static TIMER_FREQ_HZ_BY_CPU: [AtomicU64; CPU_CAPACITY] =
     [const { AtomicU64::new(0) }; CPU_CAPACITY];

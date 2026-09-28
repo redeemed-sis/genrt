@@ -6,10 +6,23 @@ use core::{
 use kernel::sync::IrqSpinLock;
 
 use crate::{
-    mmio::{mmio_read32, mmio_write8, mmio_write32},
-    mmu::phys_to_hva_const,
-    platform::PlatformInfo,
+    mmio::{mmio_read32, mmio_write32},
+    mmu::phys_to_hva,
+    platform::{InterruptMap, PlatformInfo},
 };
+
+#[inline(always)]
+unsafe fn mmio_write8(addr: usize, value: u8) {
+    // SAFETY: callers select a valid mapped GIC byte register.
+    unsafe {
+        asm!(
+            "strb {value:w}, [{addr}]",
+            addr = in(reg) addr,
+            value = in(reg) value as u32,
+            options(nostack, preserves_flags)
+        );
+    }
+}
 
 // INTID value returned when no pending interrupt is available.
 const GICV2_SPURIOUS_IRQ_ID: u32 = 1023;
@@ -45,16 +58,14 @@ static SCHEDULER_IPI_SENT: [AtomicUsize; crate::platform::CPU_CAPACITY] =
     [const { AtomicUsize::new(0) }; crate::platform::CPU_CAPACITY];
 
 pub fn configure_from_platform(platform: &PlatformInfo) {
-    if platform.gic_distributor.is_present() && platform.gic_cpu_interface.is_present() {
+    let InterruptMap::GicV2 {
+        distributor,
+        cpu_interface,
+    } = platform.interrupts;
+    if distributor.is_present() && cpu_interface.is_present() {
         let mut initialized = DISTRIBUTOR.lock();
-        GICD_BASE.store(
-            phys_to_hva_const(platform.gic_distributor.start as usize),
-            Ordering::Release,
-        );
-        GICC_BASE.store(
-            phys_to_hva_const(platform.gic_cpu_interface.start as usize),
-            Ordering::Release,
-        );
+        GICD_BASE.store(phys_to_hva(distributor.start as usize), Ordering::Release);
+        GICC_BASE.store(phys_to_hva(cpu_interface.start as usize), Ordering::Release);
         *initialized = false;
     }
 }

@@ -1,4 +1,4 @@
-//! Immutable AArch64 CPU topology and PSCI startup metadata.
+//! Immutable AArch64 CPU topology and firmware startup metadata.
 
 use core::{
     cell::UnsafeCell,
@@ -25,18 +25,29 @@ pub(crate) enum CpuTopologyError {
     /// The executing boot CPU was absent from enabled topology.
     BootCpuMissing,
     /// PSCI metadata or CPU_ON function ID was absent.
+    #[cfg(not(feature = "platform-raspberrypi-3b-plus"))]
     MissingPsci,
     /// The platform requested a conduit not supported by this QEMU target.
+    #[cfg(not(feature = "platform-raspberrypi-3b-plus"))]
     UnsupportedPsciMethod,
     /// The platform does not advertise the PSCI 0.2 system-call contract.
+    #[cfg(not(feature = "platform-raspberrypi-3b-plus"))]
     UnsupportedPsciVersion,
+    /// Pi CPU identity, enable method, or reserved spin-table word is invalid.
+    #[cfg(feature = "platform-raspberrypi-3b-plus")]
+    InvalidSpinTable,
 }
 
 #[derive(Copy, Clone)]
 struct CpuTopology {
     target_ids: [u64; MAX_BOOT_CPUS],
     count: usize,
+    #[cfg(not(feature = "platform-raspberrypi-3b-plus"))]
     psci_cpu_on: u64,
+    #[cfg(not(feature = "platform-raspberrypi-3b-plus"))]
+    conduit: Option<super::psci::Conduit>,
+    #[cfg(feature = "platform-raspberrypi-3b-plus")]
+    release_addresses: [usize; MAX_BOOT_CPUS],
 }
 
 const EMPTY: u8 = 0;
@@ -101,6 +112,8 @@ fn parse_cpu_topology(dtb: &[u8], boot_hardware_id: u64) -> Result<CpuTopology, 
     let fdt = Fdt::from_bytes(dtb).map_err(|_| CpuTopologyError::Parse)?;
     let mut target_ids = [0u64; MAX_BOOT_CPUS];
     let mut count = 0usize;
+    #[cfg(feature = "platform-raspberrypi-3b-plus")]
+    let mut release_addresses = [0usize; MAX_BOOT_CPUS];
     for node in fdt.find_children_by_path("/cpus") {
         if node.find_property_str("device_type") != Some("cpu")
             || node
@@ -124,6 +137,25 @@ fn parse_cpu_topology(dtb: &[u8], boot_hardware_id: u64) -> Result<CpuTopology, 
             .get_mut(count)
             .ok_or(CpuTopologyError::TooManyCpus)?;
         *slot = hardware;
+        #[cfg(feature = "platform-raspberrypi-3b-plus")]
+        {
+            // The shared spin entry derives its stack slot from Aff0. Reject
+            // topology that would make that identity differ from logical order.
+            if hardware != count as u64
+                || node.find_property_str("enable-method") != Some("spin-table")
+            {
+                return Err(CpuTopologyError::InvalidSpinTable);
+            }
+            let address = node
+                .find_property("cpu-release-addr")
+                .and_then(|property| property.as_u64())
+                .ok_or(CpuTopologyError::InvalidSpinTable)?;
+            // Only the standard armstub8 reserved low-RAM slots are supported.
+            if address != 0xd8 + 8 * hardware {
+                return Err(CpuTopologyError::InvalidSpinTable);
+            }
+            release_addresses[count] = address as usize;
+        }
         count += 1;
     }
     if count == 0 {
@@ -136,28 +168,70 @@ fn parse_cpu_topology(dtb: &[u8], boot_hardware_id: u64) -> Result<CpuTopology, 
         .ok_or(CpuTopologyError::BootCpuMissing)?;
     target_ids.swap(0, boot_index);
 
-    let psci = fdt
-        .find_by_path("/psci")
-        .ok_or(CpuTopologyError::MissingPsci)?;
-    if !psci
-        .compatibles()
-        .any(|compatible| matches!(compatible, "arm,psci-0.2" | "arm,psci-1.0"))
+    #[cfg(feature = "platform-raspberrypi-3b-plus")]
     {
-        return Err(CpuTopologyError::UnsupportedPsciVersion);
+        if boot_index != 0 {
+            return Err(CpuTopologyError::InvalidSpinTable);
+        }
+        return Ok(CpuTopology {
+            target_ids,
+            count,
+            release_addresses,
+        });
     }
-    if psci.find_property_str("method") != Some("hvc") {
-        return Err(CpuTopologyError::UnsupportedPsciMethod);
-    }
-    let psci_cpu_on = psci
-        .find_property("cpu_on")
-        .and_then(|property| property.as_u32())
-        .ok_or(CpuTopologyError::MissingPsci)? as u64;
 
-    Ok(CpuTopology {
-        target_ids,
-        count,
-        psci_cpu_on,
-    })
+    #[cfg(not(feature = "platform-raspberrypi-3b-plus"))]
+    {
+        let Some(psci) = fdt.find_by_path("/psci") else {
+            if count != 1 {
+                return Err(CpuTopologyError::MissingPsci);
+            }
+            return Ok(CpuTopology {
+                target_ids,
+                count,
+                psci_cpu_on: 0,
+                conduit: None,
+            });
+        };
+        if !psci
+            .compatibles()
+            .any(|compatible| matches!(compatible, "arm,psci-0.2" | "arm,psci-1.0"))
+        {
+            return Err(CpuTopologyError::UnsupportedPsciVersion);
+        }
+        let conduit = match psci.find_property_str("method") {
+            Some("hvc") => super::psci::Conduit::Hvc,
+            Some("smc") => super::psci::Conduit::Smc,
+            _ => return Err(CpuTopologyError::UnsupportedPsciMethod),
+        };
+        let psci_cpu_on = psci
+            .find_property("cpu_on")
+            .and_then(|property| property.as_u32())
+            .unwrap_or(0xc400_0003) as u64;
+
+        Ok(CpuTopology {
+            target_ids,
+            count,
+            psci_cpu_on,
+            conduit: Some(conduit),
+        })
+    }
+}
+
+/// Return the validated reserved release word for secondary `logical_index`.
+/// Returns `None` for CPU0 or an absent CPU; boot-only and allocation-free.
+#[cfg(feature = "platform-raspberrypi-3b-plus")]
+pub(super) fn spin_release_address(logical_index: usize) -> Option<usize> {
+    let topology = topology();
+    (logical_index > 0 && logical_index < topology.count)
+        .then(|| topology.release_addresses[logical_index])
+}
+
+/// Return the firmware-advertised PSCI conduit, or `None` without PSCI.
+/// No arguments; requires published topology, allocates nothing and does not block.
+#[cfg(not(feature = "platform-raspberrypi-3b-plus"))]
+pub(super) fn psci_conduit() -> Option<super::psci::Conduit> {
+    topology().conduit
 }
 
 fn topology() -> &'static CpuTopology {
@@ -206,6 +280,7 @@ pub(crate) fn expected_hardware_id(logical_index: usize) -> Option<u64> {
 /// # Returns
 ///
 /// Returns `(function_id, raw_target_mpidr)` for an in-range CPU, or `None`.
+#[cfg(not(feature = "platform-raspberrypi-3b-plus"))]
 pub(crate) fn psci_cpu_on_call(logical_index: usize) -> Option<(u64, u64)> {
     let topology = topology();
     if logical_index == 0 || logical_index >= topology.count {

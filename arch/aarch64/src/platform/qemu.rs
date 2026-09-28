@@ -40,11 +40,11 @@ pub(crate) fn apply_fallback_platform_info(info: &mut BootPlatformInfo) {
         start: UART_START,
         size: EMERGENCY_MMIO_SIZE,
     };
-    info.gic_distributor = BootDeviceRange {
+    info.irq_primary = BootDeviceRange {
         start: GICD_START,
         size: EMERGENCY_MMIO_SIZE,
     };
-    info.gic_cpu_interface = BootDeviceRange {
+    info.irq_secondary = BootDeviceRange {
         start: GICC_START,
         size: EMERGENCY_MMIO_SIZE,
     };

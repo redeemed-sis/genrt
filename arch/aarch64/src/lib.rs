@@ -1,5 +1,8 @@
 #![no_std]
 
+#[cfg(all(feature = "platform-raspberrypi-3b-plus", feature = "qemu-test"))]
+compile_error!("Raspberry Pi runtime cannot execute QEMU test contracts");
+
 use core::{
     arch::{asm, global_asm},
     sync::atomic::{AtomicU64, Ordering},
@@ -11,14 +14,18 @@ mod console;
 mod context;
 mod esr;
 mod exception;
-mod gic;
+mod interrupts;
 mod mmio;
 mod mmu;
 mod platform;
 mod timer;
 mod trap_frame;
 
-global_asm!(include_str!("boot.s"));
+global_asm!(
+    ".equ GENRT_PI_RUNTIME, {pi_runtime}",
+    include_str!("boot.s"),
+    pi_runtime = const platform::PI_RUNTIME,
+);
 global_asm!(include_str!("exceptions.s"));
 
 #[unsafe(no_mangle)]
@@ -79,22 +86,16 @@ pub extern "C" fn rust_entry(boot_mmu_params_pa: usize, bootstrap_slot: usize) -
         platform::init(platform_info)
             .unwrap_or_else(|err| panic!("arch: invalid AArch64 platform info: {err:?}"))
     };
-    console::configure_from_platform(platform);
-    gic::configure_from_platform(platform);
     let dtb = unsafe { core::slice::from_raw_parts(dtb_va as *const u8, dtb_size as usize) };
+    console::configure_from_platform(platform, dtb);
     platform::init_cpu_topology(dtb, arch_current_cpu_hardware_id())
         .unwrap_or_else(|err| panic!("arch: invalid AArch64 CPU topology: {err:?}"));
+    platform::init_boot_payloads(dtb);
     let bootinfo: &'static BootInfo = unsafe { kernel::boot::init_bootinfo(dtb_pa, dtb_va) };
     if bootinfo.cpu_count as usize != platform::cpu_count() {
         panic!("arch: generic and AArch64 CPU topology counts differ");
     }
-    if !gic::init_global_distributor() {
-        panic!("arch: failed to initialize GIC distributor");
-    }
-    console::enable_rx_interrupts();
-    if !gic::enable_spi_on_cpu0(platform::qemu::UART0_IRQ_ID, 0x60) {
-        panic!("arch: failed to route UART SPI to CPU0");
-    }
+    interrupts::init_global(platform);
     if !init_current_cpu_interrupt_state() {
         panic!("arch: failed to initialize CPU0 interrupt state");
     }
@@ -158,9 +159,7 @@ fn init_current_cpu_interrupt_state() -> bool {
             options(nomem, nostack, preserves_flags)
         );
         timer::init_current_cpu()
-    } && gic::init_current_cpu_interface()
-        && gic::enable_current_cpu_private_irq(timer::TIMER_IRQ_ID_PHYS, 0x40)
-        && gic::init_current_cpu_scheduler_ipi()
+    } && interrupts::init_local()
         && vectors_installed();
 
     ready
@@ -206,7 +205,7 @@ pub extern "C" fn arch_secondary_cpu_identity_matches(logical_index: usize) -> b
 }
 
 #[unsafe(no_mangle)]
-/// Start one platform-described secondary CPU through PSCI HVC.
+/// Start one platform-described secondary CPU through its platform protocol.
 ///
 /// # Arguments
 ///
@@ -214,18 +213,16 @@ pub extern "C" fn arch_secondary_cpu_identity_matches(logical_index: usize) -> b
 ///
 /// # Returns
 ///
-/// Returns the signed PSCI status. Zero means CPU_ON accepted the request;
-/// every other value is a controlled startup failure. The call publishes the
-/// live runtime TTBR1 root before entering the hypervisor and allocates nothing.
+/// Returns zero on accepted publication, otherwise a startup failure code.
+/// Pi uses a cleaned spin-table word and SEV; other targets use DTB-selected
+/// PSCI. Publishes runtime TTBR1 before release without allocation. Generic
+/// boot separately waits for bounded scheduler-online acknowledgement.
 ///
 /// # Safety
 ///
 /// CPU0 must invoke this only after runtime TTBR1 and immutable CPU topology
 /// publication. The selected slot must not already have been started.
 pub extern "C" fn arch_start_secondary_cpu(logical_index: usize) -> i64 {
-    let Some((function_id, target_hardware)) = platform::psci_cpu_on_call(logical_index) else {
-        return -2;
-    };
     let entry_pa = unsafe { core::ptr::addr_of!(__secondary_start_value).read_volatile() };
     let ttbr1 = read_ttbr1();
     let handoff_pa = unsafe { core::ptr::addr_of!(__secondary_ttbr1_value).read_volatile() };
@@ -234,33 +231,28 @@ pub extern "C" fn arch_start_secondary_cpu(logical_index: usize) -> i64 {
     // value before any CPU_ON request. The low secondary entry observes it with
     // an Acquire load.
     unsafe { (&*handoff).store(ttbr1, Ordering::Release) };
-    // SAFETY: the barrier orders the handoff before the PSCI call. QEMU's DTB
-    // selected the HVC conduit and supplied the CPU_ON function ID/target.
+    // SAFETY: order the root publication before architecture-owned CPU release.
     unsafe {
         asm!("dsb ishst", options(nostack, preserves_flags));
     }
-    platform::psci::cpu_on(
-        function_id,
-        target_hardware,
-        entry_pa as u64,
-        logical_index as u64,
-    )
+    platform::start_secondary_cpu(logical_index, entry_pa, handoff_pa, ttbr1 as usize)
 }
 
-/// Request a system-wide restart through the platform PSCI conduit.
+/// Request a system-wide restart through the selected platform backend.
 ///
 /// # Returns
 ///
 /// Success is terminal. If firmware returns, its status is translated to the
 /// generic power-hook error ABI as a controlled failure.
 ///
-/// This call is allocation-free, lock-free, and valid on every initialized CPU.
+/// No arguments. Allocation-free and valid on every initialized CPU. Pi uses
+/// a terminal atomic claim and watchdog; other targets use their PSCI conduit.
 #[unsafe(no_mangle)]
 pub extern "C" fn arch_system_restart() -> i64 {
-    platform::psci::system_reset()
+    platform::system_restart()
 }
 
-/// Request a system-wide power off through the platform PSCI conduit.
+/// Request platform power off; Pi firmware halt does not remove board power.
 ///
 /// # Returns
 ///
@@ -270,7 +262,7 @@ pub extern "C" fn arch_system_restart() -> i64 {
 /// This call is allocation-free, lock-free, and valid on every initialized CPU.
 #[unsafe(no_mangle)]
 pub extern "C" fn arch_system_power_off() -> i64 {
-    platform::psci::system_off()
+    platform::system_power_off()
 }
 
 #[unsafe(no_mangle)]
@@ -351,11 +343,11 @@ pub extern "C" fn arch_current_cpu_hardware_id() -> u64 {
 /// # Returns
 ///
 /// Returns `true` after publishing both the logical identity and its unique
-/// GICv2 target binding, or `false` when the local GIC target cannot be bound.
+/// platform interrupt-target binding, or `false` for an invalid local target.
 /// The index is stored in `TPIDR_EL1` as `logical_index + 1`, reserving zero for
 /// an unbound CPU. The operation is allocation-free and non-blocking.
 pub extern "C" fn arch_bind_current_cpu_logical_id(logical_index: usize) -> bool {
-    if !gic::bind_current_cpu_target(logical_index) {
+    if !interrupts::bind_cpu(logical_index) {
         return false;
     }
     let encoded = logical_index
@@ -374,7 +366,7 @@ pub extern "C" fn arch_bind_current_cpu_logical_id(logical_index: usize) -> bool
 }
 
 #[unsafe(no_mangle)]
-/// Send a scheduler notification to one logical CPU through GICv2 SGI.
+/// Send a scheduler notification through a platform SGI or Pi mailbox.
 ///
 /// # Arguments
 ///
@@ -386,7 +378,7 @@ pub extern "C" fn arch_bind_current_cpu_logical_id(logical_index: usize) -> bool
 /// Returns `true` after one targeted, bounded, allocation-free SGI write, or
 /// `false` when the logical CPU has no architecture target binding.
 pub extern "C" fn arch_send_scheduler_ipi(logical_index: usize) -> bool {
-    gic::send_scheduler_ipi(logical_index)
+    interrupts::send_ipi(logical_index)
 }
 
 #[unsafe(no_mangle)]
@@ -450,12 +442,12 @@ pub extern "C" fn arch_sched_call(request: *const core::ffi::c_void) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn arch_initramfs_load_pa() -> usize {
-    platform::qemu::INITRAMFS_LOAD_PA
+    platform::initramfs_range().0
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn arch_initramfs_reserved_size() -> usize {
-    platform::qemu::INITRAMFS_RESERVED_SIZE
+    platform::initramfs_range().1
 }
 
 #[unsafe(no_mangle)]
@@ -498,7 +490,7 @@ fn hard_park_current_cpu() -> ! {
 #[cfg(feature = "qemu-test-smp-boot")]
 #[unsafe(no_mangle)]
 pub extern "C" fn arch_smp_device_routing_ready_for_test() -> bool {
-    gic::spi_targets_cpu0(platform::qemu::UART0_IRQ_ID)
+    platform::gic::spi_targets_cpu0(platform::qemu::UART0_IRQ_ID)
 }
 
 /// Return delivered scheduler SGIs for one logical CPU in the SMP contract.
@@ -514,7 +506,7 @@ pub extern "C" fn arch_smp_device_routing_ready_for_test() -> bool {
 #[cfg(feature = "qemu-test-smp-boot")]
 #[unsafe(no_mangle)]
 pub extern "C" fn arch_scheduler_ipi_received_count_for_test(logical_index: usize) -> usize {
-    gic::scheduler_ipi_received_count_for_test(logical_index)
+    platform::gic::scheduler_ipi_received_count_for_test(logical_index)
 }
 
 /// Return successful scheduler-SGI sends to one CPU in the SMP contract.
@@ -532,7 +524,7 @@ pub extern "C" fn arch_scheduler_ipi_received_count_for_test(logical_index: usiz
 #[cfg(feature = "qemu-test-smp-boot")]
 #[unsafe(no_mangle)]
 pub extern "C" fn arch_scheduler_ipi_sent_count_for_test(logical_index: usize) -> usize {
-    gic::scheduler_ipi_sent_count_for_test(logical_index)
+    platform::gic::scheduler_ipi_sent_count_for_test(logical_index)
 }
 
 unsafe fn clear_local_ttbr0() {

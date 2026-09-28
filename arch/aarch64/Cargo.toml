@@ -9,6 +9,7 @@ crate-type = ["staticlib"]
 
 [features]
 default = []
+platform-raspberrypi-3b-plus = []
 log-level-error = ["kernel/log-level-error"]
 log-level-warn = ["kernel/log-level-warn"]
 log-level-info = ["kernel/log-level-info"]

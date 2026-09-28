@@ -152,11 +152,6 @@ fn ttbr1_l0_pa() -> usize {
     read_ttbr1() & DESC_ADDR_MASK as usize
 }
 
-/// Const helper для MMIO base constants: `HVA = PA + KERNEL_HVA_OFFSET`.
-pub const fn phys_to_hva_const(pa: usize) -> usize {
-    pa.wrapping_add(KERNEL_HVA_OFFSET)
-}
-
 /// Runtime PA -> high direct-map VA conversion.
 #[inline(always)]
 pub fn phys_to_hva(pa: usize) -> usize {
@@ -450,10 +445,17 @@ pub(super) unsafe fn switch_to_runtime_kernel_tables() -> Result<(), VmError> {
     )?;
     let mut l0_frame = OwnedTableFrame::alloc()?;
     let mut l1_frame = OwnedTableFrame::alloc()?;
-    let mut l2_gic_frame = OwnedTableFrame::alloc()?;
-    let mut l2_uart_frame = if l1_index(phys_to_hva(platform.gic.start))
-        == l1_index(phys_to_hva(platform.uart.start))
-    {
+    // RAM and peripherals may occupy the same 1 GiB L1 slot (BCM2837).
+    // Reuse that L2 table instead of replacing the RAM table's descriptor.
+    let ram_index = l1_index(phys_to_hva(platform.ram.start));
+    let irq_index = l1_index(phys_to_hva(platform.irq.start));
+    let uart_index = l1_index(phys_to_hva(platform.uart.start));
+    let mut l2_irq_frame = if irq_index == ram_index {
+        None
+    } else {
+        Some(OwnedTableFrame::alloc()?)
+    };
+    let mut l2_uart_frame = if uart_index == ram_index || uart_index == irq_index {
         None
     } else {
         Some(OwnedTableFrame::alloc()?)
@@ -462,27 +464,36 @@ pub(super) unsafe fn switch_to_runtime_kernel_tables() -> Result<(), VmError> {
 
     let l0 = l0_frame.table();
     let l1 = l1_frame.table();
-    let l2_gic = l2_gic_frame.table();
+    let l2_ram = l2_ram_frame.table();
+    let l2_irq = l2_irq_frame
+        .as_ref()
+        .map(OwnedTableFrame::table)
+        .unwrap_or(l2_ram);
     let l2_uart = l2_uart_frame
         .as_ref()
         .map(OwnedTableFrame::table)
-        .unwrap_or(l2_gic);
-    let l2_ram = l2_ram_frame.table();
+        .unwrap_or(if uart_index == ram_index {
+            l2_ram
+        } else {
+            l2_irq
+        });
 
     l0.clear();
     l1.clear();
-    l2_gic.clear();
+    l2_irq.clear();
     if let Some(frame) = l2_uart_frame.as_ref() {
         frame.table().clear();
     }
     l2_ram.clear();
 
     let high_ram = phys_to_hva(platform.ram.start);
-    let high_gic = phys_to_hva(platform.gic.start);
+    let high_irq = phys_to_hva(platform.irq.start);
     let high_uart = phys_to_hva(platform.uart.start);
     l0.install_table(l0_index(high_ram), l1_frame.pa());
     l1.install_table(l1_index(high_ram), l2_ram_frame.pa());
-    l1.install_table(l1_index(high_gic), l2_gic_frame.pa());
+    if let Some(frame) = l2_irq_frame.as_ref() {
+        l1.install_table(l1_index(high_irq), frame.pa());
+    }
     if let Some(frame) = l2_uart_frame.as_ref() {
         l1.install_table(l1_index(high_uart), frame.pa());
     }
@@ -495,10 +506,10 @@ pub(super) unsafe fn switch_to_runtime_kernel_tables() -> Result<(), VmError> {
         VmFlags::from_bits((1 << 1) | (1 << 2) | (1 << 4)),
     );
     map_l2_2m_blocks(
-        l2_gic,
-        high_gic,
-        platform.gic.start,
-        platform.gic.size,
+        l2_irq,
+        high_irq,
+        platform.irq.start,
+        platform.irq.size,
         VmMemoryAttr::DeviceNgRnE,
         VmFlags::from_bits((1 << 1) | (1 << 4)),
     );
@@ -514,7 +525,9 @@ pub(super) unsafe fn switch_to_runtime_kernel_tables() -> Result<(), VmError> {
     unsafe { install_runtime_ttbrs(l0_frame.pa()) };
     l0_frame.release();
     l1_frame.release();
-    l2_gic_frame.release();
+    if let Some(frame) = l2_irq_frame.as_mut() {
+        frame.release();
+    }
     if let Some(frame) = l2_uart_frame.as_mut() {
         frame.release();
     }
@@ -590,6 +603,7 @@ pub(super) unsafe fn map_user_page(
         return Err(VmError::AlreadyMapped);
     }
 
+    unsafe { crate::platform::prepare_user_page(pa, flags.contains(UserMapFlags::EXECUTE)) };
     l3.write(index, user_page_desc(pa, flags));
     Ok(())
 }
@@ -630,7 +644,7 @@ pub(super) unsafe fn clear_user_address_space() -> Result<(), VmError> {
 #[derive(Copy, Clone)]
 struct RuntimePlatformMap {
     ram: AlignedMapRange,
-    gic: AlignedMapRange,
+    irq: AlignedMapRange,
     uart: AlignedMapRange,
 }
 
@@ -638,14 +652,13 @@ impl RuntimePlatformMap {
     fn from_platform_info(platform: &crate::platform::PlatformInfo) -> Result<Self, VmError> {
         let ram = aligned_range_from_device(platform.ram)?;
         let uart = aligned_range_from_device(platform.uart)?;
-        let gicd = aligned_range_from_device(platform.gic_distributor)?;
-        let gicc = aligned_range_from_device(platform.gic_cpu_interface)?;
+        let (primary, secondary) = platform.interrupts.ranges();
+        let mut irq = aligned_range_from_device(primary)?;
+        if let Some(secondary) = secondary {
+            irq = irq.cover(aligned_range_from_device(secondary)?)?;
+        }
 
-        Ok(Self {
-            ram,
-            gic: gicd.cover(gicc)?,
-            uart,
-        })
+        Ok(Self { ram, irq, uart })
     }
 }
 
