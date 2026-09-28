@@ -1,6 +1,6 @@
 name = "reviewer"
 description = "Read-only reviewer for correctness, safety, determinism, regressions, and missing tests in a concrete diff."
-model = "gpt-6-astra"
+model = "gpt-6-sol"
 model_reasoning_effort = "high"
 sandbox_mode = "read-only"
 

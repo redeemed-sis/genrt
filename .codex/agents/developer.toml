@@ -1,6 +1,6 @@
 name = "developer"
 description = "Single-writer implementation agent for an approved genrt scope after discovery and consolidation."
-model = "gpt-5.6-terra"
+model = "gpt-6-sol"
 model_reasoning_effort = "high"
 sandbox_mode = "workspace-write"
 
