@@ -89,6 +89,17 @@ just gdb-aarch64
 See [AArch64 debugging](docs/development/debugging.md) for the two-terminal GDB
 workflow and artifact locations.
 
+## Hardware bootstrap
+
+Raspberry Pi 3B+ can boot the shared kernel through an installed 64-bit U-Boot:
+
+```bash
+cargo xtask build-raspberrypi-3b-plus
+```
+
+See the [Raspberry Pi 3B+ bootstrap guide](arch/aarch64/platform/raspberrypi-3b-plus/README.md)
+for UART upload, microSD installation, and automatic boot with `boot.scr`.
+
 ## Build and verification
 
 ```bash
