@@ -1,6 +1,6 @@
 name = "architect"
 description = "Read-only architecture analyst for cross-layer changes, ownership, invariants, migration, and ADR needs."
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 model_reasoning_effort = "high"
 sandbox_mode = "read-only"
 
