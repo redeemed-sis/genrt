@@ -523,6 +523,8 @@ pub fn query_user_mapping(aspace: AddressSpaceId, va: VirtAddr) -> Option<UserMa
 /// # Returns
 ///
 /// Returns `Ok(())` after the architecture installed the root.
+/// An already-active immutable root is retained without a register write or
+/// invalidation. The active record includes lazy retention during local idle.
 ///
 /// # Errors
 ///
@@ -539,6 +541,10 @@ pub(crate) unsafe fn activate_user_address_space(aspace: AddressSpaceId) -> Resu
     if current_cpu != aspace.owner_cpu() {
         return Err(VmError::WrongCpu);
     }
+    let active = &ACTIVE_USER_ADDRESS_SPACES[current_cpu.index()];
+    if active.load(Ordering::Acquire) == aspace.root_pa() {
+        return Ok(());
+    }
     if ACTIVE_USER_ADDRESS_SPACES
         .iter()
         .enumerate()
@@ -549,7 +555,7 @@ pub(crate) unsafe fn activate_user_address_space(aspace: AddressSpaceId) -> Resu
         return Err(VmError::ActiveAddressSpace);
     }
     vm_result(unsafe { arch_activate_user_address_space(aspace.root_pa()) })?;
-    ACTIVE_USER_ADDRESS_SPACES[current_cpu.index()].store(aspace.root_pa(), Ordering::Release);
+    active.store(aspace.root_pa(), Ordering::Release);
     Ok(())
 }
 
@@ -561,6 +567,7 @@ pub(crate) unsafe fn activate_user_address_space(aspace: AddressSpaceId) -> Resu
 /// # Returns
 ///
 /// Returns `Ok(())` after the architecture cleared the root.
+/// An already-clear CPU is a no-op; publication follows completed invalidation.
 ///
 /// # Errors
 ///
@@ -573,9 +580,28 @@ pub(crate) unsafe fn activate_user_address_space(aspace: AddressSpaceId) -> Resu
 /// valid user address space is activated again.
 pub(crate) unsafe fn clear_user_address_space() -> Result<(), VmError> {
     let current_cpu = cpu::current_id().map_err(|_| VmError::WrongCpu)?;
+    let active = &ACTIVE_USER_ADDRESS_SPACES[current_cpu.index()];
+    if active.load(Ordering::Acquire) == NO_ACTIVE_USER_ROOT {
+        return Ok(());
+    }
     vm_result(unsafe { arch_clear_user_address_space() })?;
-    ACTIVE_USER_ADDRESS_SPACES[current_cpu.index()].store(NO_ACTIVE_USER_ROOT, Ordering::Release);
+    active.store(NO_ACTIVE_USER_ROOT, Ordering::Release);
     Ok(())
+}
+
+/// Read the actual architecture TTBR0-write count in the single-CPU contract.
+///
+/// # Returns
+///
+/// Returns a test-only count of root replacement/clear operations that include
+/// local invalidation. This atomic query allocates nothing and does not block.
+#[cfg(feature = "qemu-test-kernel-runtime")]
+pub(crate) fn user_root_writes_for_test() -> u64 {
+    unsafe extern "C" {
+        fn arch_user_root_writes_for_test() -> u64;
+    }
+    // SAFETY: the test backend returns one atomic diagnostic value.
+    unsafe { arch_user_root_writes_for_test() }
 }
 
 fn vm_result(code: u64) -> Result<(), VmError> {

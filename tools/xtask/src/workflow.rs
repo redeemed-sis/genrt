@@ -880,6 +880,13 @@ struct UserProgram {
 
 const USER_PROGRAMS: &[UserProgram] = &[
     UserProgram {
+        name: "test_wakeup_probe",
+        source: "tests/qemu/user/wakeup_probe.c",
+        defines: &[],
+        test_artifact: true,
+        checked: false,
+    },
+    UserProgram {
         name: "hello",
         source: "user/c/hello.c",
         checked: true,

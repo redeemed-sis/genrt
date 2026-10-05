@@ -14,10 +14,22 @@ use std::cell::Cell;
 static CURRENT_CPU_LOGICAL_ID: AtomicUsize = AtomicUsize::new(0);
 std::thread_local! {
     static IRQ_MASK_STATE: Cell<usize> = const { Cell::new(0) };
+    static TIMER_PROGRAM_COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
 pub(crate) fn irq_mask_state() -> usize {
     IRQ_MASK_STATE.with(Cell::get)
+}
+
+/// Return this host test thread's timer-arm and timer-disarm call counts.
+///
+/// # Returns
+///
+/// Returns `(arms, disarms)` for the inert architecture timer stubs. This query
+/// does not allocate, block, or access hardware; counters are thread-local so
+/// parallel host tests cannot affect each other's observations.
+pub(crate) fn timer_program_counts() -> (usize, usize) {
+    TIMER_PROGRAM_COUNTS.with(Cell::get)
 }
 
 #[unsafe(no_mangle)]
@@ -82,12 +94,30 @@ extern "C" fn arch_counter_freq_hz() -> u64 {
     1_000_000
 }
 #[unsafe(no_mangle)]
-extern "C" fn arch_timer_arm_deadline(_deadline: u64) {}
+extern "C" fn arch_timer_arm_deadline(_deadline: u64) {
+    TIMER_PROGRAM_COUNTS.with(|counts| {
+        let (arms, disarms) = counts.get();
+        counts.set((arms + 1, disarms));
+    });
+}
 #[unsafe(no_mangle)]
-extern "C" fn arch_timer_disarm() {}
+extern "C" fn arch_timer_disarm() {
+    TIMER_PROGRAM_COUNTS.with(|counts| {
+        let (arms, disarms) = counts.get();
+        counts.set((arms, disarms + 1));
+    });
+}
 #[unsafe(no_mangle)]
 extern "C" fn arch_phys_to_virt(pa: usize) -> usize {
     pa
+}
+#[unsafe(no_mangle)]
+extern "C" fn arch_query_user_mapping(
+    _root_pa: usize,
+    _va: usize,
+    _out_info: *mut crate::memory::vm::UserMappingInfo,
+) -> u64 {
+    panic!("host test queried a hardware user mapping")
 }
 #[unsafe(no_mangle)]
 extern "C" fn arch_sched_call(_request: *const c_void) {

@@ -119,7 +119,6 @@ impl PreemptionState {
         }
     }
 
-    #[cfg(any(test, feature = "qemu-test-kernel-runtime"))]
     const fn is_disabled(&self) -> bool {
         self.disable_depth != 0
     }
@@ -253,13 +252,16 @@ impl Drop for PreemptGuard {
 
 /// Return whether preemption is disabled on the executing CPU.
 ///
-/// This test-only query takes a short local-IRQ guard, allocates nothing, and
+/// This query takes a short local-IRQ guard, allocates nothing, and
 /// does not acknowledge a pending reschedule request.
 ///
 /// # Returns
 ///
 /// Returns `true` when the current CPU has one or more active guards.
-#[cfg(feature = "qemu-test-kernel-runtime")]
+///
+/// # Panics
+///
+/// Panics when the executing CPU has no valid logical binding.
 pub(crate) fn is_disabled() -> bool {
     let cpu = current_cpu();
     let _irq_guard = LocalIrqGuard::save_and_disable();

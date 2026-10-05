@@ -623,6 +623,14 @@ impl CpuScheduler<'_> {
         else {
             panic!("thread: exit transition continued current thread")
         };
+        if self.thread_address_space(exited.index()).is_some() && self.state().idle == Some(next) {
+            // Idle may retain a sleeping root, never an exiting one. Detach
+            // before the post-handoff SGI can publish join/reap resources.
+            // SAFETY: this owner-CPU terminal transition holds scheduler and
+            // local IRQ exclusion; the exited thread can never resume EL0.
+            unsafe { crate::memory::vm::clear_user_address_space() }
+                .unwrap_or_else(|err| panic!("thread: exit TTBR0 detach failed: {err:?}"));
+        }
         self.saved_context(next).restore_into(context);
         self.activate_thread_address_space(next);
         self.finish_block_current(exited, next);

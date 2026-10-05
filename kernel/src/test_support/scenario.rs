@@ -41,7 +41,13 @@ impl Scenario {
         Self { name, body }
     }
 
-    fn run(&self) {
+    /// Run this descriptor with one CASE_START and terminal PASS or FAIL.
+    ///
+    /// # Returns
+    ///
+    /// Returns after a successful body and PASS; failure emits FAIL and parks.
+    /// Protocol emission allocates nothing; the body owns its bounded work.
+    pub(crate) fn run(&self) {
         protocol::case_start(self.name);
         if let Err(reason) = (self.body)() {
             protocol::fail(self.name, reason);
@@ -65,6 +71,7 @@ impl Scenario {
 /// # Returns
 ///
 /// This function never returns after emitting `DONE PASS` for the suite.
+#[cfg(feature = "qemu-test-smp-boot")]
 pub(crate) fn run_suite(suite: &'static str, scenarios: &'static [Scenario]) -> ! {
     protocol::ready(suite);
     for scenario in scenarios {
@@ -98,6 +105,7 @@ pub(crate) fn run_suite(suite: &'static str, scenarios: &'static [Scenario]) -> 
 ///     Ok(())
 /// }
 /// ```
+#[cfg(feature = "qemu-test-smp-boot")]
 macro_rules! kernel_test_suite {
     (
         suite: $suite:expr,
@@ -128,4 +136,5 @@ macro_rules! kernel_test_suite {
     };
 }
 
+#[cfg(feature = "qemu-test-smp-boot")]
 pub(crate) use kernel_test_suite;

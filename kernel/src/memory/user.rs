@@ -5,7 +5,7 @@
 //! and therefore copy through the current user VA. They do not copy from an
 //! arbitrary inactive process address space.
 //!
-//! The byte loops are bring-up-only: validation happens before the copy, but
+//! The copy loops are bring-up-only: validation happens before the copy, but
 //! there is not yet an exception/fixup table for fault recovery if the actual
 //! load/store faults.
 
@@ -26,6 +26,9 @@ pub const USER_STACK_TOP: VirtAddr = 0x0000_0080_0000_0000;
 /// This prevents early syscalls from copying unbounded user buffers before the
 /// kernel has fault-recovering copy loops and a richer process memory model.
 pub const MAX_USER_COPY: usize = 1024;
+
+const COPY_WORD_BYTES: usize = core::mem::size_of::<usize>();
+const _: () = assert!(PAGE_SIZE.is_multiple_of(COPY_WORD_BYTES));
 
 /// Exclusive ownership of mapped user-stack frames.
 ///
@@ -162,25 +165,45 @@ pub enum UserCopyError {
     OutOfMemory,
 }
 
+/// Copy at most `MAX_USER_COPY` bytes from the current user address space.
+///
+/// The complete range is validated before copying aligned user words and byte
+/// edges. The active user mappings must remain stable throughout the copy;
+/// fault recovery is not implemented. This bounded operation allocates
+/// nothing, does not block or change IRQ state, and runs in syscall/trap context.
+///
+/// # Arguments
+///
+/// * `dst` - Writable kernel buffer receiving the user bytes.
+/// * `user_src` - Source virtual address in the active user address space.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after copying every byte. An empty destination succeeds
+/// without validating `user_src`.
+///
+/// # Errors
+///
+/// Returns `UserCopyError::TooLarge` when `dst` exceeds `MAX_USER_COPY`, or a
+/// range/permission error. Validation errors leave `dst` unchanged.
 pub fn copy_from_user(dst: &mut [u8], user_src: VirtAddr) -> Result<(), UserCopyError> {
     if dst.is_empty() {
         return Ok(());
     }
     validate_user_read_range(user_src, dst.len())?;
 
-    let mut offset = 0usize;
-    while offset < dst.len() {
-        // SAFETY: validation checked the full range against the current TTBR0
-        // mapping and read permissions. This is bring-up-only: it assumes user
-        // mappings remain stable during the syscall and does not yet provide
-        // fault recovery if the actual load faults.
-        dst[offset] = unsafe { (user_src as *const u8).add(offset).read_volatile() };
-        offset += 1;
-    }
+    // SAFETY: validation checked the entire readable user range. The current
+    // address space remains installed and immutable until the copy completes.
+    unsafe { read_validated_user_bytes(dst, user_src) };
     Ok(())
 }
 
 /// Copy at most `MAX_USER_COPY` kernel bytes into the current user address space.
+///
+/// The complete range is validated before copying aligned user words and byte
+/// edges. The active user mappings must remain stable throughout the copy;
+/// fault recovery is not implemented. This bounded operation allocates
+/// nothing, does not block or change IRQ state, and runs in syscall/trap context.
 ///
 /// # Arguments
 ///
@@ -196,6 +219,7 @@ pub fn copy_from_user(dst: &mut [u8], user_src: VirtAddr) -> Result<(), UserCopy
 ///
 /// Returns `UserCopyError::TooLarge` when `src` exceeds `MAX_USER_COPY`, or the
 /// permission/range errors returned while validating the active user mapping.
+/// Validation errors leave the user destination unchanged.
 pub fn copy_to_user(user_dst: VirtAddr, src: &[u8]) -> Result<(), UserCopyError> {
     if src.is_empty() {
         return Ok(());
@@ -204,7 +228,10 @@ pub fn copy_to_user(user_dst: VirtAddr, src: &[u8]) -> Result<(), UserCopyError>
         return Err(UserCopyError::TooLarge);
     }
     validate_user_range_unbounded(user_dst, src.len(), AccessKind::Write)?;
-    write_validated_user_bytes(user_dst, src)
+    // SAFETY: validation checked the entire writable user range, whose
+    // immutable mappings remain active until the copy completes.
+    unsafe { write_validated_user_bytes(user_dst, src) };
+    Ok(())
 }
 
 /// Copy a bounded kernel byte string and terminating NUL into userspace.
@@ -240,7 +267,8 @@ pub fn copy_cstr_to_user(
         return Err(UserCopyError::TooLarge);
     }
     validate_user_range_unbounded(user_dst, required, AccessKind::Write)?;
-    write_validated_user_bytes(user_dst, value)?;
+    // SAFETY: the complete value-plus-NUL range was validated as writable.
+    unsafe { write_validated_user_bytes(user_dst, value) };
     let nul_dst = user_dst
         .checked_add(value.len())
         .ok_or(UserCopyError::AddressOverflow)?;
@@ -249,29 +277,97 @@ pub fn copy_cstr_to_user(
     Ok(required)
 }
 
-fn write_validated_user_bytes(user_dst: VirtAddr, src: &[u8]) -> Result<(), UserCopyError> {
+/// # Safety
+///
+/// `user_src..user_src + dst.len()` must be validated, readable normal user
+/// memory with stable active mappings and must not overlap `dst`. There is no
+/// fault recovery. Aligned words cannot cross a page boundary because page
+/// size is a multiple of `COPY_WORD_BYTES`; byte edges never overread the range.
+unsafe fn read_validated_user_bytes(dst: &mut [u8], user_src: VirtAddr) {
+    let src = user_src as *const u8;
+    let prefix = (user_src.wrapping_neg() & (COPY_WORD_BYTES - 1)).min(dst.len());
+    let word_end = dst.len() - (dst.len() - prefix) % COPY_WORD_BYTES;
+    let kernel_aligned = dst
+        .as_ptr()
+        .addr()
+        .wrapping_add(prefix)
+        .is_multiple_of(COPY_WORD_BYTES);
     let mut offset = 0usize;
-    while offset < src.len() {
-        let chunk_start = user_dst
-            .checked_add(offset)
-            .ok_or(UserCopyError::AddressOverflow)?;
-        let page_remaining = PAGE_SIZE - (chunk_start & (PAGE_SIZE - 1));
-        let chunk_len = page_remaining.min(src.len() - offset);
-        let mut chunk_offset = 0usize;
-        while chunk_offset < chunk_len {
-            // SAFETY: validation checked the full range against the current
-            // TTBR0 mapping and write permissions. This is bring-up-only and
-            // does not yet recover from a faulting store.
-            unsafe {
-                (chunk_start as *mut u8)
-                    .add(chunk_offset)
-                    .write_volatile(src[offset + chunk_offset])
-            };
-            chunk_offset += 1;
-        }
-        offset += chunk_len;
+    while offset < prefix {
+        // SAFETY: offset is inside both buffers; byte access needs no alignment.
+        dst[offset] = unsafe { src.add(offset).read_volatile() };
+        offset += 1;
     }
-    Ok(())
+    while offset < word_end {
+        // SAFETY: the prefix aligned the user pointer and a full word remains
+        // inside both buffers. Kernel slice storage need not be word-aligned.
+        unsafe {
+            let word = src.add(offset).cast::<usize>().read_volatile();
+            let kernel_word = dst.as_mut_ptr().add(offset).cast::<usize>();
+            if kernel_aligned {
+                kernel_word.write(word);
+            } else {
+                kernel_word.write_unaligned(word);
+            }
+        }
+        offset += COPY_WORD_BYTES;
+    }
+    while offset < dst.len() {
+        // SAFETY: the final byte edges stay inside the validated range.
+        dst[offset] = unsafe { src.add(offset).read_volatile() };
+        offset += 1;
+    }
+}
+
+/// # Safety
+///
+/// `user_dst..user_dst + src.len()` must be validated, writable normal user
+/// memory with stable active mappings and must not overlap `src`. There is no
+/// fault recovery. Aligned words cannot cross a page boundary; byte edges
+/// never overwrite bytes outside the validated range.
+unsafe fn write_validated_user_bytes(user_dst: VirtAddr, src: &[u8]) {
+    let dst = user_dst as *mut u8;
+    let prefix = (user_dst.wrapping_neg() & (COPY_WORD_BYTES - 1)).min(src.len());
+    let word_end = src.len() - (src.len() - prefix) % COPY_WORD_BYTES;
+    let kernel_aligned = src
+        .as_ptr()
+        .addr()
+        .wrapping_add(prefix)
+        .is_multiple_of(COPY_WORD_BYTES);
+    let mut offset = 0usize;
+    while offset < prefix {
+        // SAFETY: offset is inside both buffers; byte access needs no alignment.
+        unsafe { dst.add(offset).write_volatile(src[offset]) };
+        offset += 1;
+    }
+    // Select outside the loop so strict-alignment code generation retains
+    // aligned kernel loads instead of merging them with bytewise fallback.
+    if kernel_aligned {
+        while offset < word_end {
+            // SAFETY: both pointers are word-aligned and a complete word
+            // remains inside the source and validated user destination.
+            unsafe {
+                let word = src.as_ptr().add(offset).cast::<usize>().read();
+                dst.add(offset).cast::<usize>().write_volatile(word);
+            }
+            offset += COPY_WORD_BYTES;
+        }
+    } else {
+        while offset < word_end {
+            // SAFETY: the user pointer is aligned and a complete word remains
+            // in both buffers; unaligned kernel storage uses the fallback.
+            unsafe {
+                let word = src.as_ptr().add(offset).cast::<usize>().read_unaligned();
+                dst.add(offset).cast::<usize>().write_volatile(word);
+            }
+            offset += COPY_WORD_BYTES;
+        }
+    }
+    while offset < src.len() {
+        // SAFETY: the final byte edges stay inside the validated range.
+        unsafe { dst.add(offset).write_volatile(src[offset]) };
+        offset += 1;
+    }
 }
 
 pub fn validate_user_read_range(ptr: VirtAddr, len: usize) -> Result<(), UserCopyError> {
@@ -422,5 +518,123 @@ fn check_mapping(mapping: UserMappingInfo, access: AccessKind) -> Result<(), Use
         AccessKind::Read if !mapping.readable => Err(UserCopyError::NotReadable),
         AccessKind::Write if !mapping.writable => Err(UserCopyError::NotWritable),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exercise_copy(user_offset: usize, kernel_offset: usize, len: usize) {
+        let mut user = alloc::vec![0x9b; len + 2 * COPY_WORD_BYTES];
+        let mut kernel = alloc::vec![0xa5; len + 2 * COPY_WORD_BYTES];
+        for index in 0..len {
+            user[user_offset + index] = index.wrapping_mul(37) as u8;
+        }
+        let original_user = user.clone();
+        // SAFETY: both disjoint host allocations cover the exact copy range.
+        unsafe {
+            read_validated_user_bytes(
+                &mut kernel[kernel_offset..kernel_offset + len],
+                user.as_ptr().add(user_offset) as VirtAddr,
+            );
+        }
+        assert_eq!(
+            kernel[kernel_offset..kernel_offset + len],
+            user[user_offset..user_offset + len]
+        );
+        assert!(kernel[..kernel_offset].iter().all(|byte| *byte == 0xa5));
+        assert!(
+            kernel[kernel_offset + len..]
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+        assert_eq!(user, original_user);
+
+        user.fill(0x9b);
+        let original_kernel = kernel.clone();
+        // SAFETY: both disjoint host allocations cover the exact copy range.
+        unsafe {
+            write_validated_user_bytes(
+                user.as_mut_ptr().add(user_offset) as VirtAddr,
+                &kernel[kernel_offset..kernel_offset + len],
+            );
+        }
+        assert_eq!(
+            user[user_offset..user_offset + len],
+            kernel[kernel_offset..kernel_offset + len]
+        );
+        assert!(user[..user_offset].iter().all(|byte| *byte == 0x9b));
+        assert!(user[user_offset + len..].iter().all(|byte| *byte == 0x9b));
+        assert_eq!(kernel, original_kernel);
+    }
+
+    #[test]
+    fn word_copies_preserve_exact_ranges_for_every_alignment_and_byte_tail() {
+        for user_offset in 0..COPY_WORD_BYTES {
+            for kernel_offset in 0..COPY_WORD_BYTES {
+                for len in 0..=3 * COPY_WORD_BYTES {
+                    exercise_copy(user_offset, kernel_offset, len);
+                }
+                exercise_copy(user_offset, kernel_offset, MAX_USER_COPY);
+                exercise_copy(user_offset, kernel_offset, GENRT_PATH_MAX + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn word_copies_cross_page_boundaries_without_touching_guards() {
+        #[repr(align(4096))]
+        struct UserPages([u8; 2 * PAGE_SIZE]);
+
+        for edge in 0..COPY_WORD_BYTES {
+            let mut user = UserPages([0xa5; 2 * PAGE_SIZE]);
+            let start = PAGE_SIZE - COPY_WORD_BYTES + edge;
+            let mut kernel = [0u8; 4 * COPY_WORD_BYTES];
+            let len = kernel.len();
+            for (index, byte) in kernel.iter_mut().enumerate() {
+                *byte = index as u8;
+            }
+            // SAFETY: the disjoint arrays cover a range spanning their two
+            // resident user pages and the complete kernel buffer.
+            unsafe {
+                write_validated_user_bytes(user.0.as_mut_ptr().add(start) as VirtAddr, &kernel);
+            }
+            assert_eq!(user.0[start..start + len], kernel);
+            assert!(user.0[..start].iter().all(|byte| *byte == 0xa5));
+            assert!(user.0[start + len..].iter().all(|byte| *byte == 0xa5));
+            kernel.fill(0xff);
+            // SAFETY: the same resident, disjoint ranges remain valid.
+            unsafe {
+                read_validated_user_bytes(&mut kernel, user.0.as_ptr().add(start) as VirtAddr);
+            }
+            for (index, byte) in kernel.iter().enumerate() {
+                assert_eq!(*byte, index as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_read_ranges_leave_kernel_buffers_unchanged() {
+        let mut buffer = [0xa5; 2 * COPY_WORD_BYTES];
+        for (ptr, error) in [
+            (0, UserCopyError::NotUserRange),
+            (usize::MAX - COPY_WORD_BYTES, UserCopyError::AddressOverflow),
+            (
+                USER_STACK_TOP - COPY_WORD_BYTES,
+                UserCopyError::NotUserRange,
+            ),
+        ] {
+            assert_eq!(copy_from_user(&mut buffer, ptr), Err(error));
+            assert_eq!(buffer, [0xa5; 2 * COPY_WORD_BYTES]);
+        }
+        let mut too_large = [0xa5; MAX_USER_COPY + 1];
+        assert_eq!(
+            copy_from_user(&mut too_large, USER_TEXT_BASE),
+            Err(UserCopyError::TooLarge)
+        );
+        assert!(too_large.iter().all(|byte| *byte == 0xa5));
+        assert_eq!(copy_from_user(&mut [], usize::MAX), Ok(()));
+        assert_eq!(copy_to_user(usize::MAX, &[]), Ok(()));
     }
 }

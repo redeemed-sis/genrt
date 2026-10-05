@@ -106,7 +106,7 @@ pub enum DispatchError {
 /// # Errors
 ///
 /// Returns [`DispatchError::UnknownSyscall`] with the unrecognized syscall
-/// number.
+/// number without modifying `context` or performing a syscall operation.
 ///
 /// Individual handlers may allocate, copy userspace memory, or block only in
 /// synchronous thread/syscall context. Dispatch itself adds no allocation, and

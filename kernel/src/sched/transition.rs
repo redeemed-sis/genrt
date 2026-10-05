@@ -440,6 +440,59 @@ impl CpuScheduler<'_> {
         SwitchOutcome::Switch { from, to }
     }
 
+    /// Complete and select one local timed wait directly from permanent idle.
+    ///
+    /// The caller owns the timer transaction at enabled task preemption. A
+    /// populated ready queue or remote ingress requires the normal RR path.
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - Exact local registration whose deadline expired.
+    ///
+    /// # Returns
+    ///
+    /// Returns the idle-to-thread switch without ready-queue insertion, or
+    /// `None` without mutation when the sole-wake conditions do not hold.
+    /// This transition is bounded and allocation-free.
+    ///
+    /// # Panics
+    ///
+    /// Panics when current identity, wait state, or lifecycle ownership violates
+    /// scheduler invariants.
+    pub(super) fn transition_timed_wake_from_idle(
+        &mut self,
+        token: WaitToken,
+    ) -> Option<SwitchOutcome> {
+        let from = self.state().current?;
+        if self.state().idle != Some(from)
+            || !self.state().ready_queue.is_empty()
+            || !self.scheduler.remote_ready[self.cpu().index()].is_empty()
+            || token.cpu() != self.cpu()
+            || !self.thread_matches(token.thread())
+            || self.thread_home_cpu(token.thread().index()) != self.cpu()
+            || self.thread_state(token.thread().index()) != ThreadState::Blocked
+        {
+            return None;
+        }
+        self.assert_current_running(from, "idle timed wake");
+        let to = token.thread();
+        if self
+            .thread_mut(to.index())
+            .wait
+            .complete(token, WaitCause::Timeout)
+            != CompletionResult::WokeBlocked
+        {
+            return None;
+        }
+        // Use the same lifecycle states and exact wait consumption as the
+        // queued path, without publishing an intermediate ready membership.
+        self.thread_mut(to.index()).state = ThreadState::Ready;
+        self.make_ready_and_queue(from, false);
+        self.make_running(to);
+        self.validate_after_transition();
+        Some(SwitchOutcome::Switch { from, to })
+    }
+
     pub(super) fn transition_commit_wait(
         &mut self,
         prepared: PreparedWait,
@@ -509,6 +562,22 @@ impl Scheduler {
         token: WaitToken,
         cause: WaitCause,
     ) -> CompletionResult {
+        self.complete_wait_transition(token, cause, true)
+    }
+
+    pub(super) fn transition_complete_wait_for_timer(
+        &mut self,
+        token: WaitToken,
+    ) -> CompletionResult {
+        self.complete_wait_transition(token, WaitCause::Timeout, false)
+    }
+
+    fn complete_wait_transition(
+        &mut self,
+        token: WaitToken,
+        cause: WaitCause,
+        notify_ready: bool,
+    ) -> CompletionResult {
         if !self.thread_matches(token.thread()) {
             return CompletionResult::Stale;
         }
@@ -520,7 +589,13 @@ impl Scheduler {
             }
             let cpu = self.thread_home_cpu(id);
             if cpu == super::current_cpu() {
-                self.on_cpu(cpu).make_ready_and_queue(token.thread(), true);
+                self.on_cpu(cpu)
+                    .make_ready_and_queue(token.thread(), notify_ready);
+                if !notify_ready {
+                    // Timer batches defer time-queue changes, not scheduling
+                    // requests. Retired joiners need this request too.
+                    crate::sync::preempt::request_reschedule_on(cpu);
+                }
             } else {
                 self.thread_mut(id).state = ThreadState::Ready;
                 self.publish_remote_ready(token.thread(), cpu);
@@ -604,6 +679,14 @@ impl Scheduler {
 
 impl CpuScheduler<'_> {
     pub(super) fn transition_finalize_retired(&mut self) {
+        self.finalize_retired(true);
+    }
+
+    pub(super) fn transition_finalize_retired_for_timer(&mut self) {
+        self.finalize_retired(false);
+    }
+
+    fn finalize_retired(&mut self, notify_ready: bool) {
         let Some(exited) = self.state_mut().retired.take() else {
             return;
         };
@@ -621,7 +704,7 @@ impl CpuScheduler<'_> {
             let code = self
                 .thread_exit_code(exited.index())
                 .unwrap_or_else(|| panic!("thread: retired thread without exit code"));
-            self.complete_joiner(exited, joiner, code);
+            self.complete_joiner(exited, joiner, code, notify_ready);
             let resources = self.reap_exited(exited);
             self.set_reaped_user(joiner.thread(), resources);
         } else if !joinable {
@@ -695,8 +778,14 @@ impl Scheduler {
             && self.cpu_state_for(self.thread_home_cpu(id.index())).retired == Some(id)
     }
 
-    fn complete_joiner(&mut self, target: ThreadId, joiner: WaitToken, code: usize) {
-        if self.transition_complete_wait(joiner, WaitCause::Notified)
+    fn complete_joiner(
+        &mut self,
+        target: ThreadId,
+        joiner: WaitToken,
+        code: usize,
+        notify_ready: bool,
+    ) {
+        if self.complete_wait_transition(joiner, WaitCause::Notified, notify_ready)
             != CompletionResult::WokeBlocked
         {
             panic!("thread: joiner {joiner:?} has invalid state while target {target} exited");
@@ -946,11 +1035,11 @@ impl CpuScheduler<'_> {
 
 impl Scheduler {
     fn validate_after_transition(&self) {
-        #[cfg(any(debug_assertions, feature = "qemu-test"))]
+        #[cfg(any(test, debug_assertions, feature = "qemu-test"))]
         self.validate_invariants();
     }
 
-    #[cfg(any(debug_assertions, feature = "qemu-test"))]
+    #[cfg(any(test, debug_assertions, feature = "qemu-test"))]
     pub(super) fn validate_invariants(&self) {
         for (cpu_index, state) in self.cpus.iter().enumerate() {
             if state.ready_queue.len() > state.ready_queue.capacity() {
@@ -1216,6 +1305,176 @@ mod tests {
         scheduler
             .on_cpu(CPU0)
             .transition_publish_runtime(CPU0, slot, context, None, true)
+    }
+
+    fn idle_with_blocked_wait(automatic: bool) -> (Scheduler, WaitToken, ThreadId) {
+        let mut scheduler = Scheduler::transition_new(4, 1);
+        let idle = scheduler.on_cpu(CPU0).transition_append_bootstrap(
+            |_| 0,
+            thread::ThreadArg::empty(),
+            true,
+        );
+        let worker = scheduler.on_cpu(CPU0).transition_append_bootstrap(
+            |_| 0,
+            thread::ThreadArg::empty(),
+            false,
+        );
+        scheduler.transition_fill_free_slots(4);
+        scheduler
+            .on_cpu(CPU0)
+            .transition_initial_dispatch()
+            .unwrap();
+        let idle = scheduler.thread_id(idle);
+        let worker = scheduler.thread_id(worker);
+        let wait = &mut scheduler.thread_mut(worker.index()).wait;
+        let prepared = if automatic {
+            wait.prepare_automatic(worker, CPU0)
+        } else {
+            wait.prepare(worker, CPU0)
+        };
+        let token = prepared.token();
+        assert_eq!(wait.commit(prepared), CommitState::Block(token));
+        scheduler.thread_mut(worker.index()).state = ThreadState::Blocked;
+        scheduler.on_cpu(CPU0).make_running(idle);
+        scheduler.validate_invariants();
+        (scheduler, token, idle)
+    }
+
+    #[test]
+    fn idle_timed_wake_preserves_exact_wait_and_context_ownership() {
+        for automatic in [false, true] {
+            let (mut scheduler, token, idle) = idle_with_blocked_wait(automatic);
+            let idle_context = &scheduler.thread(idle.index()).context as *const SavedContext;
+            let worker_context =
+                &scheduler.thread(token.thread().index()).context as *const SavedContext;
+            assert_eq!(
+                scheduler
+                    .on_cpu(CPU0)
+                    .transition_timed_wake_from_idle(token),
+                Some(SwitchOutcome::Switch {
+                    from: idle,
+                    to: token.thread()
+                })
+            );
+            assert_eq!(scheduler.cpus[0].current, Some(token.thread()));
+            assert!(scheduler.cpus[0].ready_queue.is_empty());
+            assert_eq!(scheduler.thread_state(idle.index()), ThreadState::Ready);
+            assert_eq!(
+                scheduler.thread_state(token.thread().index()),
+                ThreadState::Running
+            );
+            assert_eq!(
+                &scheduler.thread(idle.index()).context as *const SavedContext,
+                idle_context
+            );
+            assert_eq!(
+                &scheduler.thread(token.thread().index()).context as *const SavedContext,
+                worker_context
+            );
+            if automatic {
+                assert!(scheduler.thread(token.thread().index()).wait.is_none());
+            } else {
+                assert_eq!(
+                    scheduler
+                        .thread_mut(token.thread().index())
+                        .wait
+                        .finish(token),
+                    Ok(WaitCause::Timeout)
+                );
+            }
+            assert_eq!(
+                scheduler
+                    .on_cpu(CPU0)
+                    .transition_timed_wake_from_idle(token),
+                None
+            );
+            scheduler.validate_invariants();
+        }
+    }
+
+    #[test]
+    fn idle_timed_wake_rejects_stale_registration_without_mutation() {
+        let (mut scheduler, old, idle) = idle_with_blocked_wait(false);
+        let worker = old.thread();
+        let wait = &mut scheduler.thread_mut(worker.index()).wait;
+        assert_eq!(
+            wait.complete(old, WaitCause::Notified),
+            CompletionResult::WokeBlocked
+        );
+        assert_eq!(wait.finish(old), Ok(WaitCause::Notified));
+        let prepared = wait.prepare(worker, CPU0);
+        let current = prepared.token();
+        assert_eq!(wait.commit(prepared), CommitState::Block(current));
+        assert_eq!(
+            scheduler.on_cpu(CPU0).transition_timed_wake_from_idle(old),
+            None
+        );
+        assert_eq!(scheduler.cpus[0].current, Some(idle));
+        assert!(scheduler.cpus[0].ready_queue.is_empty());
+        assert!(
+            scheduler
+                .on_cpu(CPU0)
+                .transition_timed_wake_from_idle(current)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn idle_timed_wake_rejects_foreign_cpu_and_generation() {
+        let (mut scheduler, token, idle) = idle_with_blocked_wait(false);
+        for (thread, cpu) in [
+            (token.thread(), CpuId::from_index(1).unwrap()),
+            (
+                ThreadId::new(token.thread().index(), token.thread().generation() + 1),
+                CPU0,
+            ),
+        ] {
+            let mut wait = WaitMetadata::with_next_sequence(0);
+            let wrong = wait.prepare(thread, cpu).token();
+            assert_eq!(
+                scheduler
+                    .on_cpu(CPU0)
+                    .transition_timed_wake_from_idle(wrong),
+                None
+            );
+            assert_eq!(scheduler.cpus[0].current, Some(idle));
+            assert!(scheduler.thread(token.thread().index()).wait.is_blocked());
+        }
+        assert!(
+            scheduler
+                .on_cpu(CPU0)
+                .transition_timed_wake_from_idle(token)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn idle_timed_wake_keeps_queued_and_remote_peer_ordering() {
+        for remote in [false, true] {
+            let (mut scheduler, token, idle) = idle_with_blocked_wait(false);
+            if remote {
+                let slot = scheduler.take_free_slot().unwrap();
+                let context = SavedContext::kernel_entry(scheduler.stack_top(slot), 0, 0, 0);
+                scheduler
+                    .on_cpu(CpuId::from_index(1).unwrap())
+                    .transition_publish_runtime(CPU0, slot, context, None, true);
+            } else {
+                scheduler.on_cpu(CPU0).transition_append_bootstrap(
+                    |_| 0,
+                    thread::ThreadArg::empty(),
+                    false,
+                );
+            }
+            assert_eq!(
+                scheduler
+                    .on_cpu(CPU0)
+                    .transition_timed_wake_from_idle(token),
+                None
+            );
+            assert_eq!(scheduler.cpus[0].current, Some(idle));
+            assert!(scheduler.thread(token.thread().index()).wait.is_blocked());
+            scheduler.validate_invariants();
+        }
     }
 
     #[test]

@@ -622,23 +622,48 @@ pub(super) unsafe fn activate_user_address_space(root_pa: PhysAddr) -> Result<()
     if root_pa == 0 {
         return Err(VmError::InvalidRange);
     }
+    if ttbr0_l0_pa() == root_pa {
+        return Ok(());
+    }
 
     unsafe {
         dsb_sy();
         set_ttbr0(root_pa);
         flush_tlb_local();
     }
+    #[cfg(feature = "qemu-test-kernel-runtime")]
+    USER_ROOT_WRITES.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
 pub(super) unsafe fn clear_user_address_space() -> Result<(), VmError> {
     require_runtime_tables()?;
+    if ttbr0_l0_pa() == 0 {
+        return Ok(());
+    }
     unsafe {
         dsb_sy();
         clear_ttbr0();
         flush_tlb_local();
     }
+    #[cfg(feature = "qemu-test-kernel-runtime")]
+    USER_ROOT_WRITES.fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+#[cfg(feature = "qemu-test-kernel-runtime")]
+static USER_ROOT_WRITES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Observe actual runtime TTBR0 writes for the single-CPU QEMU contract.
+///
+/// # Returns
+///
+/// Returns the number of writes paired with local invalidation. This test-only
+/// atomic read does not allocate, block, or change IRQ or VM state.
+#[cfg(feature = "qemu-test-kernel-runtime")]
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_user_root_writes_for_test() -> u64 {
+    USER_ROOT_WRITES.load(Ordering::Relaxed)
 }
 
 #[derive(Copy, Clone)]

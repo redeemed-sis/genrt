@@ -56,54 +56,95 @@ pub extern "C" fn sync_entry(vector: u64, frame: *mut TrapFrame) {
 }
 
 #[unsafe(no_mangle)]
+/// Handle a lower-EL syscall or synchronous fault using its exclusive frame.
+///
+/// Known syscalls take an allocation-free dispatch path without a diagnostic
+/// frame copy or FAR read. Handlers may allocate or block under their existing
+/// contracts. Fault diagnostics run before process termination replaces the
+/// live return context.
+///
+/// # Arguments
+///
+/// * `vector` - Exception-vector identity used by the fatal fallback.
+/// * `frame` - Non-null, aligned live frame saved by exception assembly.
+///
+/// # Returns
+///
+/// Returns after handling the syscall or replacing the faulting process's
+/// return context. An unattributed fault enters the non-returning fatal path.
+///
+/// # Panics
+///
+/// Panics if `frame` is null.
+///
+/// # Safety
+///
+/// Exception assembly must exclusively own the writable frame and keep it
+/// resident until this entry returns; no other reference may access it.
 pub extern "C" fn lower_el_sync_entry(vector: u64, frame: *mut TrapFrame) {
     let raw_esr = read_esr_el1();
     let ec = esr::ec(raw_esr);
-    let iss = esr::iss(raw_esr);
 
     // This is the userspace syscall/fault boundary. It is deliberately separate
     // from `sync_entry()`, whose SVC #0 ABI is reserved for controlled EL1 thread
     // calls such as sleep, mailbox wait, exit, and join.
-    let far = read_far_el1();
     // SAFETY: exception assembly supplies the live frame for this entry.
     let frame = unsafe { live_trap_frame(frame) };
-    let frame_ptr = frame as *mut TrapFrame as *const TrapFrame;
-    let diagnostic_frame = *frame;
-    let request = (ec == esr::EC_SVC_AARCH64).then(|| context::syscall_request(frame));
-    // SAFETY: lower-EL synchronous entry owns this one live frame for syscall,
-    // fault policy, and any scheduler handoff performed before return.
-    let mut active = unsafe { context::active_context(frame) };
-
-    if let Some(request) = request {
-        let syscall_number = request.number();
+    let fault = if ec == esr::EC_SVC_AARCH64 {
+        let request = context::syscall_request(frame);
+        // SAFETY: lower-EL synchronous entry owns this one live frame for the
+        // complete syscall and any scheduler handoff before return.
+        let mut active = unsafe { context::active_context(frame) };
         match kernel::syscall::dispatch(&mut active, request) {
             Ok(()) => return,
             Err(kernel::syscall::DispatchError::UnknownSyscall(nr)) => {
-                let fault = kernel::process::UserFault::unknown_syscall(nr);
-                log_lower_el_user_fault("unknown syscall", &fault, raw_esr, far, &diagnostic_frame);
-                if kernel::process::kill_current_process_on_user_fault(&mut active, fault).is_ok() {
-                    return;
-                }
+                // Unknown dispatch leaves the frame untouched. Ending this
+                // borrow lets the cold path log it before fault handoff.
+                kernel::process::UserFault::unknown_syscall(nr)
             }
         }
-        kernel::error!(
-            "exception: lower EL syscall fault without current process nr={}",
-            syscall_number
-        );
-        drop(active);
-        exception_entry(vector, frame_ptr)
-    }
+    } else {
+        kernel::process::UserFault::sync_exception(user_fault_kind(raw_esr))
+    };
+    handle_lower_el_user_fault(vector, frame, raw_esr, fault);
+}
 
-    let fault = kernel::process::UserFault::sync_exception(user_fault_kind(raw_esr));
-    log_lower_el_user_fault("sync fault", &fault, raw_esr, far, &diagnostic_frame);
+#[cold]
+#[inline(never)]
+fn handle_lower_el_user_fault(
+    vector: u64,
+    frame: &mut TrapFrame,
+    raw_esr: u64,
+    fault: kernel::process::UserFault,
+) {
+    let label = match fault.kind {
+        kernel::process::UserFaultKind::UnknownSyscall(_) => "unknown syscall",
+        _ => "sync fault",
+    };
+    // Diagnose the original frame before process termination can replace it.
+    // Successful SVC entry needs neither FAR nor a diagnostic frame copy.
+    log_lower_el_user_fault(label, &fault, raw_esr, read_far_el1(), frame);
+    let frame_ptr = frame as *const TrapFrame;
+    // SAFETY: this cold path owns the same exception frame after syscall
+    // dispatch (if any) has released its exclusive active-context borrow.
+    let mut active = unsafe { context::active_context(frame) };
     if kernel::process::kill_current_process_on_user_fault(&mut active, fault).is_ok() {
         return;
     }
 
-    kernel::error!(
-        "exception: lower EL sync fault without current process EC=0x{ec:02x} ({}) ISS=0x{iss:08x}",
-        esr::ec_name(ec)
-    );
+    match fault.kind {
+        kernel::process::UserFaultKind::UnknownSyscall(nr) => {
+            kernel::error!("exception: lower EL syscall fault without current process nr={nr}");
+        }
+        _ => {
+            let ec = esr::ec(raw_esr);
+            let iss = esr::iss(raw_esr);
+            kernel::error!(
+                "exception: lower EL sync fault without current process EC=0x{ec:02x} ({}) ISS=0x{iss:08x}",
+                esr::ec_name(ec)
+            );
+        }
+    }
     drop(active);
     exception_entry(vector, frame_ptr)
 }

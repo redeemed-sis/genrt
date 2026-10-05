@@ -68,6 +68,85 @@ static int directory_io(void) {
     return found == 3u ? 0 : 5;
 }
 
+/* Raw byte buffers avoid imposing C alignment on syscall-only timespec and
+ * cpu_set_t storage. Exercise both usercopy directions across mapped pages. */
+static int syscall_boundaries(void) {
+    static unsigned char pages[8192] __attribute__((aligned(4096)));
+    static const unsigned char readonly[16] = {0};
+    const size_t mask_size = sizeof(cpu_set_t);
+    for (size_t alignment = 0; alignment < sizeof(unsigned long); alignment++) {
+        size_t start = 4096 - mask_size / 2 + alignment;
+        memset(pages, 0xa5, sizeof(pages));
+        if (genrt_syscall3(SYS_SCHED_GETAFFINITY, 0, mask_size,
+                           (long)(pages + start)) != 0) {
+            return 1;
+        }
+        for (size_t index = 0; index < sizeof(pages); index++) {
+            unsigned char expected = 0xa5;
+            if (index >= start && index < start + mask_size) {
+                expected = index == start ? 1 : 0;
+            }
+            if (pages[index] != expected) {
+                return 2;
+            }
+        }
+
+        start = 4096 - sizeof(struct timespec) / 2 + alignment;
+        memset(pages, 0xa5, sizeof(pages));
+        memset(pages + start, 0, sizeof(struct timespec));
+        if (genrt_syscall4(SYS_CLOCK_NANOSLEEP, CLOCK_MONOTONIC, 0,
+                           (long)(pages + start), 0) != 0) {
+            return 3;
+        }
+        for (size_t index = 0; index < sizeof(pages); index++) {
+            unsigned char expected = index >= start
+                                     && index < start + sizeof(struct timespec)
+                                     ? 0 : 0xa5;
+            if (pages[index] != expected) {
+                return 4;
+            }
+        }
+    }
+
+    if (genrt_syscall2(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, (long)readonly)
+        != -GTRT_EFAULT) {
+        return 5;
+    }
+
+    /* The controlled AArch64 user map ends its stack here. A 16-byte copy
+     * beginning eight bytes below the end must fail before changing anything. */
+    volatile unsigned char *edge = (volatile unsigned char *)0x0000007ffffffff8UL;
+    unsigned char saved[8];
+    for (size_t index = 0; index < sizeof(saved); index++) {
+        saved[index] = edge[index];
+        edge[index] = 0xa5;
+    }
+    long output = genrt_syscall2(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, (long)edge);
+    long input = genrt_syscall4(SYS_CLOCK_NANOSLEEP, CLOCK_MONOTONIC, 0,
+                                (long)edge, 0);
+    int unchanged = 1;
+    for (size_t index = 0; index < sizeof(saved); index++) {
+        if (edge[index] != 0xa5) unchanged = 0;
+        edge[index] = saved[index];
+    }
+    if (output != -GTRT_EFAULT || input != -GTRT_EFAULT || !unchanged) {
+        return 6;
+    }
+
+    /* Unknown dispatch must keep the original frame for fault attribution,
+     * terminate only this child, and leave the parent's syscall path working. */
+    pid_t child = fork();
+    if (child < 0) return 7;
+    if (child == 0) {
+        genrt_syscall0(0x7fffffff);
+        exit(42);
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || status != 0x7f) return 8;
+    struct timespec now;
+    return clock_gettime(CLOCK_MONOTONIC, &now) == 0 ? 0 : 9;
+}
+
 static int cwd_paths(void) {
     char cwd[64];
     if (chdir("/.__genrt_test__/fixtures/directory") != 0
@@ -205,6 +284,8 @@ static struct timespec timespec_add_ns(struct timespec value, long ns) {
     return value;
 }
 
+static volatile unsigned long isolated_time_value;
+
 static int time_api(void) {
     struct timespec resolution;
     struct timespec start;
@@ -325,11 +406,16 @@ static int time_api(void) {
         return 10;
     }
     if (child == 0) {
+        isolated_time_value = 0x51;
         const struct timespec child_sleep = {
             .tv_sec = 0,
             .tv_nsec = 20000000L,
         };
-        exit(nanosleep(&child_sleep, NULL) == 0 ? 0 : 1);
+        for (int iteration = 0; iteration < 4; iteration++) {
+            if (nanosleep(&child_sleep, NULL) != 0
+                || isolated_time_value != 0x51) exit(1);
+        }
+        exit(0);
     }
     struct timespec progress_deadline = timespec_add_ns(end, 5000000L);
     do {
@@ -338,7 +424,8 @@ static int time_api(void) {
         }
     } while (timespec_before(&start, &progress_deadline));
     int status = 0;
-    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)
+    if (isolated_time_value != 0
+        || waitpid(child, &status, 0) != child || !WIFEXITED(status)
         || WEXITSTATUS(status) != 0) {
         return 12;
     }
@@ -395,6 +482,9 @@ int main(int argc, char **argv) {
     }
     if ((strcmp(argv[1], "directory-io") == 0)) {
         return directory_io();
+    }
+    if (strcmp(argv[1], "syscall-boundaries") == 0) {
+        return syscall_boundaries();
     }
     if ((strcmp(argv[1], "cwd-paths") == 0)) {
         return cwd_paths();

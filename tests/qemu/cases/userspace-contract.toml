@@ -30,6 +30,11 @@ subject = "directory-io"
 [[steps]]
 action = "expect_case"
 producer = "api-supervisor"
+subject = "syscall-boundaries"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
 subject = "cwd-paths"
 
 [[steps]]

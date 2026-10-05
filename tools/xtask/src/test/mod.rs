@@ -286,7 +286,9 @@ fn prepare_test_initramfs(
     provenance.mark_prefix(".__genrt_test__", crate::initramfs::Origin::TestFixture)?;
 
     let init = match image {
-        cases::InitImage::KernelContract => workflow::build_user_program(profile, "hello", true)?,
+        cases::InitImage::KernelContract => {
+            workflow::build_user_program(profile, "test_wakeup_probe", true)?
+        }
         cases::InitImage::UserFault => workflow::build_user_program(profile, "fault_null", true)?,
         cases::InitImage::UserspaceContract => {
             copy_tree(

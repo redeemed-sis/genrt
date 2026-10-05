@@ -17,18 +17,15 @@ mod thread;
 mod transition;
 mod wait;
 
-#[cfg(feature = "qemu-test-kernel-runtime")]
-pub(crate) use self::preempt::validate_invariants_for_test;
 #[cfg(feature = "qemu-test-smp-boot")]
 pub(crate) use self::preempt::validate_no_polling_quantum_for_test;
+#[cfg(feature = "qemu-test-kernel-runtime")]
+pub(crate) use self::preempt::{direct_timed_wakes_for_test, validate_invariants_for_test};
 #[cfg(feature = "qemu-test-kernel-runtime")]
 pub(crate) use self::wait::on_test_wait_sync;
 pub(crate) use self::{
     bootstrap::{StaticThread, bootstrap, initialize_current_cpu},
-    preempt::{
-        enter_running_thread, finish_timer_interrupt, on_preempt_checkpoint, on_quantum_expired,
-        on_wait_deadline,
-    },
+    preempt::{enter_running_thread, finish_timer_interrupt, on_preempt_checkpoint},
     sleep::{on_sleep_sync, sleep_user_until_counter},
     thread::{
         current_user_address_space, current_user_stack_ptr, on_thread_exit_sync,

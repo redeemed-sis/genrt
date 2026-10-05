@@ -5,7 +5,7 @@ use crate::{
     sched::{ThreadId, WaitToken},
     sync::IrqSpinLock,
 };
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 #[cfg(feature = "qemu-test-smp-boot")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -273,6 +273,73 @@ struct TimeState {
     queue: DeadlineQueue,
     armed_timer_deadline: Option<u64>,
     dispatching_irq: bool,
+    expired: Option<ExpiredEvents>,
+}
+
+/// Fixed CPU-owned transfer buffer borrowed for one timer IRQ transaction.
+///
+/// Only its initialized prefix is exposed to the scheduler. Storage is
+/// allocated during bootstrap, transferred out of time ownership during
+/// dispatch, and returned before the timer is rearmed; it cannot grow.
+pub(crate) struct ExpiredEvents {
+    entries: Box<[Option<TimedEvent>]>,
+    len: usize,
+}
+
+impl ExpiredEvents {
+    fn try_new(capacity: usize) -> Result<Self, TimeInitError> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(capacity)
+            .map_err(|_| TimeInitError::OutOfMemory)?;
+        entries.resize(capacity, None);
+        Ok(Self {
+            entries: entries.into_boxed_slice(),
+            len: 0,
+        })
+    }
+
+    fn push(&mut self, event: TimedEvent) {
+        let slot = self
+            .entries
+            .get_mut(self.len)
+            .unwrap_or_else(|| panic!("time: expired buffer capacity exhausted"));
+        *slot = Some(event);
+        self.len += 1;
+    }
+
+    /// Iterate the exact expired-event prefix without taking time ownership.
+    ///
+    /// # Returns
+    ///
+    /// Returns a bounded iterator of copied events. This query allocates
+    /// nothing, does not block, and never accesses the mutable deadline queue.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = TimedEvent> + '_ {
+        self.entries[..self.len]
+            .iter()
+            .map(|event| event.expect("time: empty expired slot"))
+    }
+
+    /// Query whether this batch contains exactly one expired event.
+    ///
+    /// # Returns
+    ///
+    /// Returns its copied identity, or `None` for empty or multi-event batches.
+    /// This bounded query allocates nothing and takes no time ownership.
+    pub(crate) fn single(&self) -> Option<TimedEvent> {
+        (self.len == 1).then(|| self.entries[0].expect("time: empty expired slot"))
+    }
+}
+
+/// Bounded quantum intent returned after scheduler timer ownership releases.
+///
+/// The time owner applies cancellation before ensuring the selected thread's
+/// deadline. No timer or queue lock needs to cross the timer scheduler handoff.
+pub(crate) struct QuantumUpdate {
+    /// Exact obsolete quantum to remove, if a checkpoint refreshed scheduling.
+    pub(crate) obsolete: Option<TimedEvent>,
+    /// Candidate deadline inserted only if its exact event is not pending.
+    pub(crate) ensure: Option<(u64, TimedEvent)>,
 }
 
 impl TimeState {
@@ -281,6 +348,7 @@ impl TimeState {
             queue: DeadlineQueue::try_with_capacity(deadline_capacity)?,
             armed_timer_deadline: None,
             dispatching_irq: false,
+            expired: Some(ExpiredEvents::try_new(deadline_capacity)?),
         })
     }
 
@@ -288,16 +356,36 @@ impl TimeState {
         self.queue.schedule(deadline, event);
     }
 
-    fn cancel_event(&mut self, event: TimedEvent) -> bool {
-        self.queue.cancel(event)
+    fn cancel_event(&mut self, event: TimedEvent, rearm_at: Option<u64>) -> bool {
+        let canceled = self.queue.cancel(event);
+        // A missing quantum must not reprogram the surviving wait deadline.
+        // Remote callers and IRQ batch cleanup defer programming to the owner.
+        if canceled
+            && !self.dispatching_irq
+            && let Some(now) = rearm_at
+        {
+            self.rearm_timer(now);
+        }
+        canceled
     }
 
     fn event_pending(&self, event: TimedEvent) -> bool {
         self.queue.event_pending(event)
     }
 
-    fn pop_expired(&mut self, now: u64) -> Option<TimedEvent> {
-        self.queue.pop_expired(now)
+    fn take_expired(&mut self, cpu: CpuId, now: u64) -> ExpiredEvents {
+        self.dispatching_irq = true;
+        let mut expired = self
+            .expired
+            .take()
+            .unwrap_or_else(|| panic!("time: reentrant timer dispatch"));
+        while let Some(event) = self.queue.pop_expired(now) {
+            if event.cpu() != cpu {
+                panic!("time: expired event belongs to another CPU");
+            }
+            expired.push(event);
+        }
+        expired
     }
 
     fn rearm_timer(&mut self, now: u64) {
@@ -572,11 +660,7 @@ pub(crate) fn cancel_event(event: TimedEvent) {
     let owner = event.cpu();
     let now = now_counter();
     let canceled = with_time_mut(owner, |time| {
-        let canceled = time.cancel_event(event);
-        if current == owner && !time.dispatching_irq {
-            time.rearm_timer(now);
-        }
-        canceled
+        time.cancel_event(event, (current == owner).then_some(now))
     });
     if canceled {
         crate::trace!("time: canceled {event:?}");
@@ -616,6 +700,11 @@ pub(crate) fn event_pending(event: TimedEvent) -> bool {
 ///
 /// Returns after all events expired at the sampled counter value are handled,
 /// the scheduler handoff is committed, and the one-shot timer is rearmed.
+///
+/// # Panics
+///
+/// Panics for invalid CPU/event ownership, nested timer dispatch, buffer
+/// exhaustion, or a scheduler handoff invariant violation.
 pub fn on_timer_interrupt(context: &mut ActiveContext<'_>) {
     let cpu = current_cpu();
     crate::trace!("time: timer IRQ cpu={}", cpu.index());
@@ -623,30 +712,34 @@ pub fn on_timer_interrupt(context: &mut ActiveContext<'_>) {
     #[cfg(feature = "qemu-test-kernel-runtime")]
     crate::test_support::kernel_runtime::note_timer_irq();
 
-    if time_slot(cpu).lock().is_none() {
+    let mut owner = time_slot(cpu).lock();
+    let Some(time) = owner.as_mut() else {
         // Keep stray early-boot timer IRQs from ever reaching scheduler
         // state before this CPU's queue is initialized.
         program_timer_deadline(None);
         return;
-    }
+    };
 
     // Timer IRQ fast-path policy: do not allocate here. The heap is protected
     // against local IRQ reentrancy for ordinary thread-context allocations, but
     // timed-event dispatch itself must stay on preallocated, bounded state.
     let now = now_counter();
-    with_time_mut(cpu, |time| {
-        time.dispatching_irq = true;
-    });
+    let mut expired = time.take_expired(cpu, now);
+    drop(owner);
 
-    // Do not retain the time owner across scheduler dispatch: completion can
-    // acquire scheduler state and potentially select another return context.
-    while let Some(event) = with_time_mut(cpu, |time| time.pop_expired(now)) {
-        dispatch_expired_event(cpu, event);
-    }
-
-    crate::sched::finish_timer_interrupt(context, now);
+    let quantum = crate::sched::finish_timer_interrupt(context, now, &expired);
 
     with_time_mut(cpu, |time| {
+        if let Some(event) = quantum.obsolete {
+            time.cancel_event(event, None);
+        }
+        if let Some((deadline, event)) = quantum.ensure {
+            if !time.event_pending(event) {
+                time.schedule_event(deadline, event);
+            }
+        }
+        expired.len = 0;
+        time.expired = Some(expired);
         time.dispatching_irq = false;
         time.rearm_timer(now);
     });
@@ -685,29 +778,6 @@ pub(crate) fn local_timer_probes_complete_for_test(cpu_count: usize) -> bool {
         && TIMER_PROBE_COMPLETIONS[..cpu_count]
             .iter()
             .all(|count| count.load(Ordering::Acquire) >= 2)
-}
-
-#[inline(always)]
-fn dispatch_expired_event(cpu: CpuId, event: TimedEvent) {
-    if event.cpu() != cpu {
-        panic!(
-            "time: CPU{} dequeued event owned by CPU{}",
-            cpu.index(),
-            event.cpu().index()
-        );
-    }
-    match event {
-        TimedEvent::WaitDeadline { token, .. } => {
-            crate::trace!("time: dispatch WaitDeadline({token:?})");
-            crate::sched::on_wait_deadline(token);
-        }
-        TimedEvent::QuantumExpired {
-            thread: thread_id, ..
-        } => {
-            crate::trace!("time: dispatch QuantumExpired({thread_id})");
-            crate::sched::on_quantum_expired(thread_id);
-        }
-    }
 }
 
 #[inline(always)]
@@ -792,12 +862,22 @@ fn monotonic_time_to_counter_at_frequency(
         return Err(TimeConversionError::Overflow);
     }
 
-    let whole = (seconds as u128) * frequency as u128;
-    let fractional = div_ceil((nanoseconds as u128) * frequency as u128, 1_000_000_000);
-    let counter = whole
-        .checked_add(fractional)
+    let whole = seconds
+        .checked_mul(frequency)
         .ok_or(TimeConversionError::Overflow)?;
-    u64::try_from(counter).map_err(|_| TimeConversionError::Overflow)
+    // Normal counter frequencies fit this product in u64, avoiding a software
+    // 128-bit divide in the IRQ-masked sleep syscall. Keep the wider fallback.
+    let fractional = match (nanoseconds as u64).checked_mul(frequency) {
+        Some(product) => product.div_ceil(1_000_000_000),
+        None => u64::try_from(div_ceil(
+            (nanoseconds as u128) * frequency as u128,
+            1_000_000_000,
+        ))
+        .map_err(|_| TimeConversionError::Overflow)?,
+    };
+    whole
+        .checked_add(fractional)
+        .ok_or(TimeConversionError::Overflow)
 }
 
 #[inline(always)]
@@ -808,6 +888,97 @@ fn div_ceil(numerator: u128, denominator: u128) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_cancellation_keeps_the_armed_timer_untouched() {
+        let cpu = CpuId::from_index(0).unwrap();
+        let thread = ThreadId::new(1, 1);
+        let event = TimedEvent::quantum_expired(cpu, thread);
+        let missing = TimedEvent::quantum_expired(cpu, ThreadId::new(2, 1));
+        let mut time = TimeState::try_new(2).unwrap();
+        time.schedule_event(100, event);
+        time.rearm_timer(0);
+        let before = crate::test_arch_stubs::timer_program_counts();
+
+        assert!(!time.cancel_event(missing, Some(0)));
+        assert_eq!(time.queue.next_deadline(), Some(100));
+        assert_eq!(time.armed_timer_deadline, Some(100));
+        assert_eq!(crate::test_arch_stubs::timer_program_counts(), before);
+
+        assert!(time.cancel_event(event, Some(0)));
+        assert_eq!(time.queue.next_deadline(), None);
+        assert_eq!(time.armed_timer_deadline, None);
+        assert_eq!(
+            crate::test_arch_stubs::timer_program_counts(),
+            (before.0, before.1 + 1)
+        );
+    }
+
+    #[test]
+    fn remote_and_batched_cancellation_defer_timer_programming() {
+        let cpu = CpuId::from_index(0).unwrap();
+        let event = TimedEvent::quantum_expired(cpu, ThreadId::new(1, 1));
+        for (dispatching, rearm_at) in [(false, None), (true, Some(0))] {
+            let mut time = TimeState::try_new(1).unwrap();
+            time.schedule_event(100, event);
+            time.rearm_timer(0);
+            time.dispatching_irq = dispatching;
+            let before = crate::test_arch_stubs::timer_program_counts();
+            assert!(time.cancel_event(event, rearm_at));
+            assert_eq!(time.queue.next_deadline(), None);
+            assert_eq!(time.armed_timer_deadline, Some(100));
+            assert_eq!(crate::test_arch_stubs::timer_program_counts(), before);
+        }
+    }
+
+    #[test]
+    fn expired_transfer_is_bounded_and_reuses_storage() {
+        let cpu = CpuId::from_index(0).unwrap();
+        let events = core::array::from_fn::<_, 3, _>(|index| {
+            TimedEvent::quantum_expired(cpu, ThreadId::new(index, 1))
+        });
+        let mut time = TimeState::try_new(3).unwrap();
+        for (index, event) in events.into_iter().enumerate() {
+            time.schedule_event(10 + index as u64, event);
+        }
+        let storage = time.expired.as_ref().unwrap().entries.as_ptr();
+        let mut batch = time.take_expired(cpu, 10);
+        assert_eq!(batch.single(), Some(events[0]));
+        assert_eq!(batch.iter().collect::<Vec<_>>(), [events[0]]);
+        assert!(time.expired.is_none());
+        assert_eq!(time.queue.next_deadline(), Some(11));
+        batch.len = 0;
+        time.expired = Some(batch);
+        let mut batch = time.take_expired(cpu, 12);
+        assert_eq!(batch.entries.as_ptr(), storage);
+        assert_eq!(batch.single(), None);
+        assert_eq!(batch.iter().collect::<Vec<_>>(), events[1..]);
+        assert_eq!(time.queue.next_deadline(), None);
+        batch.len = 0;
+        time.expired = Some(batch);
+        let batch = time.take_expired(cpu, 100);
+        assert_eq!(batch.single(), None);
+        assert_eq!(batch.iter().count(), 0);
+        assert_eq!(batch.entries.as_ptr(), storage);
+    }
+
+    #[test]
+    #[should_panic(expected = "expired buffer capacity exhausted")]
+    fn expired_transfer_cannot_grow() {
+        let mut batch = ExpiredEvents::try_new(1).unwrap();
+        let event = TimedEvent::quantum_expired(CpuId::from_index(0).unwrap(), ThreadId::new(1, 1));
+        batch.push(event);
+        batch.push(event);
+    }
+
+    #[test]
+    #[should_panic(expected = "reentrant timer dispatch")]
+    fn expired_transfer_has_one_owner() {
+        let cpu = CpuId::from_index(0).unwrap();
+        let mut time = TimeState::try_new(1).unwrap();
+        let _batch = time.take_expired(cpu, 0);
+        let _second = time.take_expired(cpu, 0);
+    }
 
     #[test]
     fn topology_init_preallocates_every_selected_cpu_queue() {
@@ -874,5 +1045,35 @@ mod tests {
             monotonic_time_to_counter_at_frequency(u64::MAX, 0, 2),
             Err(TimeConversionError::Overflow)
         );
+    }
+
+    #[test]
+    fn native_deadline_conversion_matches_the_wide_reference() {
+        for frequency in [
+            1,
+            19_200_000,
+            62_500_000,
+            1_000_000_000,
+            u32::MAX as u64,
+            u32::MAX as u64 + 1,
+            u64::MAX / 999_999_999,
+            u64::MAX / 999_999_999 + 1,
+            u64::MAX,
+        ] {
+            for seconds in [0, 1, 7, u64::MAX / frequency, u64::MAX] {
+                for nanoseconds in [0, 1, 8_000, 500_000_000, 999_999_999] {
+                    let reference = u64::try_from(
+                        seconds as u128 * frequency as u128
+                            + (nanoseconds as u128 * frequency as u128).div_ceil(1_000_000_000),
+                    )
+                    .map_err(|_| TimeConversionError::Overflow);
+                    assert_eq!(
+                        monotonic_time_to_counter_at_frequency(seconds, nanoseconds, frequency),
+                        reference,
+                        "seconds={seconds}, nanoseconds={nanoseconds}, frequency={frequency}"
+                    );
+                }
+            }
+        }
     }
 }

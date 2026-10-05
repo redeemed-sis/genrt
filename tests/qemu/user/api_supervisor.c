@@ -169,6 +169,7 @@ int main(void) {
     run_case("support-library");
     run_case("file-io");
     run_case("directory-io");
+    run_case("syscall-boundaries");
     run_case("cwd-paths");
     run_case("process-control");
     run_case("fork-affinity-validation");

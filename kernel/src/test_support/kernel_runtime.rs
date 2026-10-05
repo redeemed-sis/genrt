@@ -295,10 +295,43 @@ fn coordinator(_arg: ThreadArg) -> usize {
     }
     protocol::pass("allocator-preemption-lifecycle");
 
+    super::scenario::Scenario::new("user-root-idle-retention", user_root_idle_retention).run();
+
     protocol::case_start("post-test-liveness");
     sched::msleep(10);
     protocol::pass("post-test-liveness");
     protocol::done(SUITE)
+}
+
+/// Run the sole EL0 probe through 32 idle/sleep cycles, then join and reap it.
+/// Actual architecture writes must be exactly activation plus terminal detach;
+/// each timer wake must select directly from idle and all frame resources must
+/// return before the next process reuses storage.
+fn user_root_idle_retention() -> super::scenario::ScenarioResult {
+    for _ in 0..3 {
+        let frames = memory::free_frame_count().ok_or("NOT_INITIALIZED")?;
+        // Keep publication from preempting the coordinator before it commits
+        // join. No shared lock is held across the wait; the probe's saved frame
+        // restores IRQ delivery and this guard restores our original mask.
+        let irq = LocalIrqGuard::save_and_disable();
+        let before = memory::vm::user_root_writes_for_test();
+        let wakes_before = sched::direct_timed_wakes_for_test();
+        let pid = crate::process::spawn_first_user_process().map_err(|_| "SPAWN")?;
+        if crate::process::process_join(pid) != Ok(crate::process::ProcessExitStatus::Exited(0)) {
+            return Err("USER_PROBE");
+        }
+        if memory::vm::user_root_writes_for_test() - before != 2 {
+            return Err("REDUNDANT_TTBR0_WRITE");
+        }
+        if sched::direct_timed_wakes_for_test() - wakes_before != 32 {
+            return Err("IDLE_WAKE_NOT_DIRECT");
+        }
+        drop(irq);
+        if memory::free_frame_count() != Some(frames) {
+            return Err("REAP_FRAME_LEAK");
+        }
+    }
+    Ok(())
 }
 
 fn blocked_receiver(_arg: ThreadArg) -> usize {

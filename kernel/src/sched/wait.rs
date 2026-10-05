@@ -307,17 +307,17 @@ impl WaitMetadata {
         matches!(self.state, WaitState::None)
     }
 
-    #[cfg(any(debug_assertions, feature = "qemu-test"))]
+    #[cfg(any(test, debug_assertions, feature = "qemu-test"))]
     pub(super) const fn is_prepared(&self) -> bool {
         matches!(self.state, WaitState::Prepared { .. })
     }
 
-    #[cfg(any(debug_assertions, feature = "qemu-test"))]
+    #[cfg(any(test, debug_assertions, feature = "qemu-test"))]
     pub(super) const fn is_blocked(&self) -> bool {
         matches!(self.state, WaitState::Blocked { .. })
     }
 
-    #[cfg(any(debug_assertions, feature = "qemu-test"))]
+    #[cfg(any(test, debug_assertions, feature = "qemu-test"))]
     pub(super) const fn is_completed(&self) -> bool {
         matches!(self.state, WaitState::Completed { .. })
     }

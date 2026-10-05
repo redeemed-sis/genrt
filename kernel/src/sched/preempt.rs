@@ -1,10 +1,27 @@
-use crate::{arch::ActiveContext, time::TimedEvent};
+use crate::{
+    arch::ActiveContext,
+    time::{ExpiredEvents, QuantumUpdate, TimedEvent},
+};
 
 use super::{
-    CpuScheduler, ThreadId, WaitCause, WaitToken, complete_wait, current_cpu, log_switch,
-    scheduler_mut,
+    CpuScheduler, ThreadId, current_cpu, log_switch, scheduler_mut,
     transition::{SwitchOutcome, ThreadState},
 };
+
+#[cfg(feature = "qemu-test-kernel-runtime")]
+static DIRECT_TIMED_WAKES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Observe completed single-wait idle handoffs in the kernel-runtime fixture.
+///
+/// # Returns
+///
+/// Returns a test-only cumulative counter. This atomic query allocates nothing,
+/// does not block, and does not alter scheduler or timer ownership.
+#[cfg(feature = "qemu-test-kernel-runtime")]
+pub(crate) fn direct_timed_wakes_for_test() -> usize {
+    DIRECT_TIMED_WAKES.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// Finish one bounded timer IRQ and optionally replace its return context.
 ///
@@ -17,21 +34,26 @@ use super::{
 /// * `context` - Exclusive live timer IRQ context available for an optional
 ///   scheduler handoff.
 /// * `now` - Counter value sampled by the time subsystem for this interrupt.
+/// * `expired` - Fixed batch collected after releasing the local time owner.
 ///
 /// # Returns
 ///
-/// Returns after retaining the current thread or installing the selected
-/// thread's saved context into `context`.
+/// Returns the bounded quantum update to apply after scheduler ownership is
+/// released, retaining the current thread or installing a selected context.
 ///
 /// # Panics
 ///
 /// Panics if current CPU resolution, scheduler ownership, or a context-switch
 /// invariant is invalid.
-pub(crate) fn finish_timer_interrupt(context: &mut ActiveContext<'_>, now: u64) {
+pub(crate) fn finish_timer_interrupt(
+    context: &mut ActiveContext<'_>,
+    now: u64,
+    expired: &ExpiredEvents,
+) -> QuantumUpdate {
     let cpu = current_cpu();
     scheduler_mut()
         .on_cpu(cpu)
-        .finish_timer_interrupt(context, now);
+        .finish_timer_interrupt(context, now, expired)
 }
 
 /// Finish one scheduler IPI and optionally replace its IRQ-return context.
@@ -58,46 +80,6 @@ pub(crate) fn finish_timer_interrupt(context: &mut ActiveContext<'_>, now: u64) 
 pub fn finish_scheduler_ipi(context: &mut ActiveContext<'_>) {
     let cpu = current_cpu();
     scheduler_mut().on_cpu(cpu).finish_scheduler_ipi(context);
-}
-
-/// Complete one time-owned exact wait deadline.
-///
-/// # Arguments
-///
-/// * `token` - Exact wait registration stored in the expired timed event.
-///
-/// # Returns
-///
-/// Returns after a bounded completion attempt. Stale or already-completed
-/// deadlines are controlled no-ops.
-///
-/// # Panics
-///
-/// Panics if scheduler ownership or an exact-wait transition invariant is
-/// invalid.
-pub(crate) fn on_wait_deadline(token: WaitToken) {
-    let _ = complete_wait(token, WaitCause::Timeout);
-}
-
-/// Record expiration of one CPU-owned scheduler quantum.
-///
-/// # Arguments
-///
-/// * `thread` - Generation-aware thread identity carried by the expired
-///   quantum event.
-///
-/// # Returns
-///
-/// Returns after a bounded scheduler update. Stale or obsolete quantum events
-/// do not switch context directly; final handoff remains in
-/// finish_timer_interrupt.
-///
-/// # Panics
-///
-/// Panics if current CPU resolution or scheduler ownership is invalid.
-pub(crate) fn on_quantum_expired(thread: ThreadId) {
-    let cpu = current_cpu();
-    scheduler_mut().on_cpu(cpu).note_quantum_expired(thread);
 }
 
 /// Validate bounded scheduler ownership after a test-controlled transition.
@@ -236,40 +218,86 @@ impl CpuScheduler<'_> {
         self.replace_quantum_event(crate::time::now_counter(), current);
     }
 
-    pub(super) fn finish_timer_interrupt(&mut self, context: &mut ActiveContext<'_>, now: u64) {
-        self.transition_finalize_retired();
+    pub(super) fn finish_timer_interrupt(
+        &mut self,
+        context: &mut ActiveContext<'_>,
+        now: u64,
+        expired: &ExpiredEvents,
+    ) -> QuantumUpdate {
+        // Complete the batch, retired joins, and return selection under one
+        // scheduler owner. Local readiness requests no time lock here; one
+        // quantum intent is applied by the time owner after this guard drops.
+        self.transition_finalize_retired_for_timer();
         if !self.state().online {
-            return;
+            return QuantumUpdate {
+                obsolete: None,
+                ensure: None,
+            };
         }
-
-        // Scheduler IRQ-return handoff policy: this path must remain heap-free.
-        // The kernel heap is IRQ-safe for thread-context allocation, but the
-        // timer/scheduler fast path must continue to run on preallocated state.
         let current = match self.running_thread() {
             Some(id) => id,
-            None => return,
+            None => {
+                return QuantumUpdate {
+                    obsolete: None,
+                    ensure: None,
+                };
+            }
         };
-        let running_idle = self.state().idle == Some(current);
-        let must_leave_idle = running_idle && self.has_runnable_peer();
-        let mut refreshed_quantum_event = false;
-
-        if must_leave_idle {
+        if let Some(TimedEvent::WaitDeadline { cpu, token }) = expired.single() {
+            if cpu != self.cpu() || token.cpu() != self.cpu() {
+                panic!("sched: foreign timed wait in local batch");
+            }
+            if !crate::sync::preempt::is_disabled()
+                && let Some(outcome) = self.transition_timed_wake_from_idle(token)
+            {
+                // Direct selection is itself the depth-zero checkpoint; do
+                // not leave a prior coalesced request to switch again later.
+                let _ = crate::sync::preempt::consume_checkpoint_on(self.cpu(), true);
+                self.handoff_selected(context, outcome);
+                #[cfg(feature = "qemu-test-kernel-runtime")]
+                DIRECT_TIMED_WAKES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return QuantumUpdate {
+                    obsolete: None,
+                    ensure: None,
+                };
+            }
+        }
+        for event in expired.iter() {
+            match event {
+                TimedEvent::WaitDeadline { cpu, token } => {
+                    if cpu != self.cpu() || token.cpu() != self.cpu() {
+                        panic!("sched: foreign timed wait in local batch");
+                    }
+                    self.scheduler.transition_complete_wait_for_timer(token);
+                }
+                TimedEvent::QuantumExpired { cpu, thread } => {
+                    if cpu != self.cpu() {
+                        panic!("sched: foreign quantum in local batch");
+                    }
+                    self.note_quantum_expired(thread);
+                }
+            }
+        }
+        if self.state().idle == Some(current) && self.has_runnable_peer() {
             crate::sync::preempt::request_reschedule_on(self.cpu());
         }
-
-        // Safe point: timer IRQ return may replace the active frame, but only
-        // after the deferred-preemption state confirms depth zero. Timed-event
-        // dispatch and timer rearm continue even while a thread holds a guard.
         let online = self.state().online;
-        if crate::sync::preempt::consume_checkpoint_on(self.cpu(), online) {
+        let checkpoint = crate::sync::preempt::consume_checkpoint_on(self.cpu(), online);
+        if checkpoint {
             self.handoff_optional(context);
-
-            self.replace_quantum_event(now, current);
-            refreshed_quantum_event = true;
         }
-
-        if !refreshed_quantum_event {
-            self.ensure_quantum_event(now);
+        let ensure = self.has_runnable_peer().then(|| {
+            let thread = self
+                .running_thread()
+                .expect("sched: lost timer resume target");
+            (
+                now.wrapping_add(crate::time::ms_to_counts(self.rr_quantum_ms)),
+                TimedEvent::quantum_expired(self.cpu(), thread),
+            )
+        });
+        QuantumUpdate {
+            obsolete: checkpoint.then_some(TimedEvent::quantum_expired(self.cpu(), current)),
+            ensure,
         }
     }
 
@@ -332,7 +360,6 @@ impl CpuScheduler<'_> {
     }
 
     pub(super) fn note_quantum_expired(&mut self, thread: ThreadId) {
-        self.transition_finalize_retired();
         if self.running_thread() == Some(thread) {
             crate::sync::preempt::request_reschedule_on(self.cpu());
             crate::trace!("sched: quantum expired thread {thread}");
@@ -341,6 +368,11 @@ impl CpuScheduler<'_> {
 
     pub(super) fn activate_thread_address_space(&self, id: super::ThreadId) {
         let result = match self.thread_address_space(id.index()) {
+            // Permanent idle executes only trusted high-half code and never
+            // uses user pointers. Retain the installed immutable root, whose
+            // VM active record continues preventing destruction. Every other
+            // kernel thread detaches it; EL0 always activates its own root.
+            None if self.state().idle == Some(id) => Ok(()),
             None => unsafe { crate::memory::vm::clear_user_address_space() },
             Some(address_space) => unsafe {
                 crate::memory::vm::activate_user_address_space(address_space)
@@ -393,7 +425,12 @@ impl CpuScheduler<'_> {
     }
 
     fn handoff_optional(&mut self, context: &mut ActiveContext<'_>) {
-        let SwitchOutcome::Switch { from, to } = self.transition_optional_switch() else {
+        let outcome = self.transition_optional_switch();
+        self.handoff_selected(context, outcome);
+    }
+
+    fn handoff_selected(&mut self, context: &mut ActiveContext<'_>, outcome: SwitchOutcome) {
+        let SwitchOutcome::Switch { from, to } = outcome else {
             return;
         };
         self.saved_context_mut(from).save_from(context);
