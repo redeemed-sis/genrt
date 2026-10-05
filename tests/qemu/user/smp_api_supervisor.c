@@ -247,9 +247,13 @@ static void secondary_monotonic_sleep(void) {
     if (child == 0) {
         struct timespec deadline;
         struct timespec actual;
+        struct timespec raw;
         if (!gtrt_affinity_is_only(0, 2)
             || clock_gettime(CLOCK_MONOTONIC, &deadline) != 0
-            || timespec_before(&deadline, &parent_before)) {
+            || timespec_before(&deadline, &parent_before)
+            || genrt_syscall2(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, (long)&raw) != 0
+            || clock_gettime(CLOCK_MONOTONIC, &actual) != 0
+            || timespec_before(&raw, &deadline) || timespec_before(&actual, &raw)) {
             exit(80);
         }
         deadline = timespec_add_ns(deadline, 5000000L);

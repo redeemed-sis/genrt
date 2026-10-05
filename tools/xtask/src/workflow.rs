@@ -18,7 +18,9 @@ const AARCH64_INITRAMFS_IMAGE_MAX_SIZE: u64 = 4 * 1024 * 1024;
 const AARCH64_USER_CRT0: &str = "user/c/aarch64/crt0.S";
 const AARCH64_USER_INCLUDE_DIR: &str = "user/c/aarch64/include";
 const USER_COMMON_INCLUDE_DIR: &str = "user/c/include";
-const USER_SUPPORT_SOURCES: [&str; 6] = ["string", "stdio", "getopt", "parse", "unistd", "write"];
+const USER_SUPPORT_SOURCES: [&str; 7] = [
+    "string", "stdio", "getopt", "parse", "unistd", "write", "time",
+];
 // Host tests omit syscall-backed modules and interpose write at link time.
 const USER_SUPPORT_HOST_TEST_SOURCES: [&str; 4] = ["string", "stdio", "getopt", "parse"];
 const DEFAULT_INITRAMFS_ROOT: &str = "user/initramfs";
@@ -232,10 +234,15 @@ fn ci() -> Result<()> {
 fn check_user_support() -> Result<()> {
     let directory = Path::new("target/user-support-host");
     fs::create_dir_all(directory)?;
-    for (name, wrap_write) in [("support", true), ("shell_input", false)] {
+    for (name, wrap_write) in [
+        ("support", true),
+        ("shell_input", false),
+        ("rtbench", true),
+        ("time", false),
+    ] {
         check_user_host_program(directory, name, wrap_write)?;
     }
-    println!("userspace support and shell input host tests passed");
+    println!("userspace support, shell input, rtbench, and clock host tests passed");
     Ok(())
 }
 
@@ -254,6 +261,18 @@ fn check_user_host_program(directory: &Path, name: &str, wrap_write: bool) -> Re
     ]);
     if wrap_write {
         compiler.arg("-Wl,--wrap=write");
+    }
+    if name == "rtbench" {
+        compiler.args(["-I", "tests/user/rtbench_host_include"]);
+    }
+    if name == "time" {
+        compiler.args([
+            "-I",
+            "tests/user/time_host_include",
+            "-I",
+            "tests/user/rtbench_host_include",
+        ]);
+        compiler.arg("user/c/common/time.c");
     }
     compiler.arg(format!("tests/user/{name}.c"));
     for name in USER_SUPPORT_HOST_TEST_SOURCES {
@@ -619,6 +638,7 @@ pub(crate) fn build_production_user_artifacts(
     programs.try_reserve_exact(metadata.len())?;
     for program in metadata {
         let elf = build_aarch64_user_elf(
+            profile,
             program.name(),
             program.source(),
             Aarch64Artifacts::new(profile).user_elf(program.name()),
@@ -967,6 +987,7 @@ pub(crate) fn build_user_program(
         .find(|program| program.name() == name)
     {
         return build_aarch64_user_elf(
+            profile,
             program.name(),
             program.source(),
             Aarch64Artifacts::new(profile).user_elf(program.name()),
@@ -980,6 +1001,7 @@ pub(crate) fn build_user_program(
         .find(|program| program.name == name)
         .ok_or_else(|| anyhow::anyhow!("unknown userspace program {name}"))?;
     build_aarch64_user_elf(
+        profile,
         program.name,
         Path::new(program.source),
         Aarch64Artifacts::new(profile).user_elf(program.name),
@@ -1001,6 +1023,7 @@ fn build_all_production_user_programs(
 }
 
 fn build_aarch64_user_elf(
+    profile: Profile,
     name: &str,
     source: &Path,
     elf: PathBuf,
@@ -1017,14 +1040,14 @@ fn build_aarch64_user_elf(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("user ELF path has no parent: {}", elf.display()))?;
     fs::create_dir_all(parent).context("failed to create user ELF output directory")?;
-    let support = build_user_support(parent)?;
+    let support = build_user_support(parent, profile)?;
 
     let crt_obj = parent.join(format!("{name}.crt0.o"));
     let obj = parent.join(format!("{name}.o"));
 
     let mut crt_compile = Command::new("clang");
     crt_compile
-        .args(aarch64_user_compile_args())
+        .args(aarch64_user_compile_args(profile))
         .arg("-c")
         .arg(AARCH64_USER_CRT0)
         .arg("-o")
@@ -1041,7 +1064,7 @@ fn build_aarch64_user_elf(
 
     let mut source_compile = Command::new("clang");
     source_compile
-        .args(aarch64_user_compile_args())
+        .args(aarch64_user_compile_args(profile))
         .arg("-c")
         .arg(source)
         .arg("-o")
@@ -1131,7 +1154,7 @@ fn validate_initramfs_payload(path: &Path) -> Result<u64> {
 
 // Rebuild once per output directory in each xtask invocation, never reuse an
 // on-disk archive from an earlier invocation with potentially stale inputs.
-fn build_user_support(parent: &Path) -> Result<PathBuf> {
+fn build_user_support(parent: &Path, profile: Profile) -> Result<PathBuf> {
     static BUILT: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
     let mut built = BUILT.get_or_init(Mutex::default).lock().unwrap();
     let directory = parent.join("support");
@@ -1146,13 +1169,16 @@ fn build_user_support(parent: &Path) -> Result<PathBuf> {
         let object = directory.join(format!("{name}.o"));
         run_checked(
             Command::new("clang")
-                .args(aarch64_user_compile_args())
+                .args(aarch64_user_compile_args(profile))
                 .args(["-Werror", "-c"])
                 .arg(source)
                 .arg("-o")
                 .arg(&object),
             "userspace support compilation",
         )?;
+        if name == "time" {
+            verify_user_clock_fast_path(&object)?;
+        }
         objects.push(object);
     }
     if archive.exists() {
@@ -1169,9 +1195,34 @@ fn build_user_support(parent: &Path) -> Result<PathBuf> {
     Ok(archive)
 }
 
-fn aarch64_user_compile_args() -> [&'static str; 15] {
+fn verify_user_clock_fast_path(object: &Path) -> Result<()> {
+    let code = command_stdout(
+        Command::new("llvm-objdump").arg("-d").arg(object),
+        "failed to inspect EL0 clock implementation",
+    )?;
+    let undefined = command_stdout(
+        Command::new("llvm-nm").arg("--undefined-only").arg(object),
+        "failed to inspect clock dependencies",
+    )?;
+    if !undefined.trim().is_empty()
+        || !code.contains("CNTPCT_EL0")
+        || !code.contains("CNTFRQ_EL0")
+        || code
+            .lines()
+            .any(|line| objdump_instruction(line).is_some_and(|op| op.starts_with("svc")))
+    {
+        bail!("userspace clock must read the physical counter without SVC");
+    }
+    Ok(())
+}
+
+fn aarch64_user_compile_args(profile: Profile) -> [&'static str; 16] {
     [
         "--target=aarch64-none-elf",
+        match profile {
+            Profile::Debug => "-O0",
+            Profile::Release => "-O2",
+        },
         "-ffreestanding",
         "-fno-builtin",
         "-fno-stack-protector",
@@ -1622,4 +1673,30 @@ fn which(tool: &str) -> Option<String> {
         .map(|dir| dir.join(tool))
         .find(|candidate| candidate.is_file())
         .map(|candidate| candidate.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn userspace_optimization_follows_profile_without_changing_abi_flags() {
+        let debug = aarch64_user_compile_args(Profile::Debug);
+        let release = aarch64_user_compile_args(Profile::Release);
+        assert_eq!(debug[1], "-O0");
+        assert_eq!(release[1], "-O2");
+        for (index, (debug, release)) in debug.iter().zip(&release).enumerate() {
+            if index != 1 {
+                assert_eq!(debug, release);
+            }
+        }
+        for flag in [
+            "-ffreestanding",
+            "-fno-builtin",
+            "-mgeneral-regs-only",
+            "-nostdlib",
+        ] {
+            assert!(release.contains(&flag));
+        }
+    }
 }

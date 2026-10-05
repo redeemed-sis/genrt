@@ -8,6 +8,7 @@ use crate::platform::CPU_CAPACITY;
 const CNTP_CTL_ENABLE: u32 = 1 << 0;
 const CNTP_CTL_IMASK: u32 = 1 << 1;
 const CNTP_CTL_ISTATUS: u32 = 1 << 2;
+const CNTKCTL_EL0PCTEN: u64 = 1 << 0;
 
 #[unsafe(no_mangle)]
 pub static TIMER_FREQ_HZ_BY_CPU: [AtomicU64; CPU_CAPACITY] =
@@ -113,7 +114,9 @@ pub unsafe fn disable() {
 ///
 /// The local timer is disabled, its compare value is moved beyond any stale
 /// boot deadline, and the per-CPU diagnostics are reset before the PPI is
-/// enabled. This function allocates nothing and leaves DAIF unchanged.
+/// enabled. EL0 physical-counter/frequency reads are enabled, while virtual
+/// counter access, timer programming, and event streams remain disabled.
+/// This function allocates nothing and leaves DAIF unchanged.
 ///
 /// # Returns
 ///
@@ -129,6 +132,14 @@ pub unsafe fn disable() {
 /// skipped.
 pub unsafe fn init_current_cpu() -> bool {
     unsafe {
+        // Permit only EL0 physical-counter/frequency reads. Timer programming,
+        // virtual-counter access and event streams remain privileged/disabled.
+        asm!(
+            "msr CNTKCTL_EL1, {access}",
+            "isb",
+            access = in(reg) CNTKCTL_EL0PCTEN,
+            options(nomem, nostack, preserves_flags)
+        );
         let freq = frequency_hz();
         write_ctl(0);
         write_cval(u64::MAX);

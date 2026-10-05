@@ -13,13 +13,10 @@ struct timespec {
 #define CLOCK_MONOTONIC 1
 #define TIMER_ABSTIME 1
 
-static inline int clock_gettime(clockid_t clockid, struct timespec *tp) {
-    return (int)genrt_syscall2(SYS_CLOCK_GETTIME, clockid, (long)tp);
-}
-
-static inline int clock_getres(clockid_t clockid, struct timespec *res) {
-    return (int)genrt_syscall2(SYS_CLOCK_GETRES, clockid, (long)res);
-}
+/* Counter-backed EL0 operations. Non-NULL output pointers must be writable;
+ * use the raw syscall ABI when kernel pointer validation is required. */
+int clock_gettime(clockid_t clockid, struct timespec *tp);
+int clock_getres(clockid_t clockid, struct timespec *res);
 
 static inline int clock_nanosleep(clockid_t clockid, int flags,
                                   const struct timespec *req,

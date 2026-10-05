@@ -217,7 +217,7 @@ static int time_api(void) {
     }
     if (clock_getres(CLOCK_MONOTONIC, NULL) != 0
         || clock_getres(77, &resolution) != -GTRT_EINVAL
-        || clock_getres(CLOCK_MONOTONIC, (struct timespec *)1)
+        || genrt_syscall2(SYS_CLOCK_GETRES, CLOCK_MONOTONIC, 1)
                != -GTRT_EFAULT) {
         return 2;
     }
@@ -226,10 +226,37 @@ static int time_api(void) {
         || timespec_before(&end, &start) || start.tv_nsec < 0
         || start.tv_nsec >= 1000000000L
         || clock_gettime(77, &end) != -GTRT_EINVAL
-        || clock_gettime(CLOCK_MONOTONIC, (struct timespec *)1)
+        || genrt_syscall2(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, 1)
                != -GTRT_EFAULT) {
         return 3;
     }
+    /* Bracket the raw ABI sample with EL0 reads. Both paths round down in
+     * exactly the same physical-counter domain, on primary and secondary CPUs. */
+    for (int iteration = 0; iteration < 100; iteration++) {
+        struct timespec raw;
+        if (clock_gettime(CLOCK_MONOTONIC, &start) != 0
+            || genrt_syscall2(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, (long)&raw) != 0
+            || clock_gettime(CLOCK_MONOTONIC, &end) != 0
+            || timespec_before(&raw, &start) || timespec_before(&end, &raw)
+            || raw.tv_nsec < 0 || raw.tv_nsec >= 1000000000L) return 14;
+    }
+    struct timespec raw_resolution;
+    if (genrt_syscall2(SYS_CLOCK_GETRES, CLOCK_MONOTONIC,
+                       (long)&raw_resolution) != 0
+        || raw_resolution.tv_sec != resolution.tv_sec
+        || raw_resolution.tv_nsec != resolution.tv_nsec
+        || clock_gettime(CLOCK_MONOTONIC, NULL) != -GTRT_EFAULT) return 15;
+    /* Ordinary C output faults stay confined to the child; the raw ABI above
+     * continues returning EFAULT rather than faulting for a bad buffer. */
+    pid_t fault_child = fork();
+    if (fault_child < 0) return 16;
+    if (fault_child == 0) {
+        clock_gettime(CLOCK_MONOTONIC, (struct timespec *)1);
+        exit(99);
+    }
+    int fault_status = 0;
+    if (waitpid(fault_child, &fault_status, 0) != fault_child
+        || fault_status != 0x7f) return 17;
 
     const struct timespec relative = {.tv_sec = 0, .tv_nsec = 2000000L};
     if (clock_gettime(CLOCK_MONOTONIC, &start) != 0
