@@ -114,18 +114,38 @@ Each logical CPU owns one preallocated deadline queue and its architected
 physical timer. For secondaries, CPU-local queue publication precedes PSCI
 startup, timer PPI enable, and IRQ unmasking. CPU0 initializes its local timer
 hardware earlier with IRQ masked and does not unmask until generic queue and
-scheduler publication are complete. Timed events retain that CPU identity, and only the owner CPU
-inserts events or programs its one-shot nearest deadline. IRQ dispatch collects
-expired events, releases the queue lock, then directly invokes the narrow
-scheduler facade to complete tokens, account quantum expiration, and perform
-IRQ-return handoff. No callback table, allocation, or queue growth occurs in
-the interrupt path.
+scheduler publication are complete. Timed events retain that CPU identity, and
+only the owner CPU inserts events or programs its one-shot nearest deadline.
+IRQ dispatch collects expired events into CPU-owned fixed storage, releases
+the queue lock, then takes the scheduler once to complete tokens, finalize
+retired joins, account quantum expiration, and select the IRQ-return context.
+The time owner applies returned quantum intent and rearms after scheduler
+ownership releases. No callback table, allocation, queue growth, or time lock
+crosses this timer transaction.
+
+If the batch contains one exact local wait, current is permanent idle, local
+ready and remote ingress are empty, and preemption is enabled, the transition
+selects the completed thread directly without ready-queue insertion. It uses
+the same generation/sequence validation, explicit/automatic wait consumption,
+and lifecycle ownership as the queued path. With no remaining peer it arms no
+RR quantum. Multiple events or existing peers use the normal RR path. The idle
+context is still saved: idle entry is not contracted to be restartable. See
+[ADR-0055](../../../memory/decisions/ADR-0055-batched-timer-wakeup-and-idle-selection.md).
+
+Userspace-to-idle handoff retains the immutable TTBR0 root and active VM record;
+idle never uses user pointers. Resuming that root requires no write or TLBI.
+Other kernel threads detach, different user roots activate normally, and user
+exit clears a retained root before retired-thread reap. Context save/restore
+and the assembly ABI remain unchanged.
 
 The same architecture counter backs userspace `CLOCK_MONOTONIC` observation,
 resolution, relative sleeps, and `TIMER_ABSTIME` deadlines. Checked conversion
 rounds requested deadlines upward, so successful sleeps cannot finish before
 their requested time. A sleeping userspace thread keeps its immutable home CPU
 and publishes its deadline only to that CPU's queue.
+Representable conversion products use checked native-width arithmetic; wider
+inputs retain the exact 128-bit fallback. Cancelling a missing event leaves the
+timer untouched, including a nonexistent RR quantum during a sole-thread sleep.
 
 Cross-CPU cancellation may remove an exact event without touching the remote
 physical timer; at worst the old deadline causes one harmless early interrupt.

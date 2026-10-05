@@ -5,9 +5,10 @@ support**. The same kernel entry, scheduler, filesystem and userspace used on
 QEMU are linked here, with Pi-specific IRQ, UART, CPU-release and power backends.
 
 The runtime has reached the shell on QEMU's BCM2837 model, including
-secondary CPU commands.
-This is **not physical runtime validation**. Capture the serial log and repeat
-cold boot on the real board. Choose UART transfer for RAM-only iterations or
+secondary CPU commands. The user also supplied physical-Pi rtbench results
+on CPU1 and CPU3; those are distinct from emulator validation and do not
+certify worst-case timing. Capture the serial log and repeat cold boot on
+the real board. Choose UART transfer for RAM-only iterations or
 copy the FIT onto the existing microSD boot partition for persistent loading.
 
 ## Build
@@ -314,6 +315,30 @@ U-Boot. UART-only loading requires another transfer; a selected microSD
 `boot.scr` loads genrt again. In a separate boot test `poweroff`: firmware halts
 after a watchdog reset, but the board still has supply voltage. Power-cycle to
 restart. Both commands affect the whole board, even on a secondary CPU.
+
+## Periodic wakeup comparison
+
+For the periodic-wakeup comparison, rebuild with
+`cargo xtask build-raspberrypi-3b-plus`, deploy the resulting FIT, and run:
+
+```text
+taskset 3 rtbench -p 15000 -n 10000 -o 30
+taskset 3 rtbench -p 15000 -n 10000 -o 0
+```
+
+Record release latency average/maximum, elapsed TET average/maximum, and
+overruns from each SUMMARY. Public clock reads now execute at EL0; idle retains
+the unchanged user root and a sole timed wake selects its thread directly.
+See the [comparison record](../../../../docs/testing.md#periodic-wakeup-optimization-comparison)
+for the user-supplied baseline and the still-unmeasured matched 15000 ns result.
+The [final recorded profiles](../../../../docs/testing.md#final-recorded-hardware-profiles-user-reported)
+contain separate 1000-step CPU3 runs: the 8000 ns run averages 4687 ns release
+latency, peaks at 11010 ns, and has one payload overrun; the 15000 ns control
+averages 3259 ns, peaks at 5104 ns, and has no overruns. All control STEP 3..999
+release values are within 3177..3333 ns, while the 8000 ns ramp persists.
+These do not replace the unmeasured matched 10000-step comparison above.
+Retain full STEP output: zero payload overruns do not prove that every sleep
+blocked before its deadline. Kernel phase tracing is not implemented yet.
 
 ## Architecture boundary
 

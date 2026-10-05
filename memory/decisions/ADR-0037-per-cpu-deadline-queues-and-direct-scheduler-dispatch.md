@@ -4,6 +4,10 @@
 
 Accepted
 
+Superseded in part by
+[ADR-0055](ADR-0055-batched-timer-wakeup-and-idle-selection.md) for per-event
+timer-to-scheduler dispatch only.
+
 ## Context
 
 The logical-CPU scheduler and SMP synchronization work made scheduler execution

@@ -4,6 +4,10 @@
 
 Accepted
 
+Superseded in part by
+[ADR-0054](ADR-0054-idle-user-root-retention-and-detach.md) for unconditional
+activation/clear invalidation and idle-root handoff only.
+
 ## Context
 
 ADR-0040 activated a scheduler context on every registered CPU, and ADR-0041

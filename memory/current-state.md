@@ -40,8 +40,8 @@ accepted ADRs remain authoritative when details differ.
   publication performs Pi cache maintenance before local or remote execution.
   Mock-MMIO tests cover both UARTs, per-CPU IRQ/mailbox routing and PM writes.
   BCM2837 emulation reached /init, ran taskset on CPU2/3, slept and powered off.
-  Physical runtime, repeated cold boots and firmware reset/halt still require
-  operator checks.
+  The operator also supplied physical CPU1/CPU3 userspace benchmark results;
+  repeated cold boots and firmware reset/halt still require operator checks.
   See [Pi procedure](../arch/aarch64/platform/raspberrypi-3b-plus/README.md) and
   [ADR-0051](decisions/ADR-0051-raspberrypi-runtime-spin-table-and-power.md).
 
@@ -96,14 +96,24 @@ accepted ADRs remain authoritative when details differ.
   and thread-owned user stacks use 4 KiB mappings with user-specific
   permissions.
 - A published TTBR0 root is immutable and activates only on its owner CPU.
-  Per-CPU active-root tracking prevents destruction before clear. AArch64 uses
-  local invalidation for TTBR0 activation/clear while shared runtime TTBR1
-  mutation retains inner-shareable broadcast invalidation.
+  Per-CPU active-root tracking prevents destruction before detach. Reusing the
+  same installed root avoids a register write and local invalidation. Permanent
+  high-half idle retains it without accessing user pointers; ordinary kernel
+  threads clear it. User exit detaches before reap can reclaim its frames.
+  Changing roots still invalidates locally; shared runtime TTBR1 mutation
+  retains inner-shareable broadcast invalidation.
 - `copy_from_user` and `copy_to_user` validate the active user address space;
   fault recovery during the actual copy is not implemented yet.
+  Full-range validation precedes aligned volatile word copies with byte edges;
+  C-string scans remain bytewise. Successful SVC dispatch avoids diagnostic
+  frame copies and FAR reads, without changing the full exception-frame ABI.
 
 ## Scheduling and time
 
+- Public monotonic observation/resolution use an EL0 physical-counter fast
+  path in the shared library; raw clock syscalls retain pointer validation.
+  All runtime CPUs permit counter/frequency reads, not timer programming.
+  Kernel and userspace conversions retain the same epoch and rounding.
 - The scheduler is round-robin and preemptive. A bounded registry
   maps normalized AArch64 hardware identities to CPU0-first logical `CpuId`
   values before scheduler bootstrap. AArch64 retains each logical binding in
@@ -135,12 +145,20 @@ accepted ADRs remain authoritative when details differ.
 - The same architecture counter is the userspace `CLOCK_MONOTONIC` domain.
   Checked nanosecond conversion provides normalized observation and resolution,
   relative sleeps, and drift-free `TIMER_ABSTIME` deadlines without a second
-  time source.
+  time source. Representable deadline products use checked native-width
+  arithmetic rather than software 128-bit division; wider inputs retain the
+  exact fallback and the same overflow and ceiling semantics.
 - `kernel::time` owns one preallocated, IRQ-safe deadline queue per logical
   CPU for exact wait deadlines and scheduler quantum expiration. Timed events
   carry their CPU owner; only that CPU inserts events and programs its physical
-  timer. IRQ dispatch drops the queue owner before calling the scheduler facade
-  directly.
+  timer. Each CPU also owns a fixed expired-event transfer buffer allocated at
+  bootstrap. IRQ dispatch releases the queue before one scheduler transaction
+  handles the batch and return selection, then applies quantum intent and rearms
+  after releasing the scheduler. An enabled-preemption idle/single-wait path
+  skips ready-queue insertion and RR work; multi-event/peer paths retain normal
+  first-wins completion and round-robin behavior. Idle contexts remain saved.
+  Missing event cancellations do not reprogram the timer; remote or IRQ-batch
+  cancellation still leaves programming to the owning CPU's timer transaction.
 - AArch64 selects one platform interrupt-controller implementation through a
   static contract, with no IRQ-time dynamic dispatch. The common dispatcher
   handles UART, timer, and scheduler notifications; QEMU GICv2 and Pi local
@@ -208,6 +226,36 @@ accepted ADRs remain authoritative when details differ.
   and checked decimal conversion are shared by products and tests; the write
   syscall adapter remains architecture-owned. This adds no kernel syscall,
   heap runtime, TLS, file streams, or dynamic linker.
+  The common ELF builder applies `-O0` to debug and `-O2` to release programs,
+  CRT0, and library members, retaining freestanding and GP-register-only flags.
+- `/bin/rtbench` uses the existing monotonic time/sleep ABI for absolute
+  periodic releases that never reset after overruns. Required decimal options
+  select a nonzero u64 period, 1..10000 steps, and 0..UINT32_MAX unsigned-add
+  payload operations per step, preserved by a register compiler barrier.
+  One process-private 240000-byte `.bss` sample array replaces heap or large
+  stack storage. Release latency is S-R; elapsed TET is E-S, including
+  preemption; only E greater than the next release is an overrun. Each
+  non-overrun iteration includes an absolute sleep, even after the final
+  sample, with preflight horizon R[0]+period*steps. No normal measurement I/O
+  occurs. Checked timestamps, horizon/release arithmetic, and post-run sums
+  fail rather than wrap. STEP rows and summary averages/maxima/overrun count
+  and deterministic result are emitted afterward; CLI errors exit 2 and
+  runtime/arithmetic/output failures exit 1. Host tests execute the utility
+  with controlled time/output, and existing QEMU contracts cover exact product
+  execution and CPU1 placement. The [hardware validation record](../docs/testing.md#raspberry-pi-hardware-result-user-reported)
+  includes a user-reported physical Pi CPU1 run with 300 steps, a 15000 ns
+  period, 10 operations per step, zero overruns, and result 3000. A second
+  user-reported CPU3 run covers the maximum 10000-step capacity at the same
+  period with 30 operations per step, zero overruns, and result 300000. These
+  are representative functional results, not certified latency bounds;
+  emulator results remain separate from physical-board timing evidence.
+  The [final recorded profiles](../docs/testing.md#final-recorded-hardware-profiles-user-reported)
+  contain later 1000-step CPU3 runs: 8000 ns releases average 4687 ns, peak at
+  11010 ns, and have one overrun; the 15000 ns control averages 3259 ns, peaks
+  at 5104 ns, and has no overruns. The short-period ramp persists, while
+  control STEP 3..999 stay within 3177..3333 ns. First-sleep maxima remain in
+  all-sample statistics. Build/environment identity is incomplete, and no
+  kernel phase instrumentation or matched 10000-step after-result is recorded.
 - The bounded process table owns process state, TTBR0 address spaces, loaded
   ELF segments, cwd, file descriptors, relationships, exit/fault status, and
   `main_thread: ThreadId`.

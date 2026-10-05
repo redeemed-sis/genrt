@@ -3,7 +3,8 @@
 This directory contains the AArch64-specific freestanding C runtime pieces:
 
 - `crt0.S`: process entry stub;
-- `include/syscall.h`: raw syscall wrappers and AArch64 syscall numbers.
+- `include/syscall.h`: raw syscall wrappers and AArch64 syscall numbers;
+- `include/genrt/counter.h`: read-only physical-counter/frequency adapter.
 
 Architecture-neutral [support APIs](../common/README.md) live in
 `../include/` and `../common/`. xtask supplies both include directories and
@@ -139,9 +140,12 @@ so every process may request terminal power control.
 
 ## Monotonic time and sleep
 
-`clock_gettime`, `clock_getres`, and `clock_nanosleep` use syscall numbers 14,
-15, and 16. `<time.h>` exposes only `CLOCK_MONOTONIC`; its epoch is unspecified,
-and all CPUs observe the same architecture counter domain. `struct timespec`
+The raw `clock_gettime`, `clock_getres`, and `clock_nanosleep` ABI uses syscall
+numbers 14, 15, and 16. Public library observation/resolution instead reads
+CNTPCT/CNTFRQ directly at EL0 through the counter adapter; only sleep enters
+the kernel. Each runtime CPU enables read permission, not EL0 timer control.
+`<time.h>` exposes only `CLOCK_MONOTONIC`; its epoch is unspecified, and all
+CPUs observe the same architecture counter domain. `struct timespec`
 uses signed 64-bit `time_t`/`long` fields and successful observations are
 normalized to `0 <= tv_nsec < 1000000000`.
 
@@ -154,8 +158,14 @@ kernel syscall.
 
 The freestanding runtime returns negative errno values directly instead of
 setting libc `errno`. Unsupported clocks, flags, or malformed timespec values
-return `-EINVAL`; invalid user pointers return `-EFAULT`; unrepresentable time
-conversion returns `-EOVERFLOW`. `clock_getres` accepts a null result pointer.
+return `-EINVAL`; invalid raw syscall pointers return `-EFAULT`; unrepresentable
+time conversion returns `-EOVERFLOW`. Public fast-clock non-NULL outputs must
+be writable C objects: invalid pointers may fault the process. NULL gettime
+returns `-EFAULT`, and `clock_getres` accepts a null result pointer. The raw clock
+ABI still performs bounded kernel usercopy validation.
 The nullable `rem` argument is preserved but not written because genrt has no
 userspace signal interruption yet. `/bin/sleep` accepts one bounded decimal
 whole-second operand and uses the public `sleep()` wrapper.
+
+See [ADR-0053](../../../memory/decisions/ADR-0053-el0-monotonic-counter-fast-path.md)
+for the fast-clock permission and pointer boundary.

@@ -54,6 +54,12 @@ defines, marker includes, or generated invocation headers. Test programs receive
 their own marker at compilation, outside the archive. Release identity checks
 cover the resulting statically linked program bytes.
 
+The ELF builder applies `-O0` to debug userspace and `-O2` to release userspace,
+including CRT0, common library members, and test helpers. It retains
+`-ffreestanding`, `-fno-builtin`, and `-mgeneral-regs-only` in both profiles.
+The Raspberry Pi FIT uses the release userspace path. To exercise optimized
+userspace explicitly, run `cargo xtask test-aarch64 --profile release`.
+
 The host support test links portable library modules with `--wrap=write` to
 inject output behavior. Guest builds instead link the common public `write()`
 wrapper using architecture syscall transport and the sleep wrappers; test linker
@@ -61,6 +67,19 @@ options never enter production ELF builds.
 The same host check builds the shell-private input tests without write
 interposition. Production shell history/completion is exercised separately by
 `shell-contract`, whose `/bin` fixtures are explicitly marked test-only.
+
+`check` also builds `tests/user/rtbench.c`, including the actual production
+utility under a renamed entry point. Only this host target receives
+`tests/user/rtbench_host_include`, which supplies controlled public clock
+observations and syscall-backed sleeps. Shared formatting and parsing
+remain real library implementations, with output injected via `--wrap=write`.
+No test adapter path or production test conditional enters guest builds.
+
+`tests/user/time.c` substitutes only the architecture counter adapter to test
+public clock conversion, rounding, normalization, and error limits. Guest
+builds instead disassemble the complete clock object, require physical counter
+and frequency reads, reject SVC, and reject undefined helper dependencies.
+This verifies the supported clock path at both debug and release optimization.
 
 ## QEMU configuration
 

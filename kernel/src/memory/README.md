@@ -65,9 +65,14 @@ Process owns OwnedUserAddressSpace
 Only the immutable owner CPU may activate a published TTBR0 root. The generic
 VM layer tracks each CPU's active root and rejects destruction while any CPU
 still records it. AArch64 performs local invalidation on TTBR0 activation and
-clear; staged mappings need no invalidation because they have never been
-active. Runtime TTBR1 mappings remain shared, mutable, and use their existing
-inner-shareable broadcast invalidation protocol.
+clear only when the actual root changes; staged mappings need no invalidation
+because they have never been active. Permanent idle retains an immutable user
+root while executing only trusted high-half code, with no user-pointer access.
+The active record remains published during idle. Other kernel threads clear
+the root; user exit detaches before a retired join/reap can reclaim frames.
+Runtime TTBR1 mappings remain shared, mutable, and use their existing
+inner-shareable broadcast invalidation protocol. See
+[ADR-0054](../../../memory/decisions/ADR-0054-idle-user-root-retention-and-detach.md).
 
 ## User copies
 
@@ -75,6 +80,13 @@ inner-shareable broadcast invalidation protocol.
 user address space and actual page permissions. Read and write validation are
 separate. Copies are bounded and intended for syscall/trap context where active
 TTBR0 matches the current process.
+
+Validation finishes before any destination byte changes. Fixed-length copies
+use volatile, naturally aligned machine-word accesses to user memory with byte
+prefixes and tails; kernel buffers need not be word-aligned. No access extends
+past the validated range, and aligned words cannot straddle a 4 KiB page.
+Bounded C-string scans remain bytewise so finding a NUL never requires reading
+a following page. `getcwd` uses the word-copy writer plus a separate NUL.
 
 The current copy loop assumes mappings stay stable and has no exception-table
 fault recovery if an actual load/store faults after validation. Future recovery

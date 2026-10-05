@@ -78,8 +78,12 @@ Changes that invalidate one require architecture review and an ADR.
 - Boot-owned page tables are never reclaimed through the runtime frame
   allocator.
 - Staged TTBR0 mappings need no invalidation. Owner-only activation and clear
-  perform local userspace invalidation; this single-owner rule replaces a
-  general userspace TLB-shootdown protocol for the current milestone.
+  perform local userspace invalidation only when the installed root changes.
+  Permanent high-half idle may retain a user root but never accesses user
+  pointers; the active-root record remains live and prevents destruction.
+  Other kernel threads detach it, and user exit detaches before retired-thread
+  finalization can publish reap. This single-owner rule replaces a general
+  userspace TLB-shootdown protocol for the current milestone.
 - Generic kernel VM entry points serialize runtime TTBR1 writers. AArch64 owns
   descriptor replacement, break-before-make where needed, inner-shareable
   TLBI, and barriers; table frames are not reclaimed before invalidation
@@ -144,9 +148,22 @@ Changes that invalidate one require architecture review and an ADR.
   programs the timer; no time lock is retained across direct scheduler dispatch.
   Remote cancellation may leave an early interrupt, but cannot delay a remaining
   deadline. Remote insertion requires a future IPI command path.
+- A timer IRQ transfers its expired prefix through CPU-owned fixed storage,
+  releases time ownership, then completes waits and selects its return context
+  in one scheduler transaction. Quantum changes are applied after scheduler
+  ownership releases. Exact-token first-wins semantics still govern every
+  completion, including stale events copied before concurrent cancellation.
+- One exact local timed wake may switch directly from idle only with no ready
+  peers, no remote ingress, and enabled preemption. The transition preserves
+  wait consumption, lifecycle states, and saved contexts; it creates no RR
+  quantum without a remaining runnable peer. Idle's interrupted context is
+  still saved, not assumed restartable.
 - Userspace `CLOCK_MONOTONIC` observation and absolute sleep use that same
   coherent architecture counter domain. Conversion rounds deadlines upward and
   rejects overflow; a sleeping thread remains on its immutable home CPU.
+  Public observation/resolution may read the physical counter directly at EL0;
+  timer programming remains privileged. Non-NULL library outputs are ordinary
+  writable C objects; raw clock syscalls retain bounded kernel usercopy checks.
 - One local scheduler operation binds one stable `CpuId` through a
   `CpuScheduler` view. Target/home-CPU operations select their destination
   explicitly and must not silently substitute the executing CPU.

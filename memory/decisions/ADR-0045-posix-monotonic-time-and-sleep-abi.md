@@ -4,6 +4,10 @@
 
 Accepted
 
+Superseded in part by
+[ADR-0053](ADR-0053-el0-monotonic-counter-fast-path.md) for public clock
+observation transport and its non-NULL pointer boundary only.
+
 ## Context
 
 genrt already schedules kernel sleeps and timeouts with the AArch64 generic

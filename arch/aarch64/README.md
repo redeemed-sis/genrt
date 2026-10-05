@@ -92,8 +92,10 @@ diagnostics; generic kernel code does not own platform constants.
 - After physical memory initialization, allocator-owned runtime TTBR1 tables
   replace boot tables and TTBR0 is cleared.
 - Published TTBR0 roots have one immutable logical CPU owner. Activation and
-  clear use local `VMALLE1`; staged roots are mapped before first activation and
-  need no invalidation. There are no ASIDs or cross-CPU userspace shootdowns.
+  clear use local `VMALLE1` only when the installed root changes; staged roots
+  need no invalidation. Permanent high-half idle may retain that root without
+  user-memory access. Exit detaches before reap, and other kernel threads clear
+  it. There are no ASIDs or cross-CPU userspace shootdowns.
 - Runtime TTBR1 mappings remain shared across CPUs and retain inner-shareable
   broadcast invalidation.
 - The generic VM layer requests architecture operations through narrow C ABI
@@ -101,10 +103,23 @@ diagnostics; generic kernel code does not own platform constants.
 
 ## Exceptions, IRQ, and task return
 
+Every CPU's timer initialization enables only `CNTKCTL_EL1.EL0PCTEN`, permitting
+EL0 physical-counter and frequency reads. Public library `clock_gettime` and
+`clock_getres` use that same kernel monotonic domain without SVC. Virtual reads,
+event streams, and EL0 timer programming remain disabled; raw clock syscalls
+remain available with kernel pointer validation. See
+[ADR-0053](../../memory/decisions/ADR-0053-el0-monotonic-counter-fast-path.md).
+
 The vector table saves the full trap frame before using interrupted GPRs.
 Current-EL SVC handles kernel task calls; lower-EL SVC dispatches userspace
 syscalls. Lower-EL frames save `SP_EL0` while retaining a valid EL1 kernel stack.
 Restore selects EL1 or EL0 from SPSR mode bits and returns with `eret`.
+
+Successful lower-EL SVC dispatch does not read FAR or copy a diagnostic frame.
+Synchronous faults and unknown syscall numbers enter a cold helper that logs
+the original live frame before process termination can replace it. Unknown
+dispatch leaves the context untouched, and the full assembly frame ABI remains
+unchanged for blocking, fork, exec, and scheduler handoff.
 
 Rust exception entry wraps each live `TrapFrame` once as the generic kernel's
 opaque `ActiveContext`. The AArch64 context adapter alone decodes `x8` and

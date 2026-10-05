@@ -85,14 +85,29 @@ Set `optind = 1` after a completed parse to start another. Setting `optind = 0`
 also resets a partially consumed option cluster. The parser is not
 reentrant; fork copies its state and exec starts fresh process state.
 
-`<genrt/parse.h>` exposes `genrt_parse_u32_decimal(text, max_value, value)`.
+`<genrt/parse.h>` exposes `genrt_parse_u32_decimal(text, max_value, value)` and
+`genrt_parse_u64_decimal(text, max_value, value)` with matching-width arguments.
 It accepts only a nonempty sequence of ASCII decimal digits, checks arithmetic
 and the caller's inclusive maximum, stores the result on success, and returns
 zero. Invalid input returns `-GENRT_EINVAL`; overflow or an exceeded maximum
 returns `-GENRT_ERANGE`. `text` must be a readable C string and `value` a
-writable result pointer. Leading zeroes are allowed; signs, whitespace, and
+writable result pointer. Failure leaves the result unchanged. The u32 entry
+point reuses the checked u64 parser with its inclusive u32 bound.
+Leading zeroes are allowed; signs, whitespace, and
 suffixes are not. This explicit checked API does not pretend to implement
 `strtoul` or libc errno semantics.
+
+## Monotonic clock
+
+`clock_gettime(CLOCK_MONOTONIC, ...)` and `clock_getres` read the architected
+physical counter/frequency through `aarch64/include/genrt/counter.h`, without
+SVC. They share the kernel epoch and integer rounding. No library clock state
+or initialization is needed. Unsupported IDs return negative EINVAL, NULL
+gettime returns EFAULT, and NULL getres succeeds. Other output pointers must
+be writable C objects; a bad pointer can fault the process. Raw clock syscalls
+retain kernel validation and EFAULT. Sleeps still use the syscall transport.
+
+See [ADR-0053](../../../memory/decisions/ADR-0053-el0-monotonic-counter-fast-path.md).
 
 ## Boundaries and tests
 
@@ -100,13 +115,20 @@ The library has no heap, TLS, floating-point, locale, file streams, or hosted
 startup dependency. It is never linked into the kernel. Test defines, marker
 headers, and protocol strings are not archive inputs.
 
+Archive members use the same profile flags as their callers: `-O0` for debug
+and `-O2` for release, with freestanding, no-builtin, GP-register-only code.
+
 The `support-library` case in `userspace-contract` checks the public interfaces
 through a statically linked child process. Host tests substitute only the write
 call with the host linker's `--wrap=write` to exercise short writes, errors,
 and output spanning multiple staging buffers. Test diagnostics use
 `__real_write` so a simulated output failure cannot swallow its own report.
 The host suite covers the portable string, formatting, and parser modules;
-QEMU contracts cover syscall-backed `write`, `sleep`, and `usleep`.
+QEMU contracts cover syscall-backed `write`, `sleep`, and `usleep`. Both host
+and QEMU support tests cover u64 limits and preserve existing u32 behavior.
+Separate clock host tests substitute the counter adapter to check limits and
+rounding. Guest build verification inspects the complete clock object for
+counter reads, rejects SVC, and requires no undefined helper dependencies.
 Existing shell, SMP, and product contracts verify migrated callers.
 
 See [ADR-0046](../../../memory/decisions/ADR-0046-shared-freestanding-userspace-library.md)

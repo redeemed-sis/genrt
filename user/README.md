@@ -13,7 +13,8 @@ uses it for compilation, contract staging, release staging, identity checks, and
 coverage reporting.
 
 Current products are the shell and `/bin/echo`, `/bin/cat`, `/bin/ls`,
-`/bin/pwd`, `/bin/taskset`, `/bin/sleep`, `/bin/reboot`, and `/bin/poweroff`.
+`/bin/pwd`, `/bin/taskset`, `/bin/sleep`, `/bin/rtbench`, `/bin/reboot`, and
+`/bin/poweroff`.
 Other example C files may be buildable without entering production composition.
 
 `taskset <cpu> <program> [args...]` launches one new process on a decimal
@@ -70,6 +71,63 @@ The shell-private [input helpers](c/shell_input.h) are shared only with host
 tests, not exposed as support-library API. `shell-contract` exercises the exact
 production shell using controlled test commands, not prompt assertions.
 
+## Periodic timing benchmark
+
+`rtbench -p period_ns -n steps -o operations` measures periodic userspace work
+through the existing `CLOCK_MONOTONIC` API. All three options are required,
+exactly once. Period is a nonzero decimal u64; steps are decimal 1..10000;
+operations are decimal 0..4294967295. Signs, whitespace, suffixes, overflow,
+unknown options, and extra operands are rejected before observing the clock.
+The shared `getopt` parser accepts attached or separate short-option arguments.
+
+The initial observation defines `R[0]`. Each sample observes start `S`, executes
+the payload, and observes end `E`. Releases advance only by
+`R[i+1] = R[i] + period`, including after overruns; no periods are skipped and
+the origin is never reset. Release latency is `S - R[i]`; elapsed task execution
+time (TET) is `E - S`, including preemption and clock-call overhead, not CPU
+accounting time. An overrun occurs strictly when `E > R[i+1]`, with duration
+`E - R[i+1]`. Equality is not an overrun. Every non-overrun iteration sleeps
+using `TIMER_ABSTIME` until `R[i+1]`, including the final iteration.
+
+There are exactly `steps` samples, at releases `R[0]` through `R[steps-1]`.
+The final sleep targets `R[steps]`; it is not an additional sample. Both
+`period * steps` and the initial absolute horizon `R[0] + period * steps` are
+checked before payload execution. Timespec normalization, conversion,
+monotonic ordering, and release arithmetic are checked as well.
+
+One static `.bss` array holds 10000 samples of three u64 fields (240000 bytes).
+There is no heap allocation, large stack array, or normal output during the
+measurement loop or its final sleep. Each step executes exactly `operations`
+unsigned integer additions, with an empty register compiler barrier after
+each add to prevent elimination. Loop control is not payload work. Zero is
+accepted; there are no payload multipliers, floating-point, or SIMD operations.
+The accumulator starts at zero, carries across steps, and is consumed in the
+report as `result = steps * operations`.
+
+After measurement, checked sums are accumulated, then every zero-based `STEP`
+row reports `release_latency_ns`, `tet_ns`, and `overrun_ns`. The final
+`SUMMARY` reports configuration, `release_latency_avg_ns`,
+`release_latency_max_ns`, `tet_avg_ns`, `tet_max_ns`, `overrun_avg_ns`,
+`overrun_max_ns`, `overruns`, and `result`. Averages are integer-truncated
+over all requested samples, including zero overruns. Output is diagnostic,
+not a machine test protocol. Exit status is 0 for success, 2 for CLI errors,
+and 1 for runtime, timestamp, arithmetic, statistics, or output failure
+(including failure to print a CLI diagnostic). Failed runs need not emit a
+complete report; an output failure can leave a printed prefix.
+
+For a production shell session:
+
+```text
+rtbench -p 1000000 -n 100 -o 50000
+taskset 1 rtbench -p 1000000 -n 100 -o 50000
+```
+
+The second command requires logical CPU1 online and uses `taskset`'s immutable
+child placement. Period is 1 ms; workload counts are not a duration guarantee.
+QEMU contracts establish functionality, not hardware latency or a worst-case
+execution bound. See the [validation procedure](../docs/testing.md#rtbench-validation)
+for host, virtual-board, and user-performed Raspberry Pi checks.
+
 ## Build and startup
 
 The common linker script creates ELF64 little-endian AArch64 `ET_EXEC` images
@@ -107,6 +165,9 @@ does not set the userspace PC.
   the wrapper hides raw reboot magic values.
 - `<time.h>` and `<unistd.h>` expose monotonic clock observation, relative and
   absolute sleeps, and conventional `sleep`/`usleep` wrappers.
+  Public `clock_gettime`/`clock_getres` read the physical counter at EL0 without
+  SVC. Non-NULL outputs must be writable C objects; raw clock syscalls retain
+  kernel pointer validation and EFAULT. Sleep still enters the kernel.
 - Shell line editing and command policy are userspace responsibilities.
 
 Do not add libc assumptions or raw flat-binary loading paths. Syscall changes

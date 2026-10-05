@@ -13,6 +13,9 @@ stores complete evidence below `target/test-results/`.
   timeout isolation, slot reuse, and bounded mailbox loser cleanup. Its
   preemption cases use bounded task/atomic protocols and a test-only timer-IRQ
   counter without asserting scheduling jitter.
+  `user-root-idle-retention` joins a sole EL0 probe over three process lifetimes.
+  Each runs 32 sleeps with exactly 32 direct idle wakes and two actual TTBR0
+  writes (activation and exit detach), then verifies frame return after reap.
 - `user-fault`: test-enabled kernel coordinator that joins a faulting EL0
   process and verifies exact fault classification.
 - `smp-boot`: four-CPU test kernel that validates PSCI secondary high-half
@@ -25,11 +28,23 @@ stores complete evidence below `target/test-results/`.
 - `userspace-contract`: production kernel plus test supervisor, exact
   production-program invocations, and production `taskset` argument, failure,
   status propagation, child-reaping, monotonic time, relative/absolute sleep,
-  production `/bin/sleep`, and shared support-library boundary checks.
+  production `/bin/sleep`, shared support-library boundary checks, and exact
+  production `/bin/rtbench` execution plus positive-workload and invalid-CLI
+  wait/exit contracts. The registered rtbench invocation uses three 1 ms
+  steps with zero payload operations; large sample-capacity tests stay on host.
+  The `syscall-boundaries` case covers unaligned copies across mapped pages,
+  readonly/out-of-range destinations, no partial write at the stack boundary,
+  and isolated child termination for an unknown syscall.
+  Clock tests bracket raw syscall observations with fast EL0 reads, compare
+  exact resolution, isolate a bad fast-output pointer, and retain raw EFAULT
+  checks. Concurrent processes keep independent writable data across sleeps.
 - `smp-userspace-contract`: four-CPU production kernel plus a test supervisor
   covering one-shot fork placement, exact affinity masks, affinity preservation
   across exec, remote process lifecycle, production `taskset` placement, and
-  owner-local absolute sleep on a secondary CPU.
+  owner-local absolute sleep on a secondary CPU, and a short production
+  `taskset 1 rtbench` run. A separate CPU1-pinned rtbench child lets the
+  supervisor assert its immutable affinity before wait/reap without adding
+  any probe code to the production utility.
 - `shell-contract`: production kernel and shell plus test-only helpers and a
   host nonce challenge for UART input and command behavior. Arrow/Tab input
   exercises the 16-entry history ring, editing and draft restoration,
@@ -111,3 +126,8 @@ deadlines; prompts and echoed input remain outside the assertion contract.
 
 See [`docs/testing.md`](../../docs/testing.md) and ADR-0025 for gate and release
 integration.
+
+rtbench report text is retained only for diagnosis. GTRT supervisor records
+and validated child exits decide QEMU pass/fail; no jitter threshold or UART
+report parsing establishes performance. Controlled host tests execute the
+actual measurement loop to verify exact rows, sums, releases, and sleep targets.
