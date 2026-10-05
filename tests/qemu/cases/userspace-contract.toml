@@ -70,6 +70,11 @@ subject = "sleep-cli-validation"
 [[steps]]
 action = "expect_case"
 producer = "api-supervisor"
+subject = "rtbench-cli-validation"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
 subject = "production-echo-exec-smoke"
 
 [[steps]]
@@ -96,3 +101,8 @@ subject = "production-taskset-exec-smoke"
 action = "expect_case"
 producer = "api-supervisor"
 subject = "production-sleep-exec-smoke"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
+subject = "production-rtbench-exec-smoke"

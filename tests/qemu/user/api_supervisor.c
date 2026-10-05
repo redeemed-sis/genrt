@@ -132,6 +132,37 @@ static void sleep_cli_validation(void) {
     gtrt_pass(producer, name);
 }
 
+static void rtbench_cli_validation(void) {
+    const char *name = "rtbench-cli-validation";
+    char *valid[] = {"rtbench", "-p", "1000000", "-n", "3", "-o", "7", NULL};
+    char *invalid[][10] = {
+        {"rtbench", NULL},
+        {"rtbench", "-p", "1000000", "-n", "3", NULL},
+        {"rtbench", "-p0", "-n1", "-o0", NULL},
+        {"rtbench", "-p1x", "-n1", "-o0", NULL},
+        {"rtbench", "-p18446744073709551616", "-n1", "-o0", NULL},
+        {"rtbench", "-p1", "-n0", "-o0", NULL},
+        {"rtbench", "-p1", "-n10001", "-o0", NULL},
+        {"rtbench", "-p1", "-n1", "-o4294967296", NULL},
+        {"rtbench", "-p1", "-n1", "-o-1", NULL},
+        {"rtbench", "-p1", "-n1", "-o0", "-p2", NULL},
+        {"rtbench", "-p1", "-n1", "-o0", "extra", NULL},
+        {"rtbench", "-p1", "-n1", "-o0", "-x", NULL},
+    };
+    char *overflow[] = {"rtbench", "-p18446744073709551615", "-n2", "-o0", NULL};
+    gtrt_case_start(producer, name);
+    if (!exec_and_wait("/bin/rtbench", valid, 0)
+        || !exec_and_wait("/bin/rtbench", overflow, 1)) {
+        gtrt_fail(producer, name, "RESULT");
+    }
+    for (size_t index = 0; index < sizeof(invalid) / sizeof(*invalid); index++) {
+        if (!exec_and_wait("/bin/rtbench", invalid[index], 2)) {
+            gtrt_fail(producer, name, "INVALID_ACCEPTED");
+        }
+    }
+    gtrt_pass(producer, name);
+}
+
 int main(void) {
     gtrt_ready(producer, "userspace-contract");
     init_affinity();
@@ -146,6 +177,7 @@ int main(void) {
     run_case("time-api");
     taskset_cli_validation();
     sleep_cli_validation();
+    rtbench_cli_validation();
     for (size_t index = 0; index < GTRT_PROGRAM_CONTRACT_COUNT; index++) {
         run_program(&GTRT_PROGRAM_CONTRACTS[index]);
     }

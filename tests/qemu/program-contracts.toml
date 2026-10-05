@@ -50,6 +50,13 @@ args = ["sleep", "0"]
 expected_exit = 0
 
 [[invocation]]
+program = "rtbench"
+case = "production-rtbench-exec-smoke"
+path = "/bin/rtbench"
+args = ["rtbench", "-p", "1000000", "-n", "3", "-o", "0"]
+expected_exit = 0
+
+[[invocation]]
 program = "reboot"
 case = "production-reboot-terminal"
 path = "/bin/reboot"

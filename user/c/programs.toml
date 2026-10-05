@@ -51,6 +51,13 @@ contract = "userspace"
 contract_case = "production-sleep-exec-smoke"
 
 [[program]]
+name = "rtbench"
+source = "user/c/rtbench.c"
+install = "bin/rtbench"
+contract = "userspace"
+contract_case = "production-rtbench-exec-smoke"
+
+[[program]]
 name = "reboot"
 source = "user/c/reboot.c"
 install = "bin/reboot"

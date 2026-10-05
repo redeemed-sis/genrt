@@ -112,6 +112,23 @@ static int support_library(void) {
         SUPPORT_CHECK(number == UINT32_MAX);
     }
 
+    uint64_t wide = 123;
+    SUPPORT_CHECK(genrt_parse_u64_decimal("0", 0, &wide) == 0 && wide == 0);
+    SUPPORT_CHECK(genrt_parse_u64_decimal("9", 0, &wide) == -GENRT_ERANGE && wide == 0);
+    SUPPORT_CHECK(genrt_parse_u64_decimal("0007", 7, &wide) == 0 && wide == 7);
+    SUPPORT_CHECK(genrt_parse_u64_decimal("8", 7, &wide) == -GENRT_ERANGE && wide == 7);
+    SUPPORT_CHECK(genrt_parse_u64_decimal("18446744073709551615", UINT64_MAX, &wide) == 0);
+    SUPPORT_CHECK(wide == UINT64_MAX);
+    SUPPORT_CHECK(genrt_parse_u64_decimal("18446744073709551616", UINT64_MAX, &wide) == -GENRT_ERANGE);
+    SUPPORT_CHECK(wide == UINT64_MAX);
+    SUPPORT_CHECK(genrt_parse_u64_decimal("4294967296", UINT32_MAX, &wide) == -GENRT_ERANGE);
+    SUPPORT_CHECK(genrt_parse_u64_decimal(NULL, UINT64_MAX, &wide) == -GENRT_EINVAL);
+    SUPPORT_CHECK(genrt_parse_u64_decimal("1", UINT64_MAX, NULL) == -GENRT_EINVAL);
+    for (size_t index = 0; index < sizeof(invalid) / sizeof(*invalid); index++) {
+        SUPPORT_CHECK(genrt_parse_u64_decimal(invalid[index], UINT64_MAX, &wide) == -GENRT_EINVAL);
+        SUPPORT_CHECK(wide == UINT64_MAX);
+    }
+
     char *options[] = {"tool", "-ab", "-n42", "-n", "7", "--", "-x", NULL};
     optind = 0;
     opterr = 0;

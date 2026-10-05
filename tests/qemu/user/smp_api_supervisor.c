@@ -270,6 +270,35 @@ static void secondary_monotonic_sleep(void) {
     gtrt_pass(producer, name);
 }
 
+static void secondary_rtbench(void) {
+    const char *name = "secondary-rtbench";
+    char *taskset_argv[] = {"taskset", "1", "rtbench", "-p", "1000000",
+                            "-n", "3", "-o", "0", NULL};
+    gtrt_case_start(producer, name);
+    pid_t launcher = fork();
+    if (launcher < 0) gtrt_fail(producer, name, "FORK_LAUNCHER");
+    if (launcher == 0) {
+        execve("/bin/taskset", taskset_argv, NULL);
+        exit(126);
+    }
+    if (!wait_for_exit(launcher, 0)) gtrt_fail(producer, name, "TASKSET_STATUS");
+
+    /* taskset's grandchild PID is private. A second production exec gives
+     * this supervisor a child handle for the immutable owner assertion. */
+    if (sched_setforkaffinity(1) != 0) gtrt_fail(producer, name, "SET");
+    pid_t child = fork();
+    if (child < 0) gtrt_fail(producer, name, "FORK");
+    if (child == 0) {
+        char *argv[] = {"rtbench", "-p", "1000000", "-n", "3", "-o", "7", NULL};
+        if (!gtrt_affinity_is_only(0, 1)) exit(82);
+        execve("/bin/rtbench", argv, NULL);
+        exit(126);
+    }
+    if (!gtrt_affinity_is_only(child, 1) || !wait_for_exit(child, 0)
+        || !gtrt_affinity_is_only(0, 0)) gtrt_fail(producer, name, "CHILD");
+    gtrt_pass(producer, name);
+}
+
 int main(int argc, char **argv) {
     if (argc == 5 && (strcmp(argv[0], "/init") == 0)
         && (strcmp(argv[1], "--taskset-probe") == 0)
@@ -298,5 +327,6 @@ int main(int argc, char **argv) {
     affinity_validation();
     taskset_placement();
     secondary_monotonic_sleep();
+    secondary_rtbench();
     gtrt_done(producer, "smp-userspace-contract");
 }

@@ -62,3 +62,8 @@ subject = "taskset-placement"
 action = "expect_case"
 producer = "smp-api-supervisor"
 subject = "secondary-monotonic-sleep"
+
+[[steps]]
+action = "expect_case"
+producer = "smp-api-supervisor"
+subject = "secondary-rtbench"
