@@ -242,20 +242,10 @@ accepted ADRs remain authoritative when details differ.
   and deterministic result are emitted afterward; CLI errors exit 2 and
   runtime/arithmetic/output failures exit 1. Host tests execute the utility
   with controlled time/output, and existing QEMU contracts cover exact product
-  execution and CPU1 placement. The [hardware validation record](../docs/testing.md#raspberry-pi-hardware-result-user-reported)
-  includes a user-reported physical Pi CPU1 run with 300 steps, a 15000 ns
-  period, 10 operations per step, zero overruns, and result 3000. A second
-  user-reported CPU3 run covers the maximum 10000-step capacity at the same
-  period with 30 operations per step, zero overruns, and result 300000. These
-  are representative functional results, not certified latency bounds;
-  emulator results remain separate from physical-board timing evidence.
-  The [final recorded profiles](../docs/testing.md#final-recorded-hardware-profiles-user-reported)
-  contain later 1000-step CPU3 runs: 8000 ns releases average 4687 ns, peak at
-  11010 ns, and have one overrun; the 15000 ns control averages 3259 ns, peaks
-  at 5104 ns, and has no overruns. The short-period ramp persists, while
-  control STEP 3..999 stay within 3177..3333 ns. First-sleep maxima remain in
-  all-sample statistics. Build/environment identity is incomplete, and no
-  kernel phase instrumentation or matched 10000-step after-result is recorded.
+  execution and CPU1 placement. The [latest hardware results](../docs/testing.md#raspberry-pi-hardware-result-user-reported)
+  record user-supplied physical Pi CPU3 runs at 8000 ns and 15000 ns periods,
+  each with 1000 steps and 30 operations. Hardware observations remain
+  separate from emulator verification and certified timing bounds.
 - The bounded process table owns process state, TTBR0 address spaces, loaded
   ELF segments, cwd, file descriptors, relationships, exit/fault status, and
   `main_thread: ThreadId`.
