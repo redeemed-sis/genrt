@@ -17,6 +17,12 @@ cargo xtask dist --tag v0.0.0-local.1 --output-dir /tmp/genrt-dist
 
 Use `cargo xtask --help` for the complete current command surface.
 
+Diagnostic `--wake-profile` builds use separate Cargo and linked artifact
+directories. QEMU output goes below `target/wake-profile/`; Pi output goes below
+`target/raspberrypi-3b-plus/wake-profile/`. Ordinary `ci` and `dist` never enable
+profiling; release validation rejects the diagnostic kernel marker. See
+[sleep/wakeup profiling](../../docs/wake-profiling.md) for collection and reports.
+
 `cargo xtask build-raspberrypi-3b-plus` uses the shared hardware builder with
 BCM2837 UART adoption and separate `target/raspberrypi-3b-plus` artifacts.
 With the rebuilt FIT-capable U-Boot, upload `genrt-raspberrypi-3b-plus.itb`

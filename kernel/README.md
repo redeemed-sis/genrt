@@ -13,6 +13,7 @@ hooks.
 | `cpu` | Typed logical CPU identity and bounded boot hardware registry |
 | `sched` | Per-CPU thread states, controlled scheduler calls, preemption, typed waits, and lifecycle |
 | `time` | Monotonic counter conversion and one-shot timed events |
+| `profile` (optional) | [Bounded diagnostic sleep/wakeup sessions](src/profile/README.md) and frozen binary export |
 | `ipc` | Bounded mailbox buffers, wait queues, and timeout integration |
 | `process` | [Bounded process table and lifecycle](src/process/README.md), address-space/image ownership, fork/exec/wait, cwd/FD access |
 | `fs` | Initramfs mount, readonly ramfs index, paths, and descriptor tables |
@@ -65,6 +66,12 @@ Its exact wait is consumed automatically when a blocked EL0 frame becomes
 runnable because syscall return resumes directly in userspace and has no
 kernel-stack continuation. Kernel sched-call waits and condition-owner waits
 retain explicit completion consumption.
+
+The opt-in `wake-profile` feature records exact absolute-sleep episodes without
+changing scheduling policy. Its CPU-local leaf locks own preallocated trace
+storage, not wait completion. Normal builds contain no probes and return
+`ENOSYS` for the diagnostic calls. See the
+[profiling guide](../docs/wake-profiling.md) for sessions and probe boundaries.
 
 When a transition makes a thread runnable away from its immutable home CPU, it
 publishes the thread to that CPU's bounded `remote_ready` ingress and requests

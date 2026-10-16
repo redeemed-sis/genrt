@@ -62,5 +62,8 @@ growth.
 | [0053](ADR-0053-el0-monotonic-counter-fast-path.md) | EL0 monotonic counter fast path | Accepted | Time/userspace/AArch64 counter access | [0045](ADR-0045-posix-monotonic-time-and-sleep-abi.md) (public clock transport and pointer boundary only) | - |
 | [0054](ADR-0054-idle-user-root-retention-and-detach.md) | Idle user-root retention and terminal detach | Accepted | VM/scheduler lifetime | [0042](ADR-0042-smp-userspace-memory-and-fork-affinity.md) (unconditional invalidation and idle handoff only) | - |
 | [0055](ADR-0055-batched-timer-wakeup-and-idle-selection.md) | Batched timer wakeup and direct idle selection | Accepted | Time/scheduler ownership | [0037](ADR-0037-per-cpu-deadline-queues-and-direct-scheduler-dispatch.md) (per-event dispatch only) | - |
+| [0056](ADR-0056-bounded-sleep-wakeup-phase-profiling.md) | Bounded sleep/wakeup phase profiling | Accepted | Diagnostic syscall/trace ownership | - | [0057](ADR-0057-in-process-sleep-profile-reports.md) (raw UART export and host analysis only) |
+| [0057](ADR-0057-in-process-sleep-profile-reports.md) | In-process sleep-profile reports | Accepted | Userspace diagnostic reporting | [0056](ADR-0056-bounded-sleep-wakeup-phase-profiling.md) (raw UART export and host analysis only) | - |
+| [0058](ADR-0058-bounded-sleep-and-vm-owned-usercopy.md) | Bounded sleep and VM-owned usercopy | Accepted | Scheduler transaction/VM publication/frame copy | - | - |
 
 Use [`TEMPLATE.md`](TEMPLATE.md) for new decisions.

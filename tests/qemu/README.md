@@ -5,6 +5,19 @@ stores complete evidence below `target/test-results/`.
 
 ## Test layers
 
+`wake-profile-contract` is opt-in: ordinary CI excludes it. It runs a diagnostic
+kernel and test-only supervisor on four CPUs, covering exact consecutive waits,
+full/focused masks, idle/generic/deferred selection, ownership, chunked export,
+fault/exit cleanup, heap-pressure ENOMEM and frozen-result preservation. It also
+executes the production rtbench in full and focused modes and checks successful
+reporting through child exit status, including focused mode with verbose STEP
+output. Host tests check default/verbose output, grouped console tables, and
+invalid record rejection; no raw UART export or host analyzer is used. Select
+it explicitly or use
+`--wake-profile` for an instrumented regression matrix; see the
+[profiling procedure](../../docs/wake-profiling.md). Ordinary release gates
+remain uninstrumented and reject diagnostic kernel markers.
+
 - `kernel-contract`: test-enabled kernel coordinator for timer, sleep,
   deferred-preemption safe points, exact wait registration/completion, mailbox,
   thread lifecycle, CPU0 identity/per-CPU scheduler context, and allocator
@@ -16,6 +29,10 @@ stores complete evidence below `target/test-results/`.
   `user-root-idle-retention` joins a sole EL0 probe over three process lifetimes.
   Each runs 32 sleeps with exactly 32 direct idle wakes and two actual TTBR0
   writes (activation and exit detach), then verifies frame return after reap.
+  The same lifecycle checks VM usercopy eligibility against the selected
+  context, including kernel execution with a lazily retained root.
+  `saved-context-transfer` exercises the real AArch64 save/restore hooks with
+  distinct register patterns, alignment/exception padding, and guard words.
 - `user-fault`: test-enabled kernel coordinator that joins a faulting EL0
   process and verifies exact fault classification.
 - `smp-boot`: four-CPU test kernel that validates PSCI secondary high-half
@@ -30,7 +47,8 @@ stores complete evidence below `target/test-results/`.
   status propagation, child-reaping, monotonic time, relative/absolute sleep,
   production `/bin/sleep`, shared support-library boundary checks, and exact
   production `/bin/rtbench` execution plus positive-workload and invalid-CLI
-  wait/exit contracts. The registered rtbench invocation uses three 1 ms
+  wait/exit contracts, including verbose output and duplicate verbosity rejection.
+  The registered rtbench invocation uses three 1 ms
   steps with zero payload operations; large sample-capacity tests stay on host.
   The `syscall-boundaries` case covers unaligned copies across mapped pages,
   readonly/out-of-range destinations, no partial write at the stack boundary,

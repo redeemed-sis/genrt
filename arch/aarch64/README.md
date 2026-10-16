@@ -103,6 +103,14 @@ diagnostics; generic kernel code does not own platform constants.
 
 ## Exceptions, IRQ, and task return
 
+Opt-in `wake-profile` probes use the existing 8-byte live exception padding,
+after preserving x0/x1. The final EL0 probe is before GPR restoration and is
+explicitly bypassed by saved-context first entry; the TrapFrame ABI is unchanged.
+The architecture also owns the ordered counter read and narrowly scoped
+task-context IRQ window used for profiler allocation under preemption exclusion.
+All of these hooks compile out in normal builds. See the
+[phase profiling guide](../../docs/wake-profiling.md).
+
 Every CPU's timer initialization enables only `CNTKCTL_EL1.EL0PCTEN`, permitting
 EL0 physical-counter and frequency reads. Public library `clock_gettime` and
 `clock_getres` use that same kernel monotonic domain without SVC. Virtual reads,
@@ -130,6 +138,13 @@ AArch64 adapter alone interprets their storage as `TrapFrame`, initializes
 kernel/user/fork entry state, and performs bounded live-to-saved transfers.
 Compile-time checks require the architecture frame to fit with compatible
 alignment; the assembly restore layout remains unchanged.
+
+Saved/live transfers copy exactly the 280-byte payload through fixed unrolled
+general-purpose register pairs and one final word. They do not call generic
+memory-copy routines, use FP/SIMD, or touch the 8-byte exception padding or
+saved-storage alignment tail. Idle contexts are still fully saved; no idle
+restart contract is assumed. The kernel contract checks patterned payloads and
+surrounding guards through the actual architecture save/restore hooks.
 
 `src/interrupts.rs` defines the static interrupt-controller contract used by
 boot and IRQ entry: global/local setup, logical CPU binding, targeted scheduler

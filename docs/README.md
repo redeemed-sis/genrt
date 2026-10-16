@@ -17,6 +17,7 @@ Use the narrowest document that owns the question:
 | Userspace build and ABI | [`user/README.md`](../user/README.md) |
 | Build and artifact workflows | [`tools/xtask/README.md`](../tools/xtask/README.md) |
 | QEMU contracts | [`testing.md`](testing.md), [`tests/qemu/README.md`](../tests/qemu/README.md) |
+| Diagnostic sleep/wakeup phase profiling | [`wake-profiling.md`](wake-profiling.md) |
 | Tagged releases | [`releases.md`](releases.md) |
 | Host dependency setup | [`development/setup.md`](development/setup.md) |
 | Agent workflow | [`development/agent-workflow.md`](development/agent-workflow.md) |

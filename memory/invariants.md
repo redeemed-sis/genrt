@@ -84,6 +84,10 @@ Changes that invalidate one require architecture review and an ADR.
   Other kernel threads detach it, and user exit detaches before retired-thread
   finalization can publish reap. This single-owner rule replaces a general
   userspace TLB-shootdown protocol for the current milestone.
+- VM-owned CPU-local usercopy eligibility is distinct from installed-root
+  lifetime. Idle retention never grants user access; user activation publishes
+  eligibility only after successful hardware/root publication. Usercopy reads
+  this snapshot without scheduler ownership and never keeps it across handoff.
 - Generic kernel VM entry points serialize runtime TTBR1 writers. AArch64 owns
   descriptor replacement, break-before-make where needed, inner-shareable
   TLBI, and barriers; table frames are not reclaimed before invalidation
@@ -197,6 +201,9 @@ Changes that invalidate one require architecture review and an ADR.
   clears its metadata while publishing readiness because no signal result or
   kernel-stack continuation remains to consume it. Early completion is still
   consumed at commit.
+- EL0 sleep may hold scheduler ownership across its bounded exact timer
+  publication and commit; the nested time lock is released before selection.
+  No usercopy or allocation occurs while this scheduler guard is held.
 - Condition owners publish tokens before scheduler commit and claim them before
   completion. No mailbox, process, thread, console, or time-owner lock crosses
   scheduler commit/completion, and the scheduler never calls back into those
@@ -259,6 +266,14 @@ Changes that invalidate one require architecture review and an ADR.
 
 ## Testing and releases
 
+- Opt-in sleep/wakeup profiling owns at most one session per logical CPU,
+  bound to an exact generation-bearing thread. Storage is allocated before
+  collection and remains stable after STOP; protected capture paths never
+  allocate, grow, copy userspace memory, format, or print. Exact wait identity
+  prevents unrelated IRQs or stale completions from contributing timestamps.
+  Frozen storage is destroyed outside IRQ and shared-owner exclusion.
+  Feature-disabled Rust/assembly has no profiling probes; canonical release
+  verification rejects diagnostic kernels as well as test kernels.
 - `GTRT/1`, test artifact markers, supervisors, and fixture provenance are
   test-only and must not appear in production artifacts.
 - QEMU pass/fail comes only from bounded machine protocol records, never prompt

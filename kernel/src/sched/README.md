@@ -1,5 +1,11 @@
 # Scheduler, time, and blocking
 
+Opt-in `wake-profile` diagnostics observe existing absolute userspace sleep
+and wake boundaries without changing transition policy or wait consumption.
+Records use exact wait tokens, not slot-only identities. Storage, session
+ownership, frozen export, and statistics are outside scheduler ownership; see
+the [profiling procedure](../../../docs/wake-profiling.md).
+
 The scheduler is a bounded round-robin engine with one shared thread table and
 fixed per-logical-CPU contexts. CPU0 preallocates one permanent idle slot for
 every expected CPU. Each registered CPU initializes local idle/current state
@@ -188,10 +194,23 @@ no interruption result yet, so its blocked completion atomically clears the
 metadata while making the thread ready. An early completion is still consumed
 during commit. This automatic mode carries no device-specific scheduler reason.
 
+EL0 sleep holds one scheduler guard and one `CpuScheduler` view from automatic
+wait preparation through exact deadline publication and commit. Only the
+bounded time registration nests under it; time ownership releases before
+context selection. Usercopy and deadline validation precede this transaction.
+Other condition owners retain the separate prepare/publish/commit API.
+
 Mailbox queues, thread/process lifecycle, console, and time retain their own
 payloads and cleanup policy. Scheduler wait metadata contains only exact token,
 phase, and cause. No owner lock crosses scheduler commit/completion, and the
 scheduler never calls back into an owner while changing lifecycle state.
+
+Current usercopy address-space lookup is VM-owned and does not acquire this
+scheduler guard. Installed-root lifetime and current-context user access are
+separate: permanent idle retains the root but revokes usercopy eligibility.
+User activation republishes it, including same-root resumes without TTBR0
+writes. See
+[ADR-0058](../../../memory/decisions/ADR-0058-bounded-sleep-and-vm-owned-usercopy.md).
 
 Sleep, blocking IPC/stdin/join/process waits, and terminal transitions fail
 fast if thread preemption is disabled. They do not defer ownership publication

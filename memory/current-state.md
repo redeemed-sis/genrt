@@ -110,6 +110,36 @@ accepted ADRs remain authoritative when details differ.
 
 ## Scheduling and time
 
+- Latest user-reported Raspberry Pi 3B+ reference (reported 2026-10-16): CPU3,
+  `taskset 3 rtbench -p 15000 -n 10000 -o 300 -P`, full profiling at
+  19200000 Hz. Release latency averages 6169 ns, maximum 12917 ns; TET averages
+  1134 ns, maximum 1198 ns. All 10000 cycles are complete, with 9999 idle wakes,
+  one early return, no lost/incomplete records, no overruns, and result 3000000.
+  Idle deadline-to-IRQ averages 52 ns and deadline-to-first-EL0 averages
+  6065 ns. The previous supplied full run averaged 9103 ns release latency;
+  this observation follows the ADR-0058 optimizations, not a controlled
+  per-change attribution or an uninstrumented round-trip measurement. See the
+  [recorded phase reference](../docs/wake-profiling.md#recorded-pi-reference-user-reported)
+  and [active measurement target](../docs/roadmap/hardening.md#high-value-architecture-work).
+- EL0 sleep uses one scheduler transaction for automatic wait preparation,
+  exact timer publication, and commit. Time ownership ends before handoff.
+  Usercopy obtains its identity from VM-owned CPU-local installed-root and
+  user-access publication, without a scheduler lookup. Idle retains root
+  lifetime but not usercopy eligibility. AArch64 saved/live transfers use a
+  fixed GP-register copy of the full payload, preserving idle and frame ABI.
+  See [ADR-0058](decisions/ADR-0058-bounded-sleep-and-vm-owned-usercopy.md).
+- Optional `wake-profile` diagnostics correlate absolute userspace sleeps with
+  exact wait identities and raw counter phase observations. Configurable
+  heap storage is prepared before START; active collection stays bounded and
+  allocation-free. STOP freezes owner-only byte-offset retrieval. Full and
+  selected-pair modes distinguish early returns, direct idle wakes, and generic
+  selection. Diagnostic artifacts stay separate from ordinary release inputs.
+  After STOP, rtbench streams frozen records into fixed per-path aggregates and
+  prints interval counts, averages, and maxima directly in the console. There
+  is no raw UART export or separate host analyzer. Report sections separate
+  execution stages from overlapping totals and deadline references.
+  See [profiling procedure](../docs/wake-profiling.md) and
+  [ADR-0056](decisions/ADR-0056-bounded-sleep-wakeup-phase-profiling.md).
 - Public monotonic observation/resolution use an EL0 physical-counter fast
   path in the shared library; raw clock syscalls retain pointer validation.
   All runtime CPUs permit counter/frequency reads, not timer programming.
@@ -238,11 +268,11 @@ accepted ADRs remain authoritative when details differ.
   non-overrun iteration includes an absolute sleep, even after the final
   sample, with preflight horizon R[0]+period*steps. No normal measurement I/O
   occurs. Checked timestamps, horizon/release arithmetic, and post-run sums
-  fail rather than wrap. STEP rows and summary averages/maxima/overrun count
-  and deterministic result are emitted afterward; CLI errors exit 2 and
-  runtime/arithmetic/output failures exit 1. Host tests execute the utility
+  fail rather than wrap. Summary averages/maxima/overrun count and deterministic
+  result are emitted afterward; per-STEP rows require verbose `-v`. CLI errors
+  exit 2 and runtime/arithmetic/output failures exit 1. Host tests execute the utility
   with controlled time/output, and existing QEMU contracts cover exact product
-  execution and CPU1 placement. The [latest hardware results](../docs/testing.md#raspberry-pi-hardware-result-user-reported)
+  execution and CPU1 placement. The [unprofiled hardware results](../docs/testing.md#raspberry-pi-hardware-result-user-reported)
   record user-supplied physical Pi CPU3 runs at 8000 ns and 15000 ns periods,
   each with 1000 steps and 30 operations. Hardware observations remain
   separate from emulator verification and certified timing bounds.

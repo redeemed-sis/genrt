@@ -73,6 +73,18 @@ production shell using controlled test commands, not prompt assertions.
 
 ## Periodic timing benchmark
 
+Optional `-P` (full) or `-F start:end` (focused) collects diagnostic sleep phases
+only on a `wake-profile` kernel. `-n` sets both the step count and profile record
+capacity; no separate capacity option is needed. The normal invocation remains
+unchanged. Collection adds fixed process-private correlation storage. After
+STOP, rtbench prints per-path phase interval counts, averages, and maxima in
+nanoseconds directly in the console. Numbered sections separate submission,
+waiting, IRQ handling, resume selection, and EL0 return; overlapping totals and
+deadline references are listed separately. No raw export or host analyzer is
+needed.
+See the [profiling guide](../docs/wake-profiling.md) for isolated builds, phase
+IDs, report interpretation, and overhead runs.
+
 `rtbench -p period_ns -n steps -o operations` measures periodic userspace work
 through the existing `CLOCK_MONOTONIC` API. All three options are required,
 exactly once. Period is a nonzero decimal u64; steps are decimal 1..10000;
@@ -95,7 +107,7 @@ The final sleep targets `R[steps]`; it is not an additional sample. Both
 checked before payload execution. Timespec normalization, conversion,
 monotonic ordering, and release arithmetic are checked as well.
 
-One static `.bss` array holds 10000 samples of three u64 fields (240000 bytes).
+The baseline `.bss` array holds 10000 samples of three u64 fields (240000 bytes).
 There is no heap allocation, large stack array, or normal output during the
 measurement loop or its final sleep. Each step executes exactly `operations`
 unsigned integer additions, with an empty register compiler barrier after
@@ -104,9 +116,12 @@ accepted; there are no payload multipliers, floating-point, or SIMD operations.
 The accumulator starts at zero, carries across steps, and is consumed in the
 report as `result = steps * operations`.
 
-After measurement, checked sums are accumulated, then every zero-based `STEP`
-row reports `release_latency_ns`, `tet_ns`, and `overrun_ns`. The final
-`SUMMARY` reports configuration, `release_latency_avg_ns`,
+After measurement, checked sums are accumulated. By default only the final
+`SUMMARY` and any enabled phase profile are printed. Add `-v` for verbose
+output: each zero-based `STEP` row then reports `release_latency_ns`, `tet_ns`,
+and `overrun_ns` before the summary. Verbosity does not change measurement,
+statistics, or profiling. `SUMMARY` reports configuration,
+`release_latency_avg_ns`,
 `release_latency_max_ns`, `tet_avg_ns`, `tet_max_ns`, `overrun_avg_ns`,
 `overrun_max_ns`, `overruns`, and `result`. Averages are integer-truncated
 over all requested samples, including zero overruns. Output is diagnostic,

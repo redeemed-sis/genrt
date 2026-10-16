@@ -156,13 +156,13 @@ to boot the production kernel and initramfs on the user's Raspberry Pi 3B+.
 Confirm logical CPU1 is online before the pinned run. At the production shell:
 
 ```text
-rtbench -p 1000000 -n 100 -o 50000
-taskset 1 rtbench -p 1000000 -n 100 -o 50000
+rtbench -p 1000000 -n 100 -o 50000 -v
+taskset 1 rtbench -p 1000000 -n 100 -o 50000 -v
 ```
 
 Retain each UART transcript with the build identity, board/firmware setup,
-clock resolution, and competing workload. Expect 100 zero-based STEP rows,
-then a summary with `result=5000000`; report output begins only after sampling
+clock resolution, and competing workload. With `-v`, expect 100 zero-based STEP
+rows, then a summary with `result=5000000`; report output begins only after sampling
 and the final non-overrun sleep. Compare release latency, elapsed TET, and
 overrun distributions across repeated runs and CPU placement. Record observed
 values, not a fabricated expected latency or hardware performance guarantee.
@@ -193,6 +193,15 @@ Both runs completed 1000 steps with 30 payload additions per step and
 
 Statistics include all 1000 steps. These are user-reported hardware
 observations, not QEMU measurements or worst-case timing guarantees.
+
+## Sleep/wakeup phase profiling
+
+The optional `wake-profile` build records exact absolute-sleep cycles without
+heap allocation or UART output during collection. It has separate artifacts
+and an opt-in functional contract; canonical production builds and releases
+exclude instrumentation. See the [profiling procedure](wake-profiling.md) for
+session ownership, in-process console reports, and matched hardware runs.
+Earlier hardware summaries above do not measure profiling overhead.
 
 ## Guest protocol
 

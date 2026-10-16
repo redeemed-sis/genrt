@@ -322,13 +322,21 @@ To measure periodic execution, rebuild with
 `cargo xtask build-raspberrypi-3b-plus`, deploy the resulting FIT, and run:
 
 ```text
-taskset 3 rtbench -p 8000 -n 1000 -o 30
-taskset 3 rtbench -p 15000 -n 1000 -o 30
+taskset 3 rtbench -p 8000 -n 1000 -o 30 -v
+taskset 3 rtbench -p 15000 -n 1000 -o 30 -v
 ```
 
+The `-v` flag enables per-STEP output; omit it for summary-only runs.
 Retain the full STEP output and SUMMARY with the FIT identity and firmware
 setup. See the [latest hardware results](../../../../docs/testing.md#raspberry-pi-hardware-result-user-reported).
 QEMU checks functionality; it does not establish physical-board timing bounds.
+
+For diagnostic phase collection, build with
+`cargo xtask build-raspberrypi-3b-plus --wake-profile` and deploy the FIT from
+`target/raspberrypi-3b-plus/wake-profile/`, not the ordinary image directory.
+The [profiling guide](../../../../docs/wake-profiling.md) describes full and
+focused console reports and matched overhead runs. The existing timing
+results above are not phase profiles.
 
 ## Architecture boundary
 

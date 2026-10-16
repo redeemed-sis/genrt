@@ -81,6 +81,15 @@ user address space and actual page permissions. Read and write validation are
 separate. Copies are bounded and intended for syscall/trap context where active
 TTBR0 matches the current process.
 
+The executing CPU's VM publication supplies the root identity in O(1), without
+locking or looking up the scheduler thread. A user-access eligibility flag is
+published only after successful activation and revoked before kernel/idle
+execution or detach. Idle's retained physical root continues protecting its
+lifetime but does not authorize usercopy. IDs are borrowed only during a
+stable syscall context, never retained across handoff. Per-CPU publication uses
+fixed, separately aligned storage. See
+[ADR-0058](../../../memory/decisions/ADR-0058-bounded-sleep-and-vm-owned-usercopy.md).
+
 Validation finishes before any destination byte changes. Fixed-length copies
 use volatile, naturally aligned machine-word accesses to user memory with byte
 prefixes and tails; kernel buffers need not be word-aligned. No access extends
