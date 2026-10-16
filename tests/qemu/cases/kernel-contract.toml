@@ -126,6 +126,11 @@ subject = "allocator-preemption-lifecycle"
 [[steps]]
 action = "expect_case"
 producer = "kernel"
+subject = "saved-context-transfer"
+
+[[steps]]
+action = "expect_case"
+producer = "kernel"
 subject = "user-root-idle-retention"
 
 [[steps]]

@@ -372,7 +372,9 @@ impl CpuScheduler<'_> {
             // uses user pointers. Retain the installed immutable root, whose
             // VM active record continues preventing destruction. Every other
             // kernel thread detaches it; EL0 always activates its own root.
-            None if self.state().idle == Some(id) => Ok(()),
+            None if self.state().idle == Some(id) => {
+                crate::memory::vm::retain_user_address_space_for_idle()
+            }
             None => unsafe { crate::memory::vm::clear_user_address_space() },
             Some(address_space) => unsafe {
                 crate::memory::vm::activate_user_address_space(address_space)
@@ -385,6 +387,12 @@ impl CpuScheduler<'_> {
                 id.index()
             );
         }
+        #[cfg(feature = "qemu-test-kernel-runtime")]
+        assert_eq!(
+            crate::memory::vm::current_user_address_space(),
+            self.thread_address_space(id.index()),
+            "sched test: VM usercopy eligibility differs from selected context"
+        );
     }
 
     pub(super) fn has_runnable_peer(&self) -> bool {

@@ -1,7 +1,7 @@
 //! User memory copy helpers for the current active userspace address space.
 //!
 //! These helpers are intended for syscall/trap context. They assume the current
-//! TTBR0 installed by the scheduler matches `sched::current_user_address_space()`
+//! TTBR0 installed by the scheduler matches `vm::current_user_address_space()`
 //! and therefore copy through the current user VA. They do not copy from an
 //! arbitrary inactive process address space.
 //!
@@ -495,7 +495,7 @@ fn validate_user_range_unbounded(
     }
 
     let address_space =
-        crate::sched::current_user_address_space().ok_or(UserCopyError::NoCurrentAddressSpace)?;
+        vm::current_user_address_space().ok_or(UserCopyError::NoCurrentAddressSpace)?;
 
     let mut cursor = align_down(ptr, PAGE_SIZE);
     while cursor < end {

@@ -254,21 +254,6 @@ pub fn current_thread_id() -> Option<ThreadId> {
     try_scheduler_mut().and_then(|mut scheduler| scheduler.on_cpu(cpu).running_thread_id())
 }
 
-/// Return the active user thread's copyable address-space identifier.
-///
-/// The scheduler performs a bounded lookup under local IRQ exclusion without
-/// allocating or blocking.
-///
-/// # Returns
-///
-/// Returns `Some` only while the current schedulable thread owns userspace
-/// resources; kernel threads return `None`.
-pub(crate) fn current_user_address_space() -> Option<AddressSpaceId> {
-    let cpu = current_cpu();
-    let _irq_guard = LocalIrqGuard::save_and_disable();
-    try_scheduler_mut().and_then(|mut scheduler| scheduler.on_cpu(cpu).running_user_address_space())
-}
-
 /// Return a raw pointer to the current user thread's owned stack.
 ///
 /// This performs a bounded, allocation-free lookup under local IRQ exclusion.
@@ -724,11 +709,6 @@ impl CpuScheduler<'_> {
             .unwrap_or_else(|| panic!("thread: join result without running thread"));
         self.take_join_result(current.index())
             .map(|result| (result, self.take_reaped_user(current.index())))
-    }
-
-    fn running_user_address_space(&self) -> Option<AddressSpaceId> {
-        let current = self.running_thread()?;
-        self.thread_address_space(current.index())
     }
 
     fn replace_current_user_resources(

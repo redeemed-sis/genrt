@@ -295,6 +295,7 @@ fn coordinator(_arg: ThreadArg) -> usize {
     }
     protocol::pass("allocator-preemption-lifecycle");
 
+    super::scenario::Scenario::new("saved-context-transfer", saved_context_transfer).run();
     super::scenario::Scenario::new("user-root-idle-retention", user_root_idle_retention).run();
 
     protocol::case_start("post-test-liveness");
@@ -308,6 +309,9 @@ fn coordinator(_arg: ThreadArg) -> usize {
 /// each timer wake must select directly from idle and all frame resources must
 /// return before the next process reuses storage.
 fn user_root_idle_retention() -> super::scenario::ScenarioResult {
+    if memory::vm::current_user_address_space().is_some() {
+        return Err("KERNEL_USERCOPY_ELIGIBLE");
+    }
     for _ in 0..3 {
         let frames = memory::free_frame_count().ok_or("NOT_INITIALIZED")?;
         // Keep publication from preempting the coordinator before it commits
@@ -327,11 +331,28 @@ fn user_root_idle_retention() -> super::scenario::ScenarioResult {
             return Err("IDLE_WAKE_NOT_DIRECT");
         }
         drop(irq);
+        if memory::vm::current_user_address_space().is_some() {
+            return Err("KERNEL_USERCOPY_ELIGIBLE");
+        }
         if memory::free_frame_count() != Some(frames) {
             return Err("REAP_FRAME_LEAK");
         }
     }
     Ok(())
+}
+
+/// Exercise architecture frame copies without entering the patterned context.
+fn saved_context_transfer() -> super::scenario::ScenarioResult {
+    unsafe extern "C" {
+        fn arch_context_copy_for_test() -> bool;
+    }
+    // SAFETY: the architecture test owns all guarded frame storage and returns
+    // a bounded boolean result without changing execution context or IRQ state.
+    if unsafe { arch_context_copy_for_test() } {
+        Ok(())
+    } else {
+        Err("FRAME_COPY_OR_GUARD")
+    }
 }
 
 fn blocked_receiver(_arg: ThreadArg) -> usize {

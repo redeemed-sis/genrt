@@ -1,4 +1,4 @@
-use core::{ffi::c_void, ptr::NonNull};
+use core::{arch::asm, ffi::c_void, ptr::NonNull};
 
 use kernel::arch::{ActiveContext, SavedContext, SyscallRequest};
 
@@ -119,7 +119,8 @@ unsafe extern "C" fn arch_saved_context_init_fork_child(
     // exclusively borrowed live parent frame.
     let dst = unsafe { saved_frame_from_raw_mut(saved) };
     let src = unsafe { active_frame_from_raw_const(active) };
-    *dst = *src;
+    // SAFETY: parent live frame and child saved storage are distinct and valid.
+    unsafe { copy_frame(dst, src) };
     dst.x[0] = 0;
     dst.kernel_sp = child_kernel_sp as u64 & !0xf;
 }
@@ -129,7 +130,8 @@ unsafe extern "C" fn arch_saved_context_save(saved: *mut SavedContext, active: *
     // SAFETY: the facade supplies distinct, valid saved and live contexts.
     let dst = unsafe { saved_frame_from_raw_mut(saved) };
     let src = unsafe { active_frame_from_raw_const(active) };
-    *dst = *src;
+    // SAFETY: the facade guarantees disjoint complete frame storage.
+    unsafe { copy_frame(dst, src) };
 }
 
 #[unsafe(no_mangle)]
@@ -138,7 +140,105 @@ unsafe extern "C" fn arch_saved_context_restore(saved: *const SavedContext, acti
     // live return frame.
     let src = unsafe { saved_frame_from_raw(saved) };
     let dst = unsafe { active_frame_from_raw(active) };
-    *dst = *src;
+    // SAFETY: the facade guarantees disjoint complete frame storage.
+    unsafe { copy_frame(dst, src) };
+}
+
+// Copy exactly the 280-byte payload, never the exception padding at +280.
+// Fixed GP-register pairs avoid generic memmove/memcpy and FP/SIMD helpers.
+// The explicit offsets are checked against the frame contract below.
+#[inline(always)]
+unsafe fn copy_frame(dst: &mut TrapFrame, src: &TrapFrame) {
+    // SAFETY: callers provide distinct, initialized, u64-aligned frames.
+    // All accesses stay in [0, 280); scratch registers cannot alias inputs.
+    unsafe {
+        asm!(
+            ".irp offset, 0,16,32,48,64,80,96,112,128,144,160,176,192,208,224,240,256",
+            "ldp {lo}, {hi}, [{src}, #\\offset]",
+            "stp {lo}, {hi}, [{dst}, #\\offset]",
+            ".endr",
+            "ldr {lo}, [{src}, #272]",
+            "str {lo}, [{dst}, #272]",
+            src = in(reg) src as *const TrapFrame,
+            dst = in(reg) dst as *mut TrapFrame,
+            lo = out(reg) _,
+            hi = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Verify the real saved/live frame copy with payload patterns and guards.
+///
+/// # Returns
+///
+/// Returns `true` when every payload word round-trips and the alignment tail,
+/// exception padding, and surrounding guards remain unchanged. This bounded,
+/// test-only probe uses stack storage, allocates nothing, does not block, and
+/// does not alter IRQ state or enter the saved context.
+#[cfg(feature = "qemu-test-kernel-runtime")]
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_context_copy_for_test() -> bool {
+    #[repr(C, align(16))]
+    struct SavedProbe {
+        before: [u64; 2],
+        frame: SavedContext,
+        after: [u64; 2],
+    }
+    #[repr(C, align(16))]
+    struct LiveProbe {
+        before: [u64; 2],
+        frame: TrapFrame,
+        padding: u64,
+        after: [u64; 2],
+    }
+    let guard = [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
+    let mut live = LiveProbe {
+        before: guard,
+        frame: TrapFrame::zeroed(),
+        padding: 0xa5a5_a5a5_a5a5_a5a5,
+        after: guard,
+    };
+    for (i, register) in live.frame.x.iter_mut().enumerate() {
+        *register = guard[i % 2] ^ (i as u64 + 1).wrapping_mul(0x1020_3040_5060_7080);
+    }
+    live.frame.sp = 0x1111_2222_3333_4444;
+    live.frame.elr = 0x5555_6666_7777_8888;
+    live.frame.spsr = 0x9999_aaaa_bbbb_cccc;
+    live.frame.kernel_sp = 0xdddd_eeee_ffff_0000;
+    let expected = live.frame;
+    let mut saved = SavedProbe {
+        before: guard,
+        // SAFETY: SavedContext contains only initialized byte arrays; zero
+        // storage is valid and is not entered as an execution context here.
+        frame: unsafe { core::mem::zeroed() },
+        after: guard,
+    };
+    // SAFETY: the probes contain disjoint initialized and aligned frames.
+    unsafe {
+        arch_saved_context_save(&mut saved.frame, (&raw const live.frame).cast());
+        live.frame = TrapFrame::zeroed();
+        arch_saved_context_restore(&saved.frame, (&raw mut live.frame).cast());
+    }
+    // SAFETY: the checked SavedContext layout includes these eight initialized
+    // tail bytes after its payload. They must not be copied from a live frame.
+    let tail = unsafe {
+        ((&raw const saved.frame)
+            .cast::<u8>()
+            .add(SavedContext::PAYLOAD_BYTES) as *const u64)
+            .read()
+    };
+    live.frame.x == expected.x
+        && live.frame.sp == expected.sp
+        && live.frame.elr == expected.elr
+        && live.frame.spsr == expected.spsr
+        && live.frame.kernel_sp == expected.kernel_sp
+        && live.padding == 0xa5a5_a5a5_a5a5_a5a5
+        && tail == 0
+        && live.before == guard
+        && live.after == guard
+        && saved.before == guard
+        && saved.after == guard
 }
 
 #[unsafe(no_mangle)]
@@ -186,3 +286,4 @@ const _: [(); SavedContext::STORAGE_BYTES] = [(); core::mem::size_of::<SavedCont
 const _: [(); SavedContext::STORAGE_BYTES] = [(); TrapFrame::STACK_SIZE_BYTES];
 const _: [(); SavedContext::STORAGE_ALIGN] = [(); core::mem::align_of::<SavedContext>()];
 const _: () = assert!(core::mem::align_of::<SavedContext>() >= core::mem::align_of::<TrapFrame>());
+const _: () = assert!(TrapFrame::SIZE_BYTES == 280);

@@ -1,8 +1,6 @@
 use crate::{arch::ActiveContext, time::TimedEvent};
 
-use super::{
-    CommitResult, call::SchedCallWaitOutput, commit_wait, prepare_automatic_wait, prepare_wait,
-};
+use super::{CommitResult, call::SchedCallWaitOutput, commit_wait, prepare_wait};
 
 pub fn usleep(us: u64) {
     if us == 0 {
@@ -48,16 +46,21 @@ pub fn sleep_until_counter(deadline: u64) {
 /// Returns `true` after applying a blocking handoff and `false` if completion
 /// won before commit. The operation uses preallocated deadline and scheduler
 /// storage, allocates nothing, and may block the current thread.
+/// One scheduler guard covers prepare, timed-event publication, and commit;
+/// the time-owner lock is released before the context handoff.
 ///
 /// # Panics
 ///
 /// Panics if scheduler wait invariants fail or the current CPU's bounded time
 /// queue is unavailable or exhausted.
 pub(crate) fn sleep_user_until_counter(context: &mut ActiveContext<'_>, deadline: u64) -> bool {
-    let prepared = prepare_automatic_wait();
+    let cpu = super::current_cpu();
+    let mut scheduler = super::scheduler_mut();
+    let mut local = scheduler.on_cpu(cpu);
+    let prepared = local.transition_prepare_automatic_wait();
     let token = prepared.token();
     crate::time::schedule_event(deadline, TimedEvent::wait_deadline(token));
-    match commit_wait(context, prepared) {
+    match local.commit_prepared_wait(context, prepared) {
         CommitResult::Blocked(_) => true,
         CommitResult::Early(_) => false,
         CommitResult::Stale => {

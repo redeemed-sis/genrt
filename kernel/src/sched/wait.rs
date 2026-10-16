@@ -349,31 +349,6 @@ pub(crate) fn prepare_wait() -> PreparedWait {
     scheduler_mut().on_cpu(cpu).transition_prepare_wait()
 }
 
-/// Prepare a wait whose completion needs no owner-side result consumption.
-///
-/// This variant supports blocking EL0 syscalls that resume directly in
-/// userspace rather than through a kernel-stack continuation. A completion of
-/// an already blocked thread clears the inline wait metadata while making the
-/// thread ready. Publication-time completion is still consumed by
-/// [`commit_wait`].
-///
-/// # Returns
-///
-/// Returns a non-copyable preparation for the current running thread. The
-/// operation is bounded, allocation-free, non-blocking, and uses the same short
-/// scheduler critical section as [`prepare_wait`].
-///
-/// # Panics
-///
-/// Panics when no current thread is running, a prior wait is unfinished, or the
-/// per-slot sequence would overflow.
-pub(crate) fn prepare_automatic_wait() -> PreparedWait {
-    let cpu = super::current_cpu();
-    scheduler_mut()
-        .on_cpu(cpu)
-        .transition_prepare_automatic_wait()
-}
-
 /// Commit a published wait registration and apply its mandatory handoff.
 ///
 /// The external owner lock must already be dropped. This function either saves

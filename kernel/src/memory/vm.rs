@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::{PAGE_SIZE, PhysAddr, PhysRange, VirtAddr};
 use crate::{
@@ -9,8 +9,35 @@ use crate::{
 
 static KERNEL_VM_LOCK: SpinLock<()> = SpinLock::new(());
 const NO_ACTIVE_USER_ROOT: PhysAddr = PhysAddr::MAX;
-static ACTIVE_USER_ADDRESS_SPACES: [AtomicUsize; KERNEL_CPU_CAPACITY] =
-    [const { AtomicUsize::new(NO_ACTIVE_USER_ROOT) }; KERNEL_CPU_CAPACITY];
+// Keep frequently written CPU-local publication state in fixed separate slots.
+// The stride is a storage policy, not a cache-geometry correctness assumption.
+#[repr(align(64))]
+struct CpuUserAddressSpace {
+    installed: AtomicUsize,
+    user_access: AtomicBool,
+}
+
+impl CpuUserAddressSpace {
+    const fn new() -> Self {
+        Self {
+            installed: AtomicUsize::new(NO_ACTIVE_USER_ROOT),
+            user_access: AtomicBool::new(false),
+        }
+    }
+
+    // The owner CPU publishes both fields with IRQs excluded. Usercopy only
+    // borrows this snapshot in a stable syscall context, never across handoff.
+    fn for_usercopy(&self, owner_cpu: CpuId) -> Option<AddressSpaceId> {
+        if !self.user_access.load(Ordering::Acquire) {
+            return None;
+        }
+        let root_pa = self.installed.load(Ordering::Acquire);
+        (root_pa != NO_ACTIVE_USER_ROOT).then_some(AddressSpaceId { root_pa, owner_cpu })
+    }
+}
+
+static CPU_USER_ADDRESS_SPACES: [CpuUserAddressSpace; KERNEL_CPU_CAPACITY] =
+    [const { CpuUserAddressSpace::new() }; KERNEL_CPU_CAPACITY];
 
 unsafe extern "C" {
     fn arch_phys_to_virt(pa: usize) -> usize;
@@ -365,9 +392,9 @@ pub(crate) fn destroy_staged_user_address_space(
 pub(crate) unsafe fn destroy_user_address_space(
     aspace: OwnedUserAddressSpace,
 ) -> Result<(), VmError> {
-    if ACTIVE_USER_ADDRESS_SPACES
+    if CPU_USER_ADDRESS_SPACES
         .iter()
-        .any(|active| active.load(Ordering::Acquire) == aspace.id.root_pa())
+        .any(|state| state.installed.load(Ordering::Acquire) == aspace.id.root_pa())
     {
         return Err(VmError::ActiveAddressSpace);
     }
@@ -511,6 +538,46 @@ pub fn query_user_mapping(aspace: AddressSpaceId, va: VirtAddr) -> Option<UserMa
     }
 }
 
+/// Snapshot the current userspace execution root without scheduler ownership.
+///
+/// This O(1), allocation-free query does not lock, block, or alter IRQ state.
+/// It is intended for syscall/trap usercopy where the active context cannot
+/// change during validation and copying. The installed root remains protected
+/// from destruction by the VM active record. Do not retain the ID across a
+/// context handoff; it is not a lifetime-extending address-space reference.
+///
+/// # Returns
+///
+/// Returns the installed identity and immutable current CPU owner for a user
+/// context, or `None` before CPU binding, after detach, or during kernel/idle
+/// execution. Idle may retain a physical root without usercopy eligibility.
+#[inline(always)]
+pub(crate) fn current_user_address_space() -> Option<AddressSpaceId> {
+    let cpu = cpu::current_id().ok()?;
+    CPU_USER_ADDRESS_SPACES[cpu.index()].for_usercopy(cpu)
+}
+
+/// Revoke usercopy eligibility while permanent idle retains the installed root.
+///
+/// Scheduler handoff calls this with IRQs excluded before returning into trusted
+/// idle code. The operation is O(1), allocation-free, does not block or change
+/// IRQ state, and neither writes TTBR0 nor releases the active-root lifetime.
+///
+/// # Returns
+///
+/// Returns `Ok(())` after revocation, including when no user root is installed.
+///
+/// # Errors
+///
+/// Returns [`VmError::WrongCpu`] before logical CPU binding.
+pub(crate) fn retain_user_address_space_for_idle() -> Result<(), VmError> {
+    let cpu = cpu::current_id().map_err(|_| VmError::WrongCpu)?;
+    CPU_USER_ADDRESS_SPACES[cpu.index()]
+        .user_access
+        .store(false, Ordering::Release);
+    Ok(())
+}
+
 /// Activate a user TTBR0 root for the current execution context.
 ///
 /// This is bounded and allocation-free. Scheduler handoff calls it with local
@@ -541,21 +608,25 @@ pub(crate) unsafe fn activate_user_address_space(aspace: AddressSpaceId) -> Resu
     if current_cpu != aspace.owner_cpu() {
         return Err(VmError::WrongCpu);
     }
-    let active = &ACTIVE_USER_ADDRESS_SPACES[current_cpu.index()];
-    if active.load(Ordering::Acquire) == aspace.root_pa() {
+    let state = &CPU_USER_ADDRESS_SPACES[current_cpu.index()];
+    if state.installed.load(Ordering::Acquire) == aspace.root_pa() {
+        state.user_access.store(true, Ordering::Release);
         return Ok(());
     }
-    if ACTIVE_USER_ADDRESS_SPACES
+    if CPU_USER_ADDRESS_SPACES
         .iter()
         .enumerate()
-        .any(|(index, root)| {
-            index != current_cpu.index() && root.load(Ordering::Acquire) == aspace.root_pa()
+        .any(|(index, state)| {
+            index != current_cpu.index()
+                && state.installed.load(Ordering::Acquire) == aspace.root_pa()
         })
     {
         return Err(VmError::ActiveAddressSpace);
     }
+    state.user_access.store(false, Ordering::Release);
     vm_result(unsafe { arch_activate_user_address_space(aspace.root_pa()) })?;
-    active.store(aspace.root_pa(), Ordering::Release);
+    state.installed.store(aspace.root_pa(), Ordering::Release);
+    state.user_access.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -580,12 +651,15 @@ pub(crate) unsafe fn activate_user_address_space(aspace: AddressSpaceId) -> Resu
 /// valid user address space is activated again.
 pub(crate) unsafe fn clear_user_address_space() -> Result<(), VmError> {
     let current_cpu = cpu::current_id().map_err(|_| VmError::WrongCpu)?;
-    let active = &ACTIVE_USER_ADDRESS_SPACES[current_cpu.index()];
-    if active.load(Ordering::Acquire) == NO_ACTIVE_USER_ROOT {
+    let state = &CPU_USER_ADDRESS_SPACES[current_cpu.index()];
+    state.user_access.store(false, Ordering::Release);
+    if state.installed.load(Ordering::Acquire) == NO_ACTIVE_USER_ROOT {
         return Ok(());
     }
     vm_result(unsafe { arch_clear_user_address_space() })?;
-    active.store(NO_ACTIVE_USER_ROOT, Ordering::Release);
+    state
+        .installed
+        .store(NO_ACTIVE_USER_ROOT, Ordering::Release);
     Ok(())
 }
 
@@ -623,5 +697,54 @@ fn vm_error_from_code(code: u64) -> VmError {
         6 => VmError::MissingMapping,
         7 => VmError::OutOfFrames,
         _ => VmError::Unsupported,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usercopy_snapshot_requires_user_execution_not_only_an_installed_root() {
+        let cpu = CpuId::from_index(0).unwrap();
+        let state = CpuUserAddressSpace::new();
+        assert_eq!(state.for_usercopy(cpu), None);
+        state.installed.store(0x1000, Ordering::Release);
+        assert_eq!(state.for_usercopy(cpu), None);
+        state.user_access.store(true, Ordering::Release);
+        let id = state.for_usercopy(cpu).unwrap();
+        assert_eq!(id.root_pa(), 0x1000);
+        assert_eq!(id.owner_cpu(), cpu);
+
+        // Retaining an idle root revokes user access, not installed lifetime.
+        state.user_access.store(false, Ordering::Release);
+        assert_eq!(state.for_usercopy(cpu), None);
+        assert_eq!(state.installed.load(Ordering::Acquire), 0x1000);
+        state.user_access.store(true, Ordering::Release);
+        assert_eq!(state.for_usercopy(cpu), Some(id));
+
+        state.user_access.store(false, Ordering::Release);
+        state
+            .installed
+            .store(NO_ACTIVE_USER_ROOT, Ordering::Release);
+        assert_eq!(state.for_usercopy(cpu), None);
+    }
+
+    #[test]
+    fn root_replacement_is_not_exposed_before_user_publication() {
+        let cpu = CpuId::from_index(2).unwrap();
+        let state = CpuUserAddressSpace::new();
+        state.installed.store(0x1000, Ordering::Release);
+        state.user_access.store(true, Ordering::Release);
+        state.user_access.store(false, Ordering::Release);
+        // A failed backend activation must not re-enable user access.
+        assert_eq!(state.for_usercopy(cpu), None);
+        state.installed.store(0x2000, Ordering::Release);
+        assert_eq!(state.for_usercopy(cpu), None);
+        state.user_access.store(true, Ordering::Release);
+        let id = state.for_usercopy(cpu).unwrap();
+        assert_eq!(id.root_pa(), 0x2000);
+        assert_eq!(id.owner_cpu(), cpu);
+        assert_eq!(CpuUserAddressSpace::new().for_usercopy(cpu), None);
     }
 }
