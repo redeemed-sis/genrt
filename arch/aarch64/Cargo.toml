@@ -9,6 +9,7 @@ crate-type = ["staticlib"]
 
 [features]
 default = []
+wake-profile = ["kernel/wake-profile"]
 platform-raspberrypi-3b-plus = []
 log-level-error = ["kernel/log-level-error"]
 log-level-warn = ["kernel/log-level-warn"]

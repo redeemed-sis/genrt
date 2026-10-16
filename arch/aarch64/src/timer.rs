@@ -100,6 +100,8 @@ pub unsafe fn arm_deadline(deadline: u64) {
         write_ctl(CNTP_CTL_ENABLE);
         record_state(now, effective_deadline);
     }
+    #[cfg(feature = "wake-profile")]
+    kernel::profile::programmed(deadline, effective_deadline);
 }
 
 #[inline(always)]

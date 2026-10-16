@@ -436,6 +436,8 @@ impl CpuScheduler<'_> {
         // switch. Requeueing the outgoing thread must not create a second one.
         self.make_ready_and_queue(from, false);
         self.make_running(to);
+        #[cfg(feature = "wake-profile")]
+        crate::profile::wake_selected(to, crate::profile::WakePath::Generic);
         self.validate_after_transition();
         SwitchOutcome::Switch { from, to }
     }
@@ -489,6 +491,8 @@ impl CpuScheduler<'_> {
         self.thread_mut(to.index()).state = ThreadState::Ready;
         self.make_ready_and_queue(from, false);
         self.make_running(to);
+        #[cfg(feature = "wake-profile")]
+        crate::profile::wake_selected(to, crate::profile::WakePath::Idle);
         self.validate_after_transition();
         Some(SwitchOutcome::Switch { from, to })
     }
@@ -517,6 +521,8 @@ impl CpuScheduler<'_> {
         let to = self.ready_pop_front().unwrap_or_else(|| self.idle_thread());
         self.thread_mut(from.index()).state = ThreadState::Blocked;
         self.make_running(to);
+        #[cfg(feature = "wake-profile")]
+        crate::profile::wake_selected(to, crate::profile::WakePath::Generic);
         self.validate_after_transition();
         (commit, Some(SwitchOutcome::Switch { from, to }))
     }
@@ -736,6 +742,8 @@ impl CpuScheduler<'_> {
         self.state_mut().retired = Some(from);
         let to = self.ready_pop_front().unwrap_or_else(|| self.idle_thread());
         self.make_running(to);
+        #[cfg(feature = "wake-profile")]
+        crate::profile::wake_selected(to, crate::profile::WakePath::Generic);
         // The SGI is delivered only after exception return installs `to`'s
         // stack. Its scheduler entry can then finalize and potentially reuse
         // `from` without relying on an otherwise unnecessary periodic quantum.
@@ -1300,6 +1308,12 @@ mod tests {
 
     const CPU0: CpuId = CpuId::from_index(0).unwrap();
 
+    fn new_scheduler(capacity: usize) -> Scheduler {
+        #[cfg(feature = "wake-profile")]
+        crate::test_arch_stubs::register_profile_test_cpu();
+        Scheduler::transition_new(capacity, 1)
+    }
+
     fn publish_joinable(scheduler: &mut Scheduler, slot: usize) -> ThreadId {
         let context = SavedContext::kernel_entry(scheduler.stack_top(slot), 0, 0, 0);
         scheduler
@@ -1308,7 +1322,7 @@ mod tests {
     }
 
     fn idle_with_blocked_wait(automatic: bool) -> (Scheduler, WaitToken, ThreadId) {
-        let mut scheduler = Scheduler::transition_new(4, 1);
+        let mut scheduler = new_scheduler(4);
         let idle = scheduler.on_cpu(CPU0).transition_append_bootstrap(
             |_| 0,
             thread::ThreadArg::empty(),
@@ -1480,7 +1494,7 @@ mod tests {
     #[test]
     fn remote_ready_is_consumed_only_by_target_cpu() {
         let cpu1 = CpuId::from_index(1).unwrap();
-        let mut scheduler = Scheduler::transition_new(2, 1);
+        let mut scheduler = new_scheduler(2);
         scheduler.transition_fill_free_slots(2);
         scheduler
             .on_cpu(cpu1)
@@ -1508,7 +1522,7 @@ mod tests {
     #[test]
     fn remote_ready_notifications_coalesce_until_target_consumes_them() {
         let cpu1 = CpuId::from_index(1).unwrap();
-        let mut scheduler = Scheduler::transition_new(4, 1);
+        let mut scheduler = new_scheduler(4);
         scheduler.transition_fill_free_slots(4);
         scheduler
             .on_cpu(cpu1)
@@ -1541,7 +1555,7 @@ mod tests {
     #[test]
     fn secondary_initialization_claims_one_preallocated_idle_slot() {
         let cpu1 = CpuId::from_index(1).unwrap();
-        let mut scheduler = Scheduler::transition_new(2, 1);
+        let mut scheduler = new_scheduler(2);
         scheduler.transition_fill_free_slots(2);
 
         scheduler
@@ -1562,7 +1576,7 @@ mod tests {
     #[test]
     fn exiting_stack_is_reused_only_after_the_next_cpu_entry() {
         let cpu0 = CpuId::from_index(0).unwrap();
-        let mut scheduler = Scheduler::transition_new(3, 1);
+        let mut scheduler = new_scheduler(3);
         scheduler
             .on_cpu(cpu0)
             .transition_append_bootstrap(|_| 0, thread::ThreadArg::empty(), true);
@@ -1594,7 +1608,7 @@ mod tests {
 
     #[test]
     fn thread_table_preallocates_bounded_free_slots() {
-        let mut scheduler = Scheduler::transition_new(2, 1);
+        let mut scheduler = new_scheduler(2);
         scheduler.transition_fill_free_slots(2);
         assert_eq!(scheduler.transition_thread_count(), 2);
         assert_eq!(scheduler.lifecycle.free_slots.len(), 2);
@@ -1613,7 +1627,7 @@ mod tests {
 
     #[test]
     fn free_slot_is_not_a_valid_thread_and_reuse_changes_generation() {
-        let mut scheduler = Scheduler::transition_new(2, 1);
+        let mut scheduler = new_scheduler(2);
         scheduler.transition_fill_free_slots(2);
         let slot = scheduler.take_free_slot().expect("bounded free slot");
         let stale = ThreadId::new(slot, scheduler.lifecycle.slots[slot].generation);
@@ -1640,7 +1654,7 @@ mod tests {
 
     #[test]
     fn wait_sequence_survives_thread_release_and_slot_reuse() {
-        let mut scheduler = Scheduler::transition_new(2, 1);
+        let mut scheduler = new_scheduler(2);
         scheduler.transition_fill_free_slots(2);
         let slot = scheduler.take_free_slot().expect("bounded free slot");
         let first_id = publish_joinable(&mut scheduler, slot);

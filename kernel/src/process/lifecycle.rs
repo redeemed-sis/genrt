@@ -69,6 +69,10 @@ pub(super) fn finish_current_process(
     crate::sync::preempt::assert_preemption_enabled("process terminal state change");
     let pid = current_process_id().ok_or(ProcessFaultError::NoCurrentProcess)?;
     let thread = sched::current_thread_id();
+    #[cfg(feature = "wake-profile")]
+    if let Some(thread) = thread {
+        crate::profile::cleanup(thread);
+    }
     let wake = {
         let _irq_guard = LocalIrqGuard::save_and_disable();
         finish_process(pid, status).ok_or(ProcessFaultError::InvalidProcess)?

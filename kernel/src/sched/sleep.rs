@@ -59,7 +59,11 @@ pub(crate) fn sleep_user_until_counter(context: &mut ActiveContext<'_>, deadline
     let mut local = scheduler.on_cpu(cpu);
     let prepared = local.transition_prepare_automatic_wait();
     let token = prepared.token();
+    #[cfg(feature = "wake-profile")]
+    crate::profile::bind(token, deadline);
     crate::time::schedule_event(deadline, TimedEvent::wait_deadline(token));
+    #[cfg(feature = "wake-profile")]
+    crate::profile::wait_published(token);
     match local.commit_prepared_wait(context, prepared) {
         CommitResult::Blocked(_) => true,
         CommitResult::Early(_) => false,

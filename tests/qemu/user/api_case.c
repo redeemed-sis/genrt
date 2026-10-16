@@ -71,6 +71,12 @@ static int directory_io(void) {
 /* Raw byte buffers avoid imposing C alignment on syscall-only timespec and
  * cpu_set_t storage. Exercise both usercopy directions across mapped pages. */
 static int syscall_boundaries(void) {
+    /* Diagnostic numbers remain recognized when compiled out. Instrumented
+     * regression runs instead validate the controlled no-session responses. */
+    long profile_control = genrt_syscall2(SYS_PROFILE_CONTROL, 999, 0);
+    long profile_read = genrt_syscall3(SYS_PROFILE_READ, 0, 0, 0);
+    if (!((profile_control == -GENRT_ENOSYS && profile_read == -GENRT_ENOSYS)
+          || (profile_control == -GENRT_EINVAL && profile_read == -GENRT_ENOENT))) return 10;
     static unsigned char pages[8192] __attribute__((aligned(4096)));
     static const unsigned char readonly[16] = {0};
     const size_t mask_size = sizeof(cpu_set_t);

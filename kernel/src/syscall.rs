@@ -39,6 +39,10 @@ pub const SYS_CLOCK_GETTIME: usize = 14;
 pub const SYS_CLOCK_GETRES: usize = 15;
 /// Block until a relative or absolute POSIX-like clock deadline.
 pub const SYS_CLOCK_NANOSLEEP: usize = 16;
+/// Control an optional bounded wake profiling session.
+pub const SYS_PROFILE_CONTROL: usize = 17;
+/// Read a frozen optional wake profiling session.
+pub const SYS_PROFILE_READ: usize = 18;
 
 const CLOCK_MONOTONIC: isize = 1;
 const TIMER_ABSTIME: usize = 1;
@@ -183,6 +187,13 @@ pub fn dispatch(
         }
         SYS_CLOCK_NANOSLEEP => {
             sys_clock_nanosleep(context, request);
+            Ok(())
+        }
+        SYS_PROFILE_CONTROL | SYS_PROFILE_READ => {
+            #[cfg(feature = "wake-profile")]
+            sys_profile(context, request);
+            #[cfg(not(feature = "wake-profile"))]
+            context.set_syscall_result(-errno::ENOSYS);
             Ok(())
         }
         _ => Err(DispatchError::UnknownSyscall(nr)),
@@ -435,7 +446,14 @@ fn sys_clock_nanosleep(context: &mut ActiveContext<'_>, request: SyscallRequest)
                 .ok_or(errno::EOVERFLOW)?
         };
 
-        if deadline <= time::now_counter() {
+        let early = deadline <= time::now_counter();
+        #[cfg(feature = "wake-profile")]
+        if flags == TIMER_ABSTIME {
+            if let Some(owner) = sched::current_thread_id() {
+                crate::profile::begin(owner, deadline, early);
+            }
+        }
+        if early {
             return Ok(None);
         }
         Ok(Some(deadline))
@@ -452,6 +470,44 @@ fn sys_clock_nanosleep(context: &mut ActiveContext<'_>, request: SyscallRequest)
         Ok(None) => context.set_syscall_result(0),
         Err(err) => context.set_syscall_result(-err),
     }
+}
+
+#[cfg(feature = "wake-profile")]
+fn sys_profile(context: &mut ActiveContext<'_>, request: SyscallRequest) {
+    let result = (|| {
+        // Process reverse lookup validates the current exact main thread.
+        process::process_affinity(0)?;
+        let owner = sched::current_thread_id().ok_or(errno::EPERM)?;
+        if request.number() == SYS_PROFILE_CONTROL {
+            let command = request.arg(0);
+            let config = if command == 1 {
+                let mut bytes = [0u8; 16];
+                user::copy_from_user(&mut bytes, request.arg(1)).map_err(user_copy_errno)?;
+                let fields: [u32; 4] = core::array::from_fn(|i| {
+                    u32::from_le_bytes(core::array::from_fn(|j| bytes[i * 4 + j]))
+                });
+                Some(crate::profile::Config {
+                    mode: fields[0],
+                    max_records: fields[1],
+                    start_phase: fields[2],
+                    end_phase: fields[3],
+                })
+            } else {
+                None
+            };
+            crate::profile::control(owner, command, config)
+        } else {
+            let size = request.arg(1).min(user::MAX_USER_COPY);
+            let mut chunk = [0u8; user::MAX_USER_COPY];
+            let len = crate::profile::read(owner, request.arg(2), &mut chunk[..size])?;
+            // Frozen bytes staged under the leaf; all usercopy is outside it.
+            if len != 0 {
+                user::copy_to_user(request.arg(0), &chunk[..len]).map_err(user_copy_errno)?;
+            }
+            Ok(len)
+        }
+    })();
+    context.set_syscall_result(errno::syscall_ret(result));
 }
 
 #[derive(Copy, Clone)]

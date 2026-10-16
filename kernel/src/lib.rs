@@ -26,6 +26,9 @@ pub mod memory;
 pub mod panic;
 mod power;
 pub mod process;
+/// Opt-in bounded diagnostic profiler for absolute userspace sleeps.
+#[cfg(feature = "wake-profile")]
+pub mod profile;
 pub mod sched;
 pub mod sync;
 pub mod syscall;

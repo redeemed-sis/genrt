@@ -51,7 +51,10 @@ pub(crate) fn finish_timer_interrupt(
     expired: &ExpiredEvents,
 ) -> QuantumUpdate {
     let cpu = current_cpu();
-    scheduler_mut()
+    let mut owner = scheduler_mut();
+    #[cfg(feature = "wake-profile")]
+    crate::profile::scheduler_acquired();
+    owner
         .on_cpu(cpu)
         .finish_timer_interrupt(context, now, expired)
 }
@@ -444,6 +447,8 @@ impl CpuScheduler<'_> {
         self.saved_context_mut(from).save_from(context);
         self.saved_context(to).restore_into(context);
         self.activate_thread_address_space(to);
+        #[cfg(feature = "wake-profile")]
+        crate::profile::context_restored(to);
         log_switch(self.cpu(), from, to);
     }
 }

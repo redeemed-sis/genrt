@@ -31,6 +31,22 @@ pub(crate) struct WaitToken {
 }
 
 impl WaitToken {
+    /// Construct an isolated host-test identity without publishing a wait.
+    /// # Arguments
+    /// * `thread` - Generation-bearing test thread.
+    /// * `cpu` - Immutable test CPU.
+    /// * `sequence` - Exact test episode sequence.
+    /// # Returns
+    /// Copyable token without allocation, scheduler or IRQ state changes.
+    #[cfg(all(test, feature = "wake-profile"))]
+    pub(crate) const fn for_profile_test(thread: ThreadId, cpu: CpuId, sequence: u64) -> Self {
+        Self {
+            thread,
+            cpu,
+            sequence: WaitSequence(sequence),
+        }
+    }
+
     /// Return the generation-aware thread identity that owns this wait.
     ///
     /// # Returns
@@ -446,10 +462,16 @@ impl super::CpuScheduler<'_> {
             (CommitState::Early(cause), None) => CommitResult::Early(cause),
             (CommitState::Stale, None) => CommitResult::Stale,
             (CommitState::Block(_), Some(switch_outcome @ SwitchOutcome::Switch { from, to })) => {
+                #[cfg(feature = "wake-profile")]
+                crate::profile::sleep_committed(from);
                 self.saved_context_mut(from).save_from(context);
                 self.saved_context(to).restore_into(context);
                 self.activate_thread_address_space(to);
+                #[cfg(feature = "wake-profile")]
+                crate::profile::context_restored(to);
                 self.finish_block_current(from, to);
+                #[cfg(feature = "wake-profile")]
+                crate::profile::sleep_handoff(from);
                 CommitResult::Blocked(switch_outcome)
             }
             _ => panic!("sched: malformed wait commit transition outcome"),

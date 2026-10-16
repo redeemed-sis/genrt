@@ -618,6 +618,8 @@ impl CpuScheduler<'_> {
         }
         self.saved_context(next).restore_into(context);
         self.activate_thread_address_space(next);
+        #[cfg(feature = "wake-profile")]
+        crate::profile::context_restored(next);
         self.finish_block_current(exited, next);
         crate::debug!("thread: exited id={exited} code={code}");
     }

@@ -91,6 +91,8 @@ pub(crate) fn dispatch(active: &mut kernel::arch::ActiveContext<'_>) {
     let Some((token, events)) = <Selected as InterruptController>::acknowledge() else {
         return;
     };
+    #[cfg(feature = "wake-profile")]
+    kernel::profile::irq_ack();
     if events.uart {
         console::on_uart_irq();
     }
@@ -103,6 +105,8 @@ pub(crate) fn dispatch(active: &mut kernel::arch::ActiveContext<'_>) {
         kernel::warn!("irq: unexpected id=0x{id:08x}");
     }
     <Selected as InterruptController>::end(token);
+    #[cfg(feature = "wake-profile")]
+    kernel::profile::interrupt_completed();
     #[cfg(feature = "qemu-test-smp-boot")]
     if events.checkpoint == Some(Checkpoint::Timer) {
         kernel::time::on_local_timer_probe_eoi_for_test();

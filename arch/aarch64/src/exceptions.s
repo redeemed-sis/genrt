@@ -72,6 +72,11 @@
 .macro SAVE_CURRENT_EL_TRAPFRAME
     sub sp, sp, #TF_STACK_SIZE
     stp x0,  x1,  [sp, #TF_X0]
+    .if GENRT_WAKE_PROFILE
+    isb
+    mrs x0, CNTPCT_EL0
+    str x0, [sp, #TF_SIZE]
+    .endif
     stp x2,  x3,  [sp, #TF_X2]
     stp x4,  x5,  [sp, #TF_X4]
     stp x6,  x7,  [sp, #TF_X6]
@@ -100,6 +105,11 @@
 .macro SAVE_LOWER_EL_TRAPFRAME
     sub sp, sp, #TF_STACK_SIZE
     stp x0,  x1,  [sp, #TF_X0]
+    .if GENRT_WAKE_PROFILE
+    isb
+    mrs x0, CNTPCT_EL0
+    str x0, [sp, #TF_SIZE]
+    .endif
     stp x2,  x3,  [sp, #TF_X2]
     stp x4,  x5,  [sp, #TF_X4]
     stp x6,  x7,  [sp, #TF_X6]
@@ -308,6 +318,11 @@ trap_lower_el_aarch32_serror:
 .type arch_enter_saved_context, %function
 arch_enter_saved_context:
     mov sp, x0
+    // Inline SavedContext has only 280 bytes and is not a live exception stack.
+    // Never call Rust using it as a stack or read exception padding from it.
+    .if GENRT_WAKE_PROFILE
+    b trap_restore_frame
+    .endif
 
 // Restore contract:
 // - EL1 frame:
@@ -318,6 +333,13 @@ arch_enter_saved_context:
 // TF_SP/TF_KERNEL_SP must contain post-trapframe stack positions where applicable.
 .global trap_restore_and_eret
 trap_restore_and_eret:
+    .if GENRT_WAKE_PROFILE
+    ldr x0, [sp, #TF_SPSR]
+    and x0, x0, #SPSR_MODE_MASK
+    cbnz x0, trap_restore_frame
+    bl arch_profile_return_to_user
+    .endif
+trap_restore_frame:
     // Use x9 as frame base pointer and x10/x11 as temporaries while ELR/SPSR are restored.
     mov x9, sp
 

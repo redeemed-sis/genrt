@@ -26,7 +26,59 @@ global_asm!(
     include_str!("boot.s"),
     pi_runtime = const platform::PI_RUNTIME,
 );
-global_asm!(include_str!("exceptions.s"));
+global_asm!(
+    ".equ GENRT_WAKE_PROFILE, {wake_profile}",
+    include_str!("exceptions.s"),
+    wake_profile = const cfg!(feature = "wake-profile") as u32,
+);
+
+/// Ordered shared physical-counter read for the optional diagnostic profiler.
+/// No allocation, locks or scheduler calls; valid only at EL1.
+/// # Returns
+/// Raw CNTPCT ticks after ISB instruction synchronization.
+#[cfg(feature = "wake-profile")]
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_profile_counter() -> u64 {
+    let value: u64;
+    // SAFETY: runtime EL1 owns architected read-only physical counter access.
+    unsafe {
+        asm!("isb", "mrs {value}, CNTPCT_EL0", value = out(reg) value,
+        options(nostack, preserves_flags));
+    }
+    value
+}
+
+/// Admit local IRQs for bounded profiler task-context heap work only.
+/// Caller holds PreemptGuard, owns a live synchronous frame and holds no shared
+/// locks. IRQ handlers may run but cannot replace that frame's current thread.
+/// # Returns
+/// Opaque previous DAIF, to restore before releasing preemption exclusion.
+/// This architecture hook allocates nothing and changes only IRQ masking.
+/// # Safety
+/// Call only from synchronous task context under PreemptGuard with no shared
+/// locks; restore returned state before any handoff or guard release.
+#[cfg(feature = "wake-profile")]
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_profile_task_irq_enable() -> u64 {
+    let saved: u64;
+    // SAFETY: narrow task-context callers own DAIF under PreemptGuard and must
+    // restore this exact state before any blocking/terminal handoff.
+    unsafe {
+        asm!("mrs {saved}, DAIF", "msr DAIFClr, #2", "isb",
+        saved = out(reg) saved, options(nostack, preserves_flags));
+    }
+    saved
+}
+
+/// Final live-exception EL0 return hook before assembly GPR restoration.
+/// Assembly checks saved SPSR mode and bypasses saved-context first entry.
+/// # Returns
+/// Returns after bounded profiling without inspecting exception padding.
+#[cfg(feature = "wake-profile")]
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_profile_return_to_user() {
+    kernel::profile::return_to_user();
+}
 
 #[unsafe(no_mangle)]
 pub static BOOT_CURRENT_EL: AtomicU64 = AtomicU64::new(0);

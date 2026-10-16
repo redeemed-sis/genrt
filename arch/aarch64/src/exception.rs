@@ -7,6 +7,8 @@ const ISS_SVC_SCHED_CALL: u32 = 0;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn irq_entry(frame: *mut TrapFrame) {
+    #[cfg(feature = "wake-profile")]
+    kernel::profile::irq_entry(live_profile_entry(frame));
     // SAFETY: exception assembly supplies the live frame for this entry.
     let frame = unsafe { live_trap_frame(frame) };
     // SAFETY: exception assembly owns this one live frame for the complete IRQ
@@ -84,6 +86,10 @@ pub extern "C" fn sync_entry(vector: u64, frame: *mut TrapFrame) {
 pub extern "C" fn lower_el_sync_entry(vector: u64, frame: *mut TrapFrame) {
     let raw_esr = read_esr_el1();
     let ec = esr::ec(raw_esr);
+    // Read from the original assembly allocation before creating a 280-byte
+    // TrapFrame reference; padding is not part of that reference's extent.
+    #[cfg(feature = "wake-profile")]
+    let profile_entry = live_profile_entry(frame);
 
     // This is the userspace syscall/fault boundary. It is deliberately separate
     // from `sync_entry()`, whose SVC #0 ABI is reserved for controlled EL1 thread
@@ -92,6 +98,8 @@ pub extern "C" fn lower_el_sync_entry(vector: u64, frame: *mut TrapFrame) {
     let frame = unsafe { live_trap_frame(frame) };
     let fault = if ec == esr::EC_SVC_AARCH64 {
         let request = context::syscall_request(frame);
+        #[cfg(feature = "wake-profile")]
+        kernel::profile::svc_entry(profile_entry);
         // SAFETY: lower-EL synchronous entry owns this one live frame for the
         // complete syscall and any scheduler handoff before return.
         let mut active = unsafe { context::active_context(frame) };
@@ -107,6 +115,14 @@ pub extern "C" fn lower_el_sync_entry(vector: u64, frame: *mut TrapFrame) {
         kernel::process::UserFault::sync_exception(user_fault_kind(raw_esr))
     };
     handle_lower_el_user_fault(vector, frame, raw_esr, fault);
+}
+
+#[cfg(feature = "wake-profile")]
+fn live_profile_entry(frame: *const TrapFrame) -> u64 {
+    // SAFETY: called only by live IRQ/lower-EL SVC entry before frame handoff.
+    // Assembly allocated 288 bytes and initialized the +280 padding probe;
+    // saved 280-byte contexts and first-entry frames never reach this helper.
+    unsafe { frame.cast::<u8>().add(280).cast::<u64>().read() }
 }
 
 #[cold]

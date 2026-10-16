@@ -12,9 +12,26 @@ use core::{
 use std::cell::Cell;
 
 static CURRENT_CPU_LOGICAL_ID: AtomicUsize = AtomicUsize::new(0);
+
+/// Publish one immutable synthetic CPU binding shared by profiler-aware fixtures.
+/// Host scheduler models may invoke profiler hooks without booting a scheduler.
+/// # Returns
+/// Returns after one-time CPU0 registration; later calls preserve that binding.
+/// # Panics
+/// Panics if the synthetic boot CPU cannot be registered.
+#[cfg(feature = "wake-profile")]
+pub(crate) fn register_profile_test_cpu() {
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| {
+        crate::cpu::register_boot_cpu().expect("synthetic profiler boot CPU");
+    });
+}
+
 std::thread_local! {
     static IRQ_MASK_STATE: Cell<usize> = const { Cell::new(0) };
     static TIMER_PROGRAM_COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    #[cfg(feature = "wake-profile")]
+    static PROFILE_COUNTER_READS: Cell<u64> = const { Cell::new(0) };
 }
 
 pub(crate) fn irq_mask_state() -> usize {
@@ -92,6 +109,28 @@ extern "C" fn arch_counter_now() -> u64 {
 #[unsafe(no_mangle)]
 extern "C" fn arch_counter_freq_hz() -> u64 {
     1_000_000
+}
+#[cfg(feature = "wake-profile")]
+#[unsafe(no_mangle)]
+extern "C" fn arch_profile_counter() -> u64 {
+    PROFILE_COUNTER_READS.with(|c| {
+        let n = c.get() + 1;
+        c.set(n);
+        n
+    })
+}
+#[cfg(feature = "wake-profile")]
+#[unsafe(no_mangle)]
+extern "C" fn arch_profile_task_irq_enable() -> u64 {
+    IRQ_MASK_STATE.with(|state| state.replace(0)) as u64
+}
+
+/// Query ordered profiler reads on this host test thread, without side effects.
+/// # Returns
+/// Count of inert ordered reads; allocates nothing and touches no IRQ state.
+#[cfg(feature = "wake-profile")]
+pub(crate) fn profile_counter_reads() -> u64 {
+    PROFILE_COUNTER_READS.with(Cell::get)
 }
 #[unsafe(no_mangle)]
 extern "C" fn arch_timer_arm_deadline(_deadline: u64) {

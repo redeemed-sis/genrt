@@ -9,6 +9,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
+wake-profile = []
 log-level-error = []
 log-level-warn = []
 log-level-info = []

@@ -182,7 +182,13 @@ impl DeadlineQueue {
             return None;
         }
 
-        Some(self.remove_at(0).event)
+        let removed = self.remove_at(0);
+        #[cfg(feature = "wake-profile")]
+        if let TimedEvent::WaitDeadline { token, .. } = removed.event {
+            crate::profile::expired(token, removed.deadline);
+        }
+
+        Some(removed.event)
     }
 
     fn next_deadline(&self) -> Option<u64> {
@@ -743,6 +749,8 @@ pub fn on_timer_interrupt(context: &mut ActiveContext<'_>) {
         time.dispatching_irq = false;
         time.rearm_timer(now);
     });
+    #[cfg(feature = "wake-profile")]
+    crate::profile::timer_rearmed();
 }
 
 /// Record one fully acknowledged and EOI-completed local timer probe IRQ.
