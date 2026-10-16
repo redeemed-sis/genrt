@@ -16,6 +16,7 @@ pub(super) enum InitImage {
     RebootContract,
     PoweroffContract,
     SmpRebootContract,
+    WakeProfileContract,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]

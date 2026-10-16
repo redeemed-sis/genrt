@@ -42,7 +42,7 @@ const DEFAULT_INITRAMFS_ROOT: &str = "user/initramfs";
 pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Doctor => doctor(),
-        Commands::BuildRaspberrypi3bPlus => crate::hardware::build(),
+        Commands::BuildRaspberrypi3bPlus { wake_profile } => crate::hardware::build(wake_profile),
         Commands::Check => check(),
         Commands::TestAarch64 {
             case,
@@ -51,6 +51,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             timeout_secs,
             artifacts_dir,
             keep_going,
+            wake_profile,
         } => crate::test::run(crate::test::Options {
             case,
             list,
@@ -58,6 +59,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             timeout_secs,
             artifacts_dir,
             keep_going,
+            wake_profile,
             prepared: None,
         }),
         Commands::Ci => ci(),
@@ -68,13 +70,16 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             initramfs,
             profile,
             cpus,
-        } => qemu_cmd(arch, initramfs, profile, cpus),
+            wake_profile,
+        } => qemu_cmd(arch, initramfs, profile, cpus, wake_profile),
         Commands::GdbCmd { arch } => gdb_cmd(arch),
         Commands::BuildAarch64 {
             log_level,
             profile,
             cpus,
-        } => build_aarch64_for_cpus(profile, log_level, &[], cpus).map(|_| ()),
+            wake_profile,
+        } => build_aarch64_for_cpus(profile, log_level, profile_features(wake_profile), cpus)
+            .map(|_| ()),
         Commands::BuildUserHello => build_user_program(Profile::Debug, "hello", false).map(|_| ()),
         Commands::BuildUserFault => {
             build_user_program(Profile::Debug, "fault_null", false).map(|_| ())
@@ -100,8 +105,12 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             init,
             profile,
             cpus,
+            wake_profile,
         } => run_aarch64(
-            false,
+            RunMode {
+                wait_for_gdb: false,
+                wake_profile,
+            },
             profile,
             log_level,
             initramfs,
@@ -116,8 +125,12 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             init,
             profile,
             cpus,
+            wake_profile,
         } => run_aarch64(
-            true,
+            RunMode {
+                wait_for_gdb: true,
+                wake_profile,
+            },
             profile,
             Some(log_level.unwrap_or(LogLevel::Debug)),
             initramfs,
@@ -324,11 +337,12 @@ fn qemu_cmd(
     initramfs: Option<PathBuf>,
     profile: Profile,
     cpu_count: usize,
+    wake_profile: bool,
 ) -> Result<()> {
     match arch {
         Arch::Aarch64 => {
             validate_qemu_cpu_count(cpu_count)?;
-            let artifacts = Aarch64Artifacts::for_cpu_count(profile, cpu_count);
+            let artifacts = Aarch64Artifacts::for_composition(profile, cpu_count, wake_profile);
             let initramfs = match initramfs {
                 Some(path) => {
                     validate_initramfs_payload(&path)?;
@@ -422,7 +436,8 @@ pub(crate) fn build_aarch64_for_cpus(
     cpu_count: usize,
 ) -> Result<Aarch64Artifacts> {
     validate_qemu_cpu_count(cpu_count)?;
-    let artifacts = Aarch64Artifacts::for_cpu_count(profile, cpu_count);
+    let wake_profile = extra_features.contains(&"wake-profile");
+    let artifacts = Aarch64Artifacts::for_composition(profile, cpu_count, wake_profile);
     let dtb_path = generate_qemu_virt_dtb(&artifacts)?;
 
     let mut build = Command::new("cargo");
@@ -435,6 +450,9 @@ pub(crate) fn build_aarch64_for_cpus(
         AARCH64_TARGET,
     ]);
     profile.apply_to_cargo(&mut build);
+    if wake_profile {
+        build.args(["--target-dir", "target/wake-profile"]);
+    }
     build.env("GENRT_AARCH64_DTB_PATH", &dtb_path);
 
     let mut features = Vec::new();
@@ -476,8 +494,17 @@ pub(crate) fn build_aarch64_for_cpus(
     Ok(artifacts)
 }
 
-fn run_aarch64(
+struct RunMode {
     wait_for_gdb: bool,
+    wake_profile: bool,
+}
+
+fn profile_features(enabled: bool) -> &'static [&'static str] {
+    if enabled { &["wake-profile"] } else { &[] }
+}
+
+fn run_aarch64(
+    mode: RunMode,
     profile: Profile,
     log_level: Option<LogLevel>,
     initramfs: Option<PathBuf>,
@@ -485,10 +512,15 @@ fn run_aarch64(
     init: Option<PathBuf>,
     cpu_count: usize,
 ) -> Result<()> {
-    let artifacts = build_aarch64_for_cpus(profile, log_level, &[], cpu_count)?;
+    let artifacts = build_aarch64_for_cpus(
+        profile,
+        log_level,
+        profile_features(mode.wake_profile),
+        cpu_count,
+    )?;
     let initramfs = selected_or_build_initramfs_path(profile, initramfs, initramfs_root, init)?;
     let mut config = qemu::Config::from_artifacts(&artifacts, initramfs);
-    config.wait_for_gdb = wait_for_gdb;
+    config.wait_for_gdb = mode.wait_for_gdb;
     let mut cmd = config.command();
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -884,6 +916,13 @@ struct UserProgram {
 }
 
 const USER_PROGRAMS: &[UserProgram] = &[
+    UserProgram {
+        name: "test_profile_supervisor",
+        source: "tests/qemu/user/profile_supervisor.c",
+        checked: false,
+        defines: &[],
+        test_artifact: true,
+    },
     UserProgram {
         name: "test_wakeup_probe",
         source: "tests/qemu/user/wakeup_probe.c",

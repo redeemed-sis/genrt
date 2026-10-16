@@ -6,7 +6,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
 
-use crate::artifacts::{AARCH64_TARGET, verify_production_kernel};
+use crate::artifacts::{AARCH64_TARGET, verify_kernel_composition};
 
 const BOARD_NAME: &str = "raspberrypi-3b-plus";
 const KERNEL_ENTRY: usize = 0x0200_0000;
@@ -17,6 +17,10 @@ const ARM64_HEADER_SIZE: usize = 64;
 const ARM64_PLACEMENT_FLAGS: u64 = 8;
 
 /// Build the complete Raspberry Pi kernel, DTB, and initramfs FIT.
+///
+/// # Arguments
+///
+/// * `wake_profile` - Opt in to diagnostic code in an isolated output directory.
 ///
 /// # Returns
 ///
@@ -33,9 +37,12 @@ const ARM64_PLACEMENT_FLAGS: u64 = 8;
 /// image metadata or size, nonidentical repeated FITs, or a failed post-link
 /// check. Requires Cargo, LLD, LLVM objcopy/nm/objdump, readelf, dtc, fdtget,
 /// mkimage, and dumpimage.
-pub(crate) fn build() -> Result<()> {
+pub(crate) fn build(wake_profile: bool) -> Result<()> {
     let name = BOARD_NAME;
-    let directory = format!("target/{name}");
+    let directory = format!(
+        "target/{name}{}",
+        if wake_profile { "/wake-profile" } else { "" }
+    );
     let source = format!("arch/aarch64/platform/{name}");
     fs::create_dir_all(&directory)?;
     let root = Path::new(&directory);
@@ -47,7 +54,13 @@ pub(crate) fn build() -> Result<()> {
     run(Command::new("cargo")
         .args(["build", "--locked", "--release", "-p", "genrt-arch-aarch64"])
         .args(["--target", AARCH64_TARGET, "--no-default-features"])
-        .args(["--features", &format!("platform-{name}")])
+        .args([
+            "--features",
+            &format!(
+                "platform-{name}{}",
+                if wake_profile { ",wake-profile" } else { "" }
+            ),
+        ])
         .arg("--target-dir")
         .arg(root.join("cargo")))?;
     let library = root
@@ -66,7 +79,7 @@ pub(crate) fn build() -> Result<()> {
         .arg(&library)
         .arg("--no-whole-archive"))?;
     crate::workflow::verify_aarch64_boot_text_autonomy(&elf)?;
-    verify_production_kernel(&elf)?;
+    verify_kernel_composition(&elf, wake_profile)?;
     let symbols = output(
         Command::new("llvm-nm")
             .args(["--defined-only", "-C"])
@@ -402,6 +415,11 @@ mod tests {
         use clap::Parser;
 
         let pi = Cli::try_parse_from(["xtask", "build-raspberrypi-3b-plus"]).unwrap();
-        assert!(matches!(pi.command, Commands::BuildRaspberrypi3bPlus));
+        assert!(matches!(
+            pi.command,
+            Commands::BuildRaspberrypi3bPlus {
+                wake_profile: false
+            }
+        ));
     }
 }

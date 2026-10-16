@@ -216,6 +216,7 @@ fn run_prepared_contract(
     initramfs: PathBuf,
 ) -> Result<()> {
     test::run(Options {
+        wake_profile: false,
         case: Some(case.to_owned()),
         list: false,
         profile: Some(Profile::Release),

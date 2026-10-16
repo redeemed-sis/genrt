@@ -31,6 +31,8 @@ pub(crate) struct Options {
     pub(crate) artifacts_dir: PathBuf,
     /// Continue with later cases after a failure.
     pub(crate) keep_going: bool,
+    /// Explicitly instrument selected kernels and include diagnostic cases.
+    pub(crate) wake_profile: bool,
     /// Exact production kernel and contract image supplied without rebuilding.
     pub(crate) prepared: Option<PreparedArtifacts>,
 }
@@ -48,6 +50,7 @@ impl Options {
             timeout_secs: 60,
             artifacts_dir: PathBuf::from("target/test-results"),
             keep_going: false,
+            wake_profile: false,
             prepared: None,
         }
     }
@@ -95,6 +98,11 @@ pub(crate) fn run(options: Options) -> Result<()> {
     let mut selected = all
         .into_iter()
         .filter(|case| options.case.as_ref().is_none_or(|name| name == &case.name))
+        .filter(|case| {
+            options.case.is_some()
+                || options.wake_profile
+                || !case.kernel_features.iter().any(|f| f == "wake-profile")
+        })
         .collect::<Vec<_>>();
     if selected.is_empty() {
         bail!("unknown QEMU case {:?}", options.case);
@@ -117,6 +125,9 @@ pub(crate) fn run(options: Options) -> Result<()> {
     let mut last_kernel: Option<(Profile, String, Vec<String>, usize, Aarch64Artifacts)> = None;
 
     for mut case in selected {
+        if options.wake_profile && !case.kernel_features.iter().any(|f| f == "wake-profile") {
+            case.kernel_features.push("wake-profile".to_owned());
+        }
         let profile = options.profile.unwrap_or(case.profile);
         case.profile = profile;
         let users = if options.prepared.is_none() {
@@ -276,6 +287,7 @@ fn prepare_test_initramfs(
         cases::InitImage::RebootContract => "reboot-contract",
         cases::InitImage::PoweroffContract => "poweroff-contract",
         cases::InitImage::SmpRebootContract => "smp-reboot-contract",
+        cases::InitImage::WakeProfileContract => "wake-profile-contract",
     });
     if root.exists() {
         fs::remove_dir_all(&root)?;
@@ -286,6 +298,10 @@ fn prepare_test_initramfs(
     provenance.mark_prefix(".__genrt_test__", crate::initramfs::Origin::TestFixture)?;
 
     let init = match image {
+        cases::InitImage::WakeProfileContract => {
+            provenance.mark_prefix("init", crate::initramfs::Origin::TestSupervisor)?;
+            workflow::build_user_program(profile, "test_profile_supervisor", true)?
+        }
         cases::InitImage::KernelContract => {
             workflow::build_user_program(profile, "test_wakeup_probe", true)?
         }
@@ -356,6 +372,7 @@ fn prepare_test_initramfs(
     if !matches!(
         image,
         cases::InitImage::UserspaceContract
+            | cases::InitImage::WakeProfileContract
             | cases::InitImage::SmpUserspaceContract
             | cases::InitImage::ShellContract
             | cases::InitImage::RebootContract

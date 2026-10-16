@@ -1,0 +1,59 @@
+name = "wake-profile-contract"
+suite = "wake-profile-contract"
+supervisor = "profile-supervisor"
+profile = "debug"
+log_level = "info"
+kernel_features = ["wake-profile"]
+cpu_count = 4
+init = "wake-profile-contract"
+timeout_secs = 60
+step_timeout_secs = 15
+
+[[steps]]
+action = "expect_case"
+producer = "profile-supervisor"
+subject = "profile-validation"
+[[steps]]
+action = "expect_case"
+producer = "profile-supervisor"
+subject = "profile-idle-exact"
+[[steps]]
+action = "expect_case"
+producer = "profile-supervisor"
+subject = "profile-focused-loss"
+[[steps]]
+action = "expect_case"
+producer = "profile-supervisor"
+subject = "profile-generic-rr"
+[[steps]]
+action = "expect_case"
+producer = "profile-supervisor"
+subject = "profile-generic-exit"
+[[steps]]
+action = "expect_case"
+producer = "profile-supervisor"
+subject = "profile-generic-block"
+[[steps]]
+action = "expect_case"
+producer = "profile-supervisor"
+subject = "profile-chunks-owner"
+[[steps]]
+action = "expect_case"
+producer = "profile-supervisor"
+subject = "profile-fault-cleanup"
+[[steps]]
+action = "expect_case"
+producer = "profile-supervisor"
+subject = "profile-post-fault-reuse"
+[[steps]]
+action = "expect_case"
+producer = "profile-supervisor"
+subject = "profile-allocation-pressure"
+[[steps]]
+action = "expect_case"
+producer = "profile-supervisor"
+subject = "profile-rtbench-report"
+[[steps]]
+action = "expect_case"
+producer = "profile-supervisor"
+subject = "profile-rtbench-focused-report"

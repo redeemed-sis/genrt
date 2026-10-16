@@ -32,6 +32,9 @@ pub(crate) enum Commands {
         artifacts_dir: PathBuf,
         #[arg(long)]
         keep_going: bool,
+        /// Instrument selected kernels and include opt-in diagnostic cases.
+        #[arg(long)]
+        wake_profile: bool,
     },
     Ci,
     Dist {
@@ -51,6 +54,8 @@ pub(crate) enum Commands {
         /// CPU count represented by both the existing DTB and QEMU `-smp`.
         #[arg(long, default_value_t = 1)]
         cpus: usize,
+        #[arg(long)]
+        wake_profile: bool,
     },
     GdbCmd {
         #[arg(long, value_enum)]
@@ -64,10 +69,15 @@ pub(crate) enum Commands {
         /// CPU count encoded in the generated DTB; supported range is 1..=4.
         #[arg(long, default_value_t = 1)]
         cpus: usize,
+        #[arg(long)]
+        wake_profile: bool,
     },
     /// Build the Pi 3B+ runtime with kernel, DTB and production initramfs (FIT).
     #[command(name = "build-raspberrypi-3b-plus")]
-    BuildRaspberrypi3bPlus,
+    BuildRaspberrypi3bPlus {
+        #[arg(long)]
+        wake_profile: bool,
+    },
     BuildUserHello,
     BuildUserFault,
     BuildUserReadFile,
@@ -100,6 +110,8 @@ pub(crate) enum Commands {
         /// CPU count encoded in the generated DTB and passed to QEMU `-smp`.
         #[arg(long, default_value_t = 1)]
         cpus: usize,
+        #[arg(long)]
+        wake_profile: bool,
     },
     DebugAarch64 {
         #[arg(long, value_enum)]
@@ -115,6 +127,8 @@ pub(crate) enum Commands {
         /// CPU count encoded in the generated DTB and passed to QEMU `-smp`.
         #[arg(long, default_value_t = 1)]
         cpus: usize,
+        #[arg(long)]
+        wake_profile: bool,
     },
 }
 
