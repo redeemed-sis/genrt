@@ -135,6 +135,7 @@ static void sleep_cli_validation(void) {
 static void rtbench_cli_validation(void) {
     const char *name = "rtbench-cli-validation";
     char *valid[] = {"rtbench", "-p", "1000000", "-n", "3", "-o", "7", NULL};
+    char *verbose[] = {"rtbench", "-p", "1000000", "-n", "3", "-o", "7", "-v", NULL};
     char *invalid[][10] = {
         {"rtbench", NULL},
         {"rtbench", "-p", "1000000", "-n", "3", NULL},
@@ -148,10 +149,12 @@ static void rtbench_cli_validation(void) {
         {"rtbench", "-p1", "-n1", "-o0", "-p2", NULL},
         {"rtbench", "-p1", "-n1", "-o0", "extra", NULL},
         {"rtbench", "-p1", "-n1", "-o0", "-x", NULL},
+        {"rtbench", "-p1", "-n1", "-o0", "-vv", NULL},
     };
     char *overflow[] = {"rtbench", "-p18446744073709551615", "-n2", "-o0", NULL};
     gtrt_case_start(producer, name);
     if (!exec_and_wait("/bin/rtbench", valid, 0)
+        || !exec_and_wait("/bin/rtbench", verbose, 0)
         || !exec_and_wait("/bin/rtbench", overflow, 1)) {
         gtrt_fail(producer, name, "RESULT");
     }

@@ -5,6 +5,9 @@
 #define SYS_CLOCK_GETTIME 14
 #define SYS_CLOCK_GETRES 15
 #define SYS_CLOCK_NANOSLEEP 16
+#define SYS_PROFILE_CONTROL 17
+#define SYS_PROFILE_READ 18
 
 long genrt_syscall2(long number, long clock, long time);
+long genrt_syscall3(long number, long buffer, long size, long offset);
 long genrt_syscall4(long number, long clock, long flags, long request, long remaining);

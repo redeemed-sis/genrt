@@ -263,7 +263,12 @@ fn check_user_host_program(directory: &Path, name: &str, wrap_write: bool) -> Re
         compiler.arg("-Wl,--wrap=write");
     }
     if name == "rtbench" {
-        compiler.args(["-I", "tests/user/rtbench_host_include"]);
+        compiler.args([
+            "-I",
+            "tests/user/rtbench_host_include",
+            "-I",
+            "tests/user/time_host_include",
+        ]);
     }
     if name == "time" {
         compiler.args([
