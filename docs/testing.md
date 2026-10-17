@@ -90,6 +90,9 @@ TTBR0 writes (initial activation and terminal detach), with full frame return
 after each of three reaps. Pure host tests cover fixed expired-buffer transfer,
 direct-wake wait consumption, stale tokens, and existing/remote peers. Existing
 wait races, RR, preemption, process isolation, and SMP sleeps remain gates.
+The deferred-wakeup setup retries at most eight times if the worker's deadline
+passes before preemption exclusion is established; deferred-wakeup assertions
+run only after a future deadline is observed under that guard.
 
 `syscall-boundaries` exercises raw, unaligned input and output buffers across
 mapped page boundaries, rejects readonly and partially out-of-range buffers

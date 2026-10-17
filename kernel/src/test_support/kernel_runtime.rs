@@ -717,6 +717,17 @@ fn run_irq_masked_unlock_case() {
 }
 
 fn run_deferred_wakeup_case() {
+    // UART/host delays can let the worker finish before the guard is entered.
+    // Retry only that setup window; never wait for another IRQ with no sleeper.
+    for _ in 0..8 {
+        if try_deferred_wakeup_case() {
+            return;
+        }
+    }
+    protocol::fail("deferred-wakeup", "SETUP_WINDOW_MISSED");
+}
+
+fn try_deferred_wakeup_case() -> bool {
     WAKEUP_STAGE.store(0, Ordering::Release);
     let worker = sched::thread_spawn(wakeup_peer, ThreadArg::empty(), ThreadAttrs::joinable())
         .unwrap_or_else(|_| protocol::fail("deferred-wakeup", "SPAWN"));
@@ -729,7 +740,14 @@ fn run_deferred_wakeup_case() {
     }
 
     {
-        let _guard = PreemptGuard::enter();
+        let guard = PreemptGuard::enter();
+        if WAKEUP_STAGE.load(Ordering::Acquire) != 1 || crate::time::now_counter() >= deadline {
+            drop(guard);
+            if sched::thread_join(worker) != Ok(0) {
+                protocol::fail("deferred-wakeup", "SETUP_JOIN");
+            }
+            return false;
+        }
         while crate::time::now_counter() < deadline {
             core::hint::spin_loop();
         }
@@ -746,6 +764,7 @@ fn run_deferred_wakeup_case() {
     if sched::thread_join(worker) != Ok(0) {
         protocol::fail("deferred-wakeup", "JOIN");
     }
+    true
 }
 
 fn run_yield_inside_preempt_guard_case() {
