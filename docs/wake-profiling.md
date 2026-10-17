@@ -334,6 +334,27 @@ unrelated interrupt. Early-return calls are classified separately.
 
 ## Hardware comparison
 
+The agreed target is the observed maximum of submission plus IRQ-to-EL0,
+excluding intentional timer waiting, below 5000 ns on an agreed physical run.
+The follow-up results below belong to a reverted experiment, not the current
+runtime. Existing rtbench userspace observation is retained; no additional
+measuring mode is introduced.
+
+The current narrow follow-up removes trace-only counter reads from timer queue
+maintenance, samples RR time only when a new quantum is needed, removes unused
+architecture timer snapshots, and reuses the current SVC's staged profiler
+owner. It preserves locks, wait identity, and probe layout. No hardware result
+is inferred from its host or QEMU checks. The user subsequently reported
+10000 complete idle cycles, no early/lost/incomplete cycles, no overruns,
+and `result=3000000` for the same CPU3 command below. Release latency averaged
+6075 ns with a 12344 ns maximum; TET averaged 1134 ns with a 1198 ns maximum.
+Sequential interval means estimate 6256 ns for submission and 5921 ns from
+IRQ entry to first EL0 observation: 12177 ns excluding suspension, versus
+12262 ns in the committed reference. This roughly 0.7% difference is not
+controlled attribution or an observed round-trip maximum. START calibration
+was 156 ns for the counter pair and 52 ns for the trace write, not subtracted.
+Exact deployed FIT identity and environment details were not supplied.
+
 The current runtime uses one scheduler transaction for EL0 sleep submission,
 VM-owned CPU-local usercopy lookup, and fixed AArch64 full-frame copies without
 generic memory-copy calls. Probe identities and timing endpoints are unchanged;
@@ -404,6 +425,53 @@ a worst-case bound, or a complete round-trip measurement. Exact FIT/build
 identity, firmware, clock policy, and competing workload were not supplied.
 The [sub-5-us round-trip goal](roadmap/hardening.md#high-value-architecture-work)
 is a separate open target, not a reinterpretation of release latency.
+
+### Follow-up Pi results (user-reported)
+
+The user supplied these later full-profile runs of the same command on CPU3,
+with a 19200000 Hz counter. They belong to the now-reverted CPU-local scheduler,
+profiler, usercopy-cache, and timer experiment. The refinement precomputed
+runtime scheduler facades and removed repeated per-lock IRQ setup. Both
+experimental runs retained 9999 complete records, zero incomplete/lost records,
+and `result=3000000`.
+
+All times are nanoseconds; average/maximum pairs are reported directly.
+Submission and IRQ work estimates sum only sequential idle-path interval means.
+
+| Metric | Committed reference | Reverted experiment | Reverted refinement |
+| --- | ---: | ---: | ---: |
+| Release latency average / maximum | 6169 / 12917 | 9283 / 17657 | 6063 / 14271 |
+| TET average / maximum | 1134 / 1198 | 1162 / 1198 | 1137 / 1198 |
+| Overrun duration average / maximum | 0 / 0 | 0 / 3854 | 0 / 417 |
+| Overrun count | 0 | 1 | 1 |
+| Idle / early cycles | 9999 / 1 | 9661 / 338 | 9999 / 0 |
+| SVC entry -> sleep handoff, mean estimate | 6257 | 6892 | 6627 |
+| IRQ entry -> first EL0 observation, mean estimate | 6005 | 6368 | 5911 |
+| Combined work excluding suspension, mean estimate | 12262 | 13260 | 12538 |
+| Deadline -> IRQ entry, signed average / maximum | 52 / 1145 | 3085 / 6875 | 53 / 2500 |
+| Deadline -> first EL0 observation, average / maximum | 6065 / 12812 | 9463 / 17552 | 5972 / 14114 |
+
+Counter-pair and trace-write START observations are both 208 ns in the
+regressed run and both 52 ns in the latest run; neither is subtracted.
+Release average decreased 34.7%, but the dominant difference is the mean
+deadline-to-IRQ delay returning near one counter tick. Estimated sequential
+work decreased only 722 ns. The mixed release means also cover different
+idle/early populations, so they are not equivalent round-trip costs.
+
+The refinement did not improve the committed reference overall: its estimated
+mean work was 2.3% higher, release maximum was higher, and one overrun remained.
+The uncommitted implementation and its ownership changes were reverted at the
+user's request. These observations are retained as historical evidence, not
+current-source results or proof of an independently isolated cause.
+
+Summed means are approximate because interval means are truncated. They exclude
+the suspended interval and assembly outside the documented probes; maxima
+cannot be reconstructed by adding row maxima. The instrumented mean estimate
+alone already exceeds the sub-5-us target, but does not establish the normal
+kernel's timing or its observed maximum. Exact deployed FIT/build identities,
+clock policy, firmware, and competing workload were not supplied. These are
+user-reported hardware observations, not controlled per-change attribution or
+agent-executed/QEMU performance measurements.
 
 ### Matched collection
 

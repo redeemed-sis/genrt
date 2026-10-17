@@ -110,17 +110,33 @@ accepted ADRs remain authoritative when details differ.
 
 ## Scheduling and time
 
-- Latest user-reported Raspberry Pi 3B+ reference (reported 2026-10-16): CPU3,
+- Committed Raspberry Pi 3B+ hardware reference (reported 2026-10-16): CPU3,
   `taskset 3 rtbench -p 15000 -n 10000 -o 300 -P`, full profiling at
   19200000 Hz. Release latency averages 6169 ns, maximum 12917 ns; TET averages
   1134 ns, maximum 1198 ns. All 10000 cycles are complete, with 9999 idle wakes,
   one early return, no lost/incomplete records, no overruns, and result 3000000.
   Idle deadline-to-IRQ averages 52 ns and deadline-to-first-EL0 averages
-  6065 ns. The previous supplied full run averaged 9103 ns release latency;
-  this observation follows the ADR-0058 optimizations, not a controlled
-  per-change attribution or an uninstrumented round-trip measurement. See the
-  [recorded phase reference](../docs/wake-profiling.md#recorded-pi-reference-user-reported)
+  6065 ns. Sequential idle interval means estimate 12262 ns of work excluding
+  suspension, not an observed maximum or an uninstrumented baseline. This
+  user-reported result follows ADR-0058, not controlled per-change attribution.
+  See the [recorded reference](../docs/wake-profiling.md#recorded-pi-reference-user-reported)
   and [active measurement target](../docs/roadmap/hardening.md#high-value-architecture-work).
+- The uncommitted CPU-local scheduler/profiler, usercopy-cache, and timer
+  optimization experiment was reverted. Its final user-reported release
+  average/maximum was 6063/14271 ns with one 417 ns overrun; estimated idle-path
+  work was 12538 ns, compared with 12262 ns for the committed reference.
+  Preserve the [experimental measurements](../docs/wake-profiling.md#follow-up-pi-results-user-reported)
+  as historical evidence, not current-runtime behavior or a measured speedup.
+  The target remains an observed maximum below 5000 ns for submission plus
+  IRQ-to-EL0 excluding intentional waiting; release latency is not that metric.
+- The narrow follow-up removes trace-only queue counter reads and unused timer
+  snapshots, defers RR clock sampling until a new quantum is needed, and consumes
+  the staged SVC owner once at absolute-sleep admission. Scheduler/profiler locks,
+  wait identity, userspace ABI, and frame layout are unchanged. The user reported
+  10000 complete idle cycles with no overruns: release average/maximum
+  6075/12344 ns and estimated mean work excluding suspension 12177 ns. This is
+  instrumented user-reported evidence, not an observed round-trip maximum or
+  controlled per-change speedup; deployed FIT identity was not supplied.
 - EL0 sleep uses one scheduler transaction for automatic wait preparation,
   exact timer publication, and commit. Time ownership ends before handoff.
   Usercopy obtains its identity from VM-owned CPU-local installed-root and

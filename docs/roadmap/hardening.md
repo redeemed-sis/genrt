@@ -35,8 +35,9 @@ explicit acceptance criteria.
    - pursue the user-requested Raspberry Pi 3B+ sleep/wakeup round-trip target
      below 5000 ns, retaining the
      [latest reported reference](../wake-profiling.md#recorded-pi-reference-user-reported);
-     agree on round-trip endpoints, intentional-sleep exclusion, statistic
-     (average versus maximum), and instrumentation mode before claiming success.
+     use submission plus IRQ-to-EL0, excluding intentional timer waiting, and
+     require an observed maximum below the target on an agreed hardware run.
+     Retain instrumentation mode and exact run conditions with that result.
      Release latency and deadline-to-EL0 are not the complete sleep/wakeup
      round trip. Compare uninstrumented controls and focused probes, preserve
      validation and frame/ownership contracts, and retain build/environment
