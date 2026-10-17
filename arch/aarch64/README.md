@@ -176,6 +176,9 @@ EOIs through the executing CPU's GICC interface, and dispatches only that CPU's
 queue. The secondary first entry restores its scheduler-owned frame and timer
 IRQs can then perform normal local scheduler handoff. UART IRQ remains on CPU0
 and wakes stdin waiters without allocation.
+Timer arm, disarm, and IRQ paths do not maintain shadow register snapshots.
+Initialization readback, past-deadline clamping, programming barriers, and
+optional wake-profile probes remain in place.
 
 Cross-CPU runnable publication uses SGI 1 as a scheduler-only notification.
 The architecture translates the logical destination through its immutable GIC

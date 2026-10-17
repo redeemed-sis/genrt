@@ -152,6 +152,9 @@ and publishes its deadline only to that CPU's queue.
 Representable conversion products use checked native-width arithmetic; wider
 inputs retain the exact 128-bit fallback. Cancelling a missing event leaves the
 timer untouched, including a nonexistent RR quantum during a sole-thread sleep.
+Time queue maintenance samples a diagnostic counter only inside enabled trace
+logging. RR maintenance samples time only after confirming that a new quantum
+is needed; current-thread, peer, and existing-event checks precede that read.
 
 Cross-CPU cancellation may remove an exact event without touching the remote
 physical timer; at worst the old deadline causes one harmless early interrupt.

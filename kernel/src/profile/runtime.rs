@@ -64,6 +64,14 @@ impl CpuProfile {
             None
         }
     }
+
+    fn begin(&mut self, deadline: u64, early: bool) {
+        if let Some((owner, entry)) = self.svc.take() {
+            if let Some(session) = self.session.as_mut() {
+                session.begin(owner, deadline, early, entry);
+            }
+        }
+    }
 }
 static CPU: [IrqSpinLock<CpuProfile>; crate::config::KERNEL_CPU_CAPACITY] =
     [const { IrqSpinLock::new(CpuProfile::new()) }; crate::config::KERNEL_CPU_CAPACITY];
@@ -224,27 +232,26 @@ pub(crate) fn cleanup(owner: ThreadId) {
 /// # Arguments
 /// * `entry` - Raw probe from live exception padding, never SavedContext.
 /// # Returns
-/// Returns after staging the current exact owner, or unchanged if no thread.
+/// Returns after staging the current exact owner, or clearing stale staging
+/// when no current thread exists.
 pub fn svc_entry(entry: u64) {
     let owner = sched::current_thread_id();
-    if let Some(owner) = owner {
-        slot(cpu()).lock().svc = Some((owner, entry));
-    }
+    slot(cpu()).lock().svc = owner.map(|owner| (owner, entry));
 }
 
 /// Begin one validated absolute sleep cycle in preallocated storage.
+/// Consumes the current SVC's staged owner and entry exactly once. Syscall
+/// admission has not handed off or admitted IRQs since staging; no second
+/// scheduler lookup is needed. The session still checks the exact owner.
 /// # Arguments
-/// * `owner` - Current thread identity captured before profiler locking.
 /// * `deadline` - Checked absolute counter deadline.
 /// * `early` - Deadline already passed, so no blocked wait is claimed.
 /// # Returns
 /// Returns after retention or loss accounting; foreign/inactive calls ignored.
-pub(crate) fn begin(owner: ThreadId, deadline: u64, early: bool) {
-    let mut state = slot(cpu()).lock();
-    let entry = state.svc.filter(|(id, _)| *id == owner).map(|(_, v)| v);
-    if let (Some(entry), Some(s)) = (entry, state.session.as_mut()) {
-        s.begin(owner, deadline, early, entry);
-    }
+/// # Panics
+/// Panics if the executing CPU has no valid logical binding.
+pub(crate) fn begin(deadline: u64, early: bool) {
+    slot(cpu()).lock().begin(deadline, early);
 }
 
 /// Associate the prepared exact wait with the currently validated cycle.

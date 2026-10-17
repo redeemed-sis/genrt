@@ -218,7 +218,7 @@ impl CpuScheduler<'_> {
             return;
         };
         self.handoff_optional(context);
-        self.replace_quantum_event(crate::time::now_counter(), current);
+        self.replace_quantum_event(current);
     }
 
     pub(super) fn finish_timer_interrupt(
@@ -317,7 +317,7 @@ impl CpuScheduler<'_> {
             return;
         };
         self.handoff_optional(context);
-        self.replace_quantum_event(crate::time::now_counter(), current);
+        self.replace_quantum_event(current);
     }
 
     pub(super) fn finish_block_current(&mut self, current: ThreadId, next: ThreadId) {
@@ -325,8 +325,7 @@ impl CpuScheduler<'_> {
         // depth-zero checkpoint; it never needs to select a second thread.
         let online = self.state().online;
         let _ = crate::sync::preempt::consume_checkpoint_on(self.cpu(), online);
-        let now = crate::time::now_counter();
-        self.replace_quantum_event(now, current);
+        self.replace_quantum_event(current);
         if next != current {
             log_switch(self.cpu(), current, next);
         }
@@ -345,12 +344,10 @@ impl CpuScheduler<'_> {
         let running = self
             .running_thread()
             .unwrap_or_else(|| panic!("scheduler has no running thread"));
-        let now = crate::time::now_counter();
-
         if self.state().online {
             panic!("sched: CPU{} entered twice", self.cpu().index());
         }
-        self.ensure_quantum_event(now);
+        self.ensure_quantum_event(crate::time::now_counter);
         debug_assert_eq!(self.current_thread(), Some(running));
         debug_assert_eq!(self.thread_state(running.index()), ThreadState::Running);
         self.activate_thread_address_space(running);
@@ -405,11 +402,11 @@ impl CpuScheduler<'_> {
     pub(super) fn note_runnable_peer_available(&mut self) {
         if self.current_thread().is_some() && self.has_runnable_peer() {
             crate::sync::preempt::request_reschedule_on(self.cpu());
-            self.ensure_quantum_event(crate::time::now_counter());
+            self.ensure_quantum_event(crate::time::now_counter);
         }
     }
 
-    fn ensure_quantum_event(&mut self, now: u64) {
+    fn ensure_quantum_event(&mut self, now: impl FnOnce() -> u64) {
         let Some(current) = self.running_thread() else {
             return;
         };
@@ -422,7 +419,7 @@ impl CpuScheduler<'_> {
             return;
         }
 
-        let deadline = now.wrapping_add(crate::time::ms_to_counts(self.rr_quantum_ms));
+        let deadline = now().wrapping_add(crate::time::ms_to_counts(self.rr_quantum_ms));
         crate::time::schedule_event(deadline, event);
         crate::trace!(
             "sched: thread {current} quantum={}ms until counter {deadline}",
@@ -430,9 +427,18 @@ impl CpuScheduler<'_> {
         );
     }
 
-    pub(super) fn replace_quantum_event(&mut self, now: u64, obsolete_thread: ThreadId) {
+    /// Remove the old quantum and arm one only if the selected thread has a peer.
+    /// # Arguments
+    /// * `obsolete_thread` - Exact thread whose old quantum must be cancelled.
+    /// # Returns
+    /// Returns after bounded, allocation-free queue maintenance. The time owner
+    /// masks IRQs while updating its queue; the clock is sampled only for a new
+    /// quantum, after checking local peers and existing registration.
+    /// # Panics
+    /// Panics if the local time queue or scheduler ownership is invalid.
+    pub(super) fn replace_quantum_event(&mut self, obsolete_thread: ThreadId) {
         crate::time::cancel_event(TimedEvent::quantum_expired(self.cpu(), obsolete_thread));
-        self.ensure_quantum_event(now);
+        self.ensure_quantum_event(crate::time::now_counter);
     }
 
     fn handoff_optional(&mut self, context: &mut ActiveContext<'_>) {
@@ -450,5 +456,36 @@ impl CpuScheduler<'_> {
         #[cfg(feature = "wake-profile")]
         crate::profile::context_restored(to);
         log_switch(self.cpu(), from, to);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::sched::{Scheduler, ThreadArg};
+
+    #[test]
+    fn quantum_clock_is_not_sampled_without_a_current_thread_or_peer() {
+        #[cfg(feature = "wake-profile")]
+        crate::test_arch_stubs::register_profile_test_cpu();
+        let cpu = crate::cpu::CpuId::from_index(0).unwrap();
+        for worker in [false, true] {
+            let mut scheduler = Scheduler::transition_new(2, 1);
+            scheduler
+                .on_cpu(cpu)
+                .ensure_quantum_event(|| panic!("clock sampled without a current thread"));
+            scheduler
+                .on_cpu(cpu)
+                .transition_append_bootstrap(|_| 0, ThreadArg::empty(), true);
+            if worker {
+                scheduler
+                    .on_cpu(cpu)
+                    .transition_append_bootstrap(|_| 0, ThreadArg::empty(), false);
+            }
+            scheduler.on_cpu(cpu).transition_initial_dispatch().unwrap();
+            assert!(!scheduler.on_cpu(cpu).has_runnable_peer());
+            scheduler
+                .on_cpu(cpu)
+                .ensure_quantum_event(|| panic!("clock sampled without a runnable peer"));
+        }
     }
 }

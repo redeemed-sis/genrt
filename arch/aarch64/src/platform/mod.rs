@@ -37,6 +37,7 @@ pub(crate) mod uart;
 
 pub(crate) use self::boot_dtb::{BootDeviceRange, BootPlatformInfo};
 pub(crate) use self::cpu::{cpu_count, expected_hardware_id, init_cpu_topology};
+#[cfg(not(feature = "platform-raspberrypi-3b-plus"))]
 pub(crate) const CPU_CAPACITY: usize = cpu::MAX_BOOT_CPUS;
 /// Low assembly selector for the Raspberry Pi EL2 and spin-table entry path.
 pub(crate) const PI_RUNTIME: u8 = cfg!(feature = "platform-raspberrypi-3b-plus") as u8;

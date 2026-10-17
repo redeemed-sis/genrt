@@ -449,9 +449,7 @@ fn sys_clock_nanosleep(context: &mut ActiveContext<'_>, request: SyscallRequest)
         let early = deadline <= time::now_counter();
         #[cfg(feature = "wake-profile")]
         if flags == TIMER_ABSTIME {
-            if let Some(owner) = sched::current_thread_id() {
-                crate::profile::begin(owner, deadline, early);
-            }
+            crate::profile::begin(deadline, early);
         }
         if early {
             return Ok(None);

@@ -48,6 +48,45 @@ fn owner_lifecycle_conflicts_and_frozen_replacement_policy() {
 }
 
 #[test]
+fn sleep_admission_consumes_one_exact_staged_svc_without_owner_lookup() {
+    let mut state = CpuProfile::new();
+    state.session = Some(session(config(2)));
+    state.begin(100, false);
+    assert_eq!(state.session.as_ref().unwrap().header.recorded, 0);
+    for foreign in [ThreadId::new(8, 4), ThreadId::new(7, 5)] {
+        state.svc = Some((foreign, 10));
+        state.begin(100, false);
+        assert!(state.svc.is_none());
+        assert_eq!(state.session.as_ref().unwrap().header.recorded, 0);
+    }
+    state.svc = Some((owner(), 17));
+    state.begin(100, false);
+    assert!(state.svc.is_none());
+    let token = WaitToken::for_profile_test(owner(), cpu0(), 9);
+    state.session.as_mut().unwrap().bind(token, 100);
+    // Repeated admission and an unrelated SVC cannot erase the in-flight wait.
+    state.begin(101, false);
+    state.svc = Some((ThreadId::new(7, 5), 18));
+    state.begin(101, false);
+    let s = state.session.as_ref().unwrap();
+    assert_eq!(s.header.recorded, 1);
+    assert_eq!(s.records[0].counters[Phase::SvcEntry as usize], 17);
+    assert_eq!(s.records[0].requested_deadline, 100);
+    assert_eq!(s.cycle.as_ref().unwrap().token, Some(token));
+    state.svc = Some((owner(), 19));
+    state.begin(200, true);
+    let s = state.session.as_ref().unwrap();
+    assert_eq!(s.header.recorded, 2);
+    assert_eq!(s.header.early, 1);
+    assert_eq!(s.records[1].counters[Phase::SvcEntry as usize], 19);
+    state.session.as_mut().unwrap().freeze();
+    state.svc = Some((owner(), 20));
+    state.begin(300, false);
+    assert!(state.svc.is_none());
+    assert_eq!(state.session.as_ref().unwrap().header.recorded, 2);
+}
+
+#[test]
 fn task_irq_window_and_leaf_restore_their_exact_entry_states() {
     unsafe extern "C" {
         fn arch_local_irq_save_and_disable() -> u64;

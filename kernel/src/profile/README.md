@@ -32,6 +32,9 @@ handoff code after incoming context restoration and address-space activation.
 session. `session` owns the record lifecycle and does not acquire locks or call
 the scheduler. `format` has no runtime state or architecture dependencies.
 Counter reads use the shared private hook through the facade.
+Absolute-sleep admission consumes the current SVC's staged owner/entry once,
+without repeating scheduler identity lookup. IRQs remain masked and no handoff
+occurs between staging and admission; exact owner and wait checks remain intact.
 
 Heap allocation and destruction occur in task context outside profiler locks.
 The heap window allows IRQ delivery while preventing a scheduler handoff, then

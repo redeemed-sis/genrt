@@ -362,15 +362,12 @@ impl TimeState {
         self.queue.schedule(deadline, event);
     }
 
-    fn cancel_event(&mut self, event: TimedEvent, rearm_at: Option<u64>) -> bool {
+    fn cancel_event(&mut self, event: TimedEvent, rearm: bool) -> bool {
         let canceled = self.queue.cancel(event);
         // A missing quantum must not reprogram the surviving wait deadline.
         // Remote callers and IRQ batch cleanup defer programming to the owner.
-        if canceled
-            && !self.dispatching_irq
-            && let Some(now) = rearm_at
-        {
-            self.rearm_timer(now);
+        if canceled && !self.dispatching_irq && rearm {
+            self.rearm_timer();
         }
         canceled
     }
@@ -394,11 +391,13 @@ impl TimeState {
         expired
     }
 
-    fn rearm_timer(&mut self, now: u64) {
+    fn rearm_timer(&mut self) {
         let next_deadline = self.queue.next_deadline();
         if next_deadline != self.armed_timer_deadline {
             match next_deadline {
-                Some(deadline) => crate::trace!("time: arm next deadline={deadline} now={now}"),
+                Some(deadline) => {
+                    crate::trace!("time: arm next deadline={deadline} now={}", now_counter())
+                }
                 None => crate::trace!("time: disarm timer"),
             }
         }
@@ -630,11 +629,10 @@ pub(crate) fn schedule_event(deadline: u64, event: TimedEvent) {
             event.cpu().index()
         );
     }
-    let now = now_counter();
     with_time_mut(cpu, |time| {
         time.schedule_event(deadline, event);
         if !time.dispatching_irq {
-            time.rearm_timer(now);
+            time.rearm_timer();
         }
     });
     crate::trace!("time: scheduled {event:?} deadline={deadline}");
@@ -664,10 +662,7 @@ pub(crate) fn schedule_event(deadline: u64, event: TimedEvent) {
 pub(crate) fn cancel_event(event: TimedEvent) {
     let current = current_cpu();
     let owner = event.cpu();
-    let now = now_counter();
-    let canceled = with_time_mut(owner, |time| {
-        time.cancel_event(event, (current == owner).then_some(now))
-    });
+    let canceled = with_time_mut(owner, |time| time.cancel_event(event, current == owner));
     if canceled {
         crate::trace!("time: canceled {event:?}");
     }
@@ -737,7 +732,7 @@ pub fn on_timer_interrupt(context: &mut ActiveContext<'_>) {
 
     with_time_mut(cpu, |time| {
         if let Some(event) = quantum.obsolete {
-            time.cancel_event(event, None);
+            time.cancel_event(event, false);
         }
         if let Some((deadline, event)) = quantum.ensure {
             if !time.event_pending(event) {
@@ -747,7 +742,7 @@ pub fn on_timer_interrupt(context: &mut ActiveContext<'_>) {
         expired.len = 0;
         time.expired = Some(expired);
         time.dispatching_irq = false;
-        time.rearm_timer(now);
+        time.rearm_timer();
     });
     #[cfg(feature = "wake-profile")]
     crate::profile::timer_rearmed();
@@ -905,15 +900,15 @@ mod tests {
         let missing = TimedEvent::quantum_expired(cpu, ThreadId::new(2, 1));
         let mut time = TimeState::try_new(2).unwrap();
         time.schedule_event(100, event);
-        time.rearm_timer(0);
+        time.rearm_timer();
         let before = crate::test_arch_stubs::timer_program_counts();
 
-        assert!(!time.cancel_event(missing, Some(0)));
+        assert!(!time.cancel_event(missing, true));
         assert_eq!(time.queue.next_deadline(), Some(100));
         assert_eq!(time.armed_timer_deadline, Some(100));
         assert_eq!(crate::test_arch_stubs::timer_program_counts(), before);
 
-        assert!(time.cancel_event(event, Some(0)));
+        assert!(time.cancel_event(event, true));
         assert_eq!(time.queue.next_deadline(), None);
         assert_eq!(time.armed_timer_deadline, None);
         assert_eq!(
@@ -926,13 +921,13 @@ mod tests {
     fn remote_and_batched_cancellation_defer_timer_programming() {
         let cpu = CpuId::from_index(0).unwrap();
         let event = TimedEvent::quantum_expired(cpu, ThreadId::new(1, 1));
-        for (dispatching, rearm_at) in [(false, None), (true, Some(0))] {
+        for (dispatching, rearm) in [(false, false), (true, true)] {
             let mut time = TimeState::try_new(1).unwrap();
             time.schedule_event(100, event);
-            time.rearm_timer(0);
+            time.rearm_timer();
             time.dispatching_irq = dispatching;
             let before = crate::test_arch_stubs::timer_program_counts();
-            assert!(time.cancel_event(event, rearm_at));
+            assert!(time.cancel_event(event, rearm));
             assert_eq!(time.queue.next_deadline(), None);
             assert_eq!(time.armed_timer_deadline, Some(100));
             assert_eq!(crate::test_arch_stubs::timer_program_counts(), before);
