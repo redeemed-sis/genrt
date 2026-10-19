@@ -125,8 +125,8 @@ cargo xtask dist --tag v0.0.0-local.1 --output-dir /tmp/genrt-dist
 ```
 
 The release gate tests exact production executables in controlled contract
-images, verifies production composition and hashes, and emits a deterministic
-bundle. See [the published releases](https://github.com/redeemed-sis/genrt/releases)
+images and emits a deterministic QEMU bundle plus a Raspberry Pi 3B+ FIT.
+See [the published releases](https://github.com/redeemed-sis/genrt/releases)
 and [docs/releases.md](docs/releases.md).
 
 ## Repository layout

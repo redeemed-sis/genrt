@@ -149,9 +149,13 @@ fn doctor() -> Result<()> {
         "dtc",
         "fdtget",
         "fdtput",
+        "mkimage",
+        "dumpimage",
         "clang",
         "ld.lld",
         "llvm-ar",
+        "llvm-objcopy",
+        "llvm-nm",
         "llvm-objdump",
         "readelf",
     ];

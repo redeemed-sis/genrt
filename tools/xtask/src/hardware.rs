@@ -1,7 +1,7 @@
 //! Shared-kernel hardware builds; artifacts stay separate from QEMU.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, ensure};
@@ -9,12 +9,26 @@ use anyhow::{Context, Result, ensure};
 use crate::artifacts::{AARCH64_TARGET, verify_kernel_composition};
 
 const BOARD_NAME: &str = "raspberrypi-3b-plus";
+/// Explicit Cargo feature used by ordinary Pi builds, including releases.
+pub(crate) const RELEASE_FEATURE: &str = "platform-raspberrypi-3b-plus";
 const KERNEL_ENTRY: usize = 0x0200_0000;
 const FIT_UPLOAD: usize = 0x0100_0000;
 const MAX_IMAGE_SIZE: usize = 8 * 1024 * 1024;
 const _: () = assert!(KERNEL_ENTRY + MAX_IMAGE_SIZE < 0x0800_0000);
 const ARM64_HEADER_SIZE: usize = 64;
 const ARM64_PLACEMENT_FLAGS: u64 = 8;
+
+/// Verified Pi build inputs and the FIT containing their exact bytes.
+pub(crate) struct Artifacts {
+    /// Linked kernel ELF, checked against the selected diagnostic policy.
+    pub(crate) kernel_elf: PathBuf,
+    /// Validated board device tree embedded in the FIT.
+    pub(crate) dtb: PathBuf,
+    /// Production archive embedded in the FIT without modification.
+    pub(crate) initramfs: PathBuf,
+    /// Deterministically serialized kernel, DTB, and initramfs FIT.
+    pub(crate) image: PathBuf,
+}
 
 /// Build the complete Raspberry Pi kernel, DTB, and initramfs FIT.
 ///
@@ -38,6 +52,24 @@ const ARM64_PLACEMENT_FLAGS: u64 = 8;
 /// check. Requires Cargo, LLD, LLVM objcopy/nm/objdump, readelf, dtc, fdtget,
 /// mkimage, and dumpimage.
 pub(crate) fn build(wake_profile: bool) -> Result<()> {
+    build_inner(wake_profile, None).map(|_| ())
+}
+
+/// Build an ordinary Pi FIT using the exact release-verified initramfs.
+///
+/// # Arguments
+/// * `initramfs` - Prebuilt production CPIO with its generated JSON sidecar.
+/// # Returns
+/// Returns verified Pi artifacts without rebuilding any userspace executable.
+/// Builds only the platform kernel, DTB, and FIT; never accesses a board.
+/// # Errors
+/// Returns an error for invalid production input, tool/build failure, or failed
+/// composition, image, component-identity, or deterministic-serialization checks.
+pub(crate) fn build_release(initramfs: &Path) -> Result<Artifacts> {
+    build_inner(false, Some(initramfs))
+}
+
+fn build_inner(wake_profile: bool, prebuilt_initramfs: Option<&Path>) -> Result<Artifacts> {
     let name = BOARD_NAME;
     let directory = format!(
         "target/{name}{}",
@@ -57,7 +89,7 @@ pub(crate) fn build(wake_profile: bool) -> Result<()> {
         .args([
             "--features",
             &format!(
-                "platform-{name}{}",
+                "{RELEASE_FEATURE}{}",
                 if wake_profile { ",wake-profile" } else { "" }
             ),
         ])
@@ -108,14 +140,17 @@ pub(crate) fn build(wake_profile: bool) -> Result<()> {
     verify_payload(&payload)?;
     fs::write(&binary, &payload)?;
 
-    let initramfs_path = crate::workflow::build_initramfs(
-        crate::artifacts::Profile::Release,
-        None,
-        None,
-        Some(root.join("initramfs.cpio")),
-        false,
-    )?;
-    let initramfs = fs::read(initramfs_path)?;
+    let initramfs_path = match prebuilt_initramfs {
+        Some(source) => reuse_initramfs(source, &root.join("initramfs.cpio"))?,
+        None => crate::workflow::build_initramfs(
+            crate::artifacts::Profile::Release,
+            None,
+            None,
+            Some(root.join("initramfs.cpio")),
+            false,
+        )?,
+    };
+    let initramfs = fs::read(&initramfs_path)?;
 
     run(Command::new("dtc")
         .args(["-I", "dts", "-O", "dtb", "-o"])
@@ -137,7 +172,27 @@ pub(crate) fn build(wake_profile: bool) -> Result<()> {
     println!("U-Boot: bootm {:08x}", FIT_UPLOAD);
     println!("Experimental Pi SMP runtime: FIT includes production /init.");
     println!("Procedure: {source}/README.md");
-    Ok(())
+    Ok(Artifacts {
+        kernel_elf: elf,
+        dtb,
+        initramfs: initramfs_path,
+        image,
+    })
+}
+
+fn reuse_initramfs(source: &Path, destination: &Path) -> Result<PathBuf> {
+    use crate::initramfs::{self, Policy};
+
+    let manifest = initramfs::manifest_path(source);
+    initramfs::verify(source, &manifest, Policy::Production)?;
+    fs::copy(source, destination)?;
+    fs::copy(manifest, initramfs::manifest_path(destination))?;
+    initramfs::verify(
+        destination,
+        &initramfs::manifest_path(destination),
+        Policy::Production,
+    )?;
+    Ok(destination.to_owned())
 }
 
 fn run(command: &mut Command) -> Result<()> {
@@ -323,6 +378,50 @@ fn verify_payload(payload: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_initramfs_reuse_preserves_bytes_and_rejects_invalid_inputs() {
+        use crate::initramfs::{self, Policy, Provenance};
+
+        let root = std::env::temp_dir().join(format!("genrt-pi-cpio-{}", std::process::id()));
+        let source_tree = root.join("source");
+        fs::create_dir_all(&source_tree).unwrap();
+        let mut elf = vec![0; 64];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&183u16.to_le_bytes());
+        fs::write(source_tree.join("init"), elf).unwrap();
+        let source = root.join("release.cpio");
+        let destination = root.join("pi.cpio");
+        initramfs::build(
+            &source_tree,
+            &source,
+            Policy::Production,
+            &Provenance::default(),
+        )
+        .unwrap();
+        reuse_initramfs(&source, &destination).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
+        assert_eq!(
+            fs::read(initramfs::manifest_path(&source)).unwrap(),
+            fs::read(initramfs::manifest_path(&destination)).unwrap()
+        );
+        let retained = fs::read(&destination).unwrap();
+        fs::write(&source, "corrupt archive").unwrap();
+        assert!(reuse_initramfs(&source, &destination).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), retained);
+
+        let mut provenance = Provenance::default();
+        provenance
+            .mark_prefix("init", initramfs::Origin::TestSupervisor)
+            .unwrap();
+        initramfs::build(&source_tree, &source, Policy::Test, &provenance).unwrap();
+        assert!(reuse_initramfs(&source, &destination).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), retained);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn fit_hash_policy_checks_algorithm_bytes_and_payload() {

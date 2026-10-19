@@ -28,7 +28,7 @@ setup_backend_for_os "$SETUP_OS_ID" "$SETUP_OS_VERSION_ID" "$(uname -m)" >/dev/n
 }
 
 rustup_state=$(setup_prepare_rustup arch)
-packages=(base-devel git qemu-system-aarch64 dtc clang lld llvm binutils)
+packages=(base-devel git qemu-system-aarch64 dtc uboot-tools clang lld llvm binutils)
 if [[ "$rustup_state" == 'install' ]]; then
     packages+=(rustup)
 fi

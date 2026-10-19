@@ -68,5 +68,6 @@ growth.
 
 | [0059](ADR-0059-native-counter-sleep-and-active-read-validation.md) | Native counter sleep and active-read validation | Accepted | Syscall/time/VM ownership | - | [0060](ADR-0060-retire-native-counter-sleep-interface.md) (native userspace interface only) |
 | [0060](ADR-0060-retire-native-counter-sleep-interface.md) | Retire native counter-sleep interface | Accepted | Userspace sleep ABI | [0059](ADR-0059-native-counter-sleep-and-active-read-validation.md) (native userspace interface only) | - |
+| [0061](ADR-0061-raspberrypi-fit-release-artifacts.md) | Raspberry Pi FIT release artifacts | Accepted | Release composition and verification scope | - | - |
 
 Use [`TEMPLATE.md`](TEMPLATE.md) for new decisions.

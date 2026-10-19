@@ -279,8 +279,11 @@ Changes that invalidate one require architecture review and an ADR.
 - QEMU pass/fail comes only from bounded machine protocol records, never prompt
   text, boot prose, or a hard-coded production directory listing.
 - QEMU children are bounded by deadlines and are always terminated and reaped.
-- Release binaries are the same production artifacts exercised by contract
-  tests; packaging does not rebuild them afterward.
+- The QEMU release kernel and all released userspace executables are the exact
+  artifacts exercised by their contracts; packaging does not rebuild them.
+  Pi uses a separately built, structurally verified platform kernel and the
+  identical production initramfs. Its release metadata states the verification
+  scope and never presents QEMU tests as a physical Pi boot or timing guarantee.
 - Initramfs and release archives use canonical paths, sorted entries, fixed
   metadata, verified manifests, and content hashes.
 

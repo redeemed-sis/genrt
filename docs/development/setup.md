@@ -40,7 +40,7 @@ the package tools retain their normal confirmation prompts.
 The Arch backend uses `pacman -S --needed` and installs:
 
 ```text
-base-devel git qemu-system-aarch64 dtc clang lld llvm binutils
+base-devel git qemu-system-aarch64 dtc uboot-tools clang lld llvm binutils
 ```
 
 It also installs `rustup` only when the `rustup` command is absent. It never
@@ -51,11 +51,14 @@ The Ubuntu backend runs `apt-get update` before installation and installs:
 
 ```text
 build-essential git qemu-system-arm device-tree-compiler clang lld llvm
-binutils ca-certificates
+binutils u-boot-tools ca-certificates
 ```
 
 The LLVM packages provide `llvm-ar`, used to build the deterministic static
 userspace support archive, as well as the existing LLVM inspection tools.
+The U-Boot tools package provides `mkimage` and `dumpimage`, required for the
+Raspberry Pi FIT included by `cargo xtask dist`. Device-tree tools provide
+`dtc`, `fdtget`, and `fdtput`.
 
 It likewise adds `rustup` only when needed. If `universe` is unavailable after
 the initial update, the backend announces this, installs
@@ -96,13 +99,13 @@ manager commands for the appropriate supported platform:
 ```bash
 # Arch Linux x86_64
 sudo pacman -S --needed \
-  base-devel git rustup qemu-system-aarch64 dtc clang lld llvm binutils
+  base-devel git rustup qemu-system-aarch64 dtc uboot-tools clang lld llvm binutils
 
 # Ubuntu 24.04 or 26.04
 sudo apt-get update
 sudo apt-get install \
   build-essential git rustup qemu-system-arm device-tree-compiler clang lld \
-  llvm binutils ca-certificates
+  llvm binutils u-boot-tools ca-certificates
 ```
 
 On Ubuntu, enable `universe` through `add-apt-repository universe` and repeat

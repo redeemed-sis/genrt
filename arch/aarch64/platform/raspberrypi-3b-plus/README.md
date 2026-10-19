@@ -15,6 +15,11 @@ copy the FIT onto the existing microSD boot partition for persistent loading.
 
 ## Build
 
+Tagged releases also provide `genrt-raspberrypi-3b-plus-vX.Y.Z.itb` and its
+build/verification manifest. Verify the accompanying `SHA256SUMS`; the FIT can
+be deployed directly using the UART or microSD procedures below, without a
+local build. See [release artifacts](../../../../docs/releases.md#raspberry-pi-asset).
+
 ```bash
 cargo xtask build-raspberrypi-3b-plus
 ```

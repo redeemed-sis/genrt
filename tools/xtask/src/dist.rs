@@ -15,7 +15,7 @@ use tar::{Builder, Header};
 use crate::{
     artifacts::{AARCH64_TARGET, Aarch64Artifacts, Profile},
     cli::LogLevel,
-    initramfs, qemu,
+    hardware, initramfs, qemu,
     test::{self, Options, PreparedArtifacts},
     workflow,
 };
@@ -46,12 +46,29 @@ struct ManifestFile {
     sha256: String,
 }
 
-/// Verify and package a tagged AArch64 QEMU release.
+#[derive(Serialize)]
+struct HardwareManifest {
+    #[serde(flatten)]
+    build: Manifest,
+    platform: &'static str,
+    kernel_verification: &'static str,
+    userspace_verification: &'static str,
+    kernel_elf_sha256: String,
+    dtb_sha256: String,
+    initramfs_sha256: String,
+    dtc_version: String,
+    mkimage_version: String,
+    dumpimage_version: String,
+    llvm_objcopy_version: String,
+}
+
+/// Verify and package tagged AArch64 QEMU and Raspberry Pi release artifacts.
 ///
 /// # Arguments
 ///
 /// * tag - Version label in v-prefixed SemVer form.
-/// * output_dir - Directory that receives the archive and SHA256SUMS.
+/// * output_dir - Directory receiving the QEMU archive, Pi FIT/manifest, and
+///   SHA256SUMS. Unrelated existing output entries are rejected, never deleted.
 ///
 /// # Returns
 ///
@@ -139,9 +156,18 @@ pub(crate) fn run(tag: &str, output_dir: &Path) -> Result<()> {
         ))?;
     }
 
+    // Pi uses a distinct platform kernel, but never rebuilds the dynamically
+    // tested userspace or substitutes a stale hardware-build initramfs.
+    let pi = hardware::build_release(&prepared.initramfs)?;
+    if sha256_file(&pi.initramfs)? != sha256_file(&prepared.initramfs)? {
+        bail!("Pi FIT initramfs differs from verified QEMU release initramfs");
+    }
     fs::create_dir_all(output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
-    package(tag, &version, output_dir, &prepared)
+    let archive = package(tag, &version, output_dir, &prepared)?;
+    let mut assets = vec![archive];
+    assets.extend(package_hardware(tag, &version, output_dir, &pi)?);
+    write_checksums(output_dir, &assets)
 }
 
 fn verify_userspace_identity(
@@ -290,7 +316,7 @@ fn package(
     version: &Version,
     output_dir: &Path,
     prepared: &PreparedArtifacts,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let bundle_name = format!("genrt-aarch64-qemu-virt-{tag}");
     let staging = output_dir.join(".staging").join(&bundle_name);
     if staging.exists() {
@@ -320,31 +346,17 @@ fn package(
     fs::write(staging.join("run.sh"), launcher::script())?;
     fs::write(staging.join("RUN.md"), launcher::guide())?;
 
-    let manifest = Manifest {
-        project: "genrt",
-        tag: tag.to_owned(),
-        prerelease: !version.pre.is_empty(),
-        git_commit: command_line(Command::new("git").args(["rev-parse", "HEAD"]))?,
-        target: AARCH64_TARGET,
-        cargo_profile: "release",
-        kernel_features: vec!["log-level-info".to_owned()],
-        rustc_version: command_line(Command::new("rustc").arg("--version"))?,
-        cargo_version: command_line(Command::new("cargo").arg("--version"))?,
-        qemu_version: command_first_line(Command::new("qemu-system-aarch64").arg("--version"))?,
-        clang_version: command_first_line(Command::new("clang").arg("--version"))?,
-        llvm_ar_version: command_first_line(Command::new("llvm-ar").arg("--version"))?,
-        lld_version: command_first_line(Command::new("ld.lld").arg("--version"))?,
-        files: bundle_files()
-            .iter()
-            .filter(|name| *name != "manifest.json")
-            .map(|name| {
-                Ok(ManifestFile {
-                    path: name.clone(),
-                    sha256: sha256_file(&staging.join(name))?,
-                })
+    let files = bundle_files()
+        .iter()
+        .filter(|name| *name != "manifest.json")
+        .map(|name| {
+            Ok(ManifestFile {
+                path: name.clone(),
+                sha256: sha256_file(&staging.join(name))?,
             })
-            .collect::<Result<Vec<_>>>()?,
-    };
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let manifest = build_manifest(tag, version, vec!["log-level-info".to_owned()], files)?;
     fs::write(
         staging.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -361,11 +373,111 @@ fn package(
     if sha256_file(&archive)? != sha256_file(&repeated)? {
         bail!("release archive serialization is not deterministic");
     }
-    let archive_name = archive.file_name().unwrap().to_string_lossy();
-    let checksum = format!("{}  {archive_name}\n", sha256_file(&archive)?);
-    fs::write(output_dir.join("SHA256SUMS"), checksum)?;
     fs::remove_dir_all(output_dir.join(".staging"))?;
     println!("built {}", archive.display());
+    Ok(archive)
+}
+
+fn build_manifest(
+    tag: &str,
+    version: &Version,
+    kernel_features: Vec<String>,
+    files: Vec<ManifestFile>,
+) -> Result<Manifest> {
+    Ok(Manifest {
+        project: "genrt",
+        tag: tag.to_owned(),
+        prerelease: !version.pre.is_empty(),
+        git_commit: command_line(Command::new("git").args(["rev-parse", "HEAD"]))?,
+        target: AARCH64_TARGET,
+        cargo_profile: "release",
+        kernel_features,
+        rustc_version: command_line(Command::new("rustc").arg("--version"))?,
+        cargo_version: command_line(Command::new("cargo").arg("--version"))?,
+        qemu_version: command_first_line(Command::new("qemu-system-aarch64").arg("--version"))?,
+        clang_version: command_first_line(Command::new("clang").arg("--version"))?,
+        llvm_ar_version: command_line(Command::new("llvm-ar").arg("--version"))?,
+        lld_version: command_first_line(Command::new("ld.lld").arg("--version"))?,
+        files,
+    })
+}
+
+fn package_hardware(
+    tag: &str,
+    version: &Version,
+    output_dir: &Path,
+    pi: &hardware::Artifacts,
+) -> Result<Vec<PathBuf>> {
+    crate::artifacts::verify_production_kernel(&pi.kernel_elf)?;
+    let name = format!("genrt-raspberrypi-3b-plus-{tag}");
+    let fit = output_dir.join(format!("{name}.itb"));
+    let expected = sha256_file(&pi.image)?;
+    fs::copy(&pi.image, &fit)?;
+    if sha256_file(&fit)? != expected {
+        bail!("staged Pi FIT differs from verified build");
+    }
+    let manifest = HardwareManifest {
+        build: build_manifest(
+            tag,
+            version,
+            vec![hardware::RELEASE_FEATURE.to_owned()],
+            vec![ManifestFile {
+                path: format!("{name}.itb"),
+                sha256: expected,
+            }],
+        )?,
+        platform: "raspberrypi-3b-plus",
+        kernel_verification: "structural-only; no automated physical-board boot",
+        userspace_verification: "production ELFs byte-identical to QEMU contracts",
+        kernel_elf_sha256: sha256_file(&pi.kernel_elf)?,
+        dtb_sha256: sha256_file(&pi.dtb)?,
+        initramfs_sha256: sha256_file(&pi.initramfs)?,
+        dtc_version: command_first_line(Command::new("dtc").arg("--version"))?,
+        mkimage_version: command_first_line(Command::new("mkimage").arg("-V"))?,
+        dumpimage_version: command_first_line(Command::new("dumpimage").arg("-V"))?,
+        llvm_objcopy_version: command_line(Command::new("llvm-objcopy").arg("--version"))?,
+    };
+    let metadata = output_dir.join(format!("{name}.manifest.json"));
+    fs::write(&metadata, serde_json::to_vec_pretty(&manifest)?)?;
+    println!("built {}", fit.display());
+    Ok(vec![fit, metadata])
+}
+
+fn write_checksums(output_dir: &Path, assets: &[PathBuf]) -> Result<()> {
+    let mut names = assets
+        .iter()
+        .map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("invalid release asset {}", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    names.sort();
+    let mut actual = fs::read_dir(output_dir)?
+        .map(|entry| {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                bail!("release output must contain only regular files");
+            }
+            Ok(entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    actual.retain(|name| name != "SHA256SUMS");
+    actual.sort();
+    if actual != names {
+        bail!("release output does not match declared assets; use a dedicated directory");
+    }
+    let checksum = names
+        .iter()
+        .map(|name| {
+            Ok(format!(
+                "{}  {name}\n",
+                sha256_file(&output_dir.join(name))?
+            ))
+        })
+        .collect::<Result<String>>()?;
+    fs::write(output_dir.join("SHA256SUMS"), checksum)?;
     Ok(())
 }
 
@@ -508,6 +620,46 @@ mod tests {
         assert!(parse_release_tag("v1.0.0-rc.2").is_ok());
         assert!(parse_release_tag("1.0.0").is_err());
         assert!(parse_release_tag("vnot-semver").is_err());
+    }
+
+    #[test]
+    fn checksums_cover_all_platform_assets_and_reject_missing_or_extra_entries() {
+        let directory = temp_dir();
+        let assets = [
+            directory.join("qemu.tar.gz"),
+            directory.join("pi.itb"),
+            directory.join("pi.manifest.json"),
+        ];
+        for (index, path) in assets.iter().enumerate() {
+            fs::write(path, format!("asset-{index}")).unwrap();
+        }
+        write_checksums(&directory, &assets).unwrap();
+        let first = fs::read_to_string(directory.join("SHA256SUMS")).unwrap();
+        let expected = ["pi.itb", "pi.manifest.json", "qemu.tar.gz"]
+            .iter()
+            .map(|name| format!("{}  {name}\n", sha256_file(&directory.join(name)).unwrap()))
+            .collect::<String>();
+        assert_eq!(first, expected);
+        let mut reversed = assets.clone();
+        reversed.reverse();
+        write_checksums(&directory, &reversed).unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.join("SHA256SUMS")).unwrap(),
+            first
+        );
+
+        fs::write(directory.join("unrelated"), "keep").unwrap();
+        assert!(write_checksums(&directory, &assets).is_err());
+        assert_eq!(
+            fs::read_to_string(directory.join("unrelated")).unwrap(),
+            "keep"
+        );
+        fs::remove_file(directory.join("unrelated")).unwrap();
+        fs::remove_file(&assets[1]).unwrap();
+        assert!(write_checksums(&directory, &assets).is_err());
+        fs::create_dir(&assets[1]).unwrap();
+        assert!(write_checksums(&directory, &assets).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn sample_manifest() -> Manifest {

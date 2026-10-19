@@ -109,6 +109,12 @@ termination, wait, and complete-log validation. See
   provenance, noncanonical paths, invalid executable ELF, and hash mismatch.
 - Release packaging reuses already tested production artifacts and records
   tool versions, commit, features, and SHA-256 identity.
+- `dist` also emits a standalone versioned Raspberry Pi 3B+ `.itb` and JSON
+  sidecar. Its platform kernel is built and structurally verified separately;
+  its production initramfs is copied byte-for-byte from the QEMU release without
+  rebuilding userspace. The sidecar records this verification scope, features,
+  component hashes, and hardware build tools. `SHA256SUMS` covers the QEMU
+  archive, Pi FIT, and sidecar; unexpected output-directory entries are rejected.
 - Release bundles include an executable `run.sh` and DTBs for all supported
   CPU counts. The launcher and standalone `RUN.md` commands are generated from
   `qemu::Config`, with one sorted manifest/archive inventory and repeated

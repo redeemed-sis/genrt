@@ -413,6 +413,13 @@ accepted ADRs remain authoritative when details differ.
   one CPU by default or `-c 1..4` with matching packaged DTBs. Launcher and
   standalone guide commands share the canonical QEMU configuration. Every
   payload is hashed; tar metadata includes executable launcher permissions.
+- `dist` additionally emits a versioned Raspberry Pi 3B+ FIT and manifest,
+  covered by the shared `SHA256SUMS`. The Pi kernel receives structural,
+  composition, and FIT checks, not an automated physical boot claim. Its
+  initramfs is byte-identical to the QEMU release's verified production CPIO;
+  no contract-tested userspace is rebuilt. Metadata records platform features,
+  component hashes, hardware tools, and the verification scope. See
+  [ADR-0061](decisions/ADR-0061-raspberrypi-fit-release-artifacts.md).
 
 ## Current boundaries
 
