@@ -7,7 +7,9 @@ QEMU are linked here, with Pi-specific IRQ, UART, CPU-release and power backends
 The runtime has reached the shell on QEMU's BCM2837 model, including
 secondary CPU commands. The user also supplied physical-Pi rtbench results
 on CPU1 and CPU3; those are distinct from emulator validation and do not
-certify worst-case timing. Capture the serial log and repeat cold boot on
+certify worst-case timing. The [wake-profile comparison](../../../../docs/wake-profiling.md#wait-layout-and-dispatch-hardware-check-agent-executed)
+also records agent-executed physical UART runs with exact FIT identities.
+Capture the serial log and repeat cold boot on
 the real board. Choose UART transfer for RAM-only iterations or
 copy the FIT onto the existing microSD boot partition for persistent loading.
 
@@ -337,6 +339,10 @@ For diagnostic phase collection, build with
 The [profiling guide](../../../../docs/wake-profiling.md) describes full and
 focused console reports and matched overhead runs. The existing timing
 results above are not phase profiles.
+
+ARM CPU frequency and the 19.2 MHz timer counter frequency are different
+measurements; do not assume the nominal 1.4 GHz ARM rate when interpreting
+instruction costs.
 
 ## Architecture boundary
 

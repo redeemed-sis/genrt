@@ -48,14 +48,18 @@ remain uninstrumented and reject diagnostic kernel markers.
   production `/bin/sleep`, shared support-library boundary checks, and exact
   production `/bin/rtbench` execution plus positive-workload and invalid-CLI
   wait/exit contracts, including verbose output and duplicate verbosity rejection.
-  The registered rtbench invocation uses three 1 ms
-  steps with zero payload operations; large sample-capacity tests stay on host.
+  The registered rtbench invocation uses three 1 ms steps with zero payload
+  operations and POSIX absolute sleep. CLI scenarios reject the withdrawn
+  `-C` option. Large sample-capacity tests stay on host.
   The `syscall-boundaries` case covers unaligned copies across mapped pages,
   readonly/out-of-range destinations, no partial write at the stack boundary,
-  and isolated child termination for an unknown syscall.
+  and isolated child termination for unknown syscalls, including the withdrawn
+  counter-sleep number 19.
   Clock tests bracket raw syscall observations with fast EL0 reads, compare
   exact resolution, isolate a bad fast-output pointer, and retain raw EFAULT
   checks. Concurrent processes keep independent writable data across sleeps.
+  Single-page reads cover read-only input, every alignment, and an unmapped
+  user address.
 - `smp-userspace-contract`: four-CPU production kernel plus a test supervisor
   covering one-shot fork placement, exact affinity masks, affinity preservation
   across exec, remote process lifecycle, production `taskset` placement, and

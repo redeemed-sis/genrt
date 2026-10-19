@@ -184,6 +184,11 @@ Each blocking episode has one scheduler-owned `WaitToken` containing the full
 thread; the next sequence returns to the free slot on reap and therefore
 survives generation reuse.
 
+An active wait keeps its token and consumption mode in one stable payload;
+prepare, block, and completion change a separate phase. Blocking does not
+rebuild a token-bearing enum variant. Exact identity checks and first-wins
+completion are unchanged; automatic completion removes the active payload.
+
 A blocking operation prepares wait metadata, publishes the exact token with
 its condition owner, releases that owner, and commits the prepared wait.
 Completion before commit records the cause and leaves the caller running;
@@ -202,6 +207,12 @@ wait preparation through exact deadline publication and commit. Only the
 bounded time registration nests under it; time ownership releases before
 context selection. Usercopy and deadline validation precede this transaction.
 Other condition owners retain the separate prepare/publish/commit API.
+
+Sleep publication removes the outgoing RR event and inserts the exact wait in
+one time-owner transaction, with one final timer program. The handoff then
+maintains only the selected thread's quantum. Early completion removes any
+remaining wait event and restores current-thread RR eligibility without
+changing the exact wait identity or POSIX sleep semantics.
 
 Mailbox queues, thread/process lifecycle, console, and time retain their own
 payloads and cleanup policy. Scheduler wait metadata contains only exact token,

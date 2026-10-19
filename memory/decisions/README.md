@@ -66,4 +66,7 @@ growth.
 | [0057](ADR-0057-in-process-sleep-profile-reports.md) | In-process sleep-profile reports | Accepted | Userspace diagnostic reporting | [0056](ADR-0056-bounded-sleep-wakeup-phase-profiling.md) (raw UART export and host analysis only) | - |
 | [0058](ADR-0058-bounded-sleep-and-vm-owned-usercopy.md) | Bounded sleep and VM-owned usercopy | Accepted | Scheduler transaction/VM publication/frame copy | - | - |
 
+| [0059](ADR-0059-native-counter-sleep-and-active-read-validation.md) | Native counter sleep and active-read validation | Accepted | Syscall/time/VM ownership | - | [0060](ADR-0060-retire-native-counter-sleep-interface.md) (native userspace interface only) |
+| [0060](ADR-0060-retire-native-counter-sleep-interface.md) | Retire native counter-sleep interface | Accepted | Userspace sleep ABI | [0059](ADR-0059-native-counter-sleep-and-active-read-validation.md) (native userspace interface only) | - |
+
 Use [`TEMPLATE.md`](TEMPLATE.md) for new decisions.

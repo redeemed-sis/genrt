@@ -25,6 +25,13 @@ the maximum retained cycle count (1..10000). Each step issues at most one sleep,
 including the final sleep, so this capacity covers every eligible call. Catch-up
 iterations that issue no sleep are not sleep cycles and use no record slots.
 
+Use `-F 0:4` to observe `svc-entry -> sleep-handoff` directly, including its
+paired maximum rather than a sum of phase maxima. Focused mode suppresses
+unselected Rust timestamp reads and writes, not hook calls, leaf locking,
+record initialization, or exact-wait bookkeeping. Fixed assembly entry probes
+also remain. This is reduced timestamp collection, not a two-hook kernel or
+an uninstrumented submission baseline.
+
 rtbench starts before measurement, stores userspace correlation observations
 without output, stops after the final sleep, then reads frozen records one at
 a time. After SUMMARY output it prints a human-readable report directly
@@ -336,9 +343,75 @@ unrelated interrupt. Early-return calls are classified separately.
 
 The agreed target is the observed maximum of submission plus IRQ-to-EL0,
 excluding intentional timer waiting, below 5000 ns on an agreed physical run.
-The follow-up results below belong to a reverted experiment, not the current
-runtime. Existing rtbench userspace observation is retained; no additional
-measuring mode is introduced.
+Release latency alone is not that metric. The latest user-reported results
+after the CPU-frequency configuration change are below; older references and
+reverted experiments follow separately.
+
+### Higher CPU frequency (user-reported)
+
+After raising the configured ARM CPU frequency, the user supplied this
+physical Raspberry Pi 3B+ run on CPU3, with `wake-profile` and full collection:
+
+```text
+taskset 3 rtbench -p 15000 -n 10000 -o 300 -P
+```
+
+| SUMMARY metric | Average (ns) | Maximum (ns) |
+| --- | ---: | ---: |
+| Release latency | 2894 | 9219 |
+| TET | 573 | 625 |
+| Overrun | 0 | 0 |
+
+All 10000 cycles are complete idle wakes, with zero early returns, incomplete
+or lost records, zero overruns, and `result=3000000`. The physical counter is
+19200000 Hz; this is not the ARM CPU frequency. Single-START calibration
+reports a 0 ns counter pair and 208 ns trace write; neither is subtracted.
+
+Every interval below has 10000 observations except the final next-STEP row,
+which has 9999. Totals and deadline references overlap stage rows; maxima
+must not be added.
+
+| Idle interval | Average (ns) | Maximum (ns) |
+| --- | ---: | ---: |
+| svc-entry -> validated | 718 | 3020 |
+| validated -> timer-published | 933 | 4114 |
+| timer-published -> wait-committed | 583 | 1979 |
+| wait-committed -> sleep-handoff | 560 | 1250 |
+| sleep-handoff -> irq-entry | 8626 | 8802 |
+| irq-entry -> acknowledge | 260 | 520 |
+| acknowledge -> expired-extracted | 497 | 2343 |
+| expired-extracted -> scheduler-acquired | 225 | 625 |
+| scheduler-acquired -> wake-selected | 569 | 3333 |
+| wake-selected -> context-restored | 442 | 625 |
+| context-restored -> timer-rearmed | 260 | 677 |
+| timer-rearmed -> interrupt-completed | 135 | 156 |
+| interrupt-completed -> return-to-user | 322 | 468 |
+| return-to-user -> first EL0 observation | 131 | 364 |
+| context-restored -> return-to-user (total) | 719 | 1302 |
+| scheduler-acquired -> timer-rearmed (total) | 1274 | 4635 |
+| deadline -> irq-entry (signed reference) | 0 | 52 |
+| deadline -> first EL0 observation (total) | 2849 | 9166 |
+| first EL0 observation -> next STEP | 44 | 729 |
+
+Sequential interval means estimate 2794 ns for submission and 2841 ns from
+IRQ entry to first EL0 observation, about 5.64 us combined without suspension.
+This sums rounded interval means, not paired per-cycle maxima, and retains
+instrumentation overhead. It does not establish the sub-5-us maximum target.
+
+The user subsequently supplied ten runs at a 6000 ns period from a build
+without `wake-profile`: release averages 1319..1323 ns, overall release
+maximum 5614 ns, and one 187 ns overrun across 100000 steps. The
+[complete ordinary-build results](testing.md#raspberry-pi-hardware-result-user-reported)
+are separate from this diagnostic profile. Different periods and builds do
+not isolate instrumentation overhead or establish an ordinary-build round-trip
+maximum.
+
+These are user-reported hardware results, not agent-executed or QEMU timing
+measurements. Actual runtime ARM CPU frequency, exact FIT/build identities,
+firmware version, and competing workload were not measured or supplied with
+these reports; no controlled speedup ratio or worst-case bound is claimed.
+
+### Earlier measurements
 
 The current narrow follow-up removes trace-only counter reads from timer queue
 maintenance, samples RR time only when a new quantum is needed, removes unused
@@ -472,6 +545,164 @@ kernel's timing or its observed maximum. Exact deployed FIT/build identities,
 clock policy, firmware, and competing workload were not supplied. These are
 user-reported hardware observations, not controlled per-change attribution or
 agent-executed/QEMU performance measurements.
+
+### Wait layout and dispatch hardware check (agent-executed)
+
+On 2026-10-17 the agent loaded both diagnostic FITs through picocom/YMODEM
+into RAM on the same Raspberry Pi 3B+, using U-Boot 2026.07, 115200 baud,
+and the 19200000 Hz counter. Each image ran the CPU3 command above three
+times, in order, without changing microSD or the saved firmware environment.
+The follow-up keeps active wait identity stationary across phase changes and
+outlines other syscall handlers away from clock sleep. Release disassembly
+shows no token-copy `memcpy` in wait commit and a 48-byte clock-sleep dispatcher
+frame, down from 1344 bytes. The syscall ABI and owner locks are unchanged.
+
+| FIT / run | Release average (ns) | Release maximum (ns) | Estimated mean work excluding suspension (ns) | Overruns |
+| --- | ---: | ---: | ---: | ---: |
+| Before / 1 | 6045 | 15052 | 12181 | 1 |
+| Before / 2 | 6043 | 13229 | 12176 | 0 |
+| Before / 3 | 6039 | 13125 | 12157 | 0 |
+| After / 1 | 5960 | 14635 | 11358 | 1 |
+| After / 2 | 6026 | 12396 | 11425 | 0 |
+| After / 3 | 5957 | 12240 | 11384 | 0 |
+
+Estimated submission means changed from 6272..6287 ns to 5568..5601 ns.
+Every retained record was complete, none was lost, and each run returned
+`result=3000000`. First-run overruns remain included. These ordered runs do
+not isolate the two changes or measure a worst-case bound; CPU clock policy
+and temperature were not captured. Work estimates sum sequential idle means,
+not row maxima, and exclude assembly outside the probes. The sub-5-us target
+is not established. Local UART evidence is retained under
+`target/hardware/raspberrypi-3b-plus/wait-dispatch/` (not versioned).
+
+The uploaded FIT SHA-256 identities are:
+
+```text
+before: aa6df4030760e3cb76b5127773222b972992ab949d20d07258f4ed65488b469c
+after:  64026fffcac1d74a5e4ba0355bf79cff352bbf8bb8da50b0303600d2ada3d9a7
+```
+
+The ordinary follow-up FIT, rebuilt without `wake-profile`, also reached the
+shell through the same RAM-only UART boot. Three runs without `-P` reported
+release average/maximum pairs of 2691/7760, 2693/6927, and 2690/8385 ns, with
+zero overruns and `result=3000000`. CPU1 echo, CPU2 sleep, and initramfs reads
+also completed. Its FIT SHA-256 is
+`690ccb8a8f4f32cd51b31ad965fd8144f5f0ea69875a6b3a66a480da9bc760bd`.
+No matching ordinary before-FIT was tested, so these results do not quantify
+the changes' uninstrumented speedup. Release latency still excludes submission;
+neither ordinary SUMMARY nor the full-profile table provides the observed
+maximum of combined work. UART was disconnected with the new ordinary kernel
+left at its shell; no persistent boot files or environment were changed.
+
+### Focused submission check (agent-executed)
+
+On 2026-10-18 the agent reloaded the same diagnostic FIT (`64026fff...a3d9a7`
+above) through UART into RAM. Firmware identified Raspberry Pi 3 Model B Plus
+Rev 1.3, U-Boot 2026.07; the counter remained 19200000 Hz. No runtime source
+changes were needed. On one boot, three alternating pairs ran:
+
+```text
+taskset 3 rtbench -p 15000 -n 10000 -o 300 -P
+taskset 3 rtbench -p 15000 -n 10000 -o 300 -F 0:4
+```
+
+All times below are nanoseconds. Full-mode means sum its four sequential
+submission rows; focused maxima measure the actual paired timestamps.
+
+| Pair | Full estimated submission mean | Focused submission mean | Focused submission maximum | Focused idle samples |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 5569 | 5450 | 12395 | 10000 |
+| 2 | 5575 | 5449 | 12916 | 9999 |
+| 3 | 5566 | 5453 | 12447 | 10000 |
+
+All retained records were complete, with no lost/incomplete records. Every
+run returned `result=3000000`; focused runs had no overruns. The first full
+run had one overrun (1614 ns), retained in the evidence. The second focused
+run had one early return, which has no sleep-handoff endpoint and contributes
+no submission pair. Focused release average/maximum pairs were 5379/11823,
+5328/12813, and 5383/11927 ns, not the submission intervals above.
+
+The observed reduction in submission means was only 113..126 ns, about 2%.
+This removes intermediate Rust timestamp reads/writes, not all diagnostic
+overhead: hook calls, locks, record initialization, identity correlation,
+and assembly probes remain. It does not measure ordinary-kernel submission,
+attribute the paired maxima to a cause or iteration, or establish a sub-5-us
+round-trip bound. CPU clock policy and temperature were not captured.
+
+Three subsequent runs on this diagnostic image without `-P`/`-F` reported
+release average/maximum pairs of 4731/10521, 4805/9636, and 4785/10052 ns,
+without overruns. The diagnostic hooks remain even with collection inactive;
+these are not feature-disabled kernel measurements.
+
+UART evidence is local and not versioned:
+`target/hardware/raspberrypi-3b-plus/submission-focused-20261018/serial.log`.
+Its SHA-256 is
+`6bfe0328ca761e29fadc7d9e58b0deb2a754a1e4ffdc30f21eec1c3d4f55cbca`.
+UART was disconnected at the diagnostic kernel's shell; microSD and saved
+U-Boot environment were unchanged. The focused host test and release QEMU
+`wake-profile-contract` passed separately from the physical measurements.
+
+### Retired counter-sleep experiment (agent-executed)
+
+These are historical measurements of the withdrawn native-sleep trial, not
+the current CLI or a post-removal performance baseline. The native syscall,
+public wrapper, conversion helper, and `-C` option were removed by
+[ADR-0060](../memory/decisions/ADR-0060-retire-native-counter-sleep-interface.md).
+
+On 2026-10-18 the same physical Pi/U-Boot and CPU3 ran three repetitions of
+`rtbench -p 15000 -n 10000 -o 300`, with full `-P` and focused `-F 0:4`
+collection. Native trial runs used `-C`; all results equal 3000000. Values below
+are nanoseconds, with ranges across the three runs, not confidence intervals.
+
+| Diagnostic image / transport | Focused submission mean | Focused paired maximum | Full release mean | Full release maximum | Full overruns (total) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Before / POSIX | 5455..5484 | 12812..13125 | 5959..5984 | 12656..13229 | 0 |
+| Batched publication + AT / POSIX | 5298..5331 | 13281..14947 | 5781..5821 | 13906..16927 | 3 |
+| Same image / native `-C` | 4881..4894 | 11770..12083 | 5790..5797 | 12187..12604 | 0 |
+| Software-walk control / POSIX | 5331..5394 | 13541..14583 | 5897..5906 | 13125..15469 | 2 |
+
+Native admission removed about 0.4 us from focused submission versus POSIX on
+the same image. Nanosecond conversion still happens in userspace before SVC.
+The combined POSIX mean improves slightly, but its maximum does not. The
+software-walk control retains long tails too: these runs establish neither an
+independent timing win for AT nor the cause of the tails. Focused maxima cover
+submission only; do not add row maxima or claim a sub-5-us round-trip maximum.
+No record is lost or incomplete; an overrun can skip a sleep and reduce the
+recorded count to 9999. Instrumented results are not ordinary-kernel timings.
+
+A RAM-only U-Boot probe queried firmware tag `0x00030047` (ARM clock ID 3)
+before and after these diagnostic boots: both successful responses returned
+`0x23c44000`, or 600000000 Hz. The
+[firmware interface](https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface#get-clock-rate-measured)
+defines this as the measured, rather than requested, clock rate. This is not a
+frequency trace during rtbench. No clock, voltage, firmware, microSD file, or
+saved U-Boot environment was changed. The counter remained 19200000 Hz.
+
+Local evidence is under
+`target/hardware/raspberrypi-3b-plus/sleep-next-20261018/`, including `serial.log`,
+the read-only clock probe, and these measured FIT identities:
+
+```text
+before.itb:        64026fffcac1d74a5e4ba0355bf79cff352bbf8bb8da50b0303600d2ada3d9a7
+after.itb:         3f3ebc1c815b1a5b3d203cf6cf4cc11997927181281f0426753431301744274b
+software-walk.itb: 1b5a662eedcfa8d89520f58bbe8bf74786f907ce6d9295017673c8ad3289e409
+```
+
+The ordinary follow-up FIT (without `wake-profile`) was booted separately.
+Three alternating POSIX/native pairs at the same period/count/workload gave:
+
+| Transport | Release means (ns) | Release maxima (ns) | Overruns |
+| --- | --- | --- | ---: |
+| POSIX | 2645, 2683, 2651 | 9115, 7448, 7448 | 0 |
+| Native `-C` | 2669, 2645, 2643 | 7604, 7292, 7604 | 0 |
+
+These are release observations, not submission or round-trip profiles; no
+ordinary before-FIT was measured in this session. CPU1 echo and CPU2 sleep also
+passed. The ordinary FIT SHA-256 is
+`a2578f48890afadb888f22ea988338604af484facc6ee2310f1d4aacdf8f8c43`.
+The complete UART log SHA-256 is
+`e83164b741382aee22073c449237292fac8a33fdb713b2a0bfbb76709c7067a8`.
+The board was left at the ordinary kernel shell and picocom was closed.
 
 ### Matched collection
 

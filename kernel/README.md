@@ -67,6 +67,10 @@ runnable because syscall return resumes directly in userspace and has no
 kernel-stack continuation. Kernel sched-call waits and condition-owner waits
 retain explicit completion consumption.
 
+Clock sleep branches before the out-of-line dispatcher for other syscalls.
+Buffered I/O and filesystem temporaries therefore stay out of its stack frame;
+validation, usercopy, errno behavior, and wait publication are unchanged.
+
 The opt-in `wake-profile` feature records exact absolute-sleep episodes without
 changing scheduling policy. Its CPU-local leaf locks own preallocated trace
 storage, not wait completion. Normal builds contain no probes and return

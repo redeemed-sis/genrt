@@ -100,6 +100,9 @@ diagnostics; generic kernel code does not own platform constants.
   broadcast invalidation.
 - The generic VM layer requests architecture operations through narrow C ABI
   hooks; descriptor and system-register details stay here.
+- Current single-page user reads use `AT S1E0R` permission translation. The hook
+  preserves PAR and local IRQ state; generic code still checks user ranges and
+  VM eligibility. Inactive-root queries and cross-page copies keep table walks.
 
 ## Exceptions, IRQ, and task return
 

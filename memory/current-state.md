@@ -110,6 +110,18 @@ accepted ADRs remain authoritative when details differ.
 
 ## Scheduling and time
 
+- Latest user-reported Pi CPU3 results after raising configured CPU frequency:
+  full profiling at a 15000 ns period reports release average/maximum
+  2894/9219 ns, TET 573/625 ns, 10000 complete idle cycles, no early/lost/
+  incomplete cycles, no overruns, and result 3000000. Sequential interval means
+  estimate 5.64 us of submission plus IRQ-to-EL0, not a paired maximum.
+  Ten ordinary-build runs without `wake-profile` at a 6000 ns period report
+  release averages 1319..1323 ns and overall maximum 5614 ns, with one 187 ns
+  overrun across 100000 measured steps. Runtime ARM rate and deployed FIT
+  identities were not supplied; different periods/builds do not quantify
+  profiler overhead or prove the round-trip maximum target. See the
+  [full profile](../docs/wake-profiling.md#higher-cpu-frequency-user-reported)
+  and [ordinary-build summaries](../docs/testing.md#raspberry-pi-hardware-result-user-reported).
 - Committed Raspberry Pi 3B+ hardware reference (reported 2026-10-16): CPU3,
   `taskset 3 rtbench -p 15000 -n 10000 -o 300 -P`, full profiling at
   19200000 Hz. Release latency averages 6169 ns, maximum 12917 ns; TET averages
@@ -137,6 +149,23 @@ accepted ADRs remain authoritative when details differ.
   6075/12344 ns and estimated mean work excluding suspension 12177 ns. This is
   instrumented user-reported evidence, not an observed round-trip maximum or
   controlled per-change speedup; deployed FIT identity was not supplied.
+- Active wait metadata now retains one exact token while a separate phase
+  changes. Clock sleep bypasses the out-of-line dispatcher for buffered handlers;
+  ABI and lock ownership are unchanged. Agent-executed Pi UART checks of both
+  diagnostic FITs estimated mean work excluding suspension at 12157..12181 ns
+  before and 11358..11425 ns after. The [recorded comparison](../docs/wake-profiling.md#wait-layout-and-dispatch-hardware-check-agent-executed)
+  retains all three runs, overruns, and uploaded FIT identities; it does not
+  establish a sub-5-us observed maximum. The ordinary follow-up FIT also passed
+  physical boot and CPU1/CPU2 smoke; three uninstrumented runs reported release
+  means 2690..2693 ns and maxima 6927..8385 ns without overruns. No ordinary
+  before-FIT comparison or combined round-trip maximum was collected.
+- Agent-executed focused submission checks on 2026-10-18 used the same Pi
+  diagnostic FIT and alternated full collection with `-F 0:4`. Focused
+  SVC-to-handoff means were 5449..5453 ns and paired maxima 12395..12916 ns,
+  versus full-mode mean estimates 5566..5575 ns. No runtime code changed:
+  focused selection suppresses unselected Rust timestamps, not hook locking
+  or lifecycle bookkeeping. Ordinary-kernel submission remains unmeasured.
+  See the [focused evidence and limits](../docs/wake-profiling.md#focused-submission-check-agent-executed).
 - EL0 sleep uses one scheduler transaction for automatic wait preparation,
   exact timer publication, and commit. Time ownership ends before handoff.
   Usercopy obtains its identity from VM-owned CPU-local installed-root and
@@ -144,6 +173,22 @@ accepted ADRs remain authoritative when details differ.
   lifetime but not usercopy eligibility. AArch64 saved/live transfers use a
   fixed GP-register copy of the full payload, preserving idle and frame ABI.
   See [ADR-0058](decisions/ADR-0058-bounded-sleep-and-vm-owned-usercopy.md).
+- POSIX sleep uses one time-owner sleep/quantum publication transaction.
+  Single-page user reads use architecture EL0 permission translation with the
+  VM active-owner check; crossing-page reads and writes retain software walks.
+  See [ADR-0059](decisions/ADR-0059-native-counter-sleep-and-active-read-validation.md).
+- The native counter-sleep syscall, public helper/header, and rtbench `-C`
+  trial interface have been removed. POSIX sleep, internal counter deadlines,
+  active-read validation, and batched time publication remain unchanged.
+  See [ADR-0060](decisions/ADR-0060-retire-native-counter-sleep-interface.md).
+- The retired 2026-10-18 native-sleep trial measured focused submission
+  means of 4881..4894 ns with `-C`, versus 5298..5331 ns for POSIX on the same
+  diagnostic image. POSIX maxima did not improve; the software-walk control
+  retained long tails. No sub-5-us round-trip maximum is claimed. Firmware ARM
+  measured-rate queries in U-Boot returned 600 MHz before/after diagnostic boots,
+  not a runtime frequency trace. See the [historical evidence](../docs/wake-profiling.md#retired-counter-sleep-experiment-agent-executed).
+  On the separate ordinary FIT, three alternating POSIX/native pairs returned
+  release means 2643..2683 ns without overruns; these are not round-trip profiles.
 - Optional `wake-profile` diagnostics correlate absolute userspace sleeps with
   exact wait identities and raw counter phase observations. Configurable
   heap storage is prepared before START; active collection stays bounded and

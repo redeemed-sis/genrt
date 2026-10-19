@@ -120,6 +120,10 @@ multiple periods behind, final sleep and timespec boundaries, all 10000 rows,
 workload results, checked sums/horizons, CLI rejection before clock observation,
 malformed/backwards timestamps, and syscall/output failures. No production
 test conditionals or protocol markers are required.
+Host and QEMU CLI checks reject the withdrawn `-C` option, including `-CC`.
+The former syscall number 19 follows the unknown-call policy: its child process
+is terminated without breaking the parent. Production rtbench execution and
+full/focused profiling contracts use POSIX absolute sleep.
 
 Dynamic production-program checks are declared in
 `tests/qemu/program-contracts.toml`. xtask validates a one-to-one mapping to
@@ -174,28 +178,47 @@ preemption. Physical-board measurements remain the user's responsibility.
 
 ### Raspberry Pi hardware result (user-reported)
 
-Latest results supplied by the user from a physical Raspberry Pi 3B+, CPU3:
+After raising the configured ARM CPU frequency, the user supplied ten runs on
+a physical Raspberry Pi 3B+, CPU3, using a build **without `wake-profile`**:
 
 ```text
-taskset 3 rtbench -p 8000 -n 1000 -o 30
-taskset 3 rtbench -p 15000 -n 1000 -o 30
+taskset 3 rtbench -o 300 -n 10000 -p 6000
 ```
 
-Both runs completed 1000 steps with 30 payload additions per step and
-`result=30000`. Time values below are nanoseconds.
+Every run completed 10000 steps with 300 payload additions per step and
+`result=3000000`. All time values below are nanoseconds; run order matches the
+supplied summaries.
 
-| Metric | 8000 ns period | 15000 ns period |
-| --- | ---: | ---: |
-| Release latency average | 4687 | 3259 |
-| Release latency maximum | 11010 | 5104 |
-| Elapsed TET average | 238 | 243 |
-| Elapsed TET maximum | 365 | 365 |
-| Overrun duration average | 3 | 0 |
-| Overrun duration maximum | 3323 | 0 |
-| Overrun count | 1 | 0 |
+| Run | Release average | Release maximum | TET average | TET maximum | Overruns | Overrun maximum |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1319 | 4312 | 570 | 625 | 0 | 0 |
+| 2 | 1323 | 4781 | 573 | 573 | 0 | 0 |
+| 3 | 1320 | 4469 | 569 | 625 | 0 | 0 |
+| 4 | 1323 | 5614 | 572 | 573 | 1 | 187 |
+| 5 | 1322 | 4885 | 557 | 573 | 0 | 0 |
+| 6 | 1320 | 4729 | 571 | 573 | 0 | 0 |
+| 7 | 1323 | 4885 | 572 | 625 | 0 | 0 |
+| 8 | 1323 | 4729 | 559 | 573 | 0 | 0 |
+| 9 | 1323 | 4834 | 559 | 573 | 0 | 0 |
+| 10 | 1319 | 4572 | 569 | 625 | 0 | 0 |
 
-Statistics include all 1000 steps. These are user-reported hardware
-observations, not QEMU measurements or worst-case timing guarantees.
+Across 100000 measured steps, release averages range from 1319 to 1323 ns,
+the largest release latency is 5614 ns, and one payload end exceeds the next
+release by 187 ns. Every summary reports `overrun_avg_ns=0` because averages
+use integer division, including the run with one overrun.
+
+These summaries measure release latency and payload TET, not sleep submission
+or complete round-trip cost. They do not count blocking versus early-return
+sleeps, so neither a full timer wakeup on every step nor a round-trip maximum
+below 5 or 6 us is established. The separate
+[15000 ns full-profile result](wake-profiling.md#higher-cpu-frequency-user-reported)
+uses a different period and instrumentation; it is not a matched overhead
+comparison with these runs.
+
+These are user-reported physical-board observations, not agent-executed runs,
+QEMU timing measurements, or worst-case guarantees. The runtime ARM CPU rate,
+exact FIT/build identity, firmware version, and competing workload were not
+measured or supplied with the summaries.
 
 ## Sleep/wakeup phase profiling
 
@@ -204,7 +227,7 @@ heap allocation or UART output during collection. It has separate artifacts
 and an opt-in functional contract; canonical production builds and releases
 exclude instrumentation. See the [profiling procedure](wake-profiling.md) for
 session ownership, in-process console reports, and matched hardware runs.
-Earlier hardware summaries above do not measure profiling overhead.
+The ordinary-build summaries above do not measure profiling overhead.
 
 ## Guest protocol
 

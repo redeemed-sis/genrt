@@ -90,10 +90,18 @@ stable syscall context, never retained across handoff. Per-CPU publication uses
 fixed, separately aligned storage. See
 [ADR-0058](../../../memory/decisions/ADR-0058-bounded-sleep-and-vm-owned-usercopy.md).
 
-Validation finishes before any destination byte changes. Fixed-length copies
-use volatile, naturally aligned machine-word accesses to user memory with byte
-prefixes and tails; kernel buffers need not be word-aligned. No access extends
-past the validated range, and aligned words cannot straddle a 4 KiB page.
+Validation finishes before any destination byte changes. Single-page reads
+are validated through the current hardware EL0 translation;
+AArch64 uses AT S1E0R and preserves PAR under local IRQ exclusion. Generic
+range checks and VM current-user eligibility remain mandatory. Cross-page
+reads and all writes retain software mapping/permission walks. No validation
+result is cached across roots or context handoff. See
+[ADR-0059](../../../memory/decisions/ADR-0059-native-counter-sleep-and-active-read-validation.md).
+
+Fixed-length copies use volatile, naturally aligned machine-word accesses to
+user memory with byte prefixes and tails; kernel buffers need not be
+word-aligned. No access extends past the validated range, and aligned words
+cannot straddle a 4 KiB page.
 Bounded C-string scans remain bytewise so finding a NUL never requires reading
 a following page. `getcwd` uses the word-copy writer plus a separate NUL.
 

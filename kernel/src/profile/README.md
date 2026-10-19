@@ -1,6 +1,7 @@
 # Sleep/wakeup profiler
 
-The optional `wake-profile` subsystem observes absolute CLOCK_MONOTONIC sleeps.
+The optional `wake-profile` subsystem observes absolute CLOCK_MONOTONIC
+sleeps through the exact-wait lifecycle.
 It owns diagnostic records, not wait completion, scheduling, or timer policy.
 Other subsystems use only the `crate::profile` facade.
 
@@ -32,6 +33,8 @@ handoff code after incoming context restoration and address-space activation.
 session. `session` owns the record lifecycle and does not acquire locks or call
 the scheduler. `format` has no runtime state or architecture dependencies.
 Counter reads use the shared private hook through the facade.
+Focused mode skips unselected Rust timestamp reads/writes, but retains hook
+calls, leaf locks, lifecycle bookkeeping, and fixed assembly entry probes.
 Absolute-sleep admission consumes the current SVC's staged owner/entry once,
 without repeating scheduler identity lookup. IRQs remain masked and no handoff
 occurs between staging and admission; exact owner and wait checks remain intact.
