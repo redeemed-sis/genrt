@@ -5,11 +5,10 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-black.svg)](LICENSE)
 
 genrt is an experimental hard real-time operating system written primarily in
-Rust. The active platform is AArch64 QEMU `virt`; DTB-described CPUs complete
-high-half bring-up, run independent scheduler contexts, and may own independent
-single-threaded userspace processes. CPU0 retains global initialization and
-device IRQ ownership. The project uses that environment to make boot,
-scheduling, userspace, testing, and release invariants explicit.
+Rust. Its primary automated target is AArch64 QEMU `virt`; Raspberry Pi 3B+ is
+the experimental physical target. DTB-described CPUs run independent scheduler
+contexts and single-threaded userspace processes. CPU0 retains global
+initialization and device IRQ ownership across the shared kernel runtime.
 
 genrt is aimed at operating-system and embedded developers who want a compact,
 inspectable codebase for studying deterministic kernel mechanisms. Its focus is
@@ -19,18 +18,16 @@ a production-ready or latency-certified operating system.
 
 ## Status
 
-- [Raspberry Pi 3B+ bootstrap](arch/aarch64/platform/raspberrypi-3b-plus/README.md)
-  runs the shared kernel with a FIT-bundled DTB and initramfs through U-Boot.
-  Physical runtime validation remains pending.
+- [Raspberry Pi 3B+ hardware target](arch/aarch64/platform/raspberrypi-3b-plus/README.md)
+  with physical RT measurements and initial sleep/wakeup scheduler-path checks.
 - High-half EL1 kernel with low-linked pre-MMU bootstrap and post-link autonomy
   verification.
 - DTB-driven RAM/platform discovery, physical frame allocation, runtime TTBR1
   mappings, and a fixed bootstrap heap.
-- Bounded PSCI bring-up of secondary CPUs into unique high-half bootstrap
-  stacks with architecture-owned per-CPU exception/timer setup and active
-  scheduler idle contexts.
+- Bounded secondary-CPU bring-up (PSCI on QEMU, spin tables on Pi) with private
+  high-half stacks, CPU-local exception/timer setup, and scheduler idle contexts.
 - Preemptive IRQ-return scheduler with one-shot deadlines, bounded kernel
-  threads, sleep, and mailbox IPC.
+  threads, sleep, mailbox IPC, and targeted cross-CPU wakeup notifications.
 - Process-owned TTBR0 address spaces, static AArch64 ELF loading, lower-EL fault
   isolation, and eager-copy `fork`/`execve`/`waitpid`.
 - Readonly CPIO initramfs, bounded per-process FD tables, cwd/path traversal,
@@ -39,7 +36,7 @@ a production-ready or latency-certified operating system.
   `user/c/programs.toml`.
 - POSIX-like monotonic clock observation and relative/absolute sleep APIs,
   including `/bin/sleep`.
-- Linux-shaped system restart and power off through AArch64 PSCI.
+- Linux-shaped system restart and power off through architecture-owned backends.
 - Declarative QEMU contracts using a test-only machine protocol rather than
   human log matching.
 - Deterministic, structurally verified tagged release bundles built by `xtask`.
@@ -100,6 +97,13 @@ cargo xtask build-raspberrypi-3b-plus
 See the [Raspberry Pi 3B+ bootstrap guide](arch/aarch64/platform/raspberrypi-3b-plus/README.md)
 for UART upload, microSD installation, and automatic boot with `boot.scr`.
 
+Initial physical-board checks cover periodic userspace workloads and the
+sleep submission -> timer IRQ -> idle wake -> EL0 return path. See
+[hardware RT results](docs/testing.md#raspberry-pi-hardware-result-user-reported)
+and [scheduler-path profiles](docs/wake-profiling.md#higher-cpu-frequency-user-reported).
+These are initial measurements, not certified worst-case bounds; broader
+[scheduler contract checks](tests/qemu/README.md#test-layers) run on QEMU.
+
 ## Build and verification
 
 ```bash
@@ -158,7 +162,7 @@ and [docs/releases.md](docs/releases.md).
 
 - Device IRQ routing remains CPU0-only. Independent processes may execute on
   immutable owner CPUs selected for child creation; one address space never
-  spans CPUs. Targeted scheduler SGIs wake a thread's home CPU.
+  spans CPUs.
 - Migration, work stealing, remote timer insertion, shared userspace address
   spaces, general TLB shootdown, and latency certification are not implemented.
 - No FP/SIMD context ownership; kernel Rust uses the soft-float target.
