@@ -321,11 +321,25 @@ impl CpuScheduler<'_> {
     }
 
     pub(super) fn finish_block_current(&mut self, current: ThreadId, next: ThreadId) {
+        crate::time::cancel_event(TimedEvent::quantum_expired(self.cpu(), current));
+        self.finish_block_after_quantum_cancel(current, next);
+    }
+
+    /// Finish a mandatory handoff whose outgoing RR event is already removed.
+    /// # Arguments
+    /// * `current` - Exact outgoing thread whose quantum was cancelled.
+    /// * `next` - Committed replacement thread.
+    /// # Returns
+    /// Returns after bounded checkpoint consumption and peer-only RR upkeep.
+    /// Allocates nothing; the caller holds scheduler ownership.
+    /// # Panics
+    /// Panics if current-CPU scheduler or time ownership is invalid.
+    pub(super) fn finish_block_after_quantum_cancel(&mut self, current: ThreadId, next: ThreadId) {
         // A mandatory handoff also acknowledges any stale request at its
         // depth-zero checkpoint; it never needs to select a second thread.
         let online = self.state().online;
         let _ = crate::sync::preempt::consume_checkpoint_on(self.cpu(), online);
-        self.replace_quantum_event(current);
+        self.ensure_quantum_event(crate::time::now_counter);
         if next != current {
             log_switch(self.cpu(), current, next);
         }
@@ -406,7 +420,15 @@ impl CpuScheduler<'_> {
         }
     }
 
-    fn ensure_quantum_event(&mut self, now: impl FnOnce() -> u64) {
+    /// Restore RR eligibility after selection or an early sleep completion.
+    /// # Arguments
+    /// * `now` - Lazy counter read, called only when a new quantum is needed.
+    /// # Returns
+    /// Returns with a quantum only for a running thread with a runnable peer.
+    /// Bounded and allocation-free under scheduler ownership.
+    /// # Panics
+    /// Panics if current-CPU scheduler or time ownership is invalid.
+    pub(super) fn ensure_quantum_event(&mut self, now: impl FnOnce() -> u64) {
         let Some(current) = self.running_thread() else {
             return;
         };

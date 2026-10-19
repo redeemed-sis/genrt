@@ -61,12 +61,16 @@ pub(crate) fn sleep_user_until_counter(context: &mut ActiveContext<'_>, deadline
     let token = prepared.token();
     #[cfg(feature = "wake-profile")]
     crate::profile::bind(token, deadline);
-    crate::time::schedule_event(deadline, TimedEvent::wait_deadline(token));
+    crate::time::publish_sleep(deadline, token);
     #[cfg(feature = "wake-profile")]
     crate::profile::wait_published(token);
-    match local.commit_prepared_wait(context, prepared) {
+    match local.commit_prepared_sleep(context, prepared) {
         CommitResult::Blocked(_) => true,
-        CommitResult::Early(_) => false,
+        CommitResult::Early(_) => {
+            crate::time::cancel_event(TimedEvent::wait_deadline(token));
+            local.ensure_quantum_event(crate::time::now_counter);
+            false
+        }
         CommitResult::Stale => {
             crate::time::cancel_event(TimedEvent::wait_deadline(token));
             panic!("sched: userspace sleep wait became stale before commit")

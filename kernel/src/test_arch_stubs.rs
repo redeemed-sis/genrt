@@ -159,6 +159,10 @@ extern "C" fn arch_query_user_mapping(
     panic!("host test queried a hardware user mapping")
 }
 #[unsafe(no_mangle)]
+extern "C" fn arch_current_user_page_readable(_va: usize) -> u64 {
+    panic!("host test queried a live EL0 translation")
+}
+#[unsafe(no_mangle)]
 extern "C" fn arch_sched_call(_request: *const c_void) {
     panic!("host test invoked private scheduler call")
 }

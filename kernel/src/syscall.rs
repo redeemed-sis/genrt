@@ -114,8 +114,22 @@ pub enum DispatchError {
 ///
 /// Individual handlers may allocate, copy userspace memory, or block only in
 /// synchronous thread/syscall context. Dispatch itself adds no allocation, and
-/// IRQ entry never calls this API.
+/// IRQ entry never calls this API. Clock sleep takes a separate path so other
+/// handlers' temporary buffers do not enlarge its stack frame.
 pub fn dispatch(
+    context: &mut ActiveContext<'_>,
+    request: SyscallRequest,
+) -> Result<(), DispatchError> {
+    if request.number() == SYS_CLOCK_NANOSLEEP {
+        sys_clock_nanosleep(context, request);
+        return Ok(());
+    }
+    dispatch_other(context, request)
+}
+
+// Keep filesystem and buffered-I/O stack storage out of the clock-sleep path.
+#[inline(never)]
+fn dispatch_other(
     context: &mut ActiveContext<'_>,
     request: SyscallRequest,
 ) -> Result<(), DispatchError> {
@@ -183,10 +197,6 @@ pub fn dispatch(
         }
         SYS_CLOCK_GETRES => {
             sys_clock_getres(context, request);
-            Ok(())
-        }
-        SYS_CLOCK_NANOSLEEP => {
-            sys_clock_nanosleep(context, request);
             Ok(())
         }
         SYS_PROFILE_CONTROL | SYS_PROFILE_READ => {

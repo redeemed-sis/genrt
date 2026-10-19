@@ -494,6 +494,18 @@ fn validate_user_range_unbounded(
         return Err(UserCopyError::NotUserRange);
     }
 
+    // A small read in one page needs only current EL0 translation permission.
+    // Cross-page reads and all writes retain the complete software walk.
+    if matches!(access, AccessKind::Read)
+        && align_down(ptr, PAGE_SIZE) == align_down(end - 1, PAGE_SIZE)
+    {
+        return if vm::current_user_page_readable(ptr) {
+            Ok(())
+        } else {
+            Err(UserCopyError::NotReadable)
+        };
+    }
+
     let address_space =
         vm::current_user_address_space().ok_or(UserCopyError::NoCurrentAddressSpace)?;
 

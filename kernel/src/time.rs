@@ -362,6 +362,17 @@ impl TimeState {
         self.queue.schedule(deadline, event);
     }
 
+    fn publish_sleep(&mut self, deadline: u64, token: WaitToken) {
+        self.cancel_event(
+            TimedEvent::quantum_expired(token.cpu(), token.thread()),
+            false,
+        );
+        self.schedule_event(deadline, TimedEvent::wait_deadline(token));
+        if !self.dispatching_irq {
+            self.rearm_timer();
+        }
+    }
+
     fn cancel_event(&mut self, event: TimedEvent, rearm: bool) -> bool {
         let canceled = self.queue.cancel(event);
         // A missing quantum must not reprogram the surviving wait deadline.
@@ -638,6 +649,21 @@ pub(crate) fn schedule_event(deadline: u64, event: TimedEvent) {
     crate::trace!("time: scheduled {event:?} deadline={deadline}");
 }
 
+/// Replace a sleeping thread's RR event with its exact deadline atomically.
+/// # Arguments
+/// * `deadline` - Absolute counter deadline for the prepared sleep.
+/// * `token` - Current CPU's exact prepared automatic wait.
+/// # Returns
+/// Returns after one bounded queue transaction and at most one timer program.
+/// Allocates nothing; the caller holds scheduler ownership through commit and
+/// must restore quantum eligibility if completion wins before blocking.
+/// # Panics
+/// Panics for remote ownership, unavailable queues, or exhausted storage.
+pub(crate) fn publish_sleep(deadline: u64, token: WaitToken) {
+    assert_eq!(token.cpu(), current_cpu(), "time: remote sleep publication");
+    with_time_mut(token.cpu(), |time| time.publish_sleep(deadline, token));
+}
+
 /// Cancel an exact event from its owning CPU queue.
 ///
 /// Cancellation may be requested by another CPU after an external condition
@@ -891,6 +917,32 @@ fn div_ceil(numerator: u128, denominator: u128) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sleep_publication_replaces_quantum_before_one_timer_program() {
+        let cpu = CpuId::from_index(0).unwrap();
+        let thread = ThreadId::new(1, 1);
+        let token = WaitToken::for_profile_test(thread, cpu, 1);
+        let quantum = TimedEvent::quantum_expired(cpu, thread);
+        let peer = TimedEvent::quantum_expired(cpu, ThreadId::new(2, 1));
+        for old_quantum in [false, true] {
+            let mut time = TimeState::try_new(2).unwrap();
+            time.schedule_event(50, peer);
+            if old_quantum {
+                time.schedule_event(10, quantum);
+            }
+            let before = crate::test_arch_stubs::timer_program_counts();
+            time.publish_sleep(100, token);
+            assert!(!time.event_pending(quantum));
+            assert!(time.event_pending(peer));
+            assert!(time.event_pending(TimedEvent::wait_deadline(token)));
+            assert_eq!(time.armed_timer_deadline, Some(50));
+            assert_eq!(
+                crate::test_arch_stubs::timer_program_counts(),
+                (before.0 + 1, before.1)
+            );
+        }
+    }
 
     #[test]
     fn missing_cancellation_keeps_the_armed_timer_untouched() {

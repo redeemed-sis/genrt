@@ -38,7 +38,7 @@ impl WaitToken {
     /// * `sequence` - Exact test episode sequence.
     /// # Returns
     /// Copyable token without allocation, scheduler or IRQ state changes.
-    #[cfg(all(test, feature = "wake-profile"))]
+    #[cfg(test)]
     pub(crate) const fn for_profile_test(thread: ThreadId, cpu: CpuId, sequence: u64) -> Self {
         Self {
             thread,
@@ -163,24 +163,23 @@ pub(crate) enum FinishError {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(super) struct WaitMetadata {
     next_sequence: u64,
-    state: WaitState,
+    active: Option<ActiveWait>,
+}
+
+// Keep the exact identity stationary while only its lifecycle phase changes.
+// Separate enum payloads for Prepared/Blocked force token copies on commit.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct ActiveWait {
+    token: WaitToken,
+    phase: WaitPhase,
+    consumption: WaitConsumption,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum WaitState {
-    None,
-    Prepared {
-        token: WaitToken,
-        consumption: WaitConsumption,
-    },
-    Blocked {
-        token: WaitToken,
-        consumption: WaitConsumption,
-    },
-    Completed {
-        token: WaitToken,
-        cause: WaitCause,
-    },
+enum WaitPhase {
+    Prepared,
+    Blocked,
+    Completed(WaitCause),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -200,7 +199,7 @@ impl WaitMetadata {
     pub(super) const fn with_next_sequence(next_sequence: u64) -> Self {
         Self {
             next_sequence,
-            state: WaitState::None,
+            active: None,
         }
     }
 
@@ -222,7 +221,7 @@ impl WaitMetadata {
         cpu: CpuId,
         consumption: WaitConsumption,
     ) -> PreparedWait {
-        if self.state != WaitState::None {
+        if self.active.is_some() {
             panic!("sched: new wait before prior completion is consumed");
         }
         self.next_sequence = self
@@ -234,20 +233,28 @@ impl WaitMetadata {
             cpu,
             sequence: WaitSequence(self.next_sequence),
         };
-        self.state = WaitState::Prepared { token, consumption };
+        self.active = Some(ActiveWait {
+            token,
+            phase: WaitPhase::Prepared,
+            consumption,
+        });
         PreparedWait { token, consumption }
     }
 
     pub(super) fn commit(&mut self, prepared: PreparedWait) -> CommitState {
-        match self.state {
-            WaitState::Prepared { token, consumption }
-                if token == prepared.token && consumption == prepared.consumption =>
-            {
-                self.state = WaitState::Blocked { token, consumption };
-                CommitState::Block(token)
+        let Some(active) = self.active.as_mut() else {
+            return CommitState::Stale;
+        };
+        if active.token != prepared.token {
+            return CommitState::Stale;
+        }
+        match active.phase {
+            WaitPhase::Prepared if active.consumption == prepared.consumption => {
+                active.phase = WaitPhase::Blocked;
+                CommitState::Block(active.token)
             }
-            WaitState::Completed { token, cause, .. } if token == prepared.token => {
-                self.state = WaitState::None;
+            WaitPhase::Completed(cause) => {
+                self.active = None;
                 CommitState::Early(cause)
             }
             _ => CommitState::Stale,
@@ -255,87 +262,104 @@ impl WaitMetadata {
     }
 
     pub(super) fn complete(&mut self, token: WaitToken, cause: WaitCause) -> CompletionResult {
-        match self.state {
-            WaitState::Prepared {
-                token: active,
-                consumption: _,
-            } if active == token => {
-                self.state = WaitState::Completed { token, cause };
+        let Some(active) = self.active.as_mut() else {
+            return CompletionResult::Stale;
+        };
+        if active.token != token {
+            return CompletionResult::Stale;
+        }
+        match active.phase {
+            WaitPhase::Prepared => {
+                active.phase = WaitPhase::Completed(cause);
                 CompletionResult::CompletedPrepared
             }
-            WaitState::Blocked {
-                token: active,
-                consumption,
-            } if active == token => {
-                self.state = match consumption {
-                    WaitConsumption::Explicit => WaitState::Completed { token, cause },
-                    WaitConsumption::Automatic => WaitState::None,
-                };
+            WaitPhase::Blocked => {
+                match active.consumption {
+                    WaitConsumption::Explicit => active.phase = WaitPhase::Completed(cause),
+                    WaitConsumption::Automatic => self.active = None,
+                }
                 CompletionResult::WokeBlocked
             }
-            WaitState::Completed { token: active, .. } if active == token => {
-                CompletionResult::AlreadyCompleted
-            }
-            _ => CompletionResult::Stale,
+            WaitPhase::Completed(_) => CompletionResult::AlreadyCompleted,
         }
     }
 
     pub(super) fn cancel(&mut self, prepared: PreparedWait) -> CancelResult {
-        match self.state {
-            WaitState::Prepared { token, .. } if token == prepared.token => {
-                self.state = WaitState::None;
+        let Some(active) = self.active.as_ref() else {
+            return CancelResult::Stale;
+        };
+        if active.token != prepared.token {
+            return CancelResult::Stale;
+        }
+        match active.phase {
+            WaitPhase::Prepared => {
+                self.active = None;
                 CancelResult::Cancelled
             }
-            WaitState::Completed { token, cause, .. } if token == prepared.token => {
-                self.state = WaitState::None;
+            WaitPhase::Completed(cause) => {
+                self.active = None;
                 CancelResult::Completed(cause)
             }
-            _ => CancelResult::Stale,
+            WaitPhase::Blocked => CancelResult::Stale,
         }
     }
 
     pub(super) fn finish(&mut self, token: WaitToken) -> Result<WaitCause, FinishError> {
-        match self.state {
-            WaitState::Completed {
-                token: active,
-                cause,
-                ..
-            } if active == token => {
-                self.state = WaitState::None;
+        let Some(active) = self.active.as_ref() else {
+            return Err(FinishError::Stale);
+        };
+        if active.token != token {
+            return Err(FinishError::Stale);
+        }
+        match active.phase {
+            WaitPhase::Completed(cause) => {
+                self.active = None;
                 Ok(cause)
             }
-            WaitState::Prepared { token: active, .. }
-            | WaitState::Blocked { token: active, .. }
-                if active == token =>
-            {
-                Err(FinishError::NotCompleted)
-            }
-            _ => Err(FinishError::Stale),
+            WaitPhase::Prepared | WaitPhase::Blocked => Err(FinishError::NotCompleted),
         }
     }
 
     #[cfg(test)]
     pub(super) fn clear_active(&mut self) {
-        self.state = WaitState::None;
+        self.active = None;
     }
 
     pub(super) const fn is_none(&self) -> bool {
-        matches!(self.state, WaitState::None)
+        self.active.is_none()
     }
 
     #[cfg(any(test, debug_assertions, feature = "qemu-test"))]
     pub(super) const fn is_prepared(&self) -> bool {
-        matches!(self.state, WaitState::Prepared { .. })
+        matches!(
+            self.active,
+            Some(ActiveWait {
+                phase: WaitPhase::Prepared,
+                ..
+            })
+        )
     }
 
     #[cfg(any(test, debug_assertions, feature = "qemu-test"))]
     pub(super) const fn is_blocked(&self) -> bool {
-        matches!(self.state, WaitState::Blocked { .. })
+        matches!(
+            self.active,
+            Some(ActiveWait {
+                phase: WaitPhase::Blocked,
+                ..
+            })
+        )
     }
 
     #[cfg(any(test, debug_assertions, feature = "qemu-test"))]
     pub(super) const fn is_completed(&self) -> bool {
-        matches!(self.state, WaitState::Completed { .. })
+        matches!(
+            self.active,
+            Some(ActiveWait {
+                phase: WaitPhase::Completed(_),
+                ..
+            })
+        )
     }
 
     #[cfg(test)]
@@ -457,6 +481,33 @@ impl super::CpuScheduler<'_> {
         context: &mut ActiveContext<'_>,
         prepared: PreparedWait,
     ) -> CommitResult {
+        self.commit_wait_with(context, prepared, Self::finish_block_current)
+    }
+
+    /// Commit an EL0 sleep after time publication removed its old quantum.
+    /// # Arguments
+    /// * `context` - Exclusive live exception return context.
+    /// * `prepared` - Exact automatic wait published by the sleep owner.
+    /// # Returns
+    /// Returns Blocked after handoff, Early after consuming a winning cause,
+    /// or Stale for an invalid token. Early callers restore quantum eligibility.
+    /// Bounded and allocation-free under the existing scheduler guard.
+    /// # Panics
+    /// Panics for malformed transitions or architecture handoff failure.
+    pub(super) fn commit_prepared_sleep(
+        &mut self,
+        context: &mut ActiveContext<'_>,
+        prepared: PreparedWait,
+    ) -> CommitResult {
+        self.commit_wait_with(context, prepared, Self::finish_block_after_quantum_cancel)
+    }
+
+    fn commit_wait_with(
+        &mut self,
+        context: &mut ActiveContext<'_>,
+        prepared: PreparedWait,
+        finish: impl FnOnce(&mut Self, ThreadId, ThreadId),
+    ) -> CommitResult {
         let (state, outcome) = self.transition_commit_wait(prepared);
         match (state, outcome) {
             (CommitState::Early(cause), None) => CommitResult::Early(cause),
@@ -469,7 +520,7 @@ impl super::CpuScheduler<'_> {
                 self.activate_thread_address_space(to);
                 #[cfg(feature = "wake-profile")]
                 crate::profile::context_restored(to);
-                self.finish_block_current(from, to);
+                finish(self, from, to);
                 #[cfg(feature = "wake-profile")]
                 crate::profile::sleep_handoff(from);
                 CommitResult::Blocked(switch_outcome)
@@ -590,6 +641,54 @@ mod tests {
         );
         assert_eq!(wait.finish(token), Ok(WaitCause::Notified));
         assert!(wait.is_none());
+    }
+
+    #[test]
+    fn phase_changes_preserve_active_identity_and_first_cause() {
+        let (mut wait, prepared) = prepared();
+        let token = prepared.token();
+        assert_eq!(wait.active.as_ref().unwrap().token, token);
+        assert!(wait.is_prepared());
+        assert_eq!(wait.commit(prepared), CommitState::Block(token));
+        assert_eq!(wait.active.as_ref().unwrap().token, token);
+        assert!(wait.is_blocked());
+        assert_eq!(
+            wait.complete(token, WaitCause::Timeout),
+            CompletionResult::WokeBlocked
+        );
+        assert_eq!(wait.active.as_ref().unwrap().token, token);
+        assert!(wait.is_completed());
+        assert_eq!(
+            wait.complete(token, WaitCause::Notified),
+            CompletionResult::AlreadyCompleted
+        );
+        assert_eq!(wait.finish(token), Ok(WaitCause::Timeout));
+        assert!(wait.is_none());
+    }
+
+    #[test]
+    fn mismatched_preparation_does_not_change_active_wait() {
+        let (mut wait, prepared) = prepared();
+        let before = wait;
+        let wrong_mode = PreparedWait {
+            token: prepared.token(),
+            consumption: WaitConsumption::Automatic,
+        };
+        assert_eq!(wait.commit(wrong_mode), CommitState::Stale);
+        assert_eq!(wait, before);
+        let wrong_token = PreparedWait {
+            token: WaitToken {
+                sequence: WaitSequence(99),
+                ..prepared.token()
+            },
+            consumption: WaitConsumption::Explicit,
+        };
+        assert_eq!(wait.cancel(wrong_token), CancelResult::Stale);
+        assert_eq!(wait, before);
+        assert_eq!(
+            wait.commit(prepared),
+            CommitState::Block(before.active.unwrap().token)
+        );
     }
 
     #[test]

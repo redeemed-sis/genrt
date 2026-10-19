@@ -55,6 +55,7 @@ unsafe extern "C" {
     fn arch_map_user_page(root_pa: usize, va: usize, pa: usize, flags: u64) -> u64;
     fn arch_translate_user_va(root_pa: usize, va: usize, out_pa: *mut usize) -> u64;
     fn arch_query_user_mapping(root_pa: usize, va: usize, out_info: *mut UserMappingInfo) -> u64;
+    fn arch_current_user_page_readable(va: usize) -> u64;
     fn arch_activate_user_address_space(root_pa: usize) -> u64;
     fn arch_clear_user_address_space() -> u64;
 }
@@ -555,6 +556,21 @@ pub fn query_user_mapping(aspace: AddressSpaceId, va: VirtAddr) -> Option<UserMa
 pub(crate) fn current_user_address_space() -> Option<AddressSpaceId> {
     let cpu = cpu::current_id().ok()?;
     CPU_USER_ADDRESS_SPACES[cpu.index()].for_usercopy(cpu)
+}
+
+/// Check one current-user page through architecture translation permissions.
+/// # Arguments
+/// * `va` - Range-checked user address; no range may cross this page.
+/// # Returns
+/// Returns false without usercopy eligibility or when EL0 cannot read the page.
+/// This bounded syscall-context query allocates nothing and temporarily masks
+/// local IRQs in the architecture hook. The caller cannot retain this result
+/// across handoff; immutable mappings and the active VM root protect the copy.
+pub(crate) fn current_user_page_readable(va: VirtAddr) -> bool {
+    current_user_address_space().is_some()
+        // SAFETY: the active VM publication owns the installed immutable root;
+        // syscall usercopy cannot hand off between this check and the copy.
+        && unsafe { arch_current_user_page_readable(va) != 0 }
 }
 
 /// Revoke usercopy eligibility while permanent idle retains the installed root.

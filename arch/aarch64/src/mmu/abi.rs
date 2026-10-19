@@ -183,6 +183,40 @@ pub unsafe extern "C" fn arch_query_user_mapping(
     }
 }
 
+/// Check EL0 read permission in the currently installed stage-1 translation.
+/// # Arguments
+/// * `va` - One address in the already range-checked user page.
+/// # Returns
+/// Returns one for a successful EL0 read translation, zero on any fault.
+/// Performs no memory copy, allocation, or software walk. Local IRQ exclusion
+/// protects PAR_EL1 between AT and MRS; the prior PAR and IRQ state are restored.
+/// # Safety
+/// The caller must hold a stable current-user VM lifetime through validation
+/// and copying. This does not validate another root or a multi-page range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arch_current_user_page_readable(va: usize) -> u64 {
+    let translated: u64;
+    // SAFETY: runtime EL1 with a stable current TTBR0; no IRQ can clobber PAR.
+    unsafe {
+        core::arch::asm!(
+            "mrs {saved}, DAIF",
+            "msr DAIFSet, #2",
+            "mrs {previous}, PAR_EL1",
+            "at s1e0r, {va}",
+            "isb",
+            "mrs {translated}, PAR_EL1",
+            "msr PAR_EL1, {previous}",
+            "msr DAIF, {saved}",
+            saved = out(reg) _,
+            previous = out(reg) _,
+            translated = out(reg) translated,
+            va = in(reg) va,
+            options(nostack),
+        );
+    }
+    u64::from(translated & 1 == 0)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arch_activate_user_address_space(root_pa: usize) -> u64 {
     match unsafe { activate_user_address_space(root_pa) } {
