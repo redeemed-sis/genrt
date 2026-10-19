@@ -79,8 +79,17 @@ static int syscall_boundaries(void) {
           || (profile_control == -GENRT_EINVAL && profile_read == -GENRT_ENOENT))) return 10;
     static unsigned char pages[8192] __attribute__((aligned(4096)));
     static const unsigned char readonly[16] = {0};
+    /* A read-only input is valid; hardware permission checks must not require
+     * write permission. Unmapped addresses inside the user interval still fail. */
+    if (genrt_syscall4(SYS_CLOCK_NANOSLEEP, CLOCK_MONOTONIC, TIMER_ABSTIME,
+                      (long)readonly, 0) != 0
+        || genrt_syscall4(SYS_CLOCK_NANOSLEEP, CLOCK_MONOTONIC, 0,
+                         0x0000006000000000L, 0) != -GTRT_EFAULT) return 11;
     const size_t mask_size = sizeof(cpu_set_t);
     for (size_t alignment = 0; alignment < sizeof(unsigned long); alignment++) {
+        memset(pages + 128 + alignment, 0, sizeof(struct timespec));
+        if (genrt_syscall4(SYS_CLOCK_NANOSLEEP, CLOCK_MONOTONIC, TIMER_ABSTIME,
+                          (long)(pages + 128 + alignment), 0) != 0) return 12;
         size_t start = 4096 - mask_size / 2 + alignment;
         memset(pages, 0xa5, sizeof(pages));
         if (genrt_syscall3(SYS_SCHED_GETAFFINITY, 0, mask_size,
@@ -141,14 +150,19 @@ static int syscall_boundaries(void) {
 
     /* Unknown dispatch must keep the original frame for fault attribution,
      * terminate only this child, and leave the parent's syscall path working. */
-    pid_t child = fork();
-    if (child < 0) return 7;
-    if (child == 0) {
-        genrt_syscall0(0x7fffffff);
-        exit(42);
+    /* Number 19 belonged to the withdrawn, unpublished counter-sleep trial.
+     * Zero would return success if its handler accidentally remained. */
+    const long unknown_calls[] = {19, 0x7fffffff};
+    for (size_t i = 0; i < sizeof(unknown_calls) / sizeof(*unknown_calls); i++) {
+        pid_t child = fork();
+        if (child < 0) return 7;
+        if (child == 0) {
+            genrt_syscall1(unknown_calls[i], 0);
+            exit(42);
+        }
+        int status = 0;
+        if (waitpid(child, &status, 0) != child || status != 0x7f) return 8;
     }
-    int status = 0;
-    if (waitpid(child, &status, 0) != child || status != 0x7f) return 8;
     struct timespec now;
     return clock_gettime(CLOCK_MONOTONIC, &now) == 0 ? 0 : 9;
 }

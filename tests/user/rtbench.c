@@ -345,6 +345,8 @@ static int cli(void) {
         {"rtbench", "-p1", "-n1", "-o0", "-F5:8", "-c", "1", NULL},
         {"rtbench", "-p1", "-n1", "-o0", "-vv", NULL},
         {"rtbench", "-p1", "-n1", "-o0", "-v1", NULL},
+        {"rtbench", "-p1", "-n1", "-o0", "-C", NULL},
+        {"rtbench", "-p1", "-n1", "-o0", "-CC", NULL},
     };
     for (size_t index = 0; index < sizeof(invalid) / sizeof(*invalid); index++) {
         reset();

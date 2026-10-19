@@ -150,6 +150,8 @@ static void rtbench_cli_validation(void) {
         {"rtbench", "-p1", "-n1", "-o0", "extra", NULL},
         {"rtbench", "-p1", "-n1", "-o0", "-x", NULL},
         {"rtbench", "-p1", "-n1", "-o0", "-vv", NULL},
+        {"rtbench", "-p1", "-n1", "-o0", "-C", NULL},
+        {"rtbench", "-p1", "-n1", "-o0", "-CC", NULL},
     };
     char *overflow[] = {"rtbench", "-p18446744073709551615", "-n2", "-o0", NULL};
     gtrt_case_start(producer, name);
