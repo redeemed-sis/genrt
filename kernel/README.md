@@ -16,7 +16,7 @@ hooks.
 | `profile` (optional) | [Bounded diagnostic sleep/wakeup sessions](src/profile/README.md) and frozen binary export |
 | `ipc` | Bounded mailbox buffers, wait queues, and timeout integration |
 | `process` | [Bounded process table and lifecycle](src/process/README.md), address-space/image ownership, fork/exec/wait, cwd/FD access |
-| `fs` | Initramfs mount, readonly ramfs index, paths, and descriptor tables |
+| `fs` | Mount-aware VFS, readonly ramfs backend, paths, and shared open descriptions |
 | `loader` | Static userspace ELF validation and segment loading |
 | `syscall` | Architecture-neutral syscall behavior and errno mapping |
 | `power` | Linux reboot validation and architecture-neutral terminal power policy |

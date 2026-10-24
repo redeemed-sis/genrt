@@ -19,9 +19,21 @@
 `Process`. That aggregate owns `ProcessState`, `ProcessResources`, parent and
 main-thread relationships, terminal status, and process wait/consumer metadata.
 `ProcessResources` owns the address space, ELF image, and
-`ProcessFileState { FdTable, cwd }`; it never contains a user stack. The
+`ProcessFileState { FdTable, cwd, pending }`; it never contains a user stack. The
 corresponding `Thread` owns its `OwnedUserStack` and retains only a non-owning
 `AddressSpaceId`.
+
+FD slots own references to filesystem-independent open descriptions. Fork
+clones those references, sharing file and directory offsets; independent opens
+remain independent. Cwd is a mount-aware directory reference. Exec leaves both
+unchanged. Process ownership covers only bounded reference clone/install/take
+operations, never backend callbacks, usercopy, or final destruction. Exit,
+fault, and failed staging detach file resources before task-context cleanup.
+Pending filesystem-call metadata is stored inline. I/O payloads and reusable
+backend requests belong to OFDs and are leased across waits, not newly allocated
+per syscall or copied into process-state storage.
+See the [VFS guide](../fs/README.md) and
+[ADR-0062](../../../memory/decisions/ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md).
 
 Every live process has one immutable logical CPU owner. Before main-thread
 publication, process code assigns that same owner to the completed address

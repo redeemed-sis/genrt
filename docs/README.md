@@ -13,7 +13,7 @@ Use the narrowest document that owns the question:
 | Generic kernel subsystem map | [`kernel/README.md`](../kernel/README.md) |
 | Memory ownership and VM | [`kernel/src/memory/README.md`](../kernel/src/memory/README.md) |
 | Scheduling, time, threads, IPC | [`kernel/src/sched/README.md`](../kernel/src/sched/README.md) |
-| Initramfs, ramfs, paths, FDs | [`kernel/src/fs/README.md`](../kernel/src/fs/README.md) |
+| Mount-aware VFS, initramfs, paths, FDs | [`kernel/src/fs/README.md`](../kernel/src/fs/README.md) |
 | Userspace build and ABI | [`user/README.md`](../user/README.md) |
 | Build and artifact workflows | [`tools/xtask/README.md`](../tools/xtask/README.md) |
 | QEMU contracts | [`testing.md`](testing.md), [`tests/qemu/README.md`](../tests/qemu/README.md) |

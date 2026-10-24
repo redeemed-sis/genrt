@@ -34,6 +34,31 @@ cargo xtask test-aarch64 --case smp-boot
 
 ## Test layers
 
+`vfs-contract` uses a four-CPU kernel with the `qemu-test-vfs` feature and a
+test-only userspace supervisor. Controlled mountpoint fixtures attach independent
+writable/generated backend instances through the common VFS interface. Cases
+cover mount-aware traversal and cwd, directory enumeration, bounded partial I/O,
+shared fork offsets, exec inheritance, descriptor cleanup, cross-CPU access,
+and pending completion while another process progresses. Deferred create, open,
+truncate, and write stages check exact submission/resumption counts and final
+contents across real syscall restarts. Runtime backend callbacks assert IRQs
+are enabled. Component-limit tests reject oversized names before mutation and
+enumerate the largest accepted name. The backend and its fixtures are absent
+from production builds. Host VFS tests cover kernel-only
+mount registration, seeking, synchronization, metadata, and failure paths;
+existing production userspace and shell cases remain regression checks.
+
+Allocation-count host tests measure read/write after open/setup, including
+first use, repeated calls, backend errors, zero-length requests, and pending
+completion. They check retained request/buffer identity and growth only beyond
+4096 bytes. These are allocator/lifetime assertions, not timing benchmarks;
+the syscall transfer bound remains 1024 bytes.
+
+```bash
+cargo test -p kernel --lib --locked
+cargo xtask test-aarch64 --case vfs-contract
+```
+
 `kernel-contract` and `user-fault` use kernels compiled with scenario-specific
 `qemu-test` features. Their coordinators test CPU0 identity, per-CPU scheduler
 context ownership, scheduler/timing/mailbox behavior, and exact user-fault

@@ -33,6 +33,14 @@ remain uninstrumented and reject diagnostic kernel markers.
   context, including kernel execution with a lazily retained root.
   `saved-context-transfer` exercises the real AArch64 save/restore hooks with
   distinct register patterns, alignment/exception padding, and guard words.
+- `vfs-contract`: four-CPU `qemu-test-vfs` kernel with normal init-process
+  startup and a controlled C supervisor. Test-only mounts exercise generated
+  and writable files, mount-root `..`, cwd, bounded transfers, shared fork
+  offsets, exec persistence, cleanup, concurrent access, and pending completion.
+  Deferred mutations verify peer progress and exactly-once effects across SVC
+  restart; backend callback assertions check IRQ-enabled task context.
+  Host tests additionally exercise kernel-only mount/seek/sync/metadata APIs.
+  No test backend or mount fixture is included in production artifacts.
 - `user-fault`: test-enabled kernel coordinator that joins a faulting EL0
   process and verifies exact fault classification.
 - `smp-boot`: four-CPU test kernel that validates PSCI secondary high-half
@@ -81,6 +89,8 @@ remain uninstrumented and reject diagnostic kernel markers.
 
 Kernel contracts use scenario-specific Cargo features. System contracts use the
 byte-identical production kernel with a controlled test initramfs.
+The VFS case is explicitly test-enabled, not evidence that a writable backend
+is shipped in the ordinary production kernel.
 
 ## Machine protocol
 

@@ -4,6 +4,9 @@
 
 Accepted
 
+Superseded for ramfs-specific descriptor representation and lifetime by
+[ADR-0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md).
+
 Superseded for filesystem backing by
 [`ADR-0021`](ADR-0021-initramfs-cpio-root.md). Extended for directory handles and
 `getdents64` by [`ADR-0023`](ADR-0023-directory-fds-and-getdents64.md). The FD

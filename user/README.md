@@ -175,6 +175,9 @@ does not set the userspace PC.
 - Errors are negative errno values.
 - Pathnames, argv/envp, I/O, and directory buffers are bounded.
 - `fork` eagerly copies process memory; `execve` replaces it from ramfs.
+- Forked descriptors share open file descriptions and positions; independent
+  opens have independent positions. Exec preserves descriptors and mount-aware
+  cwd. The production VFS root remains readonly.
 - `<sched.h>` exposes fixed CPU sets and immutable process-affinity queries.
 - `<sys/reboot.h>` exposes Linux-compatible restart and power-off operations;
   the wrapper hides raw reboot magic values.

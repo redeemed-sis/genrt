@@ -380,8 +380,23 @@ accepted ADRs remain authoritative when details differ.
 
 - QEMU loads a deterministic uncompressed `newc` initramfs into a reserved
   physical region. The kernel mounts it as a readonly ramfs index.
-- Processes have bounded FD tables, immutable ramfs cwd identities, relative
-  path traversal, readonly files, and directory iteration.
+- A mount-aware VFS owns pathname traversal and dispatch to filesystem
+  backends. Ramfs remains the archive-backed readonly root; mounts are
+  kernel-controlled and cannot be dynamically unmounted.
+- Processes have bounded FD tables and mount-aware cwd references. Fork shares
+  open file descriptions and file/directory positions; exec preserves them.
+  Backend work and final resource destruction run outside process/scheduler
+  critical sections. Pending I/O uses exact waits and syscall restart rather
+  than blocking beneath a borrowed live frame.
+- Open provisions reusable request/staging storage per OFD, with a 4096-byte
+  baseline. Read/write reuse it across calls and waits; pending call metadata is
+  inline rather than separately boxed. Capacity grows only beyond the baseline
+  when insufficient, without changing the 1024-byte syscall usercopy bound.
+  See [ADR-0063](decisions/ADR-0063-reusable-open-description-io-storage.md).
+- A test-only second backend exercises generated and writable files, independent
+  mounts, pending completion, and process ownership through the same VFS
+  interfaces. It is absent from production artifacts. See
+  [ADR-0062](decisions/ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md).
 - `/init` is the freestanding shell. Product binaries are declared by
   `user/c/programs.toml` and installed under `/bin`, including `sleep`,
   `reboot`, and `poweroff`.
@@ -433,7 +448,7 @@ accepted ADRs remain authoritative when details differ.
 - No FP/SIMD context ownership; the soft-float target is intentional.
 - No ASIDs, copy-on-write, demand paging, recoverable usercopy faults, signals,
   or multiple user threads within one process.
-- No writable filesystem, VFS, storage driver, file metadata syscall set, or
-  terminal line discipline.
+- No production writable filesystem, persistent storage driver, file metadata
+  syscall set, dynamic unmount, or terminal line discipline.
 - Kernel TTBR1 mutation remains limited to the current mapping granularity.
 - Heap growth and comprehensive hardware latency certification are deferred.

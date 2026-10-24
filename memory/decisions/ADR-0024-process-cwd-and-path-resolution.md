@@ -4,6 +4,9 @@
 
 Accepted
 
+Superseded for ramfs-only cwd and resolver identities by
+[ADR-0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md).
+
 ## Context
 
 The readonly initramfs-backed ramfs has stable directory indexes, but relative

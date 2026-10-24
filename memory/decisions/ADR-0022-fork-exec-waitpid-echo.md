@@ -4,6 +4,9 @@
 
 Accepted
 
+Superseded only for independent forked descriptor offsets by
+[ADR-0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md).
+
 ## Context
 
 The first initramfs milestone could launch `/init` as one EL0 process and expose

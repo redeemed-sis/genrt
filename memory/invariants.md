@@ -245,6 +245,28 @@ Changes that invalidate one require architecture review and an ADR.
   frees ELF frames or destroys `OwnedUserAddressSpace`. Heavy resource
   destruction occurs after scheduler and local-IRQ exclusion.
 
+## Filesystem ownership
+
+- One VFS namespace owns mount placement; mount and node references remain
+  valid while descriptors or cwd refer to them. Dynamic unmount is deferred.
+- Process FD slots own references to open file descriptions, not backend
+  indexes or independent copied positions. Fork shares descriptions and
+  offsets; independent opens do not. Exec preserves descriptor and cwd state.
+- Backend calls, usercopy, allocation, and final reference destruction occur
+  in task context outside process/scheduler locks. Description serialization
+  never holds a spinlock across I/O or usercopy.
+- A pending I/O request owns its buffers and exact completion identity.
+  Registration rechecks completion before blocking; restarted syscalls consume
+  the existing operation rather than repeating committed effects. No pending
+  request retains a live exception-context borrow or syscall-stack buffer.
+- Read/write lease reusable OFD-owned request storage. Open provisions at least
+  4096 bytes; transient small-call state does not allocate or free heap memory.
+  Capacity grows only beyond that baseline when insufficient and is retained
+  across calls. Write input is copied after acquiring the lease, once before
+  submission. All reset work precedes availability publication and wakeup.
+- Ramfs data remains archive-backed and readonly. Test-only writable/generated
+  backends use the same VFS boundary and never enter production composition.
+
 ## Userspace and ABI
 
 - Shared freestanding userspace code stays separate from architecture syscall

@@ -24,12 +24,12 @@ growth.
 | [0016](ADR-0016-first-aarch64-el0-process.md) | First AArch64 EL0 process | Accepted | Userspace/MMU | - | - |
 | [0017](ADR-0017-process-table-and-user-fault-policy.md) | Process table and user faults | Accepted | Processes | - | [0032](ADR-0032-typed-wait-registrations-and-external-wake-ownership.md) (join/wait registration identity), [0033](ADR-0033-unified-thread-model-and-scheduler-process-separation.md) (main-thread join and user-stack ownership) |
 | [0018](ADR-0018-userspace-elf-loader.md) | Userspace ELF loader only | Accepted | Loader | - | - |
-| [0019](ADR-0019-readonly-ramfs-and-fd-table.md) | Readonly ramfs and FD table | Accepted | FD ABI; original backing partially replaced | - | [0021](ADR-0021-initramfs-cpio-root.md) (backing only) |
+| [0019](ADR-0019-readonly-ramfs-and-fd-table.md) | Readonly ramfs and FD table | Accepted | FD ABI; original backing partially replaced | - | [0021](ADR-0021-initramfs-cpio-root.md) (backing only), [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) (descriptor representation/lifetime) |
 | [0020](ADR-0020-uart-stdin-and-shell.md) | UART stdin and shell | Accepted | Console/userspace | - | [0032](ADR-0032-typed-wait-registrations-and-external-wake-ownership.md) (stdin waiter identity only) |
 | [0021](ADR-0021-initramfs-cpio-root.md) | CPIO initramfs root | Accepted | Filesystem backing | [0019](ADR-0019-readonly-ramfs-and-fd-table.md) (backing only) | - |
-| [0022](ADR-0022-fork-exec-waitpid-echo.md) | Minimal process control | Accepted | Processes/syscalls | - | [0033](ADR-0033-unified-thread-model-and-scheduler-process-separation.md) (main-thread resource transfer and reap) |
-| [0023](ADR-0023-directory-fds-and-getdents64.md) | Directory FDs and getdents64 | Accepted | Filesystem ABI | - | - |
-| [0024](ADR-0024-process-cwd-and-path-resolution.md) | Process cwd and path traversal | Accepted | Filesystem/process | - | - |
+| [0022](ADR-0022-fork-exec-waitpid-echo.md) | Minimal process control | Accepted | Processes/syscalls | - | [0033](ADR-0033-unified-thread-model-and-scheduler-process-separation.md) (main-thread resource transfer and reap), [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) (forked descriptor offsets only) |
+| [0023](ADR-0023-directory-fds-and-getdents64.md) | Directory FDs and getdents64 | Accepted | Filesystem ABI | - | [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) (directory-description ownership) |
+| [0024](ADR-0024-process-cwd-and-path-resolution.md) | Process cwd and path traversal | Accepted | Filesystem/process | - | [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) (cwd/resolver identities) |
 | [0025](ADR-0025-automated-qemu-testing-and-tagged-releases.md) | Automated testing and releases | Accepted | Verification/release | - | - |
 | [0026](ADR-0026-agent-oriented-development-workflow.md) | Agent-oriented development workflow | Accepted | Repository workflow | - | - |
 | [0027](ADR-0027-typed-active-context-and-syscall-boundary.md) | Typed active context and syscall boundary | Accepted | Kernel/AArch64 context boundary | - | [0028](ADR-0028-typed-saved-context-and-scheduler-ownership.md) (saved-frame bridge only) |
@@ -69,5 +69,8 @@ growth.
 | [0059](ADR-0059-native-counter-sleep-and-active-read-validation.md) | Native counter sleep and active-read validation | Accepted | Syscall/time/VM ownership | - | [0060](ADR-0060-retire-native-counter-sleep-interface.md) (native userspace interface only) |
 | [0060](ADR-0060-retire-native-counter-sleep-interface.md) | Retire native counter-sleep interface | Accepted | Userspace sleep ABI | [0059](ADR-0059-native-counter-sleep-and-active-read-validation.md) (native userspace interface only) | - |
 | [0061](ADR-0061-raspberrypi-fit-release-artifacts.md) | Raspberry Pi FIT release artifacts | Accepted | Release composition and verification scope | - | - |
+| [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) | Mount-aware VFS and shared open file descriptions | Accepted | Filesystem/mount/process/descriptor ownership | [0019](ADR-0019-readonly-ramfs-and-fd-table.md) (descriptor representation), [0022](ADR-0022-fork-exec-waitpid-echo.md) (fork offsets), [0023](ADR-0023-directory-fds-and-getdents64.md) (directory descriptions), [0024](ADR-0024-process-cwd-and-path-resolution.md) (cwd/resolver identities) | - |
+
+| [0063](ADR-0063-reusable-open-description-io-storage.md) | Reusable open-description I/O storage | Accepted | Filesystem I/O allocation and request lifetime | - | - |
 
 Use [`TEMPLATE.md`](TEMPLATE.md) for new decisions.

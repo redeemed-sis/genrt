@@ -30,8 +30,8 @@ a production-ready or latency-certified operating system.
   threads, sleep, mailbox IPC, and targeted cross-CPU wakeup notifications.
 - Process-owned TTBR0 address spaces, static AArch64 ELF loading, lower-EL fault
   isolation, and eager-copy `fork`/`execve`/`waitpid`.
-- Readonly CPIO initramfs, bounded per-process FD tables, cwd/path traversal,
-  directory iteration, and UART-backed stdin.
+- Mount-aware VFS with a readonly CPIO root, bounded per-process FD tables,
+  shared open file descriptions, directory iteration, and UART-backed stdin.
 - Freestanding C shell and product programs declared by
   `user/c/programs.toml`.
 - POSIX-like monotonic clock observation and relative/absolute sleep APIs,
@@ -169,7 +169,7 @@ and [docs/releases.md](docs/releases.md).
 - No ASIDs, copy-on-write, demand paging, signals, or recoverable usercopy
   faults.
 - One main user thread per process and a deliberately small process-control ABI.
-- Readonly ramfs rather than a writable VFS or storage stack.
+- Production root remains readonly; persistent storage backends are not present.
 - Raw UART stdin rather than a terminal/TTY subsystem.
 - Fixed bootstrap heap and limited kernel VM mapping granularity.
 - x86_64 and RISC-V ports are structural placeholders, not active targets.

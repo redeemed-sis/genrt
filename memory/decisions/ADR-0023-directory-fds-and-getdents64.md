@@ -4,6 +4,10 @@
 
 Accepted
 
+Superseded for ramfs-specific directory-description ownership by
+[ADR-0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md).
+The directory record ABI remains unchanged.
+
 ## Context
 
 The initramfs-backed ramfs can serve readonly files through per-process file
