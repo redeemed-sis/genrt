@@ -78,10 +78,18 @@ Do not treat README prose as stronger evidence than source code or tests.
 - Format commit references as explicit Markdown links to the repository's
   `/commit/<full-sha>` URL with a short SHA as the label. Do not put bare
   commit hashes in backticks: they are not clickable references on GitHub.
-- Inspect tool schemas before GitHub writes and confirm the repository and
-  issue target. Never substitute an ambiguously targeted PR action or bypass
-  a rejected operation. Complete independently authorized actions and report
-  any blocked comment or state update separately.
+- Inspect tool schemas before GitHub writes and confirm the repository,
+  resource type, and issue number. PR-oriented wording or a legacy parameter
+  name such as `pr_number` alone does not prove that issue comments are
+  unsupported. Check supported API documentation or verified tool behavior;
+  if uncertainty remains, obtain explicit user approval before one
+  target-specific attempt. Do not substitute an unrelated PR operation.
+- Distinguish schema uncertainty, a safety-review rejection before execution,
+  and an actual GitHub API response. Report only the observed limitation; do
+  not infer changed permissions or lost capabilities without evidence.
+  Never bypass a rejected operation through another tool or indirect route.
+  Complete independently authorized actions and report any blocked comment
+  or state update separately.
 - After a write, verify the returned issue state or refetch it. Before retrying
   an uncertain comment submission, inspect existing comments to avoid posting
   duplicates. Report the issue link, confirmed state, comment outcome, and
