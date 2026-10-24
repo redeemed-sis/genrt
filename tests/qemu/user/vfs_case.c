@@ -137,8 +137,8 @@ static int paths(void) {
     CHECK(fd >= 3 && getdents64(fd, cwd, sizeof(cwd)) == -ENOTDIR && close(fd) == 0);
     fd = open(A, O_DIRECTORY);
     CHECK(fd >= 3);
-    const char *names[] = {"dynamic", "errors", "open-error", "pending", "stats", "sub"};
-    for (unsigned i = 0; i < 6; i++) CHECK(entry(fd, names[i], i + 1, i == 5 ? DT_DIR : DT_REG) == 0);
+    const char *names[] = {"dynamic", "errors", "open-error", "pending", "pending-control", "stats", "sub"};
+    for (unsigned i = 0; i < 7; i++) CHECK(entry(fd, names[i], i + 1, i == 6 ? DT_DIR : DT_REG) == 0);
     CHECK(getdents64(fd, cwd, sizeof(cwd)) == 0 && close(fd) == 0);
     return 0;
 }
@@ -487,6 +487,8 @@ static int deferred_mutations(void) {
 
 static int pending(void) {
     struct stats before, observed, after;
+    int control = open(A "/pending-control", O_WRONLY); CHECK(control >= 3);
+    CHECK(write(control, "0", 1) == 1 && close(control) == 0);
     CHECK(put(A "/progress", "") == 0);
     CHECK(put(A "/pending-peer", "") == 0);
     int fd = open(A "/pending", O_RDONLY); CHECK(fd >= 3);
@@ -517,11 +519,14 @@ static int pending(void) {
         if (n == 5 && memcmp(bytes, "ready", 5) == 0) { peer_ready = 1; break; }
         CHECK(n == 0 && usleep(100) == 0);
     }
-    CHECK(peer_ready && stats(&observed) == 0);
+    /* Pending ownership must survive beyond the fixture's former 10 ms delay. */
+    CHECK(peer_ready && usleep(20000) == 0 && stats(&observed) == 0);
     CHECK(observed.pending == before.pending + 1 && observed.completed == before.completed);
     CHECK(put(A "/progress", "go") == 0);
+    control = open(A "/pending-control", O_WRONLY); CHECK(control >= 3);
+    CHECK(write(control, "1", 1) == 1 && close(control) == 0);
     CHECK(wait_ok(first) == 0 && wait_ok(second) == 0);
-    CHECK(stats(&after) == 0 && after.pending == before.pending + 2 && after.completed == before.completed + 2);
+    CHECK(stats(&after) == 0 && after.pending == before.pending + 1 && after.completed == before.completed + 2);
     CHECK(close(fd) == 0);
     return 0;
 }

@@ -468,6 +468,14 @@ fn ramfs_validates_components_and_preserves_nonzero_inode_identity() {
 fn pending_transaction_retains_lease_and_zero_length_skips_backend() {
     let (ns, _, _) = fixture();
     let fd = open(&ns, b"/m/pending", flags());
+    let control = open(
+        &ns,
+        b"/m/pending-control",
+        OpenFlags {
+            write: true,
+            ..flags()
+        },
+    );
     let mut zero = Transaction::new(
         fd.clone(),
         Operation::Read {
@@ -505,6 +513,10 @@ fn pending_transaction_retains_lease_and_zero_length_skips_backend() {
     )
     .unwrap();
     assert!(matches!(peer.poll(None), Poll::Ready(Err(errno::EAGAIN))));
+    for _ in 0..4 {
+        assert!(tx.poll(Some(token)).is_pending());
+    }
+    write(control, b"1");
     assert!(matches!(
         tx.poll(Some(token)),
         Poll::Ready(Ok(Reply::Io { count: 10, .. }))
@@ -1034,6 +1046,14 @@ fn allocation_failure_on_open_closes_once_and_growth_failure_returns_the_lease()
 #[test]
 fn pending_busy_zero_and_abandoned_io_reuse_the_same_exclusive_request() {
     let (ns, a, _) = fixture();
+    let control = open(
+        &ns,
+        b"/m/pending-control",
+        OpenFlags {
+            write: true,
+            ..flags()
+        },
+    );
     let mut parent = FdTable::new();
     parent
         .install(&mut Some(open(&ns, b"/m/pending", flags())))
@@ -1070,6 +1090,7 @@ fn pending_busy_zero_and_abandoned_io_reuse_the_same_exclusive_request() {
             Poll::Ready(Ok(Reply::Io { count: 0, .. }))
         ));
         assert_eq!(zero.staging_identity(), None);
+        write(control.clone(), b"1");
         assert!(matches!(
             tx.poll(Some(token)),
             Poll::Ready(Ok(Reply::Io { count: 5, next: 5 }))
@@ -1077,19 +1098,20 @@ fn pending_busy_zero_and_abandoned_io_reuse_the_same_exclusive_request() {
         assert_eq!(tx.buffer(), b"pendi");
         tx.commit();
         drop(tx);
-        assert!(peer.poll(Some(peer_token)).is_pending());
-        assert_eq!(peer.staging_identity(), identity);
         assert!(matches!(
             peer.poll(Some(peer_token)),
             Poll::Ready(Ok(Reply::Io { count: 5, next: 10 }))
         ));
+        assert_eq!(peer.staging_identity(), identity);
         assert_eq!(peer.buffer(), b"ng:a\n");
         drop(peer); // No commit: retain offset 5 after failed read usercopy.
+        write(control.clone(), b"0");
         let mut abandoned = read_transaction(&fd, 5);
         assert!(abandoned.poll(Some(token)).is_pending());
         drop(abandoned);
         let mut retry = read_transaction(&fd, 5);
         assert!(retry.poll(Some(token)).is_pending()); // Fresh operation, not stale marker.
+        write(control.clone(), b"1");
         assert!(matches!(
             retry.poll(Some(token)),
             Poll::Ready(Ok(Reply::Io { count: 5, next: 10 }))
@@ -1098,9 +1120,76 @@ fn pending_busy_zero_and_abandoned_io_reuse_the_same_exclusive_request() {
         assert_eq!(retry.staging_identity(), identity);
     });
     assert_eq!(counts, (0, 0, 0));
+    drop(control);
     drop(parent.take(3).unwrap());
     drop(child.take(3).unwrap());
-    assert_eq!(a.counts(), (1, 0, 1));
+    assert_eq!(a.counts(), (2, 1, 1));
     drop(fd);
-    assert_eq!(a.counts(), (1, 1, 0));
+    assert_eq!(a.counts(), (2, 2, 0));
+}
+
+#[test]
+fn pending_gate_validates_controls_and_cleans_up_replaced_waits() {
+    let (ns, _, _) = fixture();
+    let control = open(
+        &ns,
+        b"/m/pending-control",
+        OpenFlags {
+            write: true,
+            ..flags()
+        },
+    );
+    let fd = open(&ns, b"/m/pending", flags());
+    let cpu = crate::cpu::CpuId::from_index(0).unwrap();
+    let thread = crate::sched::ThreadId::new(0, 1);
+    let token = crate::sched::WaitToken::for_profile_test(thread, cpu, 1);
+    let replacement = crate::sched::WaitToken::for_profile_test(thread, cpu, 2);
+    let mut tx = read_transaction(&fd, 5);
+    assert!(tx.poll(Some(token)).is_pending());
+    assert!(tx.poll(Some(replacement)).is_pending());
+    let mut hold = Transaction::new(
+        control.clone(),
+        Operation::Write {
+            offset: 0,
+            append: false,
+        },
+        1,
+    )
+    .unwrap();
+    assert!(matches!(
+        hold.prepare(None, |buffer| {
+            buffer.copy_from_slice(b"0");
+            Ok(())
+        }),
+        Poll::Ready(Ok(()))
+    ));
+    assert!(matches!(complete(&mut hold), Err(errno::EBUSY)));
+    drop(hold);
+    let mut invalid = Transaction::new(
+        control.clone(),
+        Operation::Write {
+            offset: 0,
+            append: false,
+        },
+        1,
+    )
+    .unwrap();
+    assert!(matches!(
+        invalid.prepare(None, |buffer| {
+            buffer.copy_from_slice(b"x");
+            Ok(())
+        }),
+        Poll::Ready(Ok(()))
+    ));
+    assert!(matches!(complete(&mut invalid), Err(errno::EINVAL)));
+    drop(invalid);
+    assert!(tx.poll(Some(replacement)).is_pending());
+    drop(tx);
+    // Abandonment must detach the latest exact token, not only the first one.
+    write(control.clone(), b"0");
+    // Release before submission must not require an artificial timer wake.
+    write(control.clone(), b"1");
+    assert_eq!(read(fd.clone(), 5, true), b"pendi");
+    write(control.clone(), b"1");
+    assert_eq!(read(fd, 5, true), b"ng:a\n");
 }

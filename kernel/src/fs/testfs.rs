@@ -29,6 +29,8 @@ struct Store {
 struct State {
     store: Option<Store>,
     waiters: [Option<WaitToken>; crate::config::KERNEL_THREAD_CAPACITY],
+    pending_released: bool,
+    pending_waiters: [Option<WaitToken>; crate::config::KERNEL_THREAD_CAPACITY],
 }
 
 struct Deferred {
@@ -38,7 +40,7 @@ struct Deferred {
 
 #[derive(Default)]
 struct OpenPrivate {
-    pending_read: bool,
+    pending_read: Option<WaitToken>,
     write_reply: Option<Reply>,
 }
 
@@ -120,6 +122,8 @@ impl TestFs {
                     }],
                 }),
                 waiters: [None; crate::config::KERNEL_THREAD_CAPACITY],
+                pending_released: false,
+                pending_waiters: [None; crate::config::KERNEL_THREAD_CAPACITY],
             }),
             opens: AtomicUsize::new(0),
             closes: AtomicUsize::new(0),
@@ -161,6 +165,29 @@ impl TestFs {
             self.deferred.each_ref().map(|v| v.load(Ordering::SeqCst)),
             self.resumed.each_ref().map(|v| v.load(Ordering::SeqCst)),
         )
+    }
+
+    fn control_pending(&self, release: bool) -> Result<(), Errno> {
+        let waiters = {
+            let mut state = self.state.lock();
+            if !release && state.pending_waiters.iter().any(Option::is_some) {
+                return Err(errno::EBUSY);
+            }
+            state.pending_released = release;
+            core::mem::replace(
+                &mut state.pending_waiters,
+                [None; crate::config::KERNEL_THREAD_CAPACITY],
+            )
+        };
+        // Publish the gate before notifying exact waits, outside fixture locks.
+        #[cfg(not(test))]
+        for token in waiters.into_iter().flatten() {
+            let _ = sched::complete_wait(token, WaitCause::Notified);
+        }
+        // Host fixtures poll manually without booting the global scheduler.
+        #[cfg(test)]
+        let _ = waiters;
+        Ok(())
     }
 
     fn access(
@@ -216,10 +243,11 @@ fn node(id: u64) -> Node {
         kind: if id <= 2 { Kind::Directory } else { Kind::File },
     }
 }
-const SPECIAL: [(&[u8], u64); 6] = [
+const SPECIAL: [(&[u8], u64); 7] = [
     (b"sub", 2),
     (b"dynamic", 3),
     (b"pending", 4),
+    (b"pending-control", 8),
     (b"errors", 5),
     (b"open-error", 6),
     (b"stats", 7),
@@ -249,6 +277,20 @@ impl Backend for TestFs {
             self.resumed[saved.stage].fetch_add(1, Ordering::SeqCst);
             return Poll::Ready(Ok(saved.reply));
         }
+        if request.node.id == 8
+            && let Operation::Write { offset, .. } = request.operation
+        {
+            return Poll::Ready((|| {
+                let release = match request.buffer.as_slice() {
+                    b"0" => false,
+                    b"1" => true,
+                    _ => return Err(errno::EINVAL),
+                };
+                let next = offset.checked_add(1).ok_or(errno::EOVERFLOW)?;
+                self.control_pending(release)?;
+                Ok(Reply::Io { count: 1, next })
+            })());
+        }
         if matches!(
             request.operation,
             Operation::Read { .. } | Operation::Write { .. }
@@ -263,14 +305,19 @@ impl Backend for TestFs {
                 self.resumed[3].fetch_add(1, Ordering::SeqCst);
                 return Poll::Ready(Ok(reply));
             }
-            if request.node.id == 4 && !private.pending_read {
-                let Some(token) = wake else {
-                    return Poll::Ready(Err(errno::ENOTSUP));
-                };
-                private.pending_read = true;
-                self.pending.fetch_add(1, Ordering::SeqCst);
-                arm_delay(token);
-                return Poll::Pending;
+            if request.node.id == 4 {
+                let mut state = self.state.lock();
+                if !state.pending_released {
+                    let Some(token) = wake else {
+                        return Poll::Ready(Err(errno::ENOTSUP));
+                    };
+                    if private.pending_read.is_none() {
+                        self.pending.fetch_add(1, Ordering::SeqCst);
+                    }
+                    private.pending_read = Some(token);
+                    state.pending_waiters[token.thread().index()] = Some(token);
+                    return Poll::Pending;
+                }
             }
         }
         let mut lease = match self.access(wake) {
@@ -355,7 +402,7 @@ impl Backend for TestFs {
                 if id == 6 {
                     return Err(errno::EIO);
                 }
-                if flags.write && id < 16 && id != 5 {
+                if flags.write && id < 16 && !matches!(id, 5 | 8) {
                     return Err(errno::EROFS);
                 }
                 Ok(Reply::Done)
@@ -363,6 +410,9 @@ impl Backend for TestFs {
             Operation::Read { offset, limit } => {
                 if id == 5 {
                     return Err(errno::EIO);
+                }
+                if id == 8 {
+                    return Err(errno::ENOTSUP);
                 }
                 if request.node.kind == Kind::Directory {
                     return Err(errno::EISDIR);
@@ -567,7 +617,13 @@ impl Backend for TestFs {
             .as_mut()
             .and_then(|s| s.downcast_mut::<OpenPrivate>())
         {
-            private.pending_read = false;
+            if let Some(token) = private.pending_read.take() {
+                let mut state = self.state.lock();
+                let waiter = &mut state.pending_waiters[token.thread().index()];
+                if *waiter == Some(token) {
+                    *waiter = None;
+                }
+            }
             private.write_reply = None;
         }
         request.continuation = None;

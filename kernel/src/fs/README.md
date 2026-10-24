@@ -119,6 +119,8 @@ Host tests exercise namespace, operation, offset, error, and lifetime contracts.
 shared descriptions, process inheritance, cleanup, and pending completion.
 Deferred mutation fixtures retain completed replies across real syscall restart
 and verify exact create/open/truncate/write counts and peer progress.
+Pending-read fixtures use an explicit controller release rather than a timed
+completion; abandoned requests detach their exact wait registration.
 Its backend, fixtures, and protocol markers are test-only. Ordinary userspace,
 shell, SMP, and release checks continue to exercise the production ramfs root.
 

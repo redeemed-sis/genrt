@@ -37,6 +37,11 @@ remain uninstrumented and reject diagnostic kernel markers.
   startup and a controlled C supervisor. Test-only mounts exercise generated
   and writable files, mount-root `..`, cwd, bounded transfers, shared fork
   offsets, exec persistence, cleanup, concurrent access, and pending completion.
+  Pending reads remain blocked until the controller writes `1` to the fixture's
+  `pending-control` file (`0` rearms an idle gate). The scenario waits beyond
+  the former 10 ms completion window before release, without requiring peer
+  preparation to finish inside that window. Notifications use exact tokens
+  outside fixture locks; host step/case deadlines still bound the scenario.
   Deferred mutations verify peer progress and exactly-once effects across SVC
   restart; backend callback assertions check IRQ-enabled task context.
   Host tests additionally exercise kernel-only mount/seek/sync/metadata APIs.
