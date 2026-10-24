@@ -1,0 +1,60 @@
+name = "vfs-contract"
+suite = "vfs-contract"
+supervisor = "vfs-supervisor"
+profile = "debug"
+log_level = "info"
+kernel_features = ["qemu-test-vfs"]
+cpu_count = 4
+init = "vfs-contract"
+timeout_secs = 60
+step_timeout_secs = 15
+
+[[steps]]
+action = "expect_case"
+producer = "vfs-supervisor"
+subject = "mount-paths"
+
+[[steps]]
+action = "expect_case"
+producer = "vfs-supervisor"
+subject = "generated-instances"
+
+[[steps]]
+action = "expect_case"
+producer = "vfs-supervisor"
+subject = "writable-io"
+
+[[steps]]
+action = "expect_case"
+producer = "vfs-supervisor"
+subject = "bounded-io"
+
+[[steps]]
+action = "expect_case"
+producer = "vfs-supervisor"
+subject = "fork-exec"
+
+[[steps]]
+action = "expect_case"
+producer = "vfs-supervisor"
+subject = "fd-capacity"
+
+[[steps]]
+action = "expect_case"
+producer = "vfs-supervisor"
+subject = "cleanup"
+
+[[steps]]
+action = "expect_case"
+producer = "vfs-supervisor"
+subject = "concurrent-io"
+
+[[steps]]
+action = "expect_case"
+producer = "vfs-supervisor"
+subject = "pending-progress"
+
+[[steps]]
+action = "expect_case"
+producer = "vfs-supervisor"
+subject = "deferred-mutations"

@@ -921,6 +921,20 @@ struct UserProgram {
 
 const USER_PROGRAMS: &[UserProgram] = &[
     UserProgram {
+        name: "test_vfs_case",
+        source: "tests/qemu/user/vfs_case.c",
+        checked: false,
+        defines: &[],
+        test_artifact: true,
+    },
+    UserProgram {
+        name: "test_vfs_supervisor",
+        source: "tests/qemu/user/vfs_supervisor.c",
+        checked: false,
+        defines: &[],
+        test_artifact: true,
+    },
+    UserProgram {
         name: "test_profile_supervisor",
         source: "tests/qemu/user/profile_supervisor.c",
         checked: false,

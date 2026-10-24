@@ -11,6 +11,7 @@ pub(super) enum InitImage {
     KernelContract,
     UserFault,
     UserspaceContract,
+    VfsContract,
     SmpUserspaceContract,
     ShellContract,
     RebootContract,
@@ -114,6 +115,7 @@ pub(super) fn load_all(root: &Path) -> Result<Vec<Case>> {
         let case: Case = toml::from_str(&source)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         validate_cpu_count(&case)?;
+        validate_vfs_fixture(&case)?;
         if cases
             .iter()
             .any(|existing: &Case| existing.name == case.name)
@@ -140,9 +142,49 @@ fn validate_cpu_count(case: &Case) -> Result<()> {
     Ok(())
 }
 
+fn validate_vfs_fixture(case: &Case) -> Result<()> {
+    let image = matches!(case.init, InitImage::VfsContract);
+    let feature = case.kernel_features.iter().any(|f| f == "qemu-test-vfs");
+    if image != feature {
+        bail!(
+            "QEMU case {} must pair vfs-contract init with qemu-test-vfs",
+            case.name
+        );
+    }
+    if image && case.cpu_count != 4 {
+        bail!("QEMU case {} requires four CPUs for VFS workers", case.name);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vfs_fixture_requires_matching_feature_image_and_topology() {
+        let source = include_str!("../../../../tests/qemu/cases/vfs-contract.toml");
+        let mut case: Case = toml::from_str(source).unwrap();
+        assert!(validate_vfs_fixture(&case).is_ok());
+        case.kernel_features.clear();
+        assert!(
+            validate_vfs_fixture(&case)
+                .unwrap_err()
+                .to_string()
+                .contains("pair")
+        );
+        case.kernel_features.push("qemu-test-vfs".to_owned());
+        case.init = InitImage::UserspaceContract;
+        assert!(validate_vfs_fixture(&case).is_err());
+        case.init = InitImage::VfsContract;
+        case.cpu_count = 1;
+        assert!(
+            validate_vfs_fixture(&case)
+                .unwrap_err()
+                .to_string()
+                .contains("four CPUs")
+        );
+    }
 
     #[test]
     fn rejects_unknown_case_fields() {

@@ -282,6 +282,7 @@ fn prepare_test_initramfs(
         cases::InitImage::KernelContract => "kernel-contract",
         cases::InitImage::UserFault => "user-fault",
         cases::InitImage::UserspaceContract => "userspace-contract",
+        cases::InitImage::VfsContract => "vfs-contract",
         cases::InitImage::SmpUserspaceContract => "smp-userspace-contract",
         cases::InitImage::ShellContract => "shell-contract",
         cases::InitImage::RebootContract => "reboot-contract",
@@ -298,6 +299,23 @@ fn prepare_test_initramfs(
     provenance.mark_prefix(".__genrt_test__", crate::initramfs::Origin::TestFixture)?;
 
     let init = match image {
+        cases::InitImage::VfsContract => {
+            for name in ["mount-a", "mount-b", "bin"] {
+                fs::create_dir_all(test_namespace.join(name))?;
+            }
+            copy_tree(
+                PathBuf::from("tests/qemu/fixtures/initramfs/fixtures").as_path(),
+                &test_namespace.join("fixtures"),
+            )?;
+            fs::copy(
+                test_namespace.join("fixtures/known-content"),
+                test_namespace.join("mount-a/covered"),
+            )?;
+            let helper = workflow::build_user_program(profile, "test_vfs_case", true)?;
+            fs::copy(helper, test_namespace.join("bin/vfs-case"))?;
+            provenance.mark_prefix("init", crate::initramfs::Origin::TestSupervisor)?;
+            workflow::build_user_program(profile, "test_vfs_supervisor", true)?
+        }
         cases::InitImage::WakeProfileContract => {
             provenance.mark_prefix("init", crate::initramfs::Origin::TestSupervisor)?;
             workflow::build_user_program(profile, "test_profile_supervisor", true)?
@@ -372,6 +390,7 @@ fn prepare_test_initramfs(
     if !matches!(
         image,
         cases::InitImage::UserspaceContract
+            | cases::InitImage::VfsContract
             | cases::InitImage::WakeProfileContract
             | cases::InitImage::SmpUserspaceContract
             | cases::InitImage::ShellContract
