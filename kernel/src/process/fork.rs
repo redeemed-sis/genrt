@@ -87,8 +87,8 @@ pub(crate) fn fork_current(context: &mut ActiveContext<'_>) -> Result<usize, err
     let snapshot = fork_snapshot_current()?;
     let child_pid = allocate_process_slot(
         Some(snapshot.parent_pid),
-        snapshot.fds,
-        snapshot.cwd_dir,
+        snapshot.fds.clone(),
+        snapshot.cwd_dir.clone(),
         snapshot.child_owner_cpu,
     )
     .map_err(fork_errno)?;
@@ -171,7 +171,7 @@ struct ForkSnapshot {
     user_image: *const UserElfImage,
     stack: *const OwnedUserStack,
     fds: crate::fs::fd::FdTable,
-    cwd_dir: usize,
+    cwd_dir: crate::fs::vfs::Location,
     child_owner_cpu: crate::cpu::CpuId,
 }
 
@@ -197,8 +197,14 @@ fn fork_snapshot_current() -> Result<ForkSnapshot, errno::Errno> {
         .user_image
         .as_ref()
         .ok_or(errno::EINVAL)? as *const UserElfImage;
-    let (fds, cwd_dir) = slot.process.resources.files.snapshot();
-    let cwd_dir = cwd_dir.ok_or(errno::EINVAL)?;
+    let cwd_dir = slot
+        .process
+        .resources
+        .files
+        .cwd
+        .clone()
+        .ok_or(errno::EINVAL)?;
+    let fds = slot.process.resources.files.fds.clone();
     Ok(ForkSnapshot {
         parent_pid,
         user_image,

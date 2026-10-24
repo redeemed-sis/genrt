@@ -1,5 +1,5 @@
 use crate::{
-    fs::{fd::FdTable, initramfs, ramfs},
+    fs::{fd::FdTable, initramfs, vfs},
     loader::elf::{self, UserElfImage},
     memory::{
         user::OwnedUserStack,
@@ -21,7 +21,9 @@ use super::{
 };
 
 pub(crate) fn spawn_first_user_process() -> Result<ProcessId, ProcessError> {
-    let cwd_dir = ramfs::root_dir_index().ok_or(ProcessError::InvalidProcess)?;
+    let cwd_dir = vfs::namespace()
+        .map_err(|_| ProcessError::InvalidProcess)?
+        .root();
     let owner_cpu = crate::cpu::current_id().map_err(|_| ProcessError::InvalidProcess)?;
     let pid = allocate_process_slot(None, FdTable::new(), cwd_dir, owner_cpu)?;
     let mut staged_address_space = Some(vm::create_user_address_space().map_err(|err| {

@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 
 use crate::sync::OncePublication;
 
@@ -205,11 +205,12 @@ pub enum MountError {
     OutOfMemory,
 }
 
-static RAMFS: OncePublication<MountedRamfs> = OncePublication::new();
+static RAMFS: OncePublication<Arc<MountedRamfs>> = OncePublication::new();
 
 /// Install the global readonly ramfs index.
 ///
-/// This is intended to run once during boot before the scheduler starts.
+/// This allocates the instance's reference-counted owner once during boot,
+/// before the scheduler starts, and publishes its immutable index.
 ///
 /// # Arguments
 ///
@@ -223,7 +224,9 @@ static RAMFS: OncePublication<MountedRamfs> = OncePublication::new();
 ///
 /// Returns `MountError::AlreadyMounted` if an index has already been installed.
 pub fn mount(fs: MountedRamfs) -> Result<(), MountError> {
-    RAMFS.publish(fs).map_err(|_| MountError::AlreadyMounted)
+    RAMFS
+        .publish(Arc::new(fs))
+        .map_err(|_| MountError::AlreadyMounted)
 }
 
 /// Return whether a ramfs index has already been mounted.
@@ -274,9 +277,8 @@ pub fn root_dir_index() -> Option<usize> {
 
 /// Return the canonical absolute path for a stable ramfs directory index.
 ///
-/// Directory indexes remain valid because the mounted initramfs-backed ramfs
-/// is immutable. A future writable VFS must replace this identity with a
-/// refcounted vnode/dentry handle.
+/// Directory indexes remain private to the immutable archive adapter. Generic
+/// cwd and descriptors use mount-aware VFS references instead.
 ///
 /// # Arguments
 ///
@@ -381,7 +383,160 @@ pub fn counts() -> (usize, usize) {
 }
 
 fn ramfs() -> Option<&'static MountedRamfs> {
-    RAMFS.get()
+    RAMFS.get().map(Arc::as_ref)
+}
+
+/// Clone the root backend instance after initramfs indexing.
+/// # Returns
+/// Pinned instance or none before mount; no allocation or blocking.
+pub(crate) fn root_backend() -> Option<Arc<dyn super::backend::Backend>> {
+    RAMFS
+        .get()
+        .map(|fs| fs.clone() as Arc<dyn super::backend::Backend>)
+}
+
+impl super::backend::Backend for MountedRamfs {
+    fn root(&self) -> super::backend::Node {
+        super::backend::Node {
+            id: dir_ino(self.lookup_dir(b"/").unwrap()),
+            kind: super::backend::Kind::Directory,
+        }
+    }
+
+    fn poll(
+        &self,
+        request: &mut super::backend::Request,
+        _wake: Option<crate::sched::WaitToken>,
+    ) -> core::task::Poll<Result<super::backend::Reply, crate::errno::Errno>> {
+        use super::backend::{DirEntry, Kind, Node, Operation, Reply, Stat};
+        use crate::errno;
+        let node = request.node;
+        let Some(index) = node_index(node) else {
+            return core::task::Poll::Ready(Err(errno::ENOENT));
+        };
+        let size = if node.kind == Kind::File {
+            self.files.get(index).map(|f| f.data.len() as u64)
+        } else {
+            self.dirs.get(index).map(|_| 0)
+        };
+        let result = (|| {
+            let size = size.ok_or(errno::ENOENT)?;
+            match &request.operation {
+                Operation::Lookup(name) => {
+                    if node.kind != Kind::Directory {
+                        return Err(errno::ENOTDIR);
+                    }
+                    let directory = &self.dirs[index];
+                    let mut path = directory.path.clone();
+                    if path != b"/" {
+                        path.push(b'/');
+                    }
+                    path.extend_from_slice(name);
+                    if let Some(i) = self.lookup_dir(&path) {
+                        Ok(Reply::Node(Node {
+                            id: dir_ino(i),
+                            kind: Kind::Directory,
+                        }))
+                    } else if let Some(i) = self.lookup_file(&path) {
+                        Ok(Reply::Node(Node {
+                            id: file_ino(i),
+                            kind: Kind::File,
+                        }))
+                    } else {
+                        Err(errno::ENOENT)
+                    }
+                }
+                Operation::Open(flags) => {
+                    if flags.write || flags.create || flags.truncate || flags.append {
+                        Err(errno::EROFS)
+                    } else {
+                        Ok(Reply::Done)
+                    }
+                }
+                Operation::Read { offset, limit } => {
+                    if node.kind == Kind::Directory {
+                        return Err(errno::EISDIR);
+                    }
+                    let data = self.files[index].data;
+                    let start = usize::try_from(*offset)
+                        .unwrap_or(usize::MAX)
+                        .min(data.len());
+                    let count = (*limit).min(request.buffer.len()).min(data.len() - start);
+                    request.buffer[..count].copy_from_slice(&data[start..start + count]);
+                    Ok(Reply::Io {
+                        count,
+                        next: offset.checked_add(count as u64).ok_or(errno::EOVERFLOW)?,
+                    })
+                }
+                Operation::Readdir { offset } => {
+                    if node.kind != Kind::Directory {
+                        return Err(errno::ENOTDIR);
+                    }
+                    let entry = usize::try_from(*offset)
+                        .ok()
+                        .and_then(|i| self.dirs[index].entries.get(i));
+                    let entry = entry.map(|entry| {
+                        let mut path = self.dirs[index].path.clone();
+                        if path != b"/" {
+                            path.push(b'/');
+                        }
+                        path.extend_from_slice(&entry.name);
+                        let node = match entry.kind {
+                            DirEntryKind::File => Node {
+                                id: file_ino(self.lookup_file(&path).unwrap()),
+                                kind: Kind::File,
+                            },
+                            DirEntryKind::Directory => Node {
+                                id: dir_ino(self.lookup_dir(&path).unwrap()),
+                                kind: Kind::Directory,
+                            },
+                        };
+                        DirEntry {
+                            name: entry.name.clone(),
+                            node,
+                        }
+                    });
+                    Ok(Reply::Entry(entry))
+                }
+                Operation::Create(_) | Operation::Truncate { .. } | Operation::Write { .. } => {
+                    Err(errno::EROFS)
+                }
+                Operation::Seek {
+                    current,
+                    displacement,
+                    whence,
+                } => {
+                    let base = match whence {
+                        0 => 0,
+                        1 => *current,
+                        2 => size,
+                        _ => return Err(errno::EINVAL),
+                    };
+                    let next = base
+                        .checked_add_signed(*displacement)
+                        .ok_or(errno::EINVAL)?;
+                    Ok(Reply::Position(next))
+                }
+                Operation::Stat => Ok(Reply::Stat(Stat { node, size })),
+                Operation::Sync => Ok(Reply::Done),
+            }
+        })();
+        core::task::Poll::Ready(result)
+    }
+
+    fn close(
+        &self,
+        _node: super::backend::Node,
+        _state: Option<alloc::boxed::Box<dyn core::any::Any + Send>>,
+    ) {
+    }
+
+    fn executable(&self, node: super::backend::Node) -> Option<&'static [u8]> {
+        if node.kind != super::backend::Kind::File {
+            return None;
+        }
+        self.files.get(node_index(node)?).map(|f| f.data)
+    }
 }
 
 fn push_dir_with_parents(dirs: &mut Vec<Vec<u8>>, path: &[u8]) -> Result<(), MountError> {
@@ -480,7 +635,17 @@ fn basename(path: &[u8]) -> Result<&[u8], MountError> {
 }
 
 fn validate_absolute_path(path: &[u8]) -> Result<(), MountError> {
-    if path.is_empty() || path[0] != b'/' || (path.len() > 1 && path[path.len() - 1] == b'/') {
+    if path.is_empty()
+        || path[0] != b'/'
+        || path.len() > crate::config::GENRT_PATH_MAX
+        || path.contains(&0)
+        || (path.len() > 1
+            && path[1..].split(|b| *b == b'/').any(|component| {
+                component.is_empty()
+                    || component.len() > super::backend::NAME_MAX
+                    || matches!(component, b"." | b"..")
+            }))
+    {
         return Err(MountError::InvalidPath);
     }
     Ok(())
@@ -492,4 +657,12 @@ fn file_ino(index: usize) -> u64 {
 
 fn dir_ino(index: usize) -> u64 {
     0x8000_0000 + index as u64
+}
+
+fn node_index(node: super::backend::Node) -> Option<usize> {
+    let base = match node.kind {
+        super::backend::Kind::File => file_ino(0),
+        super::backend::Kind::Directory => dir_ino(0),
+    };
+    usize::try_from(node.id.checked_sub(base)?).ok()
 }

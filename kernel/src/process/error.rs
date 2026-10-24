@@ -31,15 +31,6 @@ pub enum ProcessFaultError {
     InvalidProcess,
 }
 
-/// Errors returned by process current-working-directory operations.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ProcessPathError {
-    /// The caller is not running as a userspace process.
-    NoCurrentProcess,
-    /// The stored or requested ramfs directory index is invalid.
-    InvalidDirectory,
-}
-
 pub(super) fn fork_errno(err: ProcessError) -> errno::Errno {
     match err {
         ProcessError::NoProcessSlots => errno::EAGAIN,

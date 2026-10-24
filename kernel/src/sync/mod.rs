@@ -13,6 +13,7 @@ use core::{
 };
 
 pub(crate) mod preempt;
+pub(crate) mod task;
 
 use preempt::PreemptGuard;
 

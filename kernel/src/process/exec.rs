@@ -1,7 +1,7 @@
 use crate::{
     arch::ActiveContext,
     errno,
-    fs::{path, ramfs},
+    fs::{backend::Kind, path},
     loader::elf::{self, UserElfImage},
     memory::{
         user::OwnedUserStack,
@@ -78,11 +78,10 @@ fn stage_exec_image(
     args: &ExecArgs,
     owner_cpu: crate::cpu::CpuId,
 ) -> Result<StagedProcessImage, errno::Errno> {
-    let file_index = match path.node {
-        path::ResolvedNode::File { file_index } => file_index,
-        path::ResolvedNode::Directory { .. } => return Err(errno::EACCES),
-    };
-    let image = ramfs::data(file_index).ok_or(errno::ENOENT)?;
+    if path.node().kind == Kind::Directory {
+        return Err(errno::EACCES);
+    }
+    let image = path.executable().ok_or(errno::ENOEXEC)?;
     let mut staged_address_space = Some(vm::create_user_address_space().map_err(exec_vm_errno)?);
     let mut stack = None;
     let mut user_image = None;

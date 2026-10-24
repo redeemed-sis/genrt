@@ -49,7 +49,9 @@ pub(crate) fn process_join(pid: ProcessId) -> Result<ProcessExitStatus, ProcessJ
 ///
 /// Returns only in the exception handler after the live frame has been replaced
 /// with another runnable thread; the exiting userspace thread does not resume.
-/// The terminal transition is bounded and does not allocate.
+/// Detachment and the scheduler transition are bounded and allocation-free.
+/// Finite backend cleanup may allocate in an IRQ-enabled task window outside
+/// process/scheduler locks, before the scheduler transition.
 ///
 /// # Panics
 ///
@@ -73,10 +75,14 @@ pub(super) fn finish_current_process(
     if let Some(thread) = thread {
         crate::profile::cleanup(thread);
     }
-    let wake = {
+    let (wake, files) = {
         let _irq_guard = LocalIrqGuard::save_and_disable();
         finish_process(pid, status).ok_or(ProcessFaultError::InvalidProcess)?
     };
+    {
+        let _window = crate::sync::task::TaskWindow::enter();
+        drop(files);
+    }
     match status {
         ProcessExitStatus::Exited(code) => {
             crate::debug!("process: pid={pid} exited code={code} thread={thread:?}")
@@ -93,20 +99,26 @@ pub(super) fn finish_current_process(
     Ok(())
 }
 
-fn finish_process(pid: ProcessId, status: ProcessExitStatus) -> Option<Option<WaitToken>> {
+fn finish_process(
+    pid: ProcessId,
+    status: ProcessExitStatus,
+) -> Option<(Option<WaitToken>, super::files::ProcessFileState)> {
     let mut table = table_mut();
-    let waiter = {
+    let (waiter, files) = {
         let slot = table.slot_mut(pid)?;
         if slot.process.exit_status.is_some() {
-            return Some(None);
+            return Some((None, super::files::ProcessFileState::free()));
         }
-        slot.process.resources.files.close_all();
+        let files = core::mem::replace(
+            &mut slot.process.resources.files,
+            super::files::ProcessFileState::free(),
+        );
         slot.process.state = ProcessState::Zombie;
         slot.process.exit_status = Some(status);
-        slot.process.waiter
+        (slot.process.waiter, files)
     };
     table.unbind_main_thread(pid);
-    Some(waiter)
+    Some((waiter, files))
 }
 
 fn claim_process_consumer(

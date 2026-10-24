@@ -39,10 +39,18 @@ impl Process {
         }
     }
 
+    /// Construct a staged live process by ownership transfer only.
+    /// # Arguments
+    /// * `parent` - Generation-checked parent or none for init.
+    /// * `fds` - Owned descriptor references; fork clones shared OFDs beforehand.
+    /// * `cwd_dir` - Pinned cwd or none in synthetic metadata-only host tests.
+    /// * `owner_cpu` - Immutable address-space and main-thread owner.
+    /// # Returns
+    /// Running aggregate without image/thread publication; no allocation/callbacks.
     pub(super) const fn running(
         parent: Option<ProcessId>,
         fds: FdTable,
-        cwd_dir: usize,
+        cwd_dir: Option<crate::fs::vfs::Location>,
         owner_cpu: CpuId,
     ) -> Self {
         Self {

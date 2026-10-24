@@ -130,6 +130,15 @@ impl ProcessTable {
     }
 
     pub(super) fn release_slot(&mut self, pid: ProcessId, generation: u32) {
+        assert!(
+            self.slot(pid)
+                .expect("process: release invalid slot")
+                .process
+                .resources
+                .files
+                .is_empty(),
+            "process: extract file resources before slot release"
+        );
         let main_thread = self
             .slot(pid)
             .unwrap_or_else(|| panic!("process: release of invalid slot {pid}"))
@@ -164,13 +173,23 @@ pub(super) fn current_process_id() -> Option<ProcessId> {
     table_mut().process_for_thread(thread)
 }
 
+/// Reserve a process slot by moving staged references under short table ownership.
+/// # Arguments
+/// * `parent` - Generation-checked parent, or none for init.
+/// * `fds` - Owned descriptor references; failure drops after table lock release.
+/// * `cwd_dir` - Pinned directory inherited or selected before reservation.
+/// * `owner_cpu` - Immutable process/address-space/main-thread owner.
+/// # Returns
+/// Reserved generation-bearing process ID, without allocation/backend calls.
+/// # Errors
+/// `InvalidProcess` for non-directory cwd; `NoProcessSlots` if capacity is full.
 pub(super) fn allocate_process_slot(
     parent: Option<ProcessId>,
     fds: FdTable,
-    cwd_dir: usize,
+    cwd_dir: crate::fs::vfs::Location,
     owner_cpu: CpuId,
 ) -> Result<ProcessId, ProcessError> {
-    if crate::fs::ramfs::dir_path(cwd_dir).is_none() {
+    if cwd_dir.node().kind != crate::fs::backend::Kind::Directory {
         return Err(ProcessError::InvalidProcess);
     }
     let _irq_guard = LocalIrqGuard::save_and_disable();
@@ -186,7 +205,7 @@ pub(super) fn allocate_process_slot(
     let generation = next_generation(table.slots[index].generation);
     table.slots[index] = ProcessSlot {
         generation,
-        process: Process::running(parent, fds, cwd_dir, owner_cpu),
+        process: Process::running(parent, fds, Some(cwd_dir), owner_cpu),
     };
     let pid = ProcessId::new(index, generation);
     crate::debug!("process: allocated slot pid={pid}");
@@ -260,11 +279,22 @@ pub(super) fn take_process_image_resources(pid: ProcessId) -> ProcessImageResour
 }
 
 pub(super) fn free_process_slot(pid: ProcessId) {
-    let _irq_guard = LocalIrqGuard::save_and_disable();
-    let mut table = table_mut();
-    if let Some(generation) = table.slot(pid).map(|slot| slot.generation) {
+    let files = {
+        let _irq_guard = LocalIrqGuard::save_and_disable();
+        let mut table = table_mut();
+        let Some(slot) = table.slot_mut(pid) else {
+            return;
+        };
+        let files = core::mem::replace(
+            &mut slot.process.resources.files,
+            super::files::ProcessFileState::free(),
+        );
+        let generation = slot.generation;
         table.release_slot(pid, generation);
-    }
+        files
+    };
+    let _window = crate::sync::task::TaskWindow::enter();
+    drop(files);
 }
 
 pub(super) fn next_generation(generation: u32) -> u32 {
@@ -299,7 +329,7 @@ mod tests {
         let pid = ProcessId::new(index, generation);
         table.slots[index] = ProcessSlot {
             generation,
-            process: Process::running(None, FdTable::new(), 0, CpuId::from_index(0).unwrap()),
+            process: Process::running(None, FdTable::new(), None, CpuId::from_index(0).unwrap()),
         };
         pid
     }
@@ -358,7 +388,8 @@ mod tests {
 
     #[test]
     fn pending_fork_cpu_can_be_replaced_or_reset_and_is_not_inherited() {
-        let mut parent = Process::running(None, FdTable::new(), 0, CpuId::from_index(0).unwrap());
+        let mut parent =
+            Process::running(None, FdTable::new(), None, CpuId::from_index(0).unwrap());
         let cpu1 = CpuId::from_index(1).unwrap();
         let cpu2 = CpuId::from_index(2).unwrap();
 
@@ -369,7 +400,7 @@ mod tests {
         assert_eq!(parent.next_child_cpu(), parent.owner_cpu());
 
         parent.set_pending_fork_cpu(Some(cpu2));
-        let child = Process::running(None, FdTable::new(), 0, parent.next_child_cpu());
+        let child = Process::running(None, FdTable::new(), None, parent.next_child_cpu());
         assert_eq!(child.owner_cpu(), cpu2);
         assert_eq!(child.pending_fork_cpu, None);
     }

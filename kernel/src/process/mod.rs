@@ -32,12 +32,10 @@ pub use fault::kill_current_process_on_user_fault;
 pub use state::{ProcessExitStatus, UserFault, UserFaultKind};
 
 pub(crate) use access::{
-    advance_current_fd_dir_read, advance_current_fd_read, close_current_fd, current_cwd_dir,
-    current_cwd_path, current_fd_dir_entry_at, current_fd_is_open, current_fd_read_slice,
-    open_current_ram_dir, open_current_ram_file, set_current_cwd,
+    close_current_fd, current_cwd_dir, current_fd, current_next_fd, early_file_call,
+    install_current_fd, set_current_cwd, store_file_call, take_file_call,
 };
 pub(crate) use affinity::process_affinity;
-pub(crate) use error::ProcessPathError;
 pub(crate) use exec::{copy_exec_args_from_user, execve_current};
 pub(crate) use fork::{fork_current, set_fork_affinity_current};
 pub(crate) use lifecycle::{process_exit_current, process_join};

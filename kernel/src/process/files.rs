@@ -1,77 +1,73 @@
-use crate::fs::fd::{FdDirEntry, FdError, FdTable};
+use crate::fs::{call::PendingFileCall, fd::FdTable, vfs::Location};
 
-/// Process-local descriptor and current-working-directory state.
-#[derive(Copy, Clone)]
+/// Process ownership; only clone/take/move these fields under the table lock.
 pub(super) struct ProcessFileState {
-    fds: FdTable,
-    cwd_dir: Option<usize>,
+    pub(super) fds: FdTable,
+    pub(super) cwd: Option<Location>,
+    pub(super) pending: Option<PendingFileCall>,
 }
 
+// Keep process-table moves and lifecycle stack usage bounded. I/O bytes live
+// only in the heap-preallocated OFD, never in this inline continuation.
+const _: () = assert!(core::mem::size_of::<PendingFileCall>() <= 256);
+const _: () = assert!(core::mem::size_of::<ProcessFileState>() <= 640);
+const _: () = assert!(core::mem::size_of::<super::table::ProcessSlot>() <= 1024);
+const _: () = assert!(core::mem::size_of::<super::table::ProcessTable>() <= 4096);
+
 impl ProcessFileState {
+    /// Test whether final owning resources have already been extracted.
+    /// # Returns
+    /// True if descriptors, cwd and continuation are empty; no destruction.
+    pub(super) fn is_empty(&self) -> bool {
+        self.fds.is_empty() && self.cwd.is_none() && self.pending.is_none()
+    }
+
+    /// Construct an empty ownership bundle without allocation or destruction.
+    /// # Returns
+    /// File state suitable for a free or terminal slot.
     pub(super) const fn free() -> Self {
         Self {
             fds: FdTable::new(),
-            cwd_dir: None,
+            cwd: None,
+            pending: None,
         }
     }
 
-    pub(super) const fn new(fds: FdTable, cwd_dir: usize) -> Self {
+    /// Move staged file ownership into a process without backend work.
+    /// # Arguments
+    /// * `fds` - Descriptor references inherited or staged outside table locks.
+    /// * `cwd` - Pinned directory, or none for synthetic host metadata tests.
+    /// # Returns
+    /// File state without a pending syscall; no allocation or destruction.
+    pub(super) const fn new(fds: FdTable, cwd: Option<Location>) -> Self {
         Self {
             fds,
-            cwd_dir: Some(cwd_dir),
+            cwd,
+            pending: None,
         }
     }
+}
 
-    pub(super) fn cwd_dir(&self) -> Option<usize> {
-        self.cwd_dir
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    pub(super) fn set_cwd(&mut self, cwd_dir: usize) {
-        self.cwd_dir = Some(cwd_dir);
-    }
-
-    pub(super) fn close_all(&mut self) {
-        self.fds.close_all();
-        self.cwd_dir = None;
-    }
-
-    pub(super) fn snapshot(&self) -> (FdTable, Option<usize>) {
-        (self.fds, self.cwd_dir)
-    }
-
-    pub(super) fn open_ram_file(&mut self, file_index: usize) -> Result<usize, FdError> {
-        self.fds.open_ram_file(file_index)
-    }
-
-    pub(super) fn open_ram_dir(&mut self, dir_index: usize) -> Result<usize, FdError> {
-        self.fds.open_ram_dir(dir_index)
-    }
-
-    pub(super) fn read_slice(&self, fd: usize, max_len: usize) -> Result<&'static [u8], FdError> {
-        self.fds.read_slice(fd, max_len)
-    }
-
-    pub(super) fn advance_read(&mut self, fd: usize, amount: usize) -> Result<(), FdError> {
-        self.fds.advance_read(fd, amount)
-    }
-
-    pub(super) fn dir_entry_at(
-        &self,
-        fd: usize,
-        relative_offset: usize,
-    ) -> Result<Option<FdDirEntry>, FdError> {
-        self.fds.dir_entry_at(fd, relative_offset)
-    }
-
-    pub(super) fn advance_dir_read(&mut self, fd: usize, amount: usize) -> Result<(), FdError> {
-        self.fds.advance_dir_read(fd, amount)
-    }
-
-    pub(super) fn close(&mut self, fd: usize) -> Result<(), FdError> {
-        self.fds.close(fd)
-    }
-
-    pub(super) fn is_open(&self, fd: usize) -> bool {
-        self.fds.is_open(fd)
+    #[test]
+    fn inline_file_metadata_stays_small() {
+        let sizes = (
+            core::mem::size_of::<crate::fs::fd::Transaction>(),
+            core::mem::size_of::<PendingFileCall>(),
+            core::mem::size_of::<ProcessFileState>(),
+            core::mem::size_of::<super::super::table::ProcessSlot>(),
+            core::mem::size_of::<super::super::table::ProcessTable>(),
+        );
+        std::println!(
+            "Transaction/PendingFileCall/ProcessFileState/ProcessSlot/ProcessTable bytes: {sizes:?}"
+        );
+        assert!(sizes.0 <= 128);
+        assert!(sizes.1 <= 256);
+        assert!(sizes.2 <= 640);
+        assert!(sizes.3 <= 1024);
+        assert!(sizes.4 <= 4096);
     }
 }

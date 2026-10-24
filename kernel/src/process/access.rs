@@ -1,268 +1,172 @@
+use super::table::{current_process_id, table_mut};
 use crate::{
-    fs::{
-        fd::{FdDirEntry, FdError},
-        ramfs,
-    },
-    sync::LocalIrqGuard,
+    errno::{self, Errno},
+    fs::{backend::Kind, call::PendingFileCall, fd::OpenDescription, vfs::Location},
 };
+use alloc::sync::Arc;
 
-use super::{
-    error::ProcessPathError,
-    files::ProcessFileState,
-    table::{current_process_id, table_mut},
-};
-
-/// Return the current user process ramfs cwd directory index.
-///
-/// The process-table read runs in a short IRQ-disabled critical section.
-///
+/// Clone current cwd under short table ownership, with no backend work.
 /// # Returns
-///
-/// Returns the stable directory index stored in the current process.
-///
+/// Pinned directory, without allocation or destruction.
 /// # Errors
-///
-/// Returns `ProcessPathError::NoCurrentProcess` outside a user process, or
-/// `ProcessPathError::InvalidDirectory` if process state lacks a cwd.
-pub(crate) fn current_cwd_dir() -> Result<usize, ProcessPathError> {
-    let pid = current_process_id().ok_or(ProcessPathError::NoCurrentProcess)?;
-    let _irq_guard = LocalIrqGuard::save_and_disable();
+/// `EINVAL` if no current process/cwd exists.
+pub(crate) fn current_cwd_dir() -> Result<Location, Errno> {
+    let pid = current_process_id().ok_or(errno::EINVAL)?;
     table_mut()
-        .slot_mut(pid)
-        .ok_or(ProcessPathError::NoCurrentProcess)?
-        .process
-        .resources
-        .files
-        .cwd_dir()
-        .ok_or(ProcessPathError::InvalidDirectory)
+        .slot(pid)
+        .and_then(|s| s.process.resources.files.cwd.clone())
+        .ok_or(errno::EINVAL)
 }
 
-/// Return the current user process canonical absolute cwd pathname.
-///
-/// The stable ramfs lookup occurs after the process-table critical section.
-///
-/// # Returns
-///
-/// Returns a static slice borrowed from the immutable mounted ramfs index.
-///
-/// # Errors
-///
-/// Returns `ProcessPathError::NoCurrentProcess` outside a user process, or
-/// `ProcessPathError::InvalidDirectory` for an invalid stored directory index.
-pub(crate) fn current_cwd_path() -> Result<&'static [u8], ProcessPathError> {
-    ramfs::dir_path(current_cwd_dir()?).ok_or(ProcessPathError::InvalidDirectory)
-}
-
-/// Replace the current user process cwd with a ramfs directory index.
-///
-/// Directory validation happens before the short IRQ-disabled process-table
-/// mutation. No allocation or pathname resolution occurs in the critical
-/// section.
-///
+/// Replace cwd by moving the old reference out before any destruction.
 /// # Arguments
-///
-/// * `dir_index` - Stable index returned by `ramfs::lookup_dir()`.
-///
+/// * `location` - Pinned directory selected by generic traversal.
 /// # Returns
-///
-/// Returns `Ok(())` after updating the current process cwd.
-///
+/// Success; final old reference drops after table ownership is released.
 /// # Errors
-///
-/// Returns `ProcessPathError::InvalidDirectory` for an invalid index, or
-/// `ProcessPathError::NoCurrentProcess` outside a user process.
-pub(crate) fn set_current_cwd(dir_index: usize) -> Result<(), ProcessPathError> {
-    if ramfs::dir_path(dir_index).is_none() {
-        return Err(ProcessPathError::InvalidDirectory);
+/// `ENOTDIR` for files, `EINVAL` outside a process. Caller provides task window.
+pub(crate) fn set_current_cwd(location: Location) -> Result<(), Errno> {
+    if location.node().kind != Kind::Directory {
+        return Err(errno::ENOTDIR);
     }
-    let pid = current_process_id().ok_or(ProcessPathError::NoCurrentProcess)?;
-    let _irq_guard = LocalIrqGuard::save_and_disable();
-    table_mut()
-        .slot_mut(pid)
-        .ok_or(ProcessPathError::NoCurrentProcess)?
-        .process
-        .resources
-        .files
-        .set_cwd(dir_index);
+    let pid = current_process_id().ok_or(errno::EINVAL)?;
+    let old = {
+        let mut table = table_mut();
+        table
+            .slot_mut(pid)
+            .ok_or(errno::EINVAL)?
+            .process
+            .resources
+            .files
+            .cwd
+            .replace(location)
+    };
+    drop(old);
     Ok(())
 }
 
-/// Open a ramfs regular file in the current user process FD table.
-///
-/// # Arguments
-///
-/// * `file_index` - Ramfs file index returned by `ramfs::lookup_file()`.
-///
+/// Check descriptor capacity before backend create/open/truncate work.
 /// # Returns
-///
-/// Returns the allocated userspace descriptor number.
-///
+/// Lowest free slot, stable across waits in the one-thread-per-process model.
 /// # Errors
-///
-/// Returns `FdError::BadFd` if there is no current user process and
-/// `FdError::TooManyOpenFiles` if the current process FD table is full.
-pub(crate) fn open_current_ram_file(file_index: usize) -> Result<usize, FdError> {
-    with_current_file_state_mut(|files| files.open_ram_file(file_index))
+/// `EBADF` outside a process, `EMFILE` when full; allocation-free.
+pub(crate) fn current_next_fd() -> Result<usize, Errno> {
+    let pid = current_process_id().ok_or(errno::EBADF)?;
+    table_mut()
+        .slot(pid)
+        .ok_or(errno::EBADF)?
+        .process
+        .resources
+        .files
+        .fds
+        .next_free()
 }
 
-/// Open a ramfs directory in the current user process FD table.
-///
+/// Install a staged OFD by bounded ownership transfer only.
 /// # Arguments
-///
-/// * `dir_index` - Ramfs directory index returned by `ramfs::lookup_dir()`.
-///
+/// * `description` - Taken only on success; caller drops failures outside locks.
 /// # Returns
-///
-/// Returns the allocated userspace descriptor number.
-///
+/// Lowest free descriptor, without callbacks or allocation.
 /// # Errors
-///
-/// Returns `FdError::BadFd` if there is no current user process and
-/// `FdError::TooManyOpenFiles` if the current process FD table is full.
-pub(crate) fn open_current_ram_dir(dir_index: usize) -> Result<usize, FdError> {
-    with_current_file_state_mut(|files| files.open_ram_dir(dir_index))
+/// `EBADF` outside process, `EMFILE` for capacity.
+pub(crate) fn install_current_fd(
+    description: &mut Option<Arc<OpenDescription>>,
+) -> Result<usize, Errno> {
+    let pid = current_process_id().ok_or(errno::EBADF)?;
+    table_mut()
+        .slot_mut(pid)
+        .ok_or(errno::EBADF)?
+        .process
+        .resources
+        .files
+        .fds
+        .install(description)
 }
 
-/// Borrow bytes at the current regular-file offset for a userspace `read()`.
-///
-/// The FD offset is advanced separately after the syscall layer successfully
-/// copies the returned slice to userspace.
-///
+/// Clone an OFD without invoking a backend or allocating.
 /// # Arguments
-///
-/// * `fd` - Descriptor in the current user process.
-/// * `max_len` - Maximum bytes to borrow from the current regular-file offset.
-///
+/// * `fd` - Current process ordinary descriptor.
 /// # Returns
-///
-/// Returns a borrowed file-data slice of at most `max_len` bytes. The slice can
-/// be empty at EOF.
-///
+/// Shared OFD reference; caller owns its destruction in task context.
 /// # Errors
-///
-/// Returns `FdError::BadFd` if there is no current process or `fd` is invalid,
-/// and propagates FD table errors such as `FdError::IsDirectory`.
-pub(crate) fn current_fd_read_slice(fd: usize, max_len: usize) -> Result<&'static [u8], FdError> {
-    with_current_file_state(|files| files.read_slice(fd, max_len))
+/// `EBADF` outside process or for invalid descriptors.
+pub(crate) fn current_fd(fd: usize) -> Result<Arc<OpenDescription>, Errno> {
+    let pid = current_process_id().ok_or(errno::EBADF)?;
+    table_mut()
+        .slot(pid)
+        .ok_or(errno::EBADF)?
+        .process
+        .resources
+        .files
+        .fds
+        .get(fd)
 }
 
-/// Advance the current process regular-file offset after a successful read.
-///
+/// Remove an FD and release its reference after the process lock is gone.
 /// # Arguments
-///
-/// * `fd` - Descriptor in the current user process.
-/// * `amount` - Number of bytes successfully copied to userspace.
-///
+/// * `fd` - Ordinary descriptor to close.
 /// # Returns
-///
-/// Returns `Ok(())` after updating the descriptor offset.
-///
+/// Success after finite backend release in the caller's task window.
 /// # Errors
-///
-/// Returns `FdError::BadFd` if there is no current process or `fd` is invalid,
-/// and propagates FD table errors such as `FdError::IsDirectory`.
-pub(crate) fn advance_current_fd_read(fd: usize, amount: usize) -> Result<(), FdError> {
-    with_current_file_state_mut(|files| files.advance_read(fd, amount))
+/// `EBADF` outside process or for invalid descriptors.
+pub(crate) fn close_current_fd(fd: usize) -> Result<(), Errno> {
+    let pid = current_process_id().ok_or(errno::EBADF)?;
+    let removed = {
+        table_mut()
+            .slot_mut(pid)
+            .ok_or(errno::EBADF)?
+            .process
+            .resources
+            .files
+            .fds
+            .take(fd)?
+    };
+    drop(removed);
+    Ok(())
 }
 
-/// Borrow a directory entry relative to the current directory FD offset.
-///
-/// This read-only query lets `getdents64` encode one or more entries before
-/// committing the directory offset.
-///
-/// # Arguments
-///
-/// * `fd` - Descriptor in the current user process.
-/// * `relative_offset` - Entry offset relative to the descriptor's current
-///   directory offset.
-///
+/// Extract retained syscall ownership for resume outside the table lock.
 /// # Returns
-///
-/// Returns `Ok(Some(entry))` for an available entry and `Ok(None)` at
-/// end-of-directory.
-///
-/// # Errors
-///
-/// Returns `FdError::BadFd` if there is no current process or `fd` is invalid,
-/// and `FdError::NotDirectory` when `fd` is a regular-file handle.
-pub(crate) fn current_fd_dir_entry_at(
-    fd: usize,
-    relative_offset: usize,
-) -> Result<Option<FdDirEntry>, FdError> {
-    with_current_file_state(|files| files.dir_entry_at(fd, relative_offset))
+/// Pending call or none; allocation-free and no destructor work.
+pub(crate) fn take_file_call() -> Option<PendingFileCall> {
+    let pid = current_process_id()?;
+    table_mut()
+        .slot_mut(pid)?
+        .process
+        .resources
+        .files
+        .pending
+        .take()
 }
 
-/// Advance the current process directory FD offset after successful `getdents64`.
-///
+/// Publish owned continuation before committing its exact scheduler wait.
 /// # Arguments
-///
-/// * `fd` - Descriptor in the current user process.
-/// * `amount` - Number of directory entries successfully copied to userspace.
-///
+/// * `call` - Fully owned call; no borrowed stack/frame/user data.
 /// # Returns
-///
-/// Returns `Ok(())` after updating the descriptor offset.
-///
-/// # Errors
-///
-/// Returns `FdError::BadFd` if there is no current process or `fd` is invalid,
-/// and `FdError::NotDirectory` when `fd` is a regular-file handle.
-pub(crate) fn advance_current_fd_dir_read(fd: usize, amount: usize) -> Result<(), FdError> {
-    with_current_file_state_mut(|files| files.advance_dir_read(fd, amount))
-}
-
-/// Close a descriptor in the current user process FD table.
-///
-/// # Arguments
-///
-/// * `fd` - Descriptor in the current user process.
-///
-/// # Returns
-///
-/// Returns `Ok(())` after clearing the descriptor.
-///
-/// # Errors
-///
-/// Returns `FdError::BadFd` if there is no current process, `fd` is reserved or
-/// out of range, or the descriptor is already closed.
-pub(crate) fn close_current_fd(fd: usize) -> Result<(), FdError> {
-    with_current_file_state_mut(|files| files.close(fd))
-}
-
-/// Return whether a descriptor is open in the current user process.
-///
-/// # Arguments
-///
-/// * `fd` - Descriptor in the current user process.
-///
-/// # Returns
-///
-/// Returns `Ok(true)` for an open user descriptor and `Ok(false)` for a closed
-/// or reserved descriptor.
-///
-/// # Errors
-///
-/// Returns `FdError::BadFd` if there is no current user process.
-pub(crate) fn current_fd_is_open(fd: usize) -> Result<bool, FdError> {
-    with_current_file_state(|files| Ok(files.is_open(fd)))
-}
-
-fn with_current_file_state<T>(
-    f: impl FnOnce(&ProcessFileState) -> Result<T, FdError>,
-) -> Result<T, FdError> {
-    let pid = current_process_id().ok_or(FdError::BadFd)?;
-    let _irq_guard = LocalIrqGuard::save_and_disable();
+/// Nothing; bounded move under short table ownership.
+/// # Panics
+/// Missing process or duplicate continuation violates single-thread ownership.
+pub(crate) fn store_file_call(call: PendingFileCall) {
+    let pid = current_process_id().expect("vfs: pending call without process");
     let mut table = table_mut();
-    let process = &table.slot_mut(pid).ok_or(FdError::BadFd)?.process;
-    f(&process.resources.files)
+    let pending = &mut table.slot_mut(pid).unwrap().process.resources.files.pending;
+    assert!(pending.is_none());
+    *pending = Some(call);
 }
 
-fn with_current_file_state_mut<T>(
-    f: impl FnOnce(&mut ProcessFileState) -> Result<T, FdError>,
-) -> Result<T, FdError> {
-    let pid = current_process_id().ok_or(FdError::BadFd)?;
-    let _irq_guard = LocalIrqGuard::save_and_disable();
-    let mut table = table_mut();
-    let process = &mut table.slot_mut(pid).ok_or(FdError::BadFd)?.process;
-    f(&mut process.resources.files)
+/// Clear an early-consumed wait identity without dropping its continuation.
+/// # Returns
+/// Nothing; bounded mutation, no allocation or backend work.
+pub(crate) fn early_file_call() {
+    let pid = current_process_id().unwrap();
+    table_mut()
+        .slot_mut(pid)
+        .unwrap()
+        .process
+        .resources
+        .files
+        .pending
+        .as_mut()
+        .unwrap()
+        .waited = None;
 }

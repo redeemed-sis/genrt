@@ -60,6 +60,19 @@ pub extern "C" fn arch_profile_counter() -> u64 {
 #[cfg(feature = "wake-profile")]
 #[unsafe(no_mangle)]
 pub extern "C" fn arch_profile_task_irq_enable() -> u64 {
+    arch_task_irq_enable()
+}
+
+/// Enable IRQs during finite task work under preemption exclusion.
+///
+/// # Returns
+/// Opaque previous DAIF; caller restores it before releasing its guard.
+///
+/// # Safety
+/// Caller owns a synchronous task frame and holds PreemptGuard, with no shared
+/// lock held. It must not block or hand off before restoring the saved state.
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_task_irq_enable() -> u64 {
     let saved: u64;
     // SAFETY: narrow task-context callers own DAIF under PreemptGuard and must
     // restore this exact state before any blocking/terminal handoff.

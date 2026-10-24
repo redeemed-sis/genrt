@@ -15,7 +15,10 @@ use super::{
 ///
 /// # Returns
 ///
-/// Returns `Ok(())` after storing fault status, waking registered waiters, and replacing the live context. The path is bounded and does not allocate.
+/// Returns `Ok(())` after storing fault status, releasing file references,
+/// waking registered waiters, and replacing the live context. Detachment and
+/// scheduler handoff are bounded and allocation-free. Finite backend cleanup
+/// may allocate in IRQ-enabled task context outside process/scheduler locks.
 ///
 /// # Errors
 ///
