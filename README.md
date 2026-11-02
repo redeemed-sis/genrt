@@ -31,7 +31,7 @@ a production-ready or latency-certified operating system.
 - Process-owned TTBR0 address spaces, static AArch64 ELF loading, lower-EL fault
   isolation, and eager-copy `fork`/`execve`/`waitpid`.
 - Mount-aware VFS with a readonly CPIO root, bounded per-process FD tables,
-  shared open file descriptions, directory iteration, and UART-backed stdin.
+  shared open descriptions, optional [QEMU FAT32 storage](docs/storage.md), and UART stdin.
 - Freestanding C shell and product programs declared by
   `user/c/programs.toml`.
 - POSIX-like monotonic clock observation and relative/absolute sleep APIs,
@@ -169,7 +169,7 @@ and [docs/releases.md](docs/releases.md).
 - No ASIDs, copy-on-write, demand paging, signals, or recoverable usercopy
   faults.
 - One main user thread per process and a deliberately small process-control ABI.
-- Production root remains readonly; persistent storage backends are not present.
+- Production root remains readonly; FAT32 storage is opt-in on QEMU, not Pi.
 - Raw UART stdin rather than a terminal/TTY subsystem.
 - Fixed bootstrap heap and limited kernel VM mapping granularity.
 - x86_64 and RISC-V ports are structural placeholders, not active targets.

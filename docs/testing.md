@@ -51,13 +51,32 @@ existing production userspace and shell cases remain regression checks.
 Allocation-count host tests measure read/write after open/setup, including
 first use, repeated calls, backend errors, zero-length requests, and pending
 completion. They check retained request/buffer identity and growth only beyond
-4096 bytes. These are allocator/lifetime assertions, not timing benchmarks;
-the syscall transfer bound remains 1024 bytes.
+4096 bytes. These are allocator/lifetime assertions, not timing benchmarks.
+The VFS contract now requires a complete 65573-byte transfer in one call,
+validates later-page faults without partial output/offset consumption, and
+rejects unrepresentable counts. No global 1024-byte usercopy limit remains.
 
 ```bash
 cargo test -p kernel --lib --locked
 cargo xtask test-aarch64 --case vfs-contract
 ```
+
+`storage-contract` uses production block/FAT code and a four-CPU topology.
+Only its supervisor, phase input and newly formatted disk are test fixtures.
+It checks mount traversal, host-seeded content, create/read/write/append/truncate,
+multi-cluster I/O, fsync, shared fork offsets and concurrent independent append.
+The runner powers off and reaps QEMU, extracts/checks the persistent payload
+with mtools, checks both FAT partitions, then adds `/fstab` and boots the same
+disk with an explicit verify-only phase. The first boot checks the absent-file
+fallback; the second must find the existing payload and the configured readonly
+nested partition. It also checks cross-CPU operations on both volumes sharing
+the controller. Host checks repeat after that boot. Install `dosfstools`, `mtools` and
+GNU `timeout`; logs and checksum are retained under the case artifact directory.
+See [storage](storage.md) for commands, budgets and verification limitations.
+The backend retains resident FAT and canonical file handles across operations;
+host tests separately cover metadata freshness, confirmed partial progress,
+FSInfo publication and non-I/O close. FAT-library allocations are permitted;
+generic reusable-staging allocation tests remain unchanged.
 
 `kernel-contract` and `user-fault` use kernels compiled with scenario-specific
 `qemu-test` features. Their coordinators test CPU0 identity, per-CPU scheduler

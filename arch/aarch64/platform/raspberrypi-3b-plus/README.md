@@ -362,8 +362,9 @@ instruction costs.
   CPU0 owns GPU IRQ cascade/UART; each CPU owns its physical timer and mailbox0.
   Mailboxes provide targeted scheduler IPIs. Simultaneous timer and mailbox
   sources use separate IRQ-return checkpoints.
-- `platform/uart/bcm2837_dtb.rs` resolves GPIO, PL011, AUX and mini UART
-  `reg` addresses through the bus translation. `bcm2837.rs` adopts ALT0 PL011
+- `platform/bootstrap/uart.rs` resolves GPIO, PL011, AUX and mini UART
+  through shared `kernel::dtb` bus translation. Disabled serial nodes remain
+  available for firmware UART adoption. `bcm2837.rs` adopts ALT0 PL011
   or ALT5 mini UART, preserving clocks, divisors and pins. Shared PL011 register
   operations live in `pl011.rs`; TX polling and RX draining stay bounded.
 - platform/pi_power.rs owns password-protected watchdog registers and firmware

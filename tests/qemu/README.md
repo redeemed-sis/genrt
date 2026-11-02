@@ -48,6 +48,15 @@ remain uninstrumented and reject diagnostic kernel markers.
   No test backend or mount fixture is included in production artifacts.
 - `user-fault`: test-enabled kernel coordinator that joins a faulting EL0
   process and verifies exact fault classification.
+- `storage-contract`: production kernel on four CPUs, with a controlled raw
+  MBR/FAT32 fixture and a test-only supervisor. Checks mount paths, multi-cluster
+  I/O, independent append/truncate coherence, fsync, shared fork offsets and
+  cross-CPU append serialization. Two separate QEMU processes reuse the same
+  two-partition image. The first boot checks absent-fstab fallback; the host
+  adds `/fstab` before the verify-only restart, which checks a readonly nested
+  mount and cross-volume CPU access. Host mtools extraction/SHA-256 and fsck
+  checks of both partitions run after both boots. No user-supplied image is formatted; see
+  [storage](../../docs/storage.md). Its dependencies are included by host setup.
 - `smp-boot`: four-CPU test kernel that validates PSCI secondary high-half
   entry, unique logical/hardware/stack ownership, architecture-owned per-CPU
   exception/GICC/PPI/SGI setup, CPU0-only device routing, online secondary

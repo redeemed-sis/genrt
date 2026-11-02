@@ -10,6 +10,11 @@ Changes that invalidate one require architecture review and an ADR.
 - Hardware configuration comes from documented architecture behavior, the
   controlled platform protocol, or parsed firmware data. Do not guess it.
 - AArch64 pre-MMU code and every dependency it reaches remain in `.boot.*`.
+- Runtime DTB consumers share one immutable borrowed reader over permanently
+  reserved/mapped firmware bytes. Generic framing and bus-resource decoding
+  carry no architecture register encodings or driver binding policy. Essential
+  boot setup remains allocation-free; late optional driver probing runs only
+  after runtime VM/heap activation in the ordinary IRQ-enabled init task.
 - Fixed hardware bring-up assumptions belong only to opt-in architecture
   platform paths. Raspberry Pi shares the kernel entry/linker with QEMU but
   uses its own interrupt, spin-table and watchdog backends, never QEMU GIC/PSCI.
@@ -249,6 +254,8 @@ Changes that invalidate one require architecture review and an ADR.
 
 - One VFS namespace owns mount placement; mount and node references remain
   valid while descriptors or cwd refer to them. Dynamic unmount is deferred.
+  Mountpoint crossing and conflicts use stable mount/node identity, not path
+  spelling; backend aliases cannot bypass a mounted filesystem.
 - Process FD slots own references to open file descriptions, not backend
   indexes or independent copied positions. Fork shares descriptions and
   offsets; independent opens do not. Exec preserves descriptor and cwd state.
@@ -260,10 +267,33 @@ Changes that invalidate one require architecture review and an ADR.
   the existing operation rather than repeating committed effects. No pending
   request retains a live exception-context borrow or syscall-stack buffer.
 - Read/write lease reusable OFD-owned request storage. Open provisions at least
-  4096 bytes; transient small-call state does not allocate or free heap memory.
+  4096 bytes; generic transient small-call state does not allocate or free heap memory.
   Capacity grows only beyond that baseline when insufficient and is retained
   across calls. Write input is copied after acquiring the lease, once before
   submission. All reset work precedes availability publication and wakeup.
+  Resident FAT-library run/cache metadata is an explicit task-context allocation
+  exception under ADR-0067, not an exception for generic staging or RT paths.
+- Generic usercopy has no fixed byte cap: validate the entire range, including
+  overflow and every page's permissions, before copying any destination byte.
+  Large copies/growth run in IRQ-enabled task context, outside owner locks.
+  File I/O retains requested lengths; natural bounded directory/stdin/profile
+  staging is not a global transfer policy.
+- Namespace construction and optional storage discovery/mounting run in the
+  first ordinary task before publication and EL0. Persistent FAT handles,
+  mutation and explicit sync share one logical volume lease, never a held
+  spinlock. One canonical file per node shares authoritative metadata across
+  independent descriptions; their positions remain VFS-owned. Library sync
+  precedes explicit device flush; close/drop never implicitly performs I/O.
+- DMA uses exclusive preallocated physical backing, not borrowed caller memory.
+  An uncertain completion is not cancellation: poison and retain device-owned
+  storage. Block requests/transfers have finite driver-owned deadlines. FAT
+  has no global call/time budget and no hard wall-time guarantee;
+  no disk waits or traversal belong in IRQ/scheduler/timer or RT measurements.
+- Partitions sharing a physical disk reserve its single driver owner before
+  filesystem work. Contention publishes exact wait tokens and returns `Pending`;
+  no spinlock spans I/O and no sector callback sleeps. Boot mount configuration
+  never creates competing FAT instances for one partition. Only an absent
+  `/fstab` on the selected first FAT32 partition permits the fallback mount.
 - Ramfs data remains archive-backed and readonly. Test-only writable/generated
   backends use the same VFS boundary and never enter production composition.
 

@@ -10,13 +10,15 @@ hooks.
 | --- | --- |
 | `config` | Central architecture-neutral capacities, scheduler policy values, and ABI limits |
 | `memory` | Physical map, frame allocator, heap, kernel/user VM, user copies |
+| `dtb` | Shared borrowed runtime firmware reader, checked MMIO translation and generic boot-memory interpretation |
 | `cpu` | Typed logical CPU identity and bounded boot hardware registry |
 | `sched` | Per-CPU thread states, controlled scheduler calls, preemption, typed waits, and lifecycle |
 | `time` | Monotonic counter conversion and one-shot timed events |
 | `profile` (optional) | [Bounded diagnostic sleep/wakeup sessions](src/profile/README.md) and frozen binary export |
 | `ipc` | Bounded mailbox buffers, wait queues, and timeout integration |
 | `process` | [Bounded process table and lifecycle](src/process/README.md), address-space/image ownership, fork/exec/wait, cwd/FD access |
-| `fs` | Mount-aware VFS, readonly ramfs backend, paths, and shared open descriptions |
+| `block` | Exclusive bounded sector devices and validated MBR partitions |
+| `fs` | Mount-aware VFS, ramfs/FAT32 backends, paths, and shared open descriptions |
 | `loader` | Static userspace ELF validation and segment loading |
 | `syscall` | Architecture-neutral syscall behavior and errno mapping |
 | `power` | Linux reboot validation and architecture-neutral terminal power policy |
@@ -27,6 +29,12 @@ Detailed ownership lives in the [memory](src/memory/README.md),
 [scheduler](src/sched/README.md), and [filesystem](src/fs/README.md) guides.
 
 ## Execution model
+
+The architecture's early bootstrap publishes one resident `RuntimeDtb` before
+heap setup. Boot memory and platform consumers reuse that reader; no raw DTB
+pointer reconstruction or duplicate header parsing is needed. The independent
+pre-MMU parser remains architecture-local. Late driver matching/probing stays
+in the architecture bootstrap, not in the generic DTB reader.
 
 Before `kernel_main`, AArch64 initializes CPU0's shared GIC policy and local
 vectors/GICC/PPI/physical-timer state. Generic boot then registers CPU0,
@@ -40,7 +48,11 @@ and enters that saved frame. Generic code neither invokes local interrupt setup
 nor controls DAIF. The scheduler marks each context online immediately before
 the saved frame entry; CPU0 waits sequentially for every exact context. CPU0
 then enters its first selected trap frame.
-The init kernel thread spawns `/init` as a normal user process and joins it.
+The init kernel thread constructs the namespace, optionally discovers/mounts
+QEMU FAT32 storage, reads boot `/fstab` or uses the `/mnt/disk` fallback,
+publishes the namespace, then spawns `/init` and joins it.
+Disk discovery and filesystem I/O therefore run in ordinary IRQ-enabled task
+context, not early bootstrap. See [storage](../docs/storage.md).
 
 The production scheduler starts with exactly two kernel threads: the permanent
 idle thread and one non-idle `kernel_init_thread`. QEMU scenario features replace

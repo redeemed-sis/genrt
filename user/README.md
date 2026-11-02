@@ -178,6 +178,9 @@ does not set the userspace PC.
 - Forked descriptors share open file descriptions and positions; independent
   opens have independent positions. Exec preserves descriptors and mount-aware
   cwd. The production VFS root remains readonly.
+- An optional QEMU FAT32 mount supports ordinary writable file I/O and
+  `fsync(fd)` through `syscall.h`. File requests are not capped at 1024 bytes;
+  short results still require the usual retry loop. See [storage](../docs/storage.md).
 - `<sched.h>` exposes fixed CPU sets and immutable process-affinity queries.
 - `<sys/reboot.h>` exposes Linux-compatible restart and power-off operations;
   the wrapper hides raw reboot magic values.

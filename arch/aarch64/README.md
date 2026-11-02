@@ -26,6 +26,21 @@ a board itself. The low DTB completion hook stays in `.boot.text`.
 
 ## Boot sequence
 
+Device bootstrap lives in `src/platform/bootstrap` and has two stages.
+`init_early` publishes one borrowed `kernel::dtb::RuntimeDtb`, configures the
+UART, CPU/firmware metadata, initramfs handoff, generic boot information and
+global interrupt controller without heap allocation. `init_devices` runs in
+the ordinary init task after runtime VM/heap activation: it matches nodes,
+resolves their resources, maps MMIO and probes optional controllers.
+Concrete block controllers live in `src/platform/block/`; `virtio_block`
+owns modern virtio identification, transport, fixed split queue and DMA backing,
+without parsing firmware or installing mappings. Bootstrap's ordinary-thread
+initialization hook stages discovered block owners in firmware order for the
+generic MBR/FAT and boot mount-policy layers.
+It never installs a storage IRQ handler; completion polling is deadline-bounded
+with IRQs enabled. Pi's storage hook is a no-op. See
+[storage](../../docs/storage.md) for ownership and verification scope.
+
 On QEMU, the kernel is loaded at physical `0x4008_0000`. CPU0 enters the low-linked
 `_start` trampoline, uses bootstrap stack slot zero, parses the QEMU-loaded DTB,
 builds bootstrap TTBR0/TTBR1 tables, programs EL1 translation state, enables
@@ -80,8 +95,14 @@ closed world.
 
 `xtask` generates a QEMU `virt` DTB for the requested bounded CPU count and
 loads it into a reserved platform slot. The low parser extracts only RAM,
-PL011, and GICv2 ranges needed for initial mappings. High Rust additionally
-parses enabled CPU identities and PSCI metadata before generic boot entry. The
+PL011, and GICv2 ranges needed for initial mappings. It stays separate from
+runtime parsing because it executes before MMU/heap/panic support. High Rust
+constructs one shared runtime reader; memory, CPU/PSCI, chosen payloads and
+late discovery reuse it without revalidating headers. Common MMIO decoding
+translates the entire extent through ancestor `ranges`. The late GIC domain
+is matched once against the already selected controller's MMIO, not searched
+again for each virtio node. Drivers receive prepared resources, not DTB bytes.
+See [ADR-0069](../../memory/decisions/ADR-0069-shared-runtime-dtb-and-staged-probe.md). The
 QEMU platform module owns a documented emergency fallback for early UART
 diagnostics; generic kernel code does not own platform constants.
 

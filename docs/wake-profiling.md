@@ -288,7 +288,8 @@ START rejects an active or foreign session. STOP freezes records, including
 incomplete ones. DISCARD releases an owned session. Termination and faults
 detach and release the owner's storage; fork does not inherit a session.
 Reads require STOP, accept byte offsets, return zero at EOF, and respect
-MAX_USER_COPY. The feature-disabled control/read interface returns ENOSYS.
+a profiler-specific 4096-byte frozen-read staging limit, independent of usercopy.
+The feature-disabled control/read interface returns ENOSYS.
 
 Records retain raw counter values, exact wait identity, absolute deadline,
 phase-presence information, and wake-path classification. Export metadata

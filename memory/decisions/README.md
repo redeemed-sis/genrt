@@ -28,7 +28,7 @@ growth.
 | [0020](ADR-0020-uart-stdin-and-shell.md) | UART stdin and shell | Accepted | Console/userspace | - | [0032](ADR-0032-typed-wait-registrations-and-external-wake-ownership.md) (stdin waiter identity only) |
 | [0021](ADR-0021-initramfs-cpio-root.md) | CPIO initramfs root | Accepted | Filesystem backing | [0019](ADR-0019-readonly-ramfs-and-fd-table.md) (backing only) | - |
 | [0022](ADR-0022-fork-exec-waitpid-echo.md) | Minimal process control | Accepted | Processes/syscalls | - | [0033](ADR-0033-unified-thread-model-and-scheduler-process-separation.md) (main-thread resource transfer and reap), [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) (forked descriptor offsets only) |
-| [0023](ADR-0023-directory-fds-and-getdents64.md) | Directory FDs and getdents64 | Accepted | Filesystem ABI | - | [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) (directory-description ownership) |
+| [0023](ADR-0023-directory-fds-and-getdents64.md) | Directory FDs and getdents64 | Accepted | Filesystem ABI | - | [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) (directory-description ownership), [0066](ADR-0066-usercopy-length-and-owned-io-growth.md) (transfer cap) |
 | [0024](ADR-0024-process-cwd-and-path-resolution.md) | Process cwd and path traversal | Accepted | Filesystem/process | - | [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) (cwd/resolver identities) |
 | [0025](ADR-0025-automated-qemu-testing-and-tagged-releases.md) | Automated testing and releases | Accepted | Verification/release | - | - |
 | [0026](ADR-0026-agent-oriented-development-workflow.md) | Agent-oriented development workflow | Accepted | Repository workflow | - | - |
@@ -71,6 +71,15 @@ growth.
 | [0061](ADR-0061-raspberrypi-fit-release-artifacts.md) | Raspberry Pi FIT release artifacts | Accepted | Release composition and verification scope | - | - |
 | [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) | Mount-aware VFS and shared open file descriptions | Accepted | Filesystem/mount/process/descriptor ownership | [0019](ADR-0019-readonly-ramfs-and-fd-table.md) (descriptor representation), [0022](ADR-0022-fork-exec-waitpid-echo.md) (fork offsets), [0023](ADR-0023-directory-fds-and-getdents64.md) (directory descriptions), [0024](ADR-0024-process-cwd-and-path-resolution.md) (cwd/resolver identities) | - |
 
-| [0063](ADR-0063-reusable-open-description-io-storage.md) | Reusable open-description I/O storage | Accepted | Filesystem I/O allocation and request lifetime | - | - |
+| [0063](ADR-0063-reusable-open-description-io-storage.md) | Reusable open-description I/O storage | Accepted | Filesystem I/O allocation and request lifetime | - | [0066](ADR-0066-usercopy-length-and-owned-io-growth.md) (1024-byte cap only), [0067](ADR-0067-resident-fat-and-canonical-file-handles.md) (FAT-library allocations only) |
+| [0064](ADR-0064-qemu-block-storage-and-fat32.md) | QEMU block storage and FAT32 ownership | Accepted | Storage/platform/FAT/initialization | - | [0067](ADR-0067-resident-fat-and-canonical-file-handles.md) (library/handles/FAT budgets), [0070](ADR-0070-fstab-boot-mounts-and-shared-disks.md) (boot staging/mount policy) |
+| [0065](ADR-0065-fsync-syscall.md) | Explicit fsync syscall | Accepted | Descriptor/durability ABI | - | - |
+| [0066](ADR-0066-usercopy-length-and-owned-io-growth.md) | Usercopy length and owned I/O growth | Accepted | Usercopy/transfer policy | [0023](ADR-0023-directory-fds-and-getdents64.md), [0063](ADR-0063-reusable-open-description-io-storage.md) (1024-byte cap only) | - |
+| [0067](ADR-0067-resident-fat-and-canonical-file-handles.md) | Resident FAT and canonical file handles | Accepted | FAT ownership/allocation/sync | [0064](ADR-0064-qemu-block-storage-and-fat32.md) (library/handles/FAT budgets), [0063](ADR-0063-reusable-open-description-io-storage.md) (FAT-library allocations only) | [0068](ADR-0068-driver-owned-storage-timeouts.md) (FAT-wide call/time budget only) |
+| [0068](ADR-0068-driver-owned-storage-timeouts.md) | Driver-owned storage timeouts | Accepted | FAT/device timeout policy | [0067](ADR-0067-resident-fat-and-canonical-file-handles.md) (FAT-wide call/time budget only) | - |
+
+| [0069](ADR-0069-shared-runtime-dtb-and-staged-probe.md) | Shared runtime DTB and staged driver probing | Accepted | Firmware resources/platform initialization | - | - |
+
+| [0070](ADR-0070-fstab-boot-mounts-and-shared-disks.md) | Fstab boot mounts and shared physical disks | Accepted | Storage/bootstrap/namespace ownership | [0064](ADR-0064-qemu-block-storage-and-fat32.md) (boot staging/mount policy) | - |
 
 Use [`TEMPLATE.md`](TEMPLATE.md) for new decisions.

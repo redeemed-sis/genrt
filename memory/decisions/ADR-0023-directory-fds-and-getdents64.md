@@ -8,6 +8,9 @@ Superseded for ramfs-specific directory-description ownership by
 [ADR-0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md).
 The directory record ABI remains unchanged.
 
+The fixed 1024-byte transfer cap is superseded by
+[ADR-0066](ADR-0066-usercopy-length-and-owned-io-growth.md).
+
 ## Context
 
 The initramfs-backed ramfs can serve readonly files through per-process file

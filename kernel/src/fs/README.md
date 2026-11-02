@@ -1,8 +1,10 @@
 # Virtual filesystem
 
 The mount-aware VFS separates pathname, descriptor, and process policy from
-filesystem backends. The production root is the readonly initramfs-backed
-ramfs; a writable/generated test backend is enabled only for controlled tests.
+filesystem backends. The production root is readonly initramfs-backed ramfs;
+optional FAT32 backends mount QEMU partitions according to boot `/fstab`, with
+`/mnt/disk` as the absent-file fallback. A separate writable/generated test
+backend is enabled only for controlled tests.
 
 | Module | Responsibility |
 | --- | --- |
@@ -11,15 +13,29 @@ ramfs; a writable/generated test backend is enabled only for controlled tests.
 | `fd` | Bounded descriptor table, shared open descriptions, and logical I/O leases |
 | `call` | Process-owned syscall restart state, bounded usercopy, and exact waits |
 | `ramfs`, `initramfs` | Readonly archive adapter and deterministic boot indexing |
+| `fat` | Leased FAT32 operations, stable nodes and sector adaptation |
+| `mounts` | First-disk FAT32 configuration lookup and boot mount policy |
 | `testfs` (test-only) | Independent writable/generated instances and pending-I/O fixture |
 
 ## Namespace and paths
 
+The first ordinary initialization thread builds and publishes the namespace
+before spawning EL0. Early boot indexes initramfs but performs no disk I/O.
 One global kernel-controlled namespace attaches filesystem instances at existing
 directories. Mounts and referenced nodes remain stable; dynamic unmount is not
 implemented. Invalid or conflicting registration fails without replacing an
 existing mount.
 The boot namespace permits at most 16 additional mounts beyond its root.
+Mountpoint crossing and conflict checks use filesystem-instance/node identity,
+so FAT case and short-name aliases cannot bypass a mounted filesystem.
+
+Current QEMU storage uses the first discovered disk and its first primary FAT32
+partition to read `/fstab`; this is not a hardware boot-medium identification
+mechanism. Only a missing file selects `/mnt/disk`; a present
+file controls all automatic mounts, including an empty table. Parsing and mount
+application happen before namespace publication. Entries name partitions with
+`/dev/diskNpM` boot selectors, support readonly policy and require existing
+mountpoint directories. See [storage](../../../docs/storage.md) for the format.
 
 Path traversal is component-based, absolute or relative to mount-aware cwd.
 `.` remains in the current directory. At a mounted root, `..` crosses to the
@@ -35,6 +51,13 @@ Executing ELF is still limited to archive-backed ramfs files; other backends
 need not expose permanent file-data slices.
 
 ## Backend contract
+
+`Location` pins the mount and node that an operation targets. Call
+`location.poll(&mut request, wake)`; it forwards the instance-local node to
+`Backend::poll` separately. `Request` owns only the operation, staging and
+continuation, never a second target identity. Retain the same location across
+`Pending` resumes. For lookup/create that location is the parent directory;
+the returned child node becomes a new location after completion.
 
 Backends provide lookup, open/release, sequential read/write, directory
 enumeration, creation/truncation, seeking, synchronization, and basic metadata.
@@ -79,9 +102,12 @@ retries retain the request and input. Completion and errors return the storage
 without shrinking capacity. A backend reset hook clears per-operation progress
 outside owner locks before the request becomes available to another caller.
 Growth is allowed only beyond 4096 bytes when the retained capacity is
-insufficient; the existing syscall usercopy limit remains
-1024 bytes. Small backend reads/writes also avoid ephemeral allocation: private
-I/O state is prepared during open and generated output uses bounded storage.
+insufficient. File read/write accept the requested byte count, with no fixed
+usercopy cap; unrepresentable counts fail with `EINVAL`, failed buffer growth
+with `ENOMEM`. Generic request/staging work avoids ephemeral small-I/O allocation:
+private I/O state is prepared during open and generated output uses bounded storage.
+The resident FAT library is an explicit exception for small cache/run metadata
+allocations in IRQ-enabled task context; it also retains volume-sized caches.
 The test backend preallocates mutable backing at creation; growth of file
 contents beyond 4096 bytes remains explicit.
 
@@ -107,12 +133,27 @@ retain an `ActiveContext`.
 
 ## Syscalls and verification
 
-`open`, `read`, `write`, `close`, `getdents64`, `chdir`, and `getcwd` dispatch
-through VFS without adding syscall numbers. Writable open flags are supported
+`open`, `read`, `write`, `close`, `getdents64`, `chdir`, `getcwd`, and `fsync`
+dispatch through VFS. `SYS_FSYNC=20` adds explicit durability; withdrawn number
+19 stays unknown. Writable open flags are supported
 where the backend supports them; ramfs remains readonly. File transfers use
-at most `MAX_USER_COPY` bytes per syscall, so larger files require repeated
-partial calls rather than a whole-file allocation. Directory records retain
-the existing Linux-like layout and entry-cookie semantics.
+the full caller-specified count through retained staging; a backend can still
+return partial progress or EOF. Directory calls emit one naturally bounded
+record using the existing Linux-like layout and entry-cookie semantics.
+
+FAT retains one resident filesystem and one canonical library file per stable
+node under an unlocked logical volume lease. Independent OFDs share current
+file metadata, not positions; append selects EOF in that same lease. Payload
+I/O uses the retained handle instead of reopening by path. Explicit fsync
+publishes FAT/FSInfo then flushes the block device; it does not unmount. No disk
+operation occurs on final OFD close. Partitions sharing a physical disk acquire
+its exclusive owner before library work; contention returns `Pending` with an
+exact token, never a nested blocking wait or a held disk spinlock. Readonly
+mounts reject mutations and do not publish FAT metadata on sync. Timeouts belong
+to the block driver; FAT has no operation-wide call/time budget or hard latency
+guarantee. See
+[storage](../../../docs/storage.md) and
+[ADR-0067](../../../memory/decisions/ADR-0067-resident-fat-and-canonical-file-handles.md).
 
 Host tests exercise namespace, operation, offset, error, and lifetime contracts.
 `vfs-contract` adds controlled mounts, generated and writable files, cross-CPU
@@ -124,7 +165,7 @@ completion; abandoned requests detach their exact wait registration.
 Its backend, fixtures, and protocol markers are test-only. Ordinary userspace,
 shell, SMP, and release checks continue to exercise the production ramfs root.
 
-Procfs, FAT32, storage drivers, dynamic unmount, links, permissions, metadata
+Procfs, Pi SDHOST, dynamic unmount, links, permissions, metadata
 syscalls, terminal integration, and a page cache remain separate work.
 
 See [ADR-0062](../../../memory/decisions/ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md)

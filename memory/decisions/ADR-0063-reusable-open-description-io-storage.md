@@ -8,6 +8,14 @@ Extends [ADR-0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md)
 with an allocation policy for ordinary read/write requests. Namespace,
 descriptor sharing, exact waits, and syscall ABI remain unchanged.
 
+The inherited 1024-byte syscall transfer cap is superseded by
+[ADR-0066](ADR-0066-usercopy-length-and-owned-io-growth.md); the allocation and
+reuse policy below remains accepted.
+
+[ADR-0067](ADR-0067-resident-fat-and-canonical-file-handles.md) permits small
+FAT-library cache/run metadata allocations only. Generic reusable request and
+staging policy remains unchanged.
+
 ## Context
 
 The initial VFS allocated a staging vector and boxed syscall continuation for

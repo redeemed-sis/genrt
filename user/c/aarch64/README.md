@@ -76,6 +76,21 @@ directory identity, and successful `execve` preserves it. Relative `open`,
 `chdir`, and `execve` paths are canonicalized against cwd. The pathname ABI is
 bounded by `GENRT_PATH_MAX = 4096` bytes excluding NUL.
 
+## File synchronization and transfer lengths
+
+`fsync(int fd)` in `syscall.h` uses `SYS_FSYNC=20`, with fd in x0 and zero or
+negative errno in x0 on return. It persists the backend's file and filesystem
+metadata, including a block-device flush for FAT32. Std streams and absent
+descriptors return `-EBADF`. Number 19 remains withdrawn/unknown. Closing or
+powering off does not replace fsync. See [ADR-0065](../../../memory/decisions/ADR-0065-fsync-syscall.md).
+
+File read/write accept the requested count up to the signed result domain;
+counts above `isize::MAX` fail with `-EINVAL`. There is no fixed 1024-byte
+usercopy cap. OFD staging grows fallibly above its 4096-byte baseline, so large
+requests can fail with `-ENOMEM`. Partial transfers and EOF remain normal.
+Every copied range is validated completely before writing its destination;
+failed usercopy does not consume an OFD position.
+
 ## Fork placement extension
 
 `sched_setforkaffinity(int cpu)` is a genrt extension using syscall number 11:

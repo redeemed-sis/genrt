@@ -368,7 +368,7 @@ accepted ADRs remain authoritative when details differ.
   `waitpid` supports a specific positive child PID with options `0`.
 - Lower-EL faults terminate the attributed user process and remain joinable;
   current-EL kernel faults stay fatal.
-- The syscall ABI supports `open`, `read`, `write`, `close`, `getdents64`,
+- The syscall ABI supports `open`, `read`, `write`, `close`, `fsync`, `getdents64`,
   `chdir`, `getcwd`, `fork`, `execve`, `waitpid`, `sched_setforkaffinity`,
   `sched_getaffinity`, `clock_gettime`, `clock_getres`, `clock_nanosleep`,
   Linux-shaped `reboot`, and `exit` with negative errno returns. Restart and
@@ -383,6 +383,63 @@ accepted ADRs remain authoritative when details differ.
 - A mount-aware VFS owns pathname traversal and dispatch to filesystem
   backends. Ramfs remains the archive-backed readonly root; mounts are
   kernel-controlled and cannot be dynamically unmounted.
+  `Location::poll` selects the backend and node together; retained requests
+  contain operation/progress storage, not a duplicate target identity.
+- The first initialization task builds/publishes the namespace before EL0,
+  including optional QEMU virtio-mmio block discovery. The first disk's first
+  primary FAT32 partition supplies `/fstab`; absence mounts it at `/mnt/disk`.
+  Present configuration controls all automatic mounts using `/dev/diskNpM`
+  selectors, existing mountpoints and FAT32 readonly/read-write policy. Empty
+  tables mount nothing; invalid configuration fails rather than falling back.
+  Partitions share one exclusive physical owner through exact-token reservations,
+  never a spinlock spanning I/O. Early boot performs no disk I/O.
+  Pi SDHOST and loader-provided boot-medium selection are not implemented; the
+  Pi storage hook still reports no disks. See the
+  [storage bootstrap backlog](../docs/roadmap/hardening.md#storage-bootstrap).
+  `--disk` shares attachments with DTB generation;
+  diskless command/release composition is unchanged. See [storage](../docs/storage.md)
+  and [ADR-0070](decisions/ADR-0070-fstab-boot-mounts-and-shared-disks.md).
+- `cargo xtask disk-create` explicitly provisions a new empty MBR/FAT32 data
+  image for QEMU by default. Optional `--layout` schema-1 TOML declares up to
+  four primary FAT32 partitions with labels, sizes and source directories;
+  the last size may be omitted. Source paths are relative to the manifest.
+  Sorted files, dotfiles and empty directories are copied with fixed FAT
+  timestamps; a first-partition source can supply `/fstab` and mountpoints.
+  `sfdisk` chooses alignment; `mkfs.fat` chooses cluster size. The default total
+  is 128 MiB.
+  Existing output paths are never overwritten;
+  a privately staged, formatted image is published with a no-clobber hard link.
+  Ordinary `--disk` attachment still never creates or formats images. See
+  [disk preparation](../docs/storage.md#create-a-data-disk).
+- One resident `kernel::dtb::RuntimeDtb` is published after MMU entry and reused
+  by boot memory, CPU/PSCI, chosen payloads, UART discovery and late probing.
+  Shared framing/status/MMIO translation is separate from device policy.
+  AArch64 `platform/bootstrap::init_early` owns essential boot setup without
+  heap allocation; `init_devices` performs late matching, MMIO mapping and
+  device registration in the IRQ-enabled init task after runtime VM/heap.
+  The selected GIC's firmware domain is resolved once per late discovery.
+  The independent pre-MMU parser remains unchanged. See
+  [ADR-0069](decisions/ADR-0069-shared-runtime-dtb-and-staged-probe.md).
+  Concrete controller implementations
+  live in `platform/block`; `virtio_block` receives mapped resources and owns
+  transport identification, queue/DMA storage and bounded request execution.
+  The driver does not parse DTB nodes or select platform resources.
+- FAT uses pinned resident-fat 0.3.1 with one persistent filesystem and one
+  canonical file handle per stable node under an unlocked volume lease. OFDs
+  share current file metadata but keep independent positions. Small library
+  metadata allocations are permitted; generic reusable staging is unchanged.
+  A private Send wrapper admits only the library's default epoch clock.
+  Explicit `fsync=20` publishes FAT/FSInfo then flushes the device without
+  unmounting; close/drop perform no I/O. Sector-fragment calls retain confirmed
+  partial progress; failures latch instead of silently retrying uncertain work.
+  FAT has no global call/time budget; actual device deadlines remain in the
+  driver. A complete filesystem operation has no hard wall-time guarantee.
+  BPB validation and partition-capacity checks use the library; the adapter
+  retains only overflow/root/FSInfo and unsupported-feature checks. Absent
+  FSInfo is supported without validating the unused backup-sector field.
+  See [ADR-0067](decisions/ADR-0067-resident-fat-and-canonical-file-handles.md),
+  [driver-owned timeouts](decisions/ADR-0068-driver-owned-storage-timeouts.md),
+  and the [library comparison](../tests/storage/fat-poc/README.md).
 - Processes have bounded FD tables and mount-aware cwd references. Fork shares
   open file descriptions and file/directory positions; exec preserves them.
   Backend work and final resource destruction run outside process/scheduler
@@ -391,8 +448,11 @@ accepted ADRs remain authoritative when details differ.
 - Open provisions reusable request/staging storage per OFD, with a 4096-byte
   baseline. Read/write reuse it across calls and waits; pending call metadata is
   inline rather than separately boxed. Capacity grows only beyond the baseline
-  when insufficient, without changing the 1024-byte syscall usercopy bound.
-  See [ADR-0063](decisions/ADR-0063-reusable-open-description-io-storage.md).
+  when insufficient. File I/O accepts the full signed-representable request
+  count; generic usercopy has no fixed byte cap and validates the whole range
+  before copying. Natural dirent/stdin/profile service bounds are separate.
+  See [ADR-0063](decisions/ADR-0063-reusable-open-description-io-storage.md) and
+  [ADR-0066](decisions/ADR-0066-usercopy-length-and-owned-io-growth.md).
 - A test-only second backend exercises generated and writable files, independent
   mounts, pending completion, and process ownership through the same VFS
   interfaces. It is absent from production artifacts. See
@@ -448,7 +508,7 @@ accepted ADRs remain authoritative when details differ.
 - No FP/SIMD context ownership; the soft-float target is intentional.
 - No ASIDs, copy-on-write, demand paging, recoverable usercopy faults, signals,
   or multiple user threads within one process.
-- No production writable filesystem, persistent storage driver, file metadata
-  syscall set, dynamic unmount, or terminal line discipline.
+- No Pi SDHOST, GPT/extended partitions, page cache, file metadata syscall set,
+  dynamic unmount, or terminal line discipline. FAT is not crash-consistent.
 - Kernel TTBR1 mutation remains limited to the current mapping granularity.
 - Heap growth and comprehensive hardware latency certification are deferred.

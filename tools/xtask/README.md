@@ -94,6 +94,42 @@ explicit GICv2, disables networking/display/monitor, and attaches DTB and
 initramfs as data without changing the kernel entry PC. QEMU command preview,
 interactive run, debug, and test paths share the same artifact model.
 
+`build-aarch64`, `run-aarch64`, `debug-aarch64` and `qemu-cmd --arch aarch64`
+accept `--disk <existing.raw>`. Validation requires a sector-aligned regular
+file. Modern virtio-mmio attachment arguments are shared with DTB generation;
+disk-bearing DTBs have distinct names. Attachment never creates or formats a disk.
+Without the option, canonical diskless arguments and release launcher behavior
+remain unchanged. `storage-contract` alone creates an explicitly owned test
+fixture and verifies two-boot persistence through mtools/fsck.
+See [storage](../../docs/storage.md).
+
+Create a separate empty data image explicitly:
+
+```bash
+cargo xtask disk-create --output target/data.raw --size-mib 128 --label GENRT
+cargo xtask run-aarch64 --cpus 4 --disk target/data.raw
+```
+
+The size is the entire disk in MiB (minimum 65, default 128). By default, `sfdisk`
+creates one FAT32 partition; `mkfs.fat` chooses cluster size. The parent must
+exist and support hard links; existing output
+entries, including symlinks, are never replaced. Formatting is bounded and
+staged privately before publication. No kernel, initramfs or fstab is installed;
+the normal absent-fstab fallback mounts the partition at `/mnt/disk`.
+See [disk preparation](../../docs/storage.md#create-a-data-disk) for dependencies
+and host-side file copying. `disk-create` does not change test fixture or release
+composition.
+
+For multiple partitions and initial files, pass
+`--layout examples/storage/disk.toml` to use the supplied example. Its schema-1
+`[[partitions]]` entries specify labels, optional source directories and sizes in
+MiB; only the last size may be omitted to use remaining space. Up to four FAT32
+partitions are supported. Source paths are relative to the TOML file. Sorted
+contents, including dotfiles and empty directories, are copied with fixed FAT
+timestamps before publication. Supply `fstab` in the first partition's source;
+it is not generated implicitly. `--label` and `--layout` are mutually exclusive.
+See the [multi-partition example](../../docs/storage.md#multiple-partitions-and-initial-files).
+
 Child ownership includes bounded deadlines, concurrent UART/stderr draining,
 termination, wait, and complete-log validation. See
 [`tests/qemu/README.md`](../../tests/qemu/README.md).
