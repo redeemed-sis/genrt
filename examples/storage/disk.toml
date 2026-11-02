@@ -1,0 +1,12 @@
+schema = 1
+
+# Boot configuration and the DATA mountpoint.
+[[partitions]]
+size_mib = 64
+label = "BOOT"
+source = "boot"
+
+# Use the remaining disk space for data.
+[[partitions]]
+label = "DATA"
+source = "data"

@@ -44,6 +44,21 @@ pub(crate) enum Commands {
         output_dir: PathBuf,
     },
     RepoTree,
+    /// Create a new raw MBR/FAT32 data disk; never overwrite an existing path.
+    DiskCreate {
+        /// New image path; its parent directory must already exist.
+        #[arg(long)]
+        output: PathBuf,
+        /// Total disk size in MiB; partition alignment is automatic.
+        #[arg(long, default_value_t = 128)]
+        size_mib: u64,
+        /// FAT volume label, at most 11 printable ASCII bytes.
+        #[arg(long, default_value = "GENRT", conflicts_with = "layout")]
+        label: String,
+        /// TOML partition sizes, labels and optional source directories.
+        #[arg(long)]
+        layout: Option<PathBuf>,
+    },
     QemuCmd {
         /// Attach an existing raw MBR/FAT32 disk; never format it implicitly.
         #[arg(long)]

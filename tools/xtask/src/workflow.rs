@@ -65,6 +65,12 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         Commands::Ci => ci(),
         Commands::Dist { tag, output_dir } => crate::dist::run(&tag, &output_dir),
         Commands::RepoTree => repo_tree(),
+        Commands::DiskCreate {
+            output,
+            size_mib,
+            label,
+            layout,
+        } => crate::disk::create(&output, size_mib, &label, layout.as_deref()),
         Commands::QemuCmd {
             disk,
             arch,

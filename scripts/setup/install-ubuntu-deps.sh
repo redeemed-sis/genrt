@@ -62,7 +62,7 @@ if ! ubuntu_has_universe; then
     enable_universe
 fi
 
-packages=(build-essential git qemu-system-arm device-tree-compiler u-boot-tools clang lld llvm binutils ca-certificates dosfstools mtools coreutils)
+packages=(build-essential git qemu-system-arm device-tree-compiler u-boot-tools clang lld llvm binutils ca-certificates dosfstools mtools coreutils fdisk)
 if [[ "$rustup_state" == 'install' ]]; then
     packages+=(rustup)
 fi

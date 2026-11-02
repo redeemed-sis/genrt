@@ -1,5 +1,6 @@
 mod artifacts;
 mod cli;
+mod disk;
 mod dist;
 mod hardware;
 mod initramfs;
