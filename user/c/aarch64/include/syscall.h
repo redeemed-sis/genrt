@@ -25,6 +25,7 @@
 #define SYS_CLOCK_NANOSLEEP 16
 #define SYS_PROFILE_CONTROL 17
 #define SYS_PROFILE_READ 18
+#define SYS_FSYNC 20
 
 #define GENRT_PATH_MAX 4096
 #define PATH_MAX GENRT_PATH_MAX
@@ -117,6 +118,10 @@ static inline ssize_t read(int fd, void *buf, size_t count) {
 
 static inline int close(int fd) {
     return (int)genrt_syscall3(SYS_CLOSE, fd, 0, 0);
+}
+
+static inline int fsync(int fd) {
+    return (int)genrt_syscall1(SYS_FSYNC, fd);
 }
 
 static inline pid_t fork(void) {

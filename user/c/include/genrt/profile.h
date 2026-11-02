@@ -95,7 +95,8 @@ static inline int genrt_profile_control(int command,
 }
 
 /* Frozen header followed by recorded records, no heap snapshot. Each read is
- * clamped to MAX_USER_COPY; offset at/beyond EOF returns zero. Active read
+ * clamped to 4096 bytes for bounded profile staging, not a usercopy limit.
+ * Offset at/beyond EOF returns zero. Active read
  * returns -EBUSY, invalid nonempty destination -EFAULT. Zero-byte/EOF reads do
  * not dereference buffer. Incomplete counts records without final lifecycle
  * completion or missing required probes:

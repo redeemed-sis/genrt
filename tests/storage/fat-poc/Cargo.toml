@@ -1,0 +1,17 @@
+[package]
+name = "genrt-fat-poc-issue24"
+version = "0.1.0"
+edition = "2024"
+default-run = "genrt-fat-poc-issue24"
+
+[dependencies]
+resident-fat = { version = "=0.3.1", default-features = false }
+fatfs = { package = "starry-fatfs", version = "=0.4.1-preview.2", default-features = false, features = ["lfn", "unicode"] }
+
+[features]
+compare-alloc = ["fatfs/alloc"]
+
+[profile.release]
+debug = true
+
+[workspace]

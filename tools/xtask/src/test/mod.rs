@@ -1,6 +1,7 @@
 mod cases;
 mod protocol;
 mod runner;
+mod storage;
 
 use std::{
     fs,
@@ -125,6 +126,12 @@ pub(crate) fn run(options: Options) -> Result<()> {
     let mut last_kernel: Option<(Profile, String, Vec<String>, usize, Aarch64Artifacts)> = None;
 
     for mut case in selected {
+        let storage_case = matches!(case.init, cases::InitImage::StorageWrite);
+        let disk = if storage_case {
+            Some(storage::prepare(&options.artifacts_dir.join(&case.name))?)
+        } else {
+            None
+        };
         if options.wake_profile && !case.kernel_features.iter().any(|f| f == "wake-profile") {
             case.kernel_features.push("wake-profile".to_owned());
         }
@@ -150,8 +157,10 @@ pub(crate) fn run(options: Options) -> Result<()> {
         };
         let built_kernel = if options.prepared.is_none() {
             let reusable = last_kernel.as_ref().is_some_and(
-                |(last_profile, log_level, features, cpu_count, _)| {
+                |(last_profile, log_level, features, cpu_count, artifacts)| {
                     *last_profile == profile
+                        && disk.is_none()
+                        && artifacts.disk().is_none()
                         && log_level == &case.log_level
                         && features == &case.kernel_features
                         && *cpu_count == case.cpu_count
@@ -164,11 +173,12 @@ pub(crate) fn run(options: Options) -> Result<()> {
                     .map(String::as_str)
                     .collect::<Vec<_>>();
                 let log_level = parse_log_level(&case.log_level)?;
-                let artifacts = workflow::build_aarch64_for_cpus(
+                let artifacts = workflow::build_aarch64_with_disk(
                     profile,
                     Some(log_level),
                     &features,
                     case.cpu_count,
+                    disk.as_deref(),
                 )?;
                 last_kernel = Some((
                     profile,
@@ -201,13 +211,54 @@ pub(crate) fn run(options: Options) -> Result<()> {
         if remaining_runtime.is_zero() {
             bail!("QEMU runtime budget expired before case {}", case.name);
         }
-        let result = runner::run_case(
+        let mut result = runner::run_case(
             &case,
             &config,
             &case_dir,
             options.timeout_secs,
             Instant::now() + remaining_runtime,
         )?;
+        if storage_case && matches!(result.status, runner::Status::Passed) {
+            storage::verify(&case_dir)?;
+            storage::configure_mounts(&case_dir)?;
+            let mut second_case = case.clone();
+            second_case.init = cases::InitImage::StorageVerify;
+            let initramfs = prepare_test_initramfs(
+                profile,
+                &second_case.init,
+                artifacts.root().join("storage-verify.initramfs.cpio"),
+                users.unwrap(),
+            )?;
+            let mut second = config.clone();
+            second.initramfs = initramfs;
+            let second_dir = case_dir.join("restart");
+            let second_result = runner::run_case(
+                &second_case,
+                &second,
+                &second_dir,
+                options.timeout_secs,
+                Instant::now()
+                    + remaining_runtime.saturating_sub(Duration::from_millis(
+                        u64::try_from(result.duration_ms).unwrap_or(u64::MAX),
+                    )),
+            )?;
+            runner::write_result(second_dir.join("result.json"), &second_result)?;
+            result.duration_ms += second_result.duration_ms;
+            if !matches!(second_result.status, runner::Status::Passed) {
+                result.status = second_result.status;
+                result.exit_reason = format!(
+                    "restart (log {}): {}",
+                    second_dir.join("serial.log").display(),
+                    second_result.exit_reason
+                );
+                result.failed_step = second_result.failed_step;
+            } else {
+                storage::verify(&case_dir)?;
+                result.exit_reason =
+                    "two QEMU boots, mount policy and independent host FAT checks passed"
+                        .to_owned();
+            }
+        }
         let result_ms = u64::try_from(result.duration_ms).unwrap_or(u64::MAX);
         suite_runtime_used = suite_runtime_used.saturating_add(Duration::from_millis(result_ms));
         runner::write_result(case_dir.join("result.json"), &result)?;
@@ -283,6 +334,8 @@ fn prepare_test_initramfs(
         cases::InitImage::UserFault => "user-fault",
         cases::InitImage::UserspaceContract => "userspace-contract",
         cases::InitImage::VfsContract => "vfs-contract",
+        cases::InitImage::StorageWrite => "storage-write",
+        cases::InitImage::StorageVerify => "storage-verify",
         cases::InitImage::SmpUserspaceContract => "smp-userspace-contract",
         cases::InitImage::ShellContract => "shell-contract",
         cases::InitImage::RebootContract => "reboot-contract",
@@ -299,6 +352,19 @@ fn prepare_test_initramfs(
     provenance.mark_prefix(".__genrt_test__", crate::initramfs::Origin::TestFixture)?;
 
     let init = match image {
+        cases::InitImage::StorageWrite | cases::InitImage::StorageVerify => {
+            fs::create_dir_all(&test_namespace)?;
+            fs::write(
+                test_namespace.join("storage-phase"),
+                if matches!(image, cases::InitImage::StorageWrite) {
+                    b"write".as_slice()
+                } else {
+                    b"verify".as_slice()
+                },
+            )?;
+            provenance.mark_prefix("init", crate::initramfs::Origin::TestSupervisor)?;
+            workflow::build_user_program(profile, "test_storage_supervisor", true)?
+        }
         cases::InitImage::VfsContract => {
             for name in ["mount-a", "mount-b", "bin"] {
                 fs::create_dir_all(test_namespace.join(name))?;
@@ -390,6 +456,8 @@ fn prepare_test_initramfs(
     if !matches!(
         image,
         cases::InitImage::UserspaceContract
+            | cases::InitImage::StorageWrite
+            | cases::InitImage::StorageVerify
             | cases::InitImage::VfsContract
             | cases::InitImage::WakeProfileContract
             | cases::InitImage::SmpUserspaceContract

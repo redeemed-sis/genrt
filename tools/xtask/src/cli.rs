@@ -45,6 +45,9 @@ pub(crate) enum Commands {
     },
     RepoTree,
     QemuCmd {
+        /// Attach an existing raw MBR/FAT32 disk; never format it implicitly.
+        #[arg(long)]
+        disk: Option<PathBuf>,
         #[arg(long, value_enum)]
         arch: Arch,
         #[arg(long)]
@@ -62,6 +65,9 @@ pub(crate) enum Commands {
         arch: Arch,
     },
     BuildAarch64 {
+        /// Include a matching modern virtio-mmio disk in the generated DTB.
+        #[arg(long)]
+        disk: Option<PathBuf>,
         #[arg(long, value_enum)]
         log_level: Option<LogLevel>,
         #[arg(long, value_enum, default_value_t = Profile::Debug)]
@@ -97,6 +103,9 @@ pub(crate) enum Commands {
         profile: Profile,
     },
     RunAarch64 {
+        /// Attach an existing raw MBR/FAT32 disk read-write.
+        #[arg(long)]
+        disk: Option<PathBuf>,
         #[arg(long, value_enum)]
         log_level: Option<LogLevel>,
         #[arg(long)]
@@ -114,6 +123,9 @@ pub(crate) enum Commands {
         wake_profile: bool,
     },
     DebugAarch64 {
+        /// Attach an existing raw MBR/FAT32 disk read-write.
+        #[arg(long)]
+        disk: Option<PathBuf>,
         #[arg(long, value_enum)]
         log_level: Option<LogLevel>,
         #[arg(long)]

@@ -1,0 +1,53 @@
+name = "storage-contract"
+suite = "storage-contract"
+supervisor = "storage-supervisor"
+profile = "debug"
+log_level = "info"
+cpu_count = 4
+init = "storage-write"
+termination = "poweroff"
+timeout_secs = 60
+step_timeout_secs = 20
+
+[[steps]]
+action = "expect_case"
+producer = "storage-supervisor"
+subject = "boot-mount-policy"
+
+[[steps]]
+action = "expect_case"
+producer = "storage-supervisor"
+subject = "mount-paths"
+
+[[steps]]
+action = "expect_case"
+producer = "storage-supervisor"
+subject = "writable-io"
+
+[[steps]]
+action = "expect_case"
+producer = "storage-supervisor"
+subject = "fork-offsets"
+
+[[steps]]
+action = "expect_case"
+producer = "storage-supervisor"
+subject = "concurrent-append"
+
+[[steps]]
+action = "expect_case"
+producer = "storage-supervisor"
+subject = "persistence"
+
+[[steps]]
+action = "expect"
+producer = "storage-supervisor"
+event = "CASE_START"
+subject = "storage-poweroff"
+
+[[steps]]
+action = "expect"
+producer = "storage-supervisor"
+event = "TERMINAL"
+subject = "storage-poweroff"
+detail = "POWER_OFF"

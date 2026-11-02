@@ -258,7 +258,12 @@ impl Backend for TestFs {
         node(1)
     }
 
-    fn poll(&self, request: &mut Request, wake: Option<WaitToken>) -> Poll<Result<Reply, Errno>> {
+    fn poll(
+        &self,
+        target: Node,
+        request: &mut Request,
+        wake: Option<WaitToken>,
+    ) -> Poll<Result<Reply, Errno>> {
         #[cfg(not(test))]
         if wake.is_some() {
             assert_task_callback();
@@ -277,7 +282,7 @@ impl Backend for TestFs {
             self.resumed[saved.stage].fetch_add(1, Ordering::SeqCst);
             return Poll::Ready(Ok(saved.reply));
         }
-        if request.node.id == 8
+        if target.id == 8
             && let Operation::Write { offset, .. } = request.operation
         {
             return Poll::Ready((|| {
@@ -305,7 +310,7 @@ impl Backend for TestFs {
                 self.resumed[3].fetch_add(1, Ordering::SeqCst);
                 return Poll::Ready(Ok(reply));
             }
-            if request.node.id == 4 {
+            if target.id == 4 {
                 let mut state = self.state.lock();
                 if !state.pending_released {
                     let Some(token) = wake else {
@@ -325,7 +330,7 @@ impl Backend for TestFs {
             Err(result) => return result,
         };
         let store = lease.store.as_mut().unwrap();
-        let id = request.node.id;
+        let id = target.id;
         let deferred_name = match &request.operation {
             Operation::Create(name) => name.starts_with(b"deferred-"),
             _ => id
@@ -349,7 +354,7 @@ impl Backend for TestFs {
         }
         let result = (|| match &request.operation {
             Operation::Lookup(name) | Operation::Create(name) => {
-                if request.node.kind != Kind::Directory {
+                if target.kind != Kind::Directory {
                     return Err(errno::ENOTDIR);
                 }
                 if id == 1
@@ -414,7 +419,7 @@ impl Backend for TestFs {
                 if id == 8 {
                     return Err(errno::ENOTSUP);
                 }
-                if request.node.kind == Kind::Directory {
+                if target.kind == Kind::Directory {
                     return Err(errno::EISDIR);
                 }
                 let mut generated = Generated {
@@ -504,7 +509,7 @@ impl Backend for TestFs {
                 Ok(Reply::Done)
             }
             Operation::Readdir { offset } => {
-                if request.node.kind != Kind::Directory {
+                if target.kind != Kind::Directory {
                     return Err(errno::ENOTDIR);
                 }
                 let mut entries: Vec<DirEntry> = if id == 1 {
@@ -563,10 +568,7 @@ impl Backend for TestFs {
                         base.checked_add_signed(displacement).ok_or(errno::EINVAL)?,
                     ))
                 } else {
-                    Ok(Reply::Stat(Stat {
-                        node: request.node,
-                        size,
-                    }))
+                    Ok(Reply::Stat(Stat { node: target, size }))
                 }
             }
             Operation::Sync => {

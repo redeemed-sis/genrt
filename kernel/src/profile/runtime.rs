@@ -194,14 +194,14 @@ pub(crate) fn control(
 /// # Arguments
 /// * `owner` - Captured current process main-thread identity.
 /// * `offset` - Byte offset; at/beyond EOF returns zero, including usize::MAX.
-/// * `output` - Kernel staging slice bounded by MAX_USER_COPY.
+/// * `output` - Kernel staging slice bounded by READ_CHUNK_BYTES.
 /// # Returns
 /// Number of copied bytes, or zero at EOF.
 /// # Errors
 /// EINVAL for oversized staging, ENOENT for absent session, EPERM for foreign
 /// ownership, EBUSY while recording.
 pub(crate) fn read(owner: ThreadId, offset: usize, output: &mut [u8]) -> Result<usize, Errno> {
-    if output.len() > crate::memory::user::MAX_USER_COPY {
+    if output.len() > super::READ_CHUNK_BYTES {
         return Err(errno::EINVAL);
     }
     let state = slot(cpu()).lock();

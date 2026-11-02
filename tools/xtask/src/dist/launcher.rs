@@ -17,6 +17,7 @@ use crate::{
 pub(super) fn config(cpu_count: usize) -> qemu::Config {
     let artifacts = Aarch64Artifacts::for_cpu_count(Profile::Release, cpu_count);
     qemu::Config {
+        disk: None,
         kernel: PathBuf::from("genrt-aarch64.elf"),
         dtb: PathBuf::from(artifacts.dtb().file_name().unwrap()),
         initramfs: PathBuf::from("initramfs.cpio"),

@@ -61,7 +61,7 @@ pub(crate) struct OpenFlags {
 }
 
 /// One backend operation. Inputs remain stable across `Pending` resumes.
-#[allow(dead_code)] // Seek/sync/stat are kernel backend APIs, not new syscalls.
+#[allow(dead_code)] // Seek/stat remain kernel backend APIs, not new syscalls.
 pub(crate) enum Operation {
     Lookup(Vec<u8>),
     Create(Vec<u8>),
@@ -104,10 +104,9 @@ pub(crate) enum Reply {
     Stat(Stat),
 }
 
-/// Retained submission, never borrowed from a syscall stack across handoff.
+/// Retained operation state, never borrowed from a syscall stack across handoff.
+/// The caller's pinned location selects the backend and target node separately.
 pub(crate) struct Request {
-    /// Target node (parent for lookup/create).
-    pub(crate) node: Node,
     /// Immutable request inputs.
     pub(crate) operation: Operation,
     /// Owned bounded I/O staging; read fills it, write consumes its bytes.
@@ -124,13 +123,11 @@ pub(crate) struct Request {
 impl Request {
     /// Construct an unsubmitted request; may subsequently allocate in task work.
     /// # Arguments
-    /// * `node` - Stable target node.
     /// * `operation` - Operation with owned inputs.
     /// # Returns
     /// Empty staging/private state; no allocation or IRQ changes.
-    pub(crate) fn new(node: Node, operation: Operation) -> Self {
+    pub(crate) fn new(operation: Operation) -> Self {
         Self {
-            node,
             operation,
             buffer: Vec::new(),
             open: None,
@@ -157,6 +154,8 @@ pub(crate) trait Backend: Send + Sync {
     /// Read/write may grow retained storage only beyond IO_CAPACITY when its
     /// existing capacity is insufficient; they must not allocate ephemeral state.
     /// # Arguments
+    /// * `target` - Instance-local node selected by the caller's pinned location;
+    ///   parent directory for lookup/create. Keep the same location on resume.
     /// * `request` - Exclusive retained request, including prior continuation.
     /// * `wake` - Exact prepared wait to publish before returning `Pending`.
     ///   `None` permits synchronous bootstrap/host calls only.
@@ -166,7 +165,12 @@ pub(crate) trait Backend: Send + Sync {
     /// # Errors
     /// Backend errno, including `ENOTSUP` for unsupported operations. Without
     /// `wake`, operations that need a wait must return `ENOTSUP`, not `Pending`.
-    fn poll(&self, request: &mut Request, wake: Option<WaitToken>) -> Poll<Result<Reply, Errno>>;
+    fn poll(
+        &self,
+        target: Node,
+        request: &mut Request,
+        wake: Option<WaitToken>,
+    ) -> Poll<Result<Reply, Errno>>;
 
     /// Reset completed or abandoned operation state before publishing its lease.
     /// # Arguments

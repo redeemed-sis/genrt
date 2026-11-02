@@ -1,26 +1,44 @@
+//! Shared runtime firmware reader and generic boot memory interpretation.
+
+mod runtime;
+pub use runtime::{DtbError, MmioRange, RuntimeDtb};
+
 use bootinfo::{MemoryRegion, MemoryRegionKind};
-use fdt_raw::{Fdt, FdtError};
+use fdt_raw::Fdt;
 
-pub(crate) const MAX_BOOT_MEMORY_REGIONS: usize = 32;
-const FDT_HEADER_SIZE: usize = 40;
+static RUNTIME: crate::sync::OncePublication<RuntimeDtb<'static>> =
+    crate::sync::OncePublication::new();
 
-#[derive(Clone)]
-pub(crate) enum DtbError {
-    BadPointer,
-    Truncated,
-    Parse(FdtError),
-    OutOfRegions,
+/// Validate and publish the one immutable runtime firmware view.
+/// Bootstrap-only; performs no heap allocation, hardware I/O or IRQ changes.
+/// # Arguments
+/// * `bytes` - Permanently resident immutable DTB, mapped across VM transitions.
+/// # Returns
+/// The shared reader used by early boot and late device discovery.
+/// # Errors
+/// Invalid DTB framing or AlreadyInitialized on repeated publication.
+pub fn init(bytes: &'static [u8]) -> Result<&'static RuntimeDtb<'static>, DtbError> {
+    let tree = RuntimeDtb::from_bytes(bytes)?;
+    RUNTIME
+        .publish(tree)
+        .map_err(|_| DtbError::AlreadyInitialized)?;
+    Ok(RUNTIME.get().expect("DTB just published"))
 }
 
-impl core::fmt::Debug for DtbError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::BadPointer => f.write_str("BadPointer"),
-            Self::Truncated => f.write_str("Truncated"),
-            Self::Parse(err) => f.debug_tuple("Parse").field(err).finish(),
-            Self::OutOfRegions => f.write_str("OutOfRegions"),
-        }
-    }
+/// Borrow the permanent runtime view without reparsing or allocation.
+/// # Returns
+/// The immutable published reader, or None before bootstrap publication.
+pub fn runtime() -> Option<&'static RuntimeDtb<'static>> {
+    RUNTIME.get()
+}
+
+pub(crate) const MAX_BOOT_MEMORY_REGIONS: usize = 32;
+
+/// Generic boot memory-map output exceeded its fixed boot-owned capacity.
+#[derive(Clone, Debug)]
+pub(crate) enum MemoryMapError {
+    /// More nonempty usable/reserved regions than the boot map can retain.
+    OutOfRegions,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -41,40 +59,23 @@ pub(crate) struct ParsedDtbInfo {
 ///
 /// # Arguments
 ///
-/// * `dtb_va` - Readable kernel virtual address of the complete resident DTB,
-///   or zero to publish an empty result.
+/// * `dtb` - Shared, already validated runtime firmware reader.
 /// * `out` - Fixed output array receiving sorted usable and reserved regions.
 ///
 /// # Returns
 ///
-/// Returns DTB size, initialized region count, and enabled CPU count. A zero
-/// `dtb_va` returns all zero counts.
+/// Returns DTB size, initialized region count, and enabled CPU count.
 ///
 /// # Errors
 ///
-/// Returns [`DtbError`] for an invalid/truncated DTB, parser failure, or region
-/// output-capacity exhaustion.
-///
-/// # Safety
-///
-/// Nonzero `dtb_va` must identify a readable DTB whose complete
-/// header-declared range remains resident for parsing.
-pub(crate) unsafe fn parse_memory_regions(
-    dtb_va: usize,
+/// Returns [`MemoryMapError`] for region output-capacity exhaustion.
+pub(crate) fn parse_memory_regions(
+    dtb: &RuntimeDtb<'_>,
     out: &mut [MemoryRegion; MAX_BOOT_MEMORY_REGIONS],
-) -> Result<ParsedDtbInfo, DtbError> {
+) -> Result<ParsedDtbInfo, MemoryMapError> {
     clear_regions(out);
-    if dtb_va == 0 {
-        return Ok(ParsedDtbInfo {
-            dtb_size: 0,
-            region_count: 0,
-            cpu_count: 0,
-        });
-    }
-
-    let dtb = unsafe { dtb_slice_from_va(dtb_va)? };
-    let fdt = Fdt::from_bytes(dtb).map_err(DtbError::Parse)?;
-    let cpu_count = enabled_cpu_count(&fdt);
+    let fdt = dtb.fdt();
+    let cpu_count = enabled_cpu_count(fdt);
     let mut count = 0usize;
 
     for reservation in fdt.memory_reservations() {
@@ -144,33 +145,16 @@ fn enabled_cpu_count(fdt: &Fdt<'_>) -> usize {
         .count()
 }
 
-unsafe fn dtb_slice_from_va(base_va: usize) -> Result<&'static [u8], DtbError> {
-    let base = base_va as *const u8;
-    if base.is_null() {
-        return Err(DtbError::BadPointer);
-    }
-
-    let total_size = unsafe { read_be_u32_ptr(base.add(4))? } as usize;
-    if total_size < FDT_HEADER_SIZE {
-        return Err(DtbError::Truncated);
-    }
-
-    // SAFETY: early boot passes a DTB blob that stays resident for the life of
-    // the kernel. We use the FDT header's total size to bound the slice.
-    let raw = core::ptr::slice_from_raw_parts(base, total_size);
-    Ok(unsafe { &*raw })
-}
-
 fn push_region(
     out: &mut [MemoryRegion; MAX_BOOT_MEMORY_REGIONS],
     count: &mut usize,
     region: MemoryRegion,
-) -> Result<(), DtbError> {
+) -> Result<(), MemoryMapError> {
     if region.size == 0 {
         return Ok(());
     }
 
-    let slot = out.get_mut(*count).ok_or(DtbError::OutOfRegions)?;
+    let slot = out.get_mut(*count).ok_or(MemoryMapError::OutOfRegions)?;
     *slot = region;
     *count += 1;
     Ok(())
@@ -198,12 +182,4 @@ fn clear_regions(out: &mut [MemoryRegion; MAX_BOOT_MEMORY_REGIONS]) {
             kind: MemoryRegionKind::Reserved,
         };
     }
-}
-
-unsafe fn read_be_u32_ptr(ptr: *const u8) -> Result<u32, DtbError> {
-    let b0 = unsafe { core::ptr::read(ptr) };
-    let b1 = unsafe { core::ptr::read(ptr.add(1)) };
-    let b2 = unsafe { core::ptr::read(ptr.add(2)) };
-    let b3 = unsafe { core::ptr::read(ptr.add(3)) };
-    Ok(u32::from_be_bytes([b0, b1, b2, b3]))
 }

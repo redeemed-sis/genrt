@@ -112,6 +112,7 @@ impl Profile {
 pub(crate) struct Aarch64Artifacts {
     root: PathBuf,
     cpu_count: usize,
+    disk: Option<PathBuf>,
 }
 
 impl Aarch64Artifacts {
@@ -130,6 +131,7 @@ impl Aarch64Artifacts {
                 .join(AARCH64_TARGET)
                 .join(profile.dir_name()),
             cpu_count: 1,
+            disk: None,
         }
     }
 
@@ -150,12 +152,30 @@ impl Aarch64Artifacts {
                 .join(AARCH64_TARGET)
                 .join(profile.dir_name()),
             cpu_count,
+            disk: None,
         }
     }
 
     /// Return the profile artifact directory without creating it.
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Select an existing raw disk and a distinct disk-bearing DTB filename.
+    /// # Arguments
+    /// * `disk` - Canonical validated file, or none for the diskless composition.
+    /// # Returns
+    /// Updated paths; does not open, format, or otherwise modify the disk.
+    pub(crate) fn with_disk(mut self, disk: Option<PathBuf>) -> Self {
+        self.disk = disk;
+        self
+    }
+
+    /// Borrow the optional canonical disk file without I/O or allocation.
+    /// # Returns
+    /// File path for both DTB generation and launch, or none when diskless.
+    pub(crate) fn disk(&self) -> Option<&Path> {
+        self.disk.as_deref()
     }
 
     /// Select isolated Cargo/ELF paths for diagnostic feature composition.
@@ -192,6 +212,11 @@ impl Aarch64Artifacts {
     /// CPU-count-qualified filename for multi-CPU topologies. No file is
     /// created or validated.
     pub(crate) fn dtb(&self) -> PathBuf {
+        if self.disk.is_some() {
+            return self
+                .root
+                .join(format!("qemu-virt-smp{}-disk.dtb", self.cpu_count));
+        }
         if self.cpu_count == 1 {
             self.root.join("qemu-virt.dtb")
         } else {

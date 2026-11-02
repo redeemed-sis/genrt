@@ -180,19 +180,22 @@ static int writable(void) {
 }
 
 static int large_io(void) {
-    static unsigned char source[4099], dest[4101];
+    static unsigned char source[65573], dest[65575];
     for (size_t i = 0; i < sizeof(source); i++) source[i] = (unsigned char)(i * 37u + 11u);
     int fd = open(A "/large", O_CREAT | O_RDWR | O_TRUNC);
     CHECK(fd >= 3 && write(fd, BAD, 8) == -EFAULT);
+    CHECK(write(fd, BAD, sizeof(source)) == -EFAULT);
+    CHECK(write(fd, source, (size_t)-1) == -22);
     size_t total = 0;
     while (total < sizeof(source)) {
         long n = write(fd, source + total, sizeof(source) - total);
-        CHECK(n > 0 && n <= 1024 && (size_t)n <= sizeof(source) - total);
+        CHECK(n > 0 && (size_t)n == sizeof(source) - total);
         total += (size_t)n;
     }
     CHECK(close(fd) == 0);
     fd = open(A "/large", O_RDONLY);
     CHECK(fd >= 3 && read(fd, BAD, 8) == -EFAULT);
+    CHECK(read(fd, dest, (size_t)-1) == -22);
     static const char readonly[8] = {0};
     CHECK(read(fd, (void *)readonly, 8) == -EFAULT);
     /* The controlled user stack ends eight bytes after this address. */
@@ -200,17 +203,18 @@ static int large_io(void) {
     unsigned char saved[8];
     for (unsigned i = 0; i < 8; i++) { saved[i] = edge[i]; edge[i] = 0xa5; }
     long partial = read(fd, (void *)edge, 16);
+    long across_unmapped = read(fd, (void *)0x0000007ffffff000UL, 8192);
     int unchanged = 1;
     for (unsigned i = 0; i < 8; i++) { if (edge[i] != 0xa5) unchanged = 0; edge[i] = saved[i]; }
-    CHECK(partial == -EFAULT && unchanged);
+    CHECK(partial == -EFAULT && across_unmapped == -EFAULT && unchanged);
     CHECK(write(fd, "x", 1) == -EBADF);
     memset(dest, 0xa5, sizeof(dest)); total = 0;
     while (total < sizeof(source)) {
         long n = read(fd, dest + 1 + total, sizeof(source) - total);
-        CHECK(n > 0 && n <= 1024 && (size_t)n <= sizeof(source) - total);
+        CHECK(n > 0 && (size_t)n == sizeof(source) - total);
         total += (size_t)n;
     }
-    CHECK(dest[0] == 0xa5 && dest[4100] == 0xa5);
+    CHECK(dest[0] == 0xa5 && dest[sizeof(dest) - 1] == 0xa5);
     CHECK(memcmp(dest + 1, source, sizeof(source)) == 0 && read(fd, dest, 1) == 0);
     CHECK(close(fd) == 0);
     /* A rejected component must not leave an unenumerable created file. */

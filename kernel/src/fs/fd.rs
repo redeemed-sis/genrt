@@ -168,7 +168,6 @@ pub(crate) struct Open {
     flags: OpenFlags,
     opened: bool,
     truncated: bool,
-    transferred: bool,
 }
 
 impl Open {
@@ -196,7 +195,6 @@ impl Open {
             flags,
             opened: false,
             truncated: false,
-            transferred: false,
         })
     }
 
@@ -231,8 +229,8 @@ impl Open {
         if !self.opened {
             let request = self
                 .request
-                .get_or_insert_with(|| Request::new(location.node(), Operation::Open(self.flags)));
-            match location.backend().poll(request, wake) {
+                .get_or_insert_with(|| Request::new(Operation::Open(self.flags)));
+            match location.poll(request, wake) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(Reply::Done)) => self.opened = true,
                 Poll::Ready(Ok(_)) => return Poll::Ready(Err(errno::EIO)),
@@ -245,7 +243,7 @@ impl Open {
                 location.backend().reset(request);
                 request.operation = Operation::Truncate { size: 0 };
             }
-            match location.backend().poll(request, wake) {
+            match location.poll(request, wake) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(Reply::Done)) => self.truncated = true,
                 Poll::Ready(Ok(_)) => return Poll::Ready(Err(errno::EIO)),
@@ -263,7 +261,6 @@ impl Open {
                 .map_err(|_| errno::ENOMEM)?;
         }
         let request = self.request.take().unwrap();
-        self.transferred = true;
         Poll::Ready(Ok(Arc::new(OpenDescription {
             location: location.clone(),
             flags: self.flags,
@@ -277,9 +274,7 @@ impl Open {
 
 impl Drop for Open {
     fn drop(&mut self) {
-        if !self.transferred
-            && let (Some(location), Some(request)) = (&self.location, &mut self.request)
-        {
+        if let (Some(location), Some(request)) = (&self.location, &mut self.request) {
             // Includes partial-open failure; close must tolerate absent state.
             location
                 .backend()
@@ -459,7 +454,7 @@ impl Transaction {
             Poll::Ready(result) => result?,
         }
         let request = &mut self.lease.as_mut().unwrap().request;
-        let result = self.description.location.backend().poll(request, wake);
+        let result = self.description.location.poll(request, wake);
         if let Poll::Ready(Ok(reply)) = &result {
             self.next = match reply {
                 Reply::Io { count, next } => {

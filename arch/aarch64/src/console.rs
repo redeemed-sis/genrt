@@ -5,7 +5,7 @@
 
 use crate::platform::uart::runtime as backend;
 
-pub(crate) use backend::{configure_from_platform, enable_rx_interrupts, on_uart_irq};
+pub(crate) use backend::{enable_rx_interrupts, on_uart_irq};
 
 /// Initialize the runtime console through the platform UART backend.
 ///

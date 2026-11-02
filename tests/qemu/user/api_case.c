@@ -20,6 +20,9 @@ static int file_io(void) {
     if (fd < 0) {
         return 1;
     }
+    if (fsync(fd) != 0 || fsync(0) != -9 || fsync(999) != -9) {
+        return 5;
+    }
     ssize_t count = read(fd, data, sizeof(data));
     if (count != (ssize_t)(sizeof(expected) - 1)
         || memcmp(data, expected, sizeof(expected) - 1) != 0) {

@@ -111,6 +111,7 @@ pub(crate) fn init() {
 }
 
 fn coordinator(_arg: ThreadArg) -> usize {
+    crate::fs::initialize_namespace().expect("vfs: namespace initialization");
     protocol::ready(SUITE);
 
     protocol::case_start("cpu-identity");

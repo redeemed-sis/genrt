@@ -21,12 +21,6 @@ use super::{
 pub const USER_TEXT_BASE: VirtAddr = 0x0000_0040_0000_0000;
 pub const USER_STACK_TOP: VirtAddr = 0x0000_0080_0000_0000;
 
-/// Bring-up copy bound.
-///
-/// This prevents early syscalls from copying unbounded user buffers before the
-/// kernel has fault-recovering copy loops and a richer process memory model.
-pub const MAX_USER_COPY: usize = 1024;
-
 const COPY_WORD_BYTES: usize = core::mem::size_of::<usize>();
 const _: () = assert!(PAGE_SIZE.is_multiple_of(COPY_WORD_BYTES));
 
@@ -165,12 +159,13 @@ pub enum UserCopyError {
     OutOfMemory,
 }
 
-/// Copy at most `MAX_USER_COPY` bytes from the current user address space.
+/// Copy the complete kernel-slice length from the current user address space.
 ///
 /// The complete range is validated before copying aligned user words and byte
 /// edges. The active user mappings must remain stable throughout the copy;
-/// fault recovery is not implemented. This bounded operation allocates
-/// nothing, does not block or change IRQ state, and runs in syscall/trap context.
+/// fault recovery is not implemented. Work is linear in the supplied length,
+/// with no fixed byte cap or allocation. Call in ordinary task context with
+/// IRQs enabled for potentially large ranges; no lock may span the copy.
 ///
 /// # Arguments
 ///
@@ -184,8 +179,8 @@ pub enum UserCopyError {
 ///
 /// # Errors
 ///
-/// Returns `UserCopyError::TooLarge` when `dst` exceeds `MAX_USER_COPY`, or a
-/// range/permission error. Validation errors leave `dst` unchanged.
+/// Returns range/permission errors, including checked address overflow.
+/// Validation errors leave `dst` unchanged, even at a later unmapped page.
 pub fn copy_from_user(dst: &mut [u8], user_src: VirtAddr) -> Result<(), UserCopyError> {
     if dst.is_empty() {
         return Ok(());
@@ -198,12 +193,13 @@ pub fn copy_from_user(dst: &mut [u8], user_src: VirtAddr) -> Result<(), UserCopy
     Ok(())
 }
 
-/// Copy at most `MAX_USER_COPY` kernel bytes into the current user address space.
+/// Copy the complete kernel slice into the current user address space.
 ///
 /// The complete range is validated before copying aligned user words and byte
 /// edges. The active user mappings must remain stable throughout the copy;
-/// fault recovery is not implemented. This bounded operation allocates
-/// nothing, does not block or change IRQ state, and runs in syscall/trap context.
+/// fault recovery is not implemented. Work is linear in the supplied length,
+/// without a fixed byte cap or allocation. Potentially large copies require
+/// ordinary IRQ-enabled task context, outside shared owner locks.
 ///
 /// # Arguments
 ///
@@ -217,17 +213,13 @@ pub fn copy_from_user(dst: &mut [u8], user_src: VirtAddr) -> Result<(), UserCopy
 ///
 /// # Errors
 ///
-/// Returns `UserCopyError::TooLarge` when `src` exceeds `MAX_USER_COPY`, or the
-/// permission/range errors returned while validating the active user mapping.
+/// Returns overflow or permission/range errors for the active user mapping.
 /// Validation errors leave the user destination unchanged.
 pub fn copy_to_user(user_dst: VirtAddr, src: &[u8]) -> Result<(), UserCopyError> {
     if src.is_empty() {
         return Ok(());
     }
-    if src.len() > MAX_USER_COPY {
-        return Err(UserCopyError::TooLarge);
-    }
-    validate_user_range_unbounded(user_dst, src.len(), AccessKind::Write)?;
+    validate_user_range(user_dst, src.len(), AccessKind::Write)?;
     // SAFETY: validation checked the entire writable user range, whose
     // immutable mappings remain active until the copy completes.
     unsafe { write_validated_user_bytes(user_dst, src) };
@@ -266,7 +258,7 @@ pub fn copy_cstr_to_user(
     if required > max_len {
         return Err(UserCopyError::TooLarge);
     }
-    validate_user_range_unbounded(user_dst, required, AccessKind::Write)?;
+    validate_user_range(user_dst, required, AccessKind::Write)?;
     // SAFETY: the complete value-plus-NUL range was validated as writable.
     unsafe { write_validated_user_bytes(user_dst, value) };
     let nul_dst = user_dst
@@ -370,10 +362,28 @@ unsafe fn write_validated_user_bytes(user_dst: VirtAddr, src: &[u8]) {
     }
 }
 
+/// Validate every page of a readable user range, without allocating or copying.
+/// # Arguments
+/// * `ptr` - First user byte in the active immutable address space.
+/// * `len` - Full byte length; there is no fixed transfer cap.
+/// # Returns
+/// Success for a completely readable range; work is linear in pages and does
+/// not change IRQ state. Large ranges require IRQ-enabled task context.
+/// # Errors
+/// Empty, overflowing, non-user, unmapped or unreadable ranges are rejected.
 pub fn validate_user_read_range(ptr: VirtAddr, len: usize) -> Result<(), UserCopyError> {
     validate_user_range(ptr, len, AccessKind::Read)
 }
 
+/// Validate every page of a writable user range without allocation or copying.
+/// # Arguments
+/// * `ptr` - First user byte in the active immutable address space.
+/// * `len` - Full byte length, without a fixed transfer cap.
+/// # Returns
+/// Success only when all pages are writable. Work is linear in pages, without
+/// IRQ changes; use ordinary IRQ-enabled task context for large ranges.
+/// # Errors
+/// Empty, overflowing, non-user, unmapped or readonly ranges are rejected.
 pub fn validate_user_write_range(ptr: VirtAddr, len: usize) -> Result<(), UserCopyError> {
     validate_user_range(ptr, len, AccessKind::Write)
 }
@@ -430,7 +440,7 @@ pub fn copy_cstr_from_user(ptr: VirtAddr, max_len: usize) -> Result<Vec<u8>, Use
             .ok_or(UserCopyError::AddressOverflow)?;
         let remaining_scan = (max_len + 1) - scanned;
         let chunk_len = page_end.saturating_sub(cursor).min(remaining_scan);
-        validate_user_read_range_unbounded(cursor, chunk_len)?;
+        validate_user_read_range(cursor, chunk_len)?;
 
         let mut offset = 0usize;
         while offset < chunk_len {
@@ -468,24 +478,6 @@ enum AccessKind {
 }
 
 fn validate_user_range(ptr: VirtAddr, len: usize, access: AccessKind) -> Result<(), UserCopyError> {
-    if len == 0 {
-        return Err(UserCopyError::Empty);
-    }
-    if len > MAX_USER_COPY {
-        return Err(UserCopyError::TooLarge);
-    }
-    validate_user_range_unbounded(ptr, len, access)
-}
-
-fn validate_user_read_range_unbounded(ptr: VirtAddr, len: usize) -> Result<(), UserCopyError> {
-    validate_user_range_unbounded(ptr, len, AccessKind::Read)
-}
-
-fn validate_user_range_unbounded(
-    ptr: VirtAddr,
-    len: usize,
-    access: AccessKind,
-) -> Result<(), UserCopyError> {
     if len == 0 {
         return Err(UserCopyError::Empty);
     }
@@ -588,7 +580,7 @@ mod tests {
                 for len in 0..=3 * COPY_WORD_BYTES {
                     exercise_copy(user_offset, kernel_offset, len);
                 }
-                exercise_copy(user_offset, kernel_offset, MAX_USER_COPY);
+                exercise_copy(user_offset, kernel_offset, 64 * 1024 + 19);
                 exercise_copy(user_offset, kernel_offset, GENRT_PATH_MAX + 1);
             }
         }
@@ -640,12 +632,12 @@ mod tests {
             assert_eq!(copy_from_user(&mut buffer, ptr), Err(error));
             assert_eq!(buffer, [0xa5; 2 * COPY_WORD_BYTES]);
         }
-        let mut too_large = [0xa5; MAX_USER_COPY + 1];
+        let mut large = alloc::vec![0xa5; 64 * 1024 + 1];
         assert_eq!(
-            copy_from_user(&mut too_large, USER_TEXT_BASE),
-            Err(UserCopyError::TooLarge)
+            copy_from_user(&mut large, USER_STACK_TOP - 4096),
+            Err(UserCopyError::NotUserRange)
         );
-        assert!(too_large.iter().all(|byte| *byte == 0xa5));
+        assert!(large.iter().all(|byte| *byte == 0xa5));
         assert_eq!(copy_from_user(&mut [], usize::MAX), Ok(()));
         assert_eq!(copy_to_user(usize::MAX, &[]), Ok(()));
     }

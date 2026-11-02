@@ -39,6 +39,8 @@ pub const SYS_CLOCK_NANOSLEEP: usize = 16;
 pub const SYS_PROFILE_CONTROL: usize = 17;
 /// Read a frozen optional wake profiling session.
 pub const SYS_PROFILE_READ: usize = 18;
+/// Persist a VFS description's data and filesystem metadata; 19 stays withdrawn.
+pub const SYS_FSYNC: usize = 20;
 
 const CLOCK_MONOTONIC: isize = 1;
 const TIMER_ABSTIME: usize = 1;
@@ -51,7 +53,7 @@ const USER_CPU_SET_BITS: usize = 1024;
 const USER_CPU_SET_BYTES: usize = USER_CPU_SET_BITS / 8;
 const DIRENT64_ALIGN: usize = 8;
 const _: () = assert!(USER_CPU_SET_BITS % 8 == 0);
-const _: () = assert!(USER_CPU_SET_BYTES <= user::MAX_USER_COPY);
+const CONSOLE_COPY_CHUNK: usize = 256;
 
 /// Fixed-width prefix of the userspace `genrt_dirent64` ABI record.
 ///
@@ -154,6 +156,10 @@ fn dispatch_other(
             sys_getdents64(context, request);
             Ok(())
         }
+        SYS_FSYNC => {
+            fs::call::dispatch(context, request);
+            Ok(())
+        }
         SYS_CHDIR => {
             sys_chdir(context, request);
             Ok(())
@@ -221,12 +227,15 @@ fn sys_read_stdin(context: &mut ActiveContext<'_>, ptr: usize, count: usize) -> 
         return ReadAction::Return(Ok(0));
     }
 
-    let max_len = count.min(user::MAX_USER_COPY);
+    if count > isize::MAX as usize {
+        return ReadAction::Return(Err(errno::EINVAL));
+    }
+    let max_len = count.min(console::STDIN_RX_CAPACITY);
     if let Err(err) = user::validate_user_write_range(ptr, max_len).map_err(user_copy_errno) {
         return ReadAction::Return(Err(err));
     }
 
-    let mut buffer = [0u8; user::MAX_USER_COPY];
+    let mut buffer = [0u8; console::STDIN_RX_CAPACITY];
     let len = console::read_stdin(&mut buffer[..max_len]);
     if len != 0 {
         let result = user::copy_to_user(ptr, &buffer[..len])
@@ -257,14 +266,31 @@ fn sys_write(context: &mut ActiveContext<'_>, request: SyscallRequest) {
         fs::call::dispatch(context, request);
         return;
     }
+    let _window = crate::sync::task::TaskWindow::enter();
     let result = (|| {
-        let len = request.arg(2).min(user::MAX_USER_COPY);
+        let len = request.arg(2);
+        if len > isize::MAX as usize {
+            return Err(errno::EINVAL);
+        }
         if len == 0 {
             return Ok(0);
         }
-        let mut buffer = [0u8; user::MAX_USER_COPY];
-        user::copy_from_user(&mut buffer[..len], request.arg(1)).map_err(user_copy_errno)?;
-        console::write_bytes(&buffer[..len]);
+        user::validate_user_read_range(request.arg(1), len).map_err(user_copy_errno)?;
+        let mut buffer = [0u8; CONSOLE_COPY_CHUNK];
+        let mut offset = 0;
+        while offset < len {
+            let count = (len - offset).min(buffer.len());
+            user::copy_from_user(&mut buffer[..count], request.arg(1) + offset)
+                .map_err(user_copy_errno)?;
+            if !console::try_write_bytes(&buffer[..count]) {
+                return if offset == 0 {
+                    Err(errno::EAGAIN)
+                } else {
+                    Ok(offset)
+                };
+            }
+            offset += count;
+        }
         Ok(len)
     })();
     context.set_syscall_result(errno::syscall_ret(result));
@@ -439,8 +465,8 @@ fn sys_profile(context: &mut ActiveContext<'_>, request: SyscallRequest) {
             };
             crate::profile::control(owner, command, config)
         } else {
-            let size = request.arg(1).min(user::MAX_USER_COPY);
-            let mut chunk = [0u8; user::MAX_USER_COPY];
+            let size = request.arg(1).min(crate::profile::READ_CHUNK_BYTES);
+            let mut chunk = [0u8; crate::profile::READ_CHUNK_BYTES];
             let len = crate::profile::read(owner, request.arg(2), &mut chunk[..size])?;
             // Frozen bytes staged under the leaf; all usercopy is outside it.
             if len != 0 {

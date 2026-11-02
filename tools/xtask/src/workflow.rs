@@ -66,20 +66,28 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         Commands::Dist { tag, output_dir } => crate::dist::run(&tag, &output_dir),
         Commands::RepoTree => repo_tree(),
         Commands::QemuCmd {
+            disk,
             arch,
             initramfs,
             profile,
             cpus,
             wake_profile,
-        } => qemu_cmd(arch, initramfs, profile, cpus, wake_profile),
+        } => qemu_cmd(arch, initramfs, profile, cpus, wake_profile, disk),
         Commands::GdbCmd { arch } => gdb_cmd(arch),
         Commands::BuildAarch64 {
+            disk,
             log_level,
             profile,
             cpus,
             wake_profile,
-        } => build_aarch64_for_cpus(profile, log_level, profile_features(wake_profile), cpus)
-            .map(|_| ()),
+        } => build_aarch64_with_disk(
+            profile,
+            log_level,
+            profile_features(wake_profile),
+            cpus,
+            disk.as_deref(),
+        )
+        .map(|_| ()),
         Commands::BuildUserHello => build_user_program(Profile::Debug, "hello", false).map(|_| ()),
         Commands::BuildUserFault => {
             build_user_program(Profile::Debug, "fault_null", false).map(|_| ())
@@ -99,6 +107,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             profile,
         } => build_initramfs(profile, root, init, output, false).map(|_| ()),
         Commands::RunAarch64 {
+            disk,
             log_level,
             initramfs,
             initramfs_root,
@@ -110,6 +119,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             RunMode {
                 wait_for_gdb: false,
                 wake_profile,
+                disk,
             },
             profile,
             log_level,
@@ -119,6 +129,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             cpus,
         ),
         Commands::DebugAarch64 {
+            disk,
             log_level,
             initramfs,
             initramfs_root,
@@ -130,6 +141,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             RunMode {
                 wait_for_gdb: true,
                 wake_profile,
+                disk,
             },
             profile,
             Some(log_level.unwrap_or(LogLevel::Debug)),
@@ -158,6 +170,11 @@ fn doctor() -> Result<()> {
         "llvm-nm",
         "llvm-objdump",
         "readelf",
+        "mkfs.fat",
+        "fsck.fat",
+        "mcopy",
+        "mmd",
+        "timeout",
     ];
     let optional = ["just", "gdb", "aarch64-linux-gnu-gdb"];
 
@@ -342,11 +359,17 @@ fn qemu_cmd(
     profile: Profile,
     cpu_count: usize,
     wake_profile: bool,
+    disk: Option<PathBuf>,
 ) -> Result<()> {
+    if disk.is_some() && !matches!(arch, Arch::Aarch64) {
+        bail!("--disk is supported only for --arch aarch64");
+    }
     match arch {
         Arch::Aarch64 => {
             validate_qemu_cpu_count(cpu_count)?;
-            let artifacts = Aarch64Artifacts::for_composition(profile, cpu_count, wake_profile);
+            let disk = disk.as_deref().map(qemu::validate_disk).transpose()?;
+            let artifacts =
+                Aarch64Artifacts::for_composition(profile, cpu_count, wake_profile).with_disk(disk);
             let initramfs = match initramfs {
                 Some(path) => {
                     validate_initramfs_payload(&path)?;
@@ -439,9 +462,32 @@ pub(crate) fn build_aarch64_for_cpus(
     extra_features: &[&str],
     cpu_count: usize,
 ) -> Result<Aarch64Artifacts> {
+    build_aarch64_with_disk(profile, log_level, extra_features, cpu_count, None)
+}
+
+/// Build one kernel/DTB composition with an optional pre-existing raw disk.
+/// # Arguments
+/// * `profile` - Cargo profile.
+/// * `log_level` - Compile-time logging selection.
+/// * `extra_features` - Architecture features, including diagnostic isolation.
+/// * `cpu_count` - Bounded topology used for both dump and launch.
+/// * `disk` - Existing regular raw disk, never created or formatted here.
+/// # Returns
+/// Linked kernel and matching disk-bearing or diskless DTB paths.
+/// # Errors
+/// Invalid disk/topology, subprocess, linking and post-link validation failures.
+pub(crate) fn build_aarch64_with_disk(
+    profile: Profile,
+    log_level: Option<LogLevel>,
+    extra_features: &[&str],
+    cpu_count: usize,
+    disk: Option<&Path>,
+) -> Result<Aarch64Artifacts> {
     validate_qemu_cpu_count(cpu_count)?;
     let wake_profile = extra_features.contains(&"wake-profile");
-    let artifacts = Aarch64Artifacts::for_composition(profile, cpu_count, wake_profile);
+    let disk = disk.map(qemu::validate_disk).transpose()?;
+    let artifacts =
+        Aarch64Artifacts::for_composition(profile, cpu_count, wake_profile).with_disk(disk);
     let dtb_path = generate_qemu_virt_dtb(&artifacts)?;
 
     let mut build = Command::new("cargo");
@@ -501,6 +547,7 @@ pub(crate) fn build_aarch64_for_cpus(
 struct RunMode {
     wait_for_gdb: bool,
     wake_profile: bool,
+    disk: Option<PathBuf>,
 }
 
 fn profile_features(enabled: bool) -> &'static [&'static str] {
@@ -516,11 +563,12 @@ fn run_aarch64(
     init: Option<PathBuf>,
     cpu_count: usize,
 ) -> Result<()> {
-    let artifacts = build_aarch64_for_cpus(
+    let artifacts = build_aarch64_with_disk(
         profile,
         log_level,
         profile_features(mode.wake_profile),
         cpu_count,
+        mode.disk.as_deref(),
     )?;
     let initramfs = selected_or_build_initramfs_path(profile, initramfs, initramfs_root, init)?;
     let mut config = qemu::Config::from_artifacts(&artifacts, initramfs);
@@ -800,6 +848,7 @@ fn build_initramfs_with_provenance(
         .with_context(|| format!("failed to create {}", staging.display()))?;
 
     copy_initramfs_root(&root, &staging)?;
+    fs::create_dir_all(staging.join("mnt/disk"))?;
     let staged_init = staging.join("init");
     if staged_init.exists() {
         bail!(
@@ -920,6 +969,13 @@ struct UserProgram {
 }
 
 const USER_PROGRAMS: &[UserProgram] = &[
+    UserProgram {
+        name: "test_storage_supervisor",
+        source: "tests/qemu/user/storage_supervisor.c",
+        checked: false,
+        defines: &[],
+        test_artifact: true,
+    },
     UserProgram {
         name: "test_vfs_case",
         source: "tests/qemu/user/vfs_case.c",
@@ -1334,14 +1390,17 @@ pub(crate) fn generate_qemu_virt_dtb(artifacts: &Aarch64Artifacts) -> Result<Pat
         fs::create_dir_all(parent).context("failed to create DTB output directory")?;
     }
 
-    let status = Command::new("qemu-system-aarch64")
+    let mut command = Command::new("qemu-system-aarch64");
+    command
         .arg("-machine")
         .arg(format!("{},dumpdtb={}", qemu::MACHINE, dtb_path.display()))
         .args(["-cpu", qemu::CPU, "-smp"])
         .arg(cpu_count.to_string())
         .args([
             "-display", "none", "-serial", "null", "-monitor", "none", "-nic", "none",
-        ])
+        ]);
+    qemu::append_disk(&mut command, artifacts.disk());
+    let status = command
         .status()
         .context("failed to invoke qemu-system-aarch64 for DTB generation")?;
 

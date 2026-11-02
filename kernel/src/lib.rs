@@ -11,11 +11,12 @@ extern crate std;
 mod test_arch_stubs;
 
 pub mod arch;
+pub mod block;
 pub mod boot;
 mod config;
 pub mod console;
 pub mod cpu;
-mod dtb;
+pub mod dtb;
 pub mod errno;
 pub mod fs;
 mod init;
@@ -112,17 +113,6 @@ pub extern "C" fn kernel_main(boot: &'static BootInfo) -> ! {
         crate::error!("initramfs: mount failed: {:?}", err);
         panic!("initramfs: failed to mount loader image");
     }
-    let namespace = fs::vfs::Namespace::new(fs::ramfs::root_backend().expect("root ramfs"))
-        .expect("vfs: invalid root");
-    #[cfg(feature = "qemu-test-vfs")]
-    let namespace = {
-        let mut namespace = namespace;
-        fs::testfs::install(&mut namespace).expect("vfs: fixture mounts");
-        namespace
-    };
-    namespace
-        .publish()
-        .expect("vfs: namespace already published");
     #[cfg(feature = "qemu-test-kernel-runtime")]
     test_support::kernel_runtime::init();
 

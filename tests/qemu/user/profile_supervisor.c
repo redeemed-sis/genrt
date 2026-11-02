@@ -141,7 +141,7 @@ static int generic_rr(void) { return generic_trace(0); }
 static int generic_exit(void) { return generic_trace(1); }
 static int generic_block(void) { return generic_trace(2); }
 
-/* Reads straddle both fixed layouts and the safe-copy ceiling. A parent-owned
+/* Reads straddle both fixed layouts and the profiler staging boundary. A parent-owned
  * frozen session remains inaccessible to a same-CPU fork child. */
 static int chunks_and_owner(void) {
     struct profile_config c = config(PROFILE_FULL,40);
@@ -149,9 +149,9 @@ static int chunks_and_owner(void) {
     struct timespec past = {0,0};
     for (int i = 0; i < 40; i++) CHECK(clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&past,NULL) == 0);
     CHECK(genrt_profile_control(PROFILE_STOP,NULL) == 0);
-    CHECK(genrt_profile_read(export_buffer,sizeof(export_buffer),0) == 1024);
+    CHECK(genrt_profile_read(export_buffer,sizeof(export_buffer),0) == 4096);
     unsigned char one;
-    for (size_t i = 0; i < 1024; i++) {
+    for (size_t i = 0; i < 4096; i++) {
         CHECK(genrt_profile_read(&one,1,i) == 1 && one == export_buffer[i]);
     }
     pid_t child = fork(); CHECK(child >= 0);

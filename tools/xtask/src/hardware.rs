@@ -445,6 +445,32 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("genrt-bcm2837-test-{}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
+        let dtb = directory.join("board.dtb");
+        run(Command::new("dtc")
+            .current_dir(root)
+            .args(["-I", "dts", "-O", "dtb", "-o"])
+            .arg(&dtb)
+            .arg("arch/aarch64/platform/raspberrypi-3b-plus/board.dts"))
+        .unwrap();
+        let bytes = fs::read(dtb).unwrap();
+        let tree = crate::dtb::RuntimeDtb::from_bytes(&bytes).unwrap();
+        let pl011 = tree
+            .fdt()
+            .all_nodes()
+            .find(|node| node.compatibles().any(|name| name == "arm,pl011"))
+            .unwrap();
+        assert_eq!(
+            tree.mmio_reg(&pl011, 0).unwrap(),
+            crate::dtb::MmioRange {
+                start: 0x3f20_1000,
+                size: 0x200
+            }
+        );
+        assert!(
+            !tree
+                .enabled_nodes()
+                .any(|node| node.compatibles().any(|name| name == "arm,pl011"))
+        );
         for source in ["bcm2837_uart", "bcm2837_interrupts"] {
             let executable = directory.join(source);
             run(Command::new("rustc")

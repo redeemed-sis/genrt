@@ -1,4 +1,8 @@
-use std::{path::PathBuf, process::Command};
+use anyhow::{Context, Result, bail};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use crate::artifacts::Aarch64Artifacts;
 
@@ -37,6 +41,8 @@ pub(crate) struct Config {
     pub(crate) wait_for_gdb: bool,
     /// QEMU action selected for a guest system reset.
     pub(crate) reset_behavior: ResetBehavior,
+    /// Optional pre-existing raw disk; never implicitly formatted.
+    pub(crate) disk: Option<PathBuf>,
 }
 
 impl Config {
@@ -58,6 +64,7 @@ impl Config {
             cpu_count: artifacts.cpu_count(),
             wait_for_gdb: false,
             reset_behavior: ResetBehavior::Reset,
+            disk: artifacts.disk().map(Path::to_path_buf),
         }
     }
 
@@ -99,6 +106,7 @@ impl Config {
         if self.wait_for_gdb {
             command.args(["-S", "-s"]);
         }
+        append_disk(&mut command, self.disk.as_deref());
         command
     }
 
@@ -118,6 +126,53 @@ impl Config {
     }
 }
 
+/// Validate a user-supplied raw disk before building or starting QEMU.
+/// # Arguments
+/// * `path` - Existing regular image file; symlinks resolve to their target.
+/// # Returns
+/// Canonical UTF-8 path. No formatting, partitioning, truncation or writes occur.
+/// # Errors
+/// Rejects nonexistent/nonregular/non-UTF8 files and non-sector-sized images.
+pub(crate) fn validate_disk(path: &Path) -> Result<PathBuf> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("invalid disk {}", path.display()))?;
+    let metadata = path.metadata()?;
+    if !metadata.is_file()
+        || metadata.len() < 512
+        || metadata.len() % 512 != 0
+        || path.to_str().is_none()
+    {
+        bail!("--disk requires an existing sector-aligned regular UTF-8 raw image");
+    }
+    Ok(path)
+}
+
+/// Append exactly the same modern virtio-mmio block attachment to dump and run.
+/// # Arguments
+/// * `command` - QEMU command being constructed.
+/// * `disk` - Validated raw image; none leaves diskless arguments unchanged.
+/// # Returns
+/// Nothing. JSON filenames prevent commas/options in paths becoming QEMU syntax.
+pub(crate) fn append_disk(command: &mut Command, disk: Option<&Path>) {
+    if let Some(disk) = disk {
+        command.args(["-global", "virtio-mmio.force-legacy=false"]);
+        command.arg("-blockdev").arg(
+            serde_json::json!({
+                "driver": "file", "node-name": "genrt-file", "filename": disk,
+            })
+            .to_string(),
+        );
+        command.arg("-blockdev").arg(
+            serde_json::json!({
+                "driver": "raw", "node-name": "genrt-disk", "file": "genrt-file",
+            })
+            .to_string(),
+        );
+        command.args(["-device", "virtio-blk-device,drive=genrt-disk"]);
+    }
+}
+
 fn shell_quote(value: &str) -> String {
     if value
         .bytes()
@@ -133,6 +188,44 @@ fn shell_quote(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::artifacts::Profile;
+
+    #[test]
+    fn disk_dump_and_launch_share_json_attachment_and_diskless_stays_unchanged() {
+        let disk = PathBuf::from("/tmp/disk,unsafe=on with 'quotes'.raw");
+        let plain = Aarch64Artifacts::for_cpu_count(Profile::Debug, 4);
+        let attached = plain.clone().with_disk(Some(disk.clone()));
+        assert_ne!(plain.dtb(), attached.dtb());
+        let normal = Config::from_artifacts(&plain, PathBuf::from("init.cpio"));
+        assert!(!normal.command().get_args().any(|arg| arg == "-blockdev"));
+        let config = Config::from_artifacts(&attached, PathBuf::from("init.cpio"));
+        let mut dump = Command::new("qemu-system-aarch64");
+        append_disk(&mut dump, attached.disk());
+        let expected = dump.get_args().collect::<Vec<_>>();
+        let launched = config.command();
+        let actual = launched.get_args().collect::<Vec<_>>();
+        assert!(actual.ends_with(&expected));
+        let filename: serde_json::Value =
+            serde_json::from_str(expected[3].to_str().unwrap()).unwrap();
+        assert_eq!(filename["filename"], disk.to_str().unwrap());
+        assert_eq!(filename["driver"], "file");
+    }
+
+    #[test]
+    fn disk_validation_never_creates_or_truncates_input() {
+        let root = std::env::temp_dir().join(format!("genrt-raw-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(validate_disk(&root).is_err());
+        let path = root.join("disk.raw");
+        assert!(validate_disk(&path).is_err());
+        let original = [0x71; 512];
+        std::fs::write(&path, original).unwrap();
+        assert_eq!(validate_disk(&path).unwrap(), path.canonicalize().unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::write(&path, [0; 513]).unwrap();
+        assert!(validate_disk(&path).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 513);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn command_uses_artifact_cpu_topology() {

@@ -153,6 +153,36 @@ fn traversal_mount_parent_relative_directory_and_conflicts() {
 }
 
 #[test]
+fn location_dispatch_selects_the_mount_and_node_without_a_request_target() {
+    let (ns, _, _) = fixture();
+    let writable = OpenFlags {
+        write: true,
+        create: true,
+        ..flags()
+    };
+    write(open(&ns, b"/m/item", writable), b"one");
+    write(open(&ns, b"/n/item", writable), b"two-two");
+    write(open(&ns, b"/m/other", writable), b"different");
+
+    let a = resolve(&ns, ns.root(), b"/m/item").unwrap();
+    let b = resolve(&ns, ns.root(), b"/n/item").unwrap();
+    let other = resolve(&ns, ns.root(), b"/m/other").unwrap();
+    assert_eq!(a.node(), b.node()); // IDs are local to each backend instance.
+    assert_ne!(a.node(), other.node());
+    let mut request = Request::new(Operation::Stat);
+    let (_, counts) = crate::test_arch_stubs::allocations(|| {
+        for (location, size) in [(&a, 3), (&b, 7), (&other, 9), (&a, 3)] {
+            let Poll::Ready(Ok(Reply::Stat(stat))) = location.poll(&mut request, None) else {
+                panic!("stat completion");
+            };
+            assert_eq!(stat.node, location.node());
+            assert_eq!(stat.size, size);
+        }
+    });
+    assert_eq!(counts, (0, 0, 0));
+}
+
+#[test]
 fn ancestor_mount_cannot_shadow_an_existing_mount() {
     let mut ns = Namespace::new(root(vec![b"/outer/inner".to_vec()])).unwrap();
     ns.mount(b"/outer/inner", Arc::new(TestFs::new("inner")))
@@ -419,7 +449,7 @@ fn bounded_names_reject_before_creation_and_remain_enumerable() {
         };
         let Some(entry) = entry else { break };
         assert!(entry.name.len() <= NAME_MAX);
-        let mut encoded = [0; crate::memory::user::MAX_USER_COPY];
+        let mut encoded = [0; IO_CAPACITY];
         assert!(
             crate::syscall::encode_dirent64(&mut encoded, entry.node.id, 1, 8, &entry.name)
                 .is_some()
@@ -515,6 +545,10 @@ fn pending_transaction_retains_lease_and_zero_length_skips_backend() {
     assert!(matches!(peer.poll(None), Poll::Ready(Err(errno::EAGAIN))));
     for _ in 0..4 {
         assert!(tx.poll(Some(token)).is_pending());
+        assert_eq!(
+            read(open(&ns, b"/n/dynamic", flags()), 99, true),
+            b"dynamic:b\n"
+        );
     }
     write(control, b"1");
     assert!(matches!(
@@ -640,7 +674,7 @@ fn concurrent_distinct_append_descriptions_never_overwrite_or_split_records() {
     let fd = open(&ns, b"/m/append", flags());
     let mut bytes = Vec::new();
     loop {
-        let chunk = read(fd.clone(), crate::memory::user::MAX_USER_COPY, true);
+        let chunk = read(fd.clone(), IO_CAPACITY, true);
         if chunk.is_empty() {
             break;
         }

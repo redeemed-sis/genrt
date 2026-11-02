@@ -11,7 +11,10 @@ use core::{
     sync::atomic::{AtomicU8, Ordering},
 };
 
+#[cfg(not(feature = "platform-raspberrypi-3b-plus"))]
+mod block;
 mod boot_dtb;
+pub(crate) mod bootstrap;
 mod cpu;
 #[cfg(not(feature = "platform-raspberrypi-3b-plus"))]
 pub(crate) mod gic;
@@ -185,13 +188,18 @@ static INITRD_START: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomi
 #[cfg(feature = "platform-raspberrypi-3b-plus")]
 static INITRD_SIZE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// Publish the firmware-loaded initramfs from resident `dtb` before memory init.
-/// Returns nothing; panics on missing/invalid Pi handoff. Boot-only, no allocation.
+/// Publish the firmware-loaded initramfs before memory init, without allocation.
 /// QEMU retains its explicit loader slot rather than requiring chosen properties.
-pub(crate) fn init_boot_payloads(dtb: &[u8]) {
+/// # Arguments
+/// * `dtb` - Shared validated reader of the resident firmware blob.
+/// # Returns
+/// Nothing; Pi payload addresses are published for subsequent memory reservation.
+/// # Panics
+/// Missing/invalid Pi initrd handoff or a payload outside mapped RAM.
+pub(crate) fn init_boot_payloads(dtb: &kernel::dtb::RuntimeDtb<'_>) {
     #[cfg(feature = "platform-raspberrypi-3b-plus")]
     {
-        let fdt = fdt_raw::Fdt::from_bytes(dtb).expect("invalid firmware DTB");
+        let fdt = dtb.fdt();
         let chosen = fdt.find_by_path("/chosen").expect("missing chosen");
         let address = |name| {
             let prop = chosen.find_property(name).expect("missing initrd handoff");

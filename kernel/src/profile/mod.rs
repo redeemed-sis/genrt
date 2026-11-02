@@ -12,6 +12,10 @@ mod format;
 mod runtime;
 mod session;
 
+/// Maximum frozen-export staging under the profiler leaf lock, independent of
+/// usercopy and filesystem transfer sizes. Reads may return a short chunk.
+pub(crate) const READ_CHUNK_BYTES: usize = 4096;
+
 pub(crate) use format::Config;
 pub(crate) use runtime::{
     WakePath, begin, bind, cleanup, context_restored, control, expired, read, scheduler_acquired,

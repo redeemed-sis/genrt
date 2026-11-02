@@ -1,7 +1,7 @@
 use bootinfo::{BootInfo, MemoryRegion, MemoryRegionKind};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::dtb::{MAX_BOOT_MEMORY_REGIONS, parse_memory_regions};
+use crate::dtb::{MAX_BOOT_MEMORY_REGIONS, RuntimeDtb, parse_memory_regions};
 
 const fn repeated_byte_pattern(byte: usize) -> usize {
     let mut pattern = 0usize;
@@ -42,7 +42,7 @@ pub struct BootstrapStackUsage {
 /// # Arguments
 ///
 /// * `dtb_pa` - Physical address of the firmware-provided DTB.
-/// * `dtb_va` - Readable kernel virtual alias of the same DTB.
+/// * `dtb` - Shared validated view of the resident firmware DTB.
 ///
 /// # Returns
 ///
@@ -58,9 +58,9 @@ pub struct BootstrapStackUsage {
 /// # Safety
 ///
 /// This must run on the boot CPU before interrupts, scheduler entry, and
-/// secondary CPU startup. `dtb_va` must reference the complete DTB containing
-/// `dtb_pa` for the duration of parsing.
-pub unsafe fn init_bootinfo(dtb_pa: usize, dtb_va: usize) -> &'static BootInfo {
+/// secondary CPU startup. The DTB bytes must remain resident at `dtb_pa` for
+/// the boot lifetime; its view must describe that same blob.
+pub unsafe fn init_bootinfo(dtb_pa: usize, dtb: &RuntimeDtb<'_>) -> &'static BootInfo {
     if BOOTINFO_CLAIMED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -69,7 +69,7 @@ pub unsafe fn init_bootinfo(dtb_pa: usize, dtb_va: usize) -> &'static BootInfo {
     }
     unsafe {
         crate::debug!("bootinfo: parsing dtb");
-        let parsed = parse_memory_regions(dtb_va, &mut *core::ptr::addr_of_mut!(BOOT_MEMORY_MAP))
+        let parsed = parse_memory_regions(dtb, &mut *core::ptr::addr_of_mut!(BOOT_MEMORY_MAP))
             .unwrap_or_else(|err| panic!("bootinfo: failed to parse DTB memory map: {err:?}"));
         BOOT_INFO.dtb_pa = dtb_pa as u64;
         BOOT_INFO.dtb_size = parsed.dtb_size;

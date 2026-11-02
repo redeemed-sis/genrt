@@ -12,6 +12,8 @@ pub(super) enum InitImage {
     UserFault,
     UserspaceContract,
     VfsContract,
+    StorageWrite,
+    StorageVerify,
     SmpUserspaceContract,
     ShellContract,
     RebootContract,
@@ -116,6 +118,7 @@ pub(super) fn load_all(root: &Path) -> Result<Vec<Case>> {
             .with_context(|| format!("failed to parse {}", path.display()))?;
         validate_cpu_count(&case)?;
         validate_vfs_fixture(&case)?;
+        validate_storage_fixture(&case)?;
         if cases
             .iter()
             .any(|existing: &Case| existing.name == case.name)
@@ -157,9 +160,40 @@ fn validate_vfs_fixture(case: &Case) -> Result<()> {
     Ok(())
 }
 
+fn validate_storage_fixture(case: &Case) -> Result<()> {
+    if matches!(case.init, InitImage::StorageVerify) {
+        bail!("storage-verify is an internal second-boot image, not a standalone case");
+    }
+    if matches!(case.init, InitImage::StorageWrite)
+        && (case.cpu_count != 4
+            || case.termination != Termination::Poweroff
+            || case.name != "storage-contract")
+    {
+        bail!("storage-contract requires four CPUs, controlled disk ownership and poweroff");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_fixture_requires_controlled_two_boot_lifecycle() {
+        let mut case: Case = toml::from_str(include_str!(
+            "../../../../tests/qemu/cases/storage-contract.toml"
+        ))
+        .unwrap();
+        validate_storage_fixture(&case).unwrap();
+        case.init = InitImage::StorageVerify;
+        assert!(validate_storage_fixture(&case).is_err());
+        case.init = InitImage::StorageWrite;
+        case.cpu_count = 1;
+        assert!(validate_storage_fixture(&case).is_err());
+        case.cpu_count = 4;
+        case.termination = Termination::Protocol;
+        assert!(validate_storage_fixture(&case).is_err());
+    }
 
     #[test]
     fn vfs_fixture_requires_matching_feature_image_and_topology() {

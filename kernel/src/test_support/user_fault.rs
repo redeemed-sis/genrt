@@ -14,6 +14,7 @@ pub(crate) const THREADS: [sched::StaticThread; 1] =
     [sched::StaticThread::new(coordinator, ThreadArg::empty())];
 
 fn coordinator(_arg: ThreadArg) -> usize {
+    crate::fs::initialize_namespace().expect("vfs: namespace initialization");
     protocol::ready(SUITE);
     protocol::case_start("null-data-abort");
     let pid = process::spawn_first_user_process()

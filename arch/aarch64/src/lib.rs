@@ -1,5 +1,7 @@
 #![no_std]
 
+extern crate alloc;
+
 #[cfg(all(feature = "platform-raspberrypi-3b-plus", feature = "qemu-test"))]
 compile_error!("Raspberry Pi runtime cannot execute QEMU test contracts");
 
@@ -7,8 +9,6 @@ use core::{
     arch::{asm, global_asm},
     sync::atomic::{AtomicU64, Ordering},
 };
-
-use bootinfo::BootInfo;
 
 mod console;
 mod context;
@@ -152,15 +152,11 @@ pub extern "C" fn rust_entry(boot_mmu_params_pa: usize, bootstrap_slot: usize) -
             .unwrap_or_else(|err| panic!("arch: invalid AArch64 platform info: {err:?}"))
     };
     let dtb = unsafe { core::slice::from_raw_parts(dtb_va as *const u8, dtb_size as usize) };
-    console::configure_from_platform(platform, dtb);
-    platform::init_cpu_topology(dtb, arch_current_cpu_hardware_id())
-        .unwrap_or_else(|err| panic!("arch: invalid AArch64 CPU topology: {err:?}"));
-    platform::init_boot_payloads(dtb);
-    let bootinfo: &'static BootInfo = unsafe { kernel::boot::init_bootinfo(dtb_pa, dtb_va) };
-    if bootinfo.cpu_count as usize != platform::cpu_count() {
-        panic!("arch: generic and AArch64 CPU topology counts differ");
-    }
-    interrupts::init_global(platform);
+    // SAFETY: CPU0 owns bootstrap with IRQs masked and a resident DTB. Runtime
+    // VM/heap initialization and ordinary-task driver probing happen later.
+    let bootinfo = unsafe {
+        platform::bootstrap::init_early(platform, dtb_pa, dtb, arch_current_cpu_hardware_id())
+    };
     if !init_current_cpu_interrupt_state() {
         panic!("arch: failed to initialize CPU0 interrupt state");
     }
@@ -471,6 +467,20 @@ pub extern "C" fn arch_current_cpu_logical_id() -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn arch_counter_now() -> u64 {
     timer::counter()
+}
+
+/// Discover storage and transfer a driver to the generic boot-device registry.
+///
+/// Call once on CPU0 from the ordinary kernel init thread, after runtime VM and
+/// heap initialization and before namespace publication. May allocate/map during
+/// initialization; never disables IRQs or holds a lock across device I/O. Pi is
+/// an explicit no-op. This hook does not initialize a filesystem.
+/// # Returns
+/// `0` for no device, `1` for an installed device, or a negative initialization
+/// failure. Requests use preallocated DMA storage and architected timeouts.
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_storage_init() -> i32 {
+    platform::bootstrap::init_devices()
 }
 
 #[unsafe(no_mangle)]

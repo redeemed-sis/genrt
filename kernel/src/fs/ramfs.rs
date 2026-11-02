@@ -405,12 +405,13 @@ impl super::backend::Backend for MountedRamfs {
 
     fn poll(
         &self,
+        target: super::backend::Node,
         request: &mut super::backend::Request,
         _wake: Option<crate::sched::WaitToken>,
     ) -> core::task::Poll<Result<super::backend::Reply, crate::errno::Errno>> {
         use super::backend::{DirEntry, Kind, Node, Operation, Reply, Stat};
         use crate::errno;
-        let node = request.node;
+        let node = target;
         let Some(index) = node_index(node) else {
             return core::task::Poll::Ready(Err(errno::ENOENT));
         };

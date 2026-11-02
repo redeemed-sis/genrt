@@ -17,6 +17,8 @@ use crate::{
 use alloc::boxed::Box;
 use core::task::Poll;
 
+const DIRENT_BUFFER_BYTES: usize = (19 + NAME_MAX + 1).next_multiple_of(8);
+
 enum Work {
     Open(Box<Open>),
     Io(Transaction),
@@ -66,8 +68,22 @@ fn initialize(request: SyscallRequest) -> Result<PendingFileCall, Errno> {
                 Work::Resolve(Box::new(Resolver::new(cwd, &path, false)?))
             }
         }
-        SYS_READ | SYS_WRITE | SYS_GETDENTS64 => {
-            let count = request.arg(2).min(user::MAX_USER_COPY);
+        SYS_READ | SYS_WRITE | SYS_GETDENTS64 | SYS_FSYNC => {
+            let count = if request.number() == SYS_FSYNC {
+                0
+            } else {
+                request.arg(2)
+            };
+            if count > isize::MAX as usize {
+                return Err(errno::EINVAL);
+            }
+            // A directory call emits one bounded record, not the caller's
+            // complete buffer. Regular read/write lease the requested size.
+            let count = if request.number() == SYS_GETDENTS64 {
+                count.min(DIRENT_BUFFER_BYTES)
+            } else {
+                count
+            };
             if request.number() == SYS_GETDENTS64 && count == 0 {
                 return Err(errno::EINVAL);
             }
@@ -81,6 +97,7 @@ fn initialize(request: SyscallRequest) -> Result<PendingFileCall, Errno> {
                     offset: 0,
                     limit: count,
                 },
+                SYS_FSYNC => Operation::Sync,
                 _ => Operation::Readdir { offset: 0 },
             };
             let transaction = Transaction::new(description, operation, count)?;
@@ -144,6 +161,7 @@ fn poll(
                 Poll::Ready(result) => result?,
             };
             let count = match reply {
+                Reply::Done if request.number() == SYS_FSYNC => 0,
                 Reply::Io { count, .. } => {
                     if request.number() == SYS_READ {
                         user::copy_to_user(request.arg(1), &transaction.buffer()[..count])

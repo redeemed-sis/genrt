@@ -120,6 +120,27 @@ pub fn init_current_cpu_interface() -> bool {
     }
 }
 
+/// Observe whether a valid shared interrupt is disabled at the distributor.
+/// # Arguments
+/// * `irq_id` - Architectural SPI identifier used by a polling driver.
+/// # Returns
+/// True only for a supported, masked SPI in the already configured GIC.
+/// Bounded read-only MMIO, with no allocation or change to interrupt state.
+pub(crate) fn spi_is_masked(irq_id: u32) -> bool {
+    let Some((gicd, _)) = bases() else {
+        return false;
+    };
+    // SAFETY: configure_from_platform published the mapped GIC distributor.
+    unsafe {
+        let count = ((mmio_read32(gicd + 4) & 31) + 1) * 32;
+        irq_id >= PRIVATE_IRQ_LIMIT
+            && irq_id < count
+            && mmio_read32(gicd + GICD_ISENABLER + (irq_id as usize / 32) * 4)
+                & (1 << (irq_id % 32))
+                == 0
+    }
+}
+
 /// Enable one banked SGI/PPI for the executing CPU.
 ///
 /// # Arguments

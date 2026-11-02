@@ -15,10 +15,14 @@ pub const EACCES: Errno = 13;
 pub const EFAULT: Errno = 14;
 /// An owned resource is active or belongs to another thread.
 pub const EBUSY: Errno = 16;
+/// A filesystem entry already exists.
+pub const EEXIST: Errno = 17;
 pub const ENOTDIR: Errno = 20;
 pub const EISDIR: Errno = 21;
 pub const EINVAL: Errno = 22;
 pub const EMFILE: Errno = 24;
+/// The filesystem has no free data or directory space.
+pub const ENOSPC: Errno = 28;
 pub const EROFS: Errno = 30;
 pub const ERANGE: Errno = 34;
 pub const ENAMETOOLONG: Errno = 36;
@@ -26,6 +30,8 @@ pub const ENOSYS: Errno = 38;
 /// A checked arithmetic conversion cannot be represented by the target type.
 pub const EOVERFLOW: Errno = 75;
 pub const ENOTSUP: Errno = 95;
+/// A bounded device or filesystem operation exceeded its deadline/budget.
+pub const ETIMEDOUT: Errno = 110;
 
 pub fn syscall_ret(result: Result<usize, Errno>) -> isize {
     match result {

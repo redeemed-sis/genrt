@@ -46,7 +46,8 @@ fn console_putc_raw(c: u8) {
     arch_console_putc_raw(c);
 }
 
-const STDIN_RX_CAPACITY: usize = 256;
+/// Natural maximum currently available stdin data, not a usercopy byte limit.
+pub(crate) const STDIN_RX_CAPACITY: usize = 256;
 const CONSOLE_TX_CAPACITY: usize = 32 * 1024;
 const CONSOLE_TX_DRAIN_CHUNK: usize = 64;
 
@@ -270,10 +271,23 @@ pub fn puts(s: &str) {
 /// copying into the bounded queue, never while polling UART hardware. A full
 /// queue drops the complete diagnostic message rather than interleaving it.
 pub fn write_bytes(bytes: &[u8]) {
+    let _ = try_write_bytes(bytes);
+}
+
+/// Try to enqueue one complete console slice without dropping accepted bytes.
+/// # Arguments
+/// * `bytes` - Bounded message; larger than queue capacity is rejected intact.
+/// # Returns
+/// True only when every byte was enqueued. False means no byte was accepted;
+/// syscall callers must return partial progress or `EAGAIN`, not full success.
+/// Allocation-free; queue copying briefly masks IRQs, UART drain does not.
+pub(crate) fn try_write_bytes(bytes: &[u8]) -> bool {
     console_init_once();
-    if CONSOLE_TX.lock().push(bytes) {
+    let accepted = CONSOLE_TX.lock().push(bytes);
+    if accepted {
         drain_console();
     }
+    accepted
 }
 
 /// Try to format one indivisible normal console message.
@@ -417,4 +431,36 @@ pub(crate) fn block_current_stdin_read_if_empty(
 
 fn stdin_mut() -> crate::sync::IrqSpinLockGuard<'static, StdinRx> {
     STDIN_RX.lock()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saturated_tx_reports_rejection_without_consuming_any_chunk() {
+        let mut queue = ConsoleTx::new();
+        assert!(queue.push(&[b'a'; CONSOLE_TX_CAPACITY]));
+        let tail = queue.tail;
+        assert!(!queue.push(&[b'b'; 256]));
+        assert_eq!(queue.len, CONSOLE_TX_CAPACITY);
+        assert_eq!(queue.tail, tail);
+        let mut chunk = [0; CONSOLE_TX_DRAIN_CHUNK];
+        for _ in 0..4 {
+            assert_eq!(queue.pop_chunk(&mut chunk), chunk.len());
+            assert!(chunk.iter().all(|b| *b == b'a'));
+        }
+        assert!(queue.push(&[b'b'; 256]));
+        let mut accepted = 256;
+        if queue.push(&[b'c'; 256]) {
+            accepted += 256;
+        }
+        assert_eq!(accepted, 256);
+        let mut count_b = 0;
+        while queue.pop_chunk(&mut chunk) != 0 {
+            assert!(chunk.iter().all(|b| matches!(b, b'a' | b'b')));
+            count_b += chunk.iter().filter(|b| **b == b'b').count();
+        }
+        assert_eq!(count_b, accepted);
+    }
 }

@@ -172,22 +172,6 @@ pub(crate) mod runtime {
         }
     }
 
-    /// Adopt the firmware UART from DT-derived physical register ranges.
-    ///
-    /// # Arguments
-    /// * `platform` - Published early SoC MMIO mapping.
-    /// * `dtb` - Board DTB with GPIO, PL011, AUX and mini-UART reg entries.
-    ///
-    /// # Returns
-    /// Nothing; invalid DT resources or unsupported firmware UART state panic.
-    /// Boot-only, allocation-free, with IRQ masked.
-    #[cfg(not(test))]
-    pub(crate) fn configure_from_platform(platform: &crate::platform::PlatformInfo, dtb: &[u8]) {
-        let mmio =
-            super::super::bcm2837_dtb::parse(dtb, platform).expect("invalid Pi UART DT resources");
-        configure_from_ranges(mmio);
-    }
-
     /// Publish a validated UART selection; used by host tests with mock MMIO.
     /// Takes DT-derived `mmio`; returns nothing and allocates nothing.
     pub(crate) fn configure_from_ranges(mmio: UartMmio) {

@@ -162,7 +162,7 @@ mod qemu_runtime {
     /// # Returns
     /// Returns nothing; an absent UART leaves the existing configuration unchanged.
     /// Boot must call this before concurrent console use. No allocation occurs.
-    pub(crate) fn configure_from_platform(platform: &PlatformInfo, _dtb: &[u8]) {
+    pub(crate) fn configure_from_platform(platform: &PlatformInfo) {
         if platform.uart.is_present() {
             PL011_BASE.store(phys_to_hva(platform.uart.start as usize), Ordering::Release);
             UART_INIT_STATE.store(UART_UNINITIALIZED, Ordering::Release);

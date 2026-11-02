@@ -52,6 +52,25 @@ impl Location {
         self.0.node
     }
 
+    /// Submit or resume an operation against this pinned mount and node.
+    /// Retain this location across `Pending`; requests contain no target identity.
+    /// # Arguments
+    /// * `request` - Owned operation state, including any backend continuation.
+    /// * `wake` - Exact prepared wait for a backend that cannot complete yet.
+    /// # Returns
+    /// Backend completion or `Pending` after arranging notification. Forwarding
+    /// allocates nothing, holds no lock and changes no IRQ state; backend work
+    /// follows the ordinary task/bootstrap callback contract.
+    /// # Errors
+    /// Propagates backend errors, including `ENOTSUP` for waits without a token.
+    pub(crate) fn poll(
+        &self,
+        request: &mut Request,
+        wake: Option<WaitToken>,
+    ) -> Poll<Result<Reply, Errno>> {
+        self.backend().poll(self.node(), request, wake)
+    }
+
     /// Borrow the immutable canonical namespace path.
     /// # Returns
     /// Absolute path without trailing slash except root; no allocation.
@@ -74,7 +93,12 @@ impl Location {
 /// One namespace, mutable only while exclusively owned during bootstrap.
 pub(crate) struct Namespace {
     root: Location,
-    mounts: Vec<(Vec<u8>, Arc<Mount>)>,
+    mounts: Vec<Mountpoint>,
+}
+
+struct Mountpoint {
+    covered: Location,
+    mounted: Arc<Mount>,
 }
 
 static NAMESPACE: OncePublication<Namespace> = OncePublication::new();
@@ -114,6 +138,7 @@ impl Namespace {
 
     /// Mount a distinct instance on an existing directory during exclusive bootstrap.
     /// Nested mounts are allowed; ancestor mounts cannot hide earlier mounts.
+    /// Mountpoints use mount/node identity so backend aliases cross the same mount.
     /// # Arguments
     /// * `path` - Absolute existing mountpoint resolved synchronously.
     /// * `backend` - Distinct filesystem instance with directory root.
@@ -131,7 +156,7 @@ impl Namespace {
             || self
                 .mounts
                 .iter()
-                .any(|(_, m)| Arc::ptr_eq(&m.backend, &backend))
+                .any(|point| Arc::ptr_eq(&point.mounted.backend, &backend))
         {
             return Err(errno::EINVAL);
         }
@@ -143,23 +168,37 @@ impl Namespace {
         if location.node().kind != Kind::Directory {
             return Err(errno::ENOTDIR);
         }
-        let path = location.path();
-        if path == b"/" {
+        if location.0.parent.is_none() {
             return Err(errno::EBUSY);
         }
-        if self
-            .mounts
-            .iter()
-            .any(|(p, _)| p == path || (p.starts_with(path) && p.get(path.len()) == Some(&b'/')))
-        {
+        if self.mounts.iter().any(|point| {
+            if Arc::ptr_eq(&point.mounted, &location.0.mount)
+                && location.node() == point.mounted.backend.root()
+            {
+                return true;
+            }
+            // Compare the covered ancestry by identity, not pathname spelling.
+            let mut ancestor = Some(&point.covered);
+            while let Some(current) = ancestor {
+                if Arc::ptr_eq(&current.0.mount, &location.0.mount)
+                    && current.node() == location.node()
+                {
+                    return true;
+                }
+                ancestor = current.0.parent.as_ref();
+            }
+            false
+        }) {
             return Err(errno::EBUSY);
         }
         if self.mounts.len() == MAX_MOUNTS {
             return Err(errno::ENOMEM);
         }
         self.mounts.try_reserve(1).map_err(|_| errno::ENOMEM)?;
-        self.mounts
-            .push((path.to_vec(), Arc::new(Mount { backend })));
+        self.mounts.push(Mountpoint {
+            covered: location,
+            mounted: Arc::new(Mount { backend }),
+        });
         Ok(())
     }
 
@@ -192,8 +231,10 @@ impl Namespace {
         let mount = self
             .mounts
             .iter()
-            .find(|(p, _)| *p == absolute)
-            .map(|(_, m)| m.clone())
+            .find(|point| {
+                Arc::ptr_eq(&point.covered.0.mount, &parent.0.mount) && point.covered.node() == node
+            })
+            .map(|point| point.mounted.clone())
             .unwrap_or_else(|| parent.0.mount.clone());
         let node = if Arc::ptr_eq(&mount, &parent.0.mount) {
             node
@@ -287,7 +328,7 @@ impl Resolver {
     ) -> Poll<Result<Location, Errno>> {
         loop {
             if let Some(request) = self.request.as_mut() {
-                let result = match self.current.backend().poll(request, wake) {
+                let result = match self.current.poll(request, wake) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(r) => r,
                 };
@@ -297,10 +338,7 @@ impl Resolver {
                     && self.input[self.cursor..].iter().all(|b| *b == b'/')
                     && matches!(request.operation, Operation::Lookup(_))
                 {
-                    self.request = Some(Request::new(
-                        self.current.node(),
-                        Operation::Create(self.component.clone()),
-                    ));
+                    self.request = Some(Request::new(Operation::Create(self.component.clone())));
                     continue;
                 }
                 let node = match result {
@@ -351,10 +389,7 @@ impl Resolver {
             if self.current.path().len() + separator + component.len() > GENRT_PATH_MAX {
                 return Poll::Ready(Err(errno::ENAMETOOLONG));
             }
-            self.request = Some(Request::new(
-                self.current.node(),
-                Operation::Lookup(self.component.clone()),
-            ));
+            self.request = Some(Request::new(Operation::Lookup(self.component.clone())));
         }
     }
 }

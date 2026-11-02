@@ -26,3 +26,4 @@ qemu-test-smp-boot = ["kernel/qemu-test-smp-boot"]
 kernel = { path = "../../kernel" }
 bootinfo = { path = "../../crates/bootinfo" }
 fdt-raw = { version = "0.3.0", default-features = false }
+virtio-drivers = { version = "=0.13.0", default-features = false }

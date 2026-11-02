@@ -1,6 +1,7 @@
 use crate::{process, sched};
 
 pub(crate) fn kernel_init_thread(_arg: sched::ThreadArg) -> usize {
+    crate::fs::initialize_namespace().expect("vfs: namespace initialization");
     crate::info!("init: scheduler is running");
     crate::info!("init: spawning first EL0 process");
 

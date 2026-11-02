@@ -6,7 +6,7 @@ use core::{
     sync::atomic::{AtomicU8, Ordering},
 };
 
-use fdt_raw::Fdt;
+use kernel::dtb::RuntimeDtb;
 
 pub(super) const MAX_BOOT_CPUS: usize = 4;
 
@@ -14,8 +14,6 @@ pub(super) const MAX_BOOT_CPUS: usize = 4;
 pub(crate) enum CpuTopologyError {
     /// Immutable topology was already initialized by CPU0.
     AlreadyInitialized,
-    /// DTB header or node traversal failed.
-    Parse,
     /// No usable CPU node or CPU `reg` value was present.
     MissingCpu,
     /// Enabled CPU nodes exceed fixed bootstrap capacity.
@@ -72,7 +70,7 @@ static TOPOLOGY: Publication = Publication {
 ///
 /// # Arguments
 ///
-/// * `dtb` - Complete resident DTB byte slice.
+/// * `dtb` - Shared validated runtime DTB reader.
 /// * `boot_hardware_id` - Normalized executing CPU affinity key.
 ///
 /// # Returns
@@ -83,7 +81,10 @@ static TOPOLOGY: Publication = Publication {
 ///
 /// Returns [`CpuTopologyError`] for malformed, missing, duplicate, excessive,
 /// or unsupported topology and for repeated initialization.
-pub(crate) fn init_cpu_topology(dtb: &[u8], boot_hardware_id: u64) -> Result<(), CpuTopologyError> {
+pub(crate) fn init_cpu_topology(
+    dtb: &RuntimeDtb<'_>,
+    boot_hardware_id: u64,
+) -> Result<(), CpuTopologyError> {
     if TOPOLOGY
         .state
         .compare_exchange(EMPTY, INITIALIZING, Ordering::Acquire, Ordering::Relaxed)
@@ -108,8 +109,11 @@ pub(crate) fn init_cpu_topology(dtb: &[u8], boot_hardware_id: u64) -> Result<(),
     }
 }
 
-fn parse_cpu_topology(dtb: &[u8], boot_hardware_id: u64) -> Result<CpuTopology, CpuTopologyError> {
-    let fdt = Fdt::from_bytes(dtb).map_err(|_| CpuTopologyError::Parse)?;
+fn parse_cpu_topology(
+    dtb: &RuntimeDtb<'_>,
+    boot_hardware_id: u64,
+) -> Result<CpuTopology, CpuTopologyError> {
+    let fdt = dtb.fdt();
     let mut target_ids = [0u64; MAX_BOOT_CPUS];
     let mut count = 0usize;
     #[cfg(feature = "platform-raspberrypi-3b-plus")]
