@@ -25,6 +25,11 @@ subject = "file-io"
 [[steps]]
 action = "expect_case"
 producer = "api-supervisor"
+subject = "descriptors"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
 subject = "directory-io"
 
 [[steps]]

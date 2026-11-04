@@ -32,8 +32,8 @@ pub use fault::kill_current_process_on_user_fault;
 pub use state::{ProcessExitStatus, UserFault, UserFaultKind};
 
 pub(crate) use access::{
-    close_current_fd, current_cwd_dir, current_fd, current_next_fd, early_file_call,
-    install_current_fd, set_current_cwd, store_file_call, take_file_call,
+    close_current_fd, current_cwd_dir, current_fd, current_next_fd, dup_current_fd,
+    early_file_call, install_current_fd, set_current_cwd, store_file_call, take_file_call,
 };
 pub(crate) use affinity::process_affinity;
 pub(crate) use exec::{copy_exec_args_from_user, execve_current};

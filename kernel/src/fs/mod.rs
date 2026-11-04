@@ -3,6 +3,7 @@ pub(crate) mod call;
 mod fat;
 pub mod fd;
 pub mod initramfs;
+pub(crate) mod io;
 mod mounts;
 pub mod path;
 pub mod ramfs;

@@ -2,6 +2,7 @@
 
 use super::{
     backend::{IO_CAPACITY, Kind, OpenFlags, Operation, Reply, Request},
+    io::Descriptor,
     vfs::{Location, Namespace, Resolver},
 };
 use crate::{
@@ -14,9 +15,6 @@ use alloc::{boxed::Box, sync::Arc};
 use core::task::Poll;
 
 pub(crate) const MAX_FDS: usize = 32;
-pub(crate) const STDIN: usize = 0;
-pub(crate) const STDOUT: usize = 1;
-pub(crate) const STDERR: usize = 2;
 
 struct OpenState {
     offset: u64,
@@ -66,14 +64,14 @@ impl OpenDescription {
     }
 }
 
-/// Fixed-size descriptor table. Cloning only increments OFD references.
+/// Fixed-size descriptor table. Cloning only increments shared references.
 #[derive(Clone)]
 pub(crate) struct FdTable {
-    entries: [Option<Arc<OpenDescription>>; MAX_FDS],
+    entries: [Option<Arc<Descriptor>>; MAX_FDS],
 }
 
 impl FdTable {
-    /// Check whether no ordinary descriptor references remain.
+    /// Check whether no descriptor references remain.
     /// # Returns
     /// True for an empty table; bounded and allocation-free, without callbacks.
     pub(crate) fn is_empty(&self) -> bool {
@@ -81,37 +79,35 @@ impl FdTable {
     }
     /// Inspect the next available slot before any create/truncate side effect.
     /// # Returns
-    /// Lowest free ordinary slot, without allocation or callbacks.
+    /// Lowest free slot including stdio, without allocation or callbacks.
     /// # Errors
-    /// `EMFILE` if all ordinary slots are occupied.
+    /// `EMFILE` if all slots are occupied.
     pub(crate) fn next_free(&self) -> Result<usize, Errno> {
-        (3..MAX_FDS)
+        (0..MAX_FDS)
             .find(|i| self.entries[*i].is_none())
             .ok_or(errno::EMFILE)
     }
-    /// Construct reserved stdio plus empty ordinary descriptors, allocation-free.
+    /// Construct an empty table, allocation-free.
     /// # Returns
-    /// Empty table; stdio 0/1/2 remain console-owned.
+    /// Empty table, including slots 0/1/2. Initial stdio is staged separately.
     pub(crate) const fn new() -> Self {
         Self {
             entries: [const { None }; MAX_FDS],
         }
     }
 
-    /// Move an OFD into the lowest free ordinary slot without destruction.
+    /// Move a descriptor into the lowest free slot without destruction.
     /// # Arguments
     /// * `description` - Taken only on success, left owned by caller on failure.
     /// # Returns
-    /// Lowest free descriptor at or above 3; no allocation or backend calls.
+    /// Lowest free descriptor; no allocation or endpoint/backend calls.
     /// # Errors
     /// `EMFILE` if full, `EBADF` if no input description.
     pub(crate) fn install(
         &mut self,
-        description: &mut Option<Arc<OpenDescription>>,
+        description: &mut Option<Arc<Descriptor>>,
     ) -> Result<usize, Errno> {
-        let fd = (3..MAX_FDS)
-            .find(|i| self.entries[*i].is_none())
-            .ok_or(errno::EMFILE)?;
+        let fd = self.next_free()?;
         if description.is_none() {
             return Err(errno::EBADF);
         }
@@ -119,17 +115,14 @@ impl FdTable {
         Ok(fd)
     }
 
-    /// Clone one descriptor's OFD under bounded table ownership.
+    /// Clone one descriptor under bounded table ownership.
     /// # Arguments
-    /// * `fd` - Ordinary descriptor.
+    /// * `fd` - Descriptor, including stdio.
     /// # Returns
-    /// Shared OFD without allocation or backend calls.
+    /// Shared VFS/endpoint target without allocation or callbacks.
     /// # Errors
-    /// `EBADF` for closed, stdio, or out-of-range descriptors.
-    pub(crate) fn get(&self, fd: usize) -> Result<Arc<OpenDescription>, Errno> {
-        if fd < 3 {
-            return Err(errno::EBADF);
-        }
+    /// `EBADF` for closed or out-of-range descriptors.
+    pub(crate) fn get(&self, fd: usize) -> Result<Arc<Descriptor>, Errno> {
         self.entries
             .get(fd)
             .and_then(Clone::clone)
@@ -138,19 +131,57 @@ impl FdTable {
 
     /// Extract ownership for destruction after releasing the process lock.
     /// # Arguments
-    /// * `fd` - Ordinary descriptor to remove.
+    /// * `fd` - Descriptor to remove, including stdio.
     /// # Returns
-    /// Removed OFD reference; no destruction/backend calls occur here.
+    /// Removed target reference; no destruction or callbacks occur here.
     /// # Errors
-    /// `EBADF` for reserved, invalid, or closed descriptors.
-    pub(crate) fn take(&mut self, fd: usize) -> Result<Arc<OpenDescription>, Errno> {
-        if fd < 3 {
-            return Err(errno::EBADF);
-        }
+    /// `EBADF` for invalid or closed descriptors.
+    pub(crate) fn take(&mut self, fd: usize) -> Result<Arc<Descriptor>, Errno> {
         self.entries
             .get_mut(fd)
             .and_then(Option::take)
             .ok_or(errno::EBADF)
+    }
+
+    /// Duplicate a reference into the lowest free slot, without allocation.
+    /// # Arguments
+    /// * `fd` - Existing descriptor to share.
+    /// # Returns
+    /// New lowest descriptor; no callbacks or final destruction.
+    /// # Errors
+    /// `EBADF` for invalid source, `EMFILE` for an exhausted table.
+    pub(crate) fn dup(&mut self, fd: usize) -> Result<usize, Errno> {
+        // Validate before cloning so failure cannot drop a reference under lock.
+        if self.entries.get(fd).is_none_or(Option::is_none) {
+            return Err(errno::EBADF);
+        }
+        let next = self.next_free()?;
+        self.entries[next] = self.entries[fd].clone();
+        Ok(next)
+    }
+
+    /// Atomically duplicate into a chosen slot, moving replaced ownership out.
+    /// # Arguments
+    /// * `fd` - Existing source descriptor, validated even for self replacement.
+    /// * `target` - Destination slot, including stdio.
+    /// # Returns
+    /// Replaced reference for destruction outside the process lock, or none for
+    /// an empty destination or valid self replacement. No allocation/callbacks.
+    /// # Errors
+    /// `EBADF` for invalid source or out-of-range destination; leaves both intact.
+    pub(crate) fn dup2(
+        &mut self,
+        fd: usize,
+        target: usize,
+    ) -> Result<Option<Arc<Descriptor>>, Errno> {
+        if target >= MAX_FDS || self.entries.get(fd).is_none_or(Option::is_none) {
+            return Err(errno::EBADF);
+        }
+        if fd == target {
+            return Ok(None);
+        }
+        let replacement = self.entries[fd].clone();
+        Ok(core::mem::replace(&mut self.entries[target], replacement))
     }
 }
 

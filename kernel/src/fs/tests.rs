@@ -3,6 +3,7 @@
 use super::{
     backend::*,
     fd::{FdTable, Open, Transaction},
+    io::Descriptor,
     ramfs::{MountedRamfs, RamFile},
     testfs::TestFs,
     vfs::{Location, Namespace, Resolver},
@@ -53,6 +54,18 @@ fn open(ns: &Namespace, path: &[u8], flags: OpenFlags) -> Arc<super::fd::OpenDes
         Poll::Ready(result) => result.unwrap(),
         Poll::Pending => panic!("unexpected pending open"),
     }
+}
+
+fn descriptor(ns: &Namespace, path: &[u8], flags: OpenFlags) -> Arc<Descriptor> {
+    Arc::new(Descriptor::Vfs(open(ns, path, flags)))
+}
+
+fn table_vfs(table: &FdTable, fd: usize) -> Arc<super::fd::OpenDescription> {
+    let descriptor = table.get(fd).unwrap();
+    let Descriptor::Vfs(description) = descriptor.as_ref() else {
+        panic!("VFS descriptor")
+    };
+    description.clone()
 }
 
 fn complete(tx: &mut Transaction) -> Result<Reply, isize> {
@@ -248,34 +261,72 @@ fn readonly_errors_and_generic_exec_preserve_archive_bytes() {
 #[test]
 fn fork_tables_share_exact_offsets_but_separate_opens_do_not() {
     let (ns, _, _) = fixture();
-    let mut parent = FdTable::new();
+    let mut parent = crate::console::stdio().unwrap();
     assert_eq!(
-        parent.install(&mut Some(open(&ns, b"/hello", flags()))),
+        parent.install(&mut Some(descriptor(&ns, b"/hello", flags()))),
         Ok(3)
     );
     let mut child = parent.clone();
     assert!(Arc::ptr_eq(&parent.get(3).unwrap(), &child.get(3).unwrap()));
-    assert_eq!(read(parent.get(3).unwrap(), 2, true), b"he");
-    assert_eq!(read(child.get(3).unwrap(), 2, true), b"ll");
+    assert_eq!(read(table_vfs(&parent, 3), 2, true), b"he");
+    assert_eq!(read(table_vfs(&child, 3), 2, true), b"ll");
     assert_eq!(read(open(&ns, b"/hello", flags()), 2, true), b"he");
     drop(parent.take(3).unwrap());
-    assert_eq!(read(child.get(3).unwrap(), 2, true), b"o");
+    assert_eq!(read(table_vfs(&child, 3), 2, true), b"o");
     drop(child.take(3).unwrap());
-    assert_eq!(child.install(&mut Some(open(&ns, b"/m", flags()))), Ok(3));
+    assert_eq!(
+        child.install(&mut Some(descriptor(&ns, b"/m", flags()))),
+        Ok(3)
+    );
     let copied = child.clone();
     let mut tx =
-        Transaction::new(child.get(3).unwrap(), Operation::Readdir { offset: 0 }, 0).unwrap();
+        Transaction::new(table_vfs(&child, 3), Operation::Readdir { offset: 0 }, 0).unwrap();
     let Reply::Entry(Some(first)) = complete(&mut tx).unwrap() else {
         panic!("entry");
     };
     tx.commit();
     drop(tx);
     let mut tx =
-        Transaction::new(copied.get(3).unwrap(), Operation::Readdir { offset: 0 }, 0).unwrap();
+        Transaction::new(table_vfs(&copied, 3), Operation::Readdir { offset: 0 }, 0).unwrap();
     let Reply::Entry(Some(second)) = complete(&mut tx).unwrap() else {
         panic!("entry");
     };
     assert_ne!(first.name, second.name);
+}
+
+#[test]
+fn dup_and_child_stdout_replacement_share_vfs_offsets_without_changing_parent_console() {
+    let (ns, backend, _) = fixture();
+    let mut parent = crate::console::stdio().unwrap();
+    let console = parent.get(1).unwrap();
+    let file = parent
+        .install(&mut Some(descriptor(&ns, b"/m/dynamic", flags())))
+        .unwrap();
+    let duplicate = parent.dup(file).unwrap();
+    assert_eq!(read(table_vfs(&parent, file), 2, true), b"dy");
+    assert_eq!(read(table_vfs(&parent, duplicate), 2, true), b"na");
+    let mut child = parent.clone();
+    drop(child.dup2(file, 1).unwrap());
+    assert!(Arc::ptr_eq(&console, &parent.get(1).unwrap()));
+    assert!(Arc::ptr_eq(
+        &child.get(1).unwrap(),
+        &parent.get(file).unwrap()
+    ));
+    drop(child.take(file).unwrap());
+    drop(parent.take(file).unwrap());
+    drop(parent.take(duplicate).unwrap());
+    assert_eq!(read(table_vfs(&child, 1), 3, true), b"mic");
+    let before = backend.counts();
+    drop(child.take(duplicate).unwrap());
+    assert_eq!(backend.counts(), before);
+    drop(child.take(1).unwrap());
+    assert_eq!(backend.counts().1, before.1 + 1);
+    drop(parent.take(0).unwrap());
+    assert_eq!(
+        parent.install(&mut Some(descriptor(&ns, b"/hello", flags()))),
+        Ok(0)
+    );
+    assert_eq!(read(table_vfs(&parent, 0), 5, true), b"hello");
 }
 
 #[test]
@@ -563,18 +614,21 @@ fn pending_transaction_retains_lease_and_zero_length_skips_backend() {
 #[test]
 fn fixed_fd_capacity_rejection_keeps_owned_description_for_unlocked_cleanup() {
     let (ns, _, _) = fixture();
-    let mut fds = FdTable::new();
+    let mut fds = crate::console::stdio().unwrap();
     for expected in 3..32 {
         assert_eq!(
-            fds.install(&mut Some(open(&ns, b"/m/dynamic", flags()))),
+            fds.install(&mut Some(descriptor(&ns, b"/m/dynamic", flags()))),
             Ok(expected)
         );
     }
     assert_eq!(fds.next_free(), Err(errno::EMFILE));
-    let mut staged = Some(open(&ns, b"/m/dynamic", flags()));
+    let mut staged = Some(descriptor(&ns, b"/m/dynamic", flags()));
     assert_eq!(fds.install(&mut staged), Err(errno::EMFILE));
     assert!(staged.is_some());
-    assert!(matches!(fds.get(0), Err(errno::EBADF)));
+    assert!(matches!(
+        fds.get(0).unwrap().as_ref(),
+        Descriptor::Endpoint(_)
+    ));
     drop(fds.take(7).unwrap());
     assert_eq!(fds.install(&mut staged), Ok(7));
     assert!(staged.is_none());
@@ -1088,12 +1142,12 @@ fn pending_busy_zero_and_abandoned_io_reuse_the_same_exclusive_request() {
             ..flags()
         },
     );
-    let mut parent = FdTable::new();
+    let mut parent = crate::console::stdio().unwrap();
     parent
-        .install(&mut Some(open(&ns, b"/m/pending", flags())))
+        .install(&mut Some(descriptor(&ns, b"/m/pending", flags())))
         .unwrap();
     let mut child = parent.clone();
-    let fd = parent.get(3).unwrap();
+    let fd = table_vfs(&parent, 3);
     let cpu = crate::cpu::CpuId::from_index(0).unwrap();
     let token =
         crate::sched::WaitToken::for_profile_test(crate::sched::ThreadId::new(0, 1), cpu, 1);
@@ -1103,7 +1157,7 @@ fn pending_busy_zero_and_abandoned_io_reuse_the_same_exclusive_request() {
         let mut tx = read_transaction(&fd, 5);
         assert!(tx.poll(Some(token)).is_pending());
         let identity = tx.staging_identity();
-        let mut peer = read_transaction(&child.get(3).unwrap(), 5);
+        let mut peer = read_transaction(&table_vfs(&child, 3), 5);
         assert!(
             peer.prepare(Some(peer_token), |_| panic!("busy request touched"))
                 .is_pending()

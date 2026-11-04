@@ -24,10 +24,10 @@ growth.
 | [0016](ADR-0016-first-aarch64-el0-process.md) | First AArch64 EL0 process | Accepted | Userspace/MMU | - | - |
 | [0017](ADR-0017-process-table-and-user-fault-policy.md) | Process table and user faults | Accepted | Processes | - | [0032](ADR-0032-typed-wait-registrations-and-external-wake-ownership.md) (join/wait registration identity), [0033](ADR-0033-unified-thread-model-and-scheduler-process-separation.md) (main-thread join and user-stack ownership) |
 | [0018](ADR-0018-userspace-elf-loader.md) | Userspace ELF loader only | Accepted | Loader | - | - |
-| [0019](ADR-0019-readonly-ramfs-and-fd-table.md) | Readonly ramfs and FD table | Accepted | FD ABI; original backing partially replaced | - | [0021](ADR-0021-initramfs-cpio-root.md) (backing only), [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) (descriptor representation/lifetime) |
-| [0020](ADR-0020-uart-stdin-and-shell.md) | UART stdin and shell | Accepted | Console/userspace | - | [0032](ADR-0032-typed-wait-registrations-and-external-wake-ownership.md) (stdin waiter identity only) |
+| [0019](ADR-0019-readonly-ramfs-and-fd-table.md) | Readonly ramfs and FD table | Accepted | FD ABI; original backing partially replaced | - | [0021](ADR-0021-initramfs-cpio-root.md) (backing only), [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) (descriptor representation/lifetime), [0071](ADR-0071-unified-descriptors-and-shell-redirection.md) (reserved stdio) |
+| [0020](ADR-0020-uart-stdin-and-shell.md) | UART stdin and shell | Accepted | Console/userspace | - | [0032](ADR-0032-typed-wait-registrations-and-external-wake-ownership.md) (stdin waiter identity only), [0071](ADR-0071-unified-descriptors-and-shell-redirection.md) (stdin-specific restart) |
 | [0021](ADR-0021-initramfs-cpio-root.md) | CPIO initramfs root | Accepted | Filesystem backing | [0019](ADR-0019-readonly-ramfs-and-fd-table.md) (backing only) | - |
-| [0022](ADR-0022-fork-exec-waitpid-echo.md) | Minimal process control | Accepted | Processes/syscalls | - | [0033](ADR-0033-unified-thread-model-and-scheduler-process-separation.md) (main-thread resource transfer and reap), [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) (forked descriptor offsets only) |
+| [0022](ADR-0022-fork-exec-waitpid-echo.md) | Minimal process control | Accepted | Processes/syscalls | - | [0033](ADR-0033-unified-thread-model-and-scheduler-process-separation.md) (main-thread resource transfer and reap), [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) (forked descriptor offsets only), [0071](ADR-0071-unified-descriptors-and-shell-redirection.md) (shell redirection) |
 | [0023](ADR-0023-directory-fds-and-getdents64.md) | Directory FDs and getdents64 | Accepted | Filesystem ABI | - | [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) (directory-description ownership), [0066](ADR-0066-usercopy-length-and-owned-io-growth.md) (transfer cap) |
 | [0024](ADR-0024-process-cwd-and-path-resolution.md) | Process cwd and path traversal | Accepted | Filesystem/process | - | [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) (cwd/resolver identities) |
 | [0025](ADR-0025-automated-qemu-testing-and-tagged-releases.md) | Automated testing and releases | Accepted | Verification/release | - | - |
@@ -81,5 +81,7 @@ growth.
 | [0069](ADR-0069-shared-runtime-dtb-and-staged-probe.md) | Shared runtime DTB and staged driver probing | Accepted | Firmware resources/platform initialization | - | - |
 
 | [0070](ADR-0070-fstab-boot-mounts-and-shared-disks.md) | Fstab boot mounts and shared physical disks | Accepted | Storage/bootstrap/namespace ownership | [0064](ADR-0064-qemu-block-storage-and-fat32.md) (boot staging/mount policy) | - |
+
+| [0071](ADR-0071-unified-descriptors-and-shell-redirection.md) | Unified descriptors and shell output redirection | Accepted | FD ownership/endpoint waits/dup ABI/shell | [0019](ADR-0019-readonly-ramfs-and-fd-table.md) (reserved stdio), [0020](ADR-0020-uart-stdin-and-shell.md) (stdin-specific restart), [0022](ADR-0022-fork-exec-waitpid-echo.md) (shell redirection) | - |
 
 Use [`TEMPLATE.md`](TEMPLATE.md) for new decisions.

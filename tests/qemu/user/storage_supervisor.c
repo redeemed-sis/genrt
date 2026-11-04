@@ -129,7 +129,7 @@ static void writable_io(void) {
     fd = open(path, O_RDONLY);
     char bytes[3];
     check(fd >= 3 && read(fd, bytes, sizeof(bytes)) == 2 && memcmp(bytes, "AB", 2) == 0, subject);
-    check(close(fd) == 0 && fsync(fd) == -9 && fsync(0) == -9 && fsync(999) == -9, subject);
+    check(close(fd) == 0 && fsync(fd) == -9 && fsync(0) == -GENRT_EINVAL && fsync(999) == -9, subject);
     gtrt_pass(PRODUCER, subject);
 }
 

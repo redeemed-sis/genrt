@@ -4,6 +4,10 @@
 
 Accepted
 
+Superseded for stdin-specific syscall dispatch and wait registration by
+[ADR-0071](ADR-0071-unified-descriptors-and-shell-redirection.md). UART RX and
+userspace line-editing ownership remain unchanged.
+
 ## Context
 
 The first EL0 userspace path already supports ELF loading, process lifecycle,

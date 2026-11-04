@@ -9,7 +9,9 @@
 #define GENRT_EFAULT 14
 #define GENRT_EBUSY 16
 #define GENRT_EEXIST 17
+#define GENRT_ENOTDIR 20
 #define GENRT_EINVAL 22
+#define GENRT_EMFILE 24
 #define GENRT_ENOSPC 28
 #define GENRT_EROFS 30
 #define GENRT_ENOSYS 38

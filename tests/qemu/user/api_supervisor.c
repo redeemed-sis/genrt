@@ -173,6 +173,7 @@ int main(void) {
     init_affinity();
     run_case("support-library");
     run_case("file-io");
+    run_case("descriptors");
     run_case("directory-io");
     run_case("syscall-boundaries");
     run_case("cwd-paths");

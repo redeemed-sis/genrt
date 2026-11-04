@@ -4,6 +4,9 @@
 
 Accepted
 
+The shell-redirection non-goal is superseded by
+[ADR-0071](ADR-0071-unified-descriptors-and-shell-redirection.md).
+
 Superseded only for independent forked descriptor offsets by
 [ADR-0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md).
 

@@ -26,6 +26,8 @@
 #define SYS_PROFILE_CONTROL 17
 #define SYS_PROFILE_READ 18
 #define SYS_FSYNC 20
+#define SYS_DUP 21
+#define SYS_DUP2 22
 
 #define GENRT_PATH_MAX 4096
 #define PATH_MAX GENRT_PATH_MAX
@@ -122,6 +124,16 @@ static inline int close(int fd) {
 
 static inline int fsync(int fd) {
     return (int)genrt_syscall1(SYS_FSYNC, fd);
+}
+
+/* Share the source's offset/endpoint state; errors are direct negative errno. */
+static inline int dup(int fd) {
+    return (int)genrt_syscall1(SYS_DUP, fd);
+}
+
+/* Validate source even for fd == target; replacement is atomic. */
+static inline int dup2(int fd, int target) {
+    return (int)genrt_syscall2(SYS_DUP2, fd, target);
 }
 
 static inline pid_t fork(void) {

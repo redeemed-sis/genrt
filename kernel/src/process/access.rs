@@ -1,7 +1,7 @@
 use super::table::{current_process_id, table_mut};
 use crate::{
     errno::{self, Errno},
-    fs::{backend::Kind, call::PendingFileCall, fd::OpenDescription, vfs::Location},
+    fs::{backend::Kind, call::PendingFileCall, io::Descriptor, vfs::Location},
 };
 use alloc::sync::Arc;
 
@@ -62,7 +62,7 @@ pub(crate) fn current_next_fd() -> Result<usize, Errno> {
         .next_free()
 }
 
-/// Install a staged OFD by bounded ownership transfer only.
+/// Install a staged VFS/endpoint target by bounded ownership transfer only.
 /// # Arguments
 /// * `description` - Taken only on success; caller drops failures outside locks.
 /// # Returns
@@ -70,7 +70,7 @@ pub(crate) fn current_next_fd() -> Result<usize, Errno> {
 /// # Errors
 /// `EBADF` outside process, `EMFILE` for capacity.
 pub(crate) fn install_current_fd(
-    description: &mut Option<Arc<OpenDescription>>,
+    description: &mut Option<Arc<Descriptor>>,
 ) -> Result<usize, Errno> {
     let pid = current_process_id().ok_or(errno::EBADF)?;
     table_mut()
@@ -83,14 +83,14 @@ pub(crate) fn install_current_fd(
         .install(description)
 }
 
-/// Clone an OFD without invoking a backend or allocating.
+/// Clone a shared descriptor without callbacks or allocation.
 /// # Arguments
-/// * `fd` - Current process ordinary descriptor.
+/// * `fd` - Current process descriptor, including stdio.
 /// # Returns
-/// Shared OFD reference; caller owns its destruction in task context.
+/// Shared target reference; caller owns its destruction in task context.
 /// # Errors
 /// `EBADF` outside process or for invalid descriptors.
-pub(crate) fn current_fd(fd: usize) -> Result<Arc<OpenDescription>, Errno> {
+pub(crate) fn current_fd(fd: usize) -> Result<Arc<Descriptor>, Errno> {
     let pid = current_process_id().ok_or(errno::EBADF)?;
     table_mut()
         .slot(pid)
@@ -104,7 +104,7 @@ pub(crate) fn current_fd(fd: usize) -> Result<Arc<OpenDescription>, Errno> {
 
 /// Remove an FD and release its reference after the process lock is gone.
 /// # Arguments
-/// * `fd` - Ordinary descriptor to close.
+/// * `fd` - Descriptor to close, including stdio.
 /// # Returns
 /// Success after finite backend release in the caller's task window.
 /// # Errors
@@ -123,6 +123,36 @@ pub(crate) fn close_current_fd(fd: usize) -> Result<(), Errno> {
     };
     drop(removed);
     Ok(())
+}
+
+/// Duplicate a current descriptor using only bounded reference transitions.
+/// # Arguments
+/// * `fd` - Existing source descriptor.
+/// * `target` - Exact destination for dup2, or none for lowest-free dup.
+/// # Returns
+/// Destination number; replaced resources drop after releasing the process lock
+/// in the caller's finite task window. No allocation or blocking.
+/// # Errors
+/// `EBADF` outside a process or for invalid descriptors, `EMFILE` for full dup.
+pub(crate) fn dup_current_fd(fd: usize, target: Option<usize>) -> Result<usize, Errno> {
+    let pid = current_process_id().ok_or(errno::EBADF)?;
+    let (result, removed) = {
+        let mut table = table_mut();
+        let fds = &mut table
+            .slot_mut(pid)
+            .ok_or(errno::EBADF)?
+            .process
+            .resources
+            .files
+            .fds;
+        if let Some(target) = target {
+            (target, fds.dup2(fd, target)?)
+        } else {
+            (fds.dup(fd)?, None)
+        }
+    };
+    drop(removed);
+    Ok(result)
 }
 
 /// Extract retained syscall ownership for resume outside the table lock.

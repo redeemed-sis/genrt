@@ -4,6 +4,10 @@
 
 Accepted
 
+Extended by [ADR-0071](ADR-0071-unified-descriptors-and-shell-redirection.md):
+descriptor numbers 0 through 2 no longer imply console or fsync policy. UART
+endpoints return `EINVAL`; VFS descriptions support sync regardless of slot.
+
 ## Context
 
 The VFS already exposes backend `Operation::Sync`, but userspace cannot request

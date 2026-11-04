@@ -299,7 +299,11 @@ static int capacity(void) {
     }
     int fd = open(A "/write", O_RDWR);
     CHECK(fd == 3 && read(fd, BAD, 0) == 0 && write(fd, BAD, 0) == 0 && close(fd) == 0);
-    for (int i = 0; i < 3; i++) CHECK(close(i) == -EBADF);
+    for (int i = 0; i < 3; i++) {
+        CHECK(close(i) == 0 && read(i, &byte, 0) == -EBADF);
+        fd = open(A "/write", O_RDONLY);
+        CHECK(fd == 0 && close(fd) == 0);
+    }
     return 0;
 }
 

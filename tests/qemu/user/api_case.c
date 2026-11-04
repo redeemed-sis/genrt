@@ -20,7 +20,7 @@ static int file_io(void) {
     if (fd < 0) {
         return 1;
     }
-    if (fsync(fd) != 0 || fsync(0) != -9 || fsync(999) != -9) {
+    if (fsync(fd) != 0 || fsync(0) != -GENRT_EINVAL || fsync(999) != -9) {
         return 5;
     }
     ssize_t count = read(fd, data, sizeof(data));
@@ -32,6 +32,61 @@ static int file_io(void) {
         return 3;
     }
     return open("/.__genrt_test__/fixtures/missing", O_RDONLY) < 0 ? 0 : 4;
+}
+
+static int fd_exec_probe(void) {
+    char bytes[5];
+    /* FD 1 is deliberately a readonly VFS description, inherited through exec.
+     * Its offset is shared with the waiting parent, not copied at fork. */
+    return read(1, bytes, sizeof(bytes)) == sizeof(bytes)
+           && memcmp(bytes, "content", sizeof(bytes)) == 0
+           && write(1, bytes, 0) == -GENRT_EBADF ? 0 : 1;
+}
+
+static int descriptors(void) {
+    const char *path = "/.__genrt_test__/fixtures/known-content";
+    char bytes[8];
+    int fd = open(path, O_RDONLY);
+    int alias = dup(fd);
+    int console = dup(1);
+    char message[600];
+    memset(message, 'x', sizeof(message));
+    message[sizeof(message) - 1] = '\n';
+    if (fd != 3 || alias != 4 || console != 5
+        || write(console, message, sizeof(message)) != sizeof(message)
+        || dup2(fd, fd) != fd || dup2(-1, -1) != -GENRT_EBADF
+        || dup2(999, alias) != -GENRT_EBADF || dup2(fd, 32) != -GENRT_EBADF
+        || read(fd, bytes, 4) != 4 || memcmp(bytes, "fixt", 4) != 0
+        || read(alias, bytes, 4) != 4 || memcmp(bytes, "ure-", 4) != 0
+        || dup2(alias, 1) != 1) return 1;
+    pid_t child = fork();
+    if (child < 0) return 2;
+    if (child == 0) {
+        char *argv[] = {"api-case", "fd-exec-probe", NULL};
+        execve("/.__genrt_test__/bin/api-case", argv, NULL);
+        _exit(126);
+    }
+    int status = -1;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)
+        || WEXITSTATUS(status) != 0 || read(fd, bytes, 3) != 3
+        || memcmp(bytes, "nt-", 3) != 0
+        || dup2(console, 1) != 1 || close(console) != 0
+        || close(alias) != 0 || close(fd) != 0) return 3;
+    /* Closing/reusing stdio is table-driven, including zero-length calls. */
+    if (close(0) != 0 || read(0, bytes, 0) != -GENRT_EBADF
+        || open(path, O_RDONLY) != 0 || read(0, bytes, 4) != 4
+        || memcmp(bytes, "fixt", 4) != 0 || fsync(0) != 0 || close(0) != 0
+        || dup(1) != 0 || write(0, bytes, 0) != 0
+        || read(0, bytes, 0) != -GENRT_EBADF || close(0) != 0) return 4;
+    if (close(1) != 0 || dup(2) != 0 || dup(2) != 1
+        || write(1, "", 0) != 0) return 5;
+    /* Duplication cannot fail from EMFILE in dup2's chosen destination. */
+    for (int i = 3; i < 32; i++) if (dup(0) != i) return 6;
+    if (dup(0) != -GENRT_EMFILE || dup(-1) != -GENRT_EBADF
+        || dup2(0, 1) != 1 || dup2(1, 1) != 1) return 7;
+    for (int i = 3; i < 32; i++) if (close(i) != 0) return 8;
+    return getdents64(0, bytes, sizeof(bytes)) == -GENRT_ENOTDIR
+           && fsync(0) == -GENRT_EINVAL ? 0 : 9;
 }
 
 static int directory_io(void) {
@@ -503,6 +558,8 @@ int main(int argc, char **argv) {
     if ((strcmp(argv[1], "file-io") == 0)) {
         return file_io();
     }
+    if (strcmp(argv[1], "descriptors") == 0) return descriptors();
+    if (strcmp(argv[1], "fd-exec-probe") == 0) return fd_exec_probe();
     if ((strcmp(argv[1], "directory-io") == 0)) {
         return directory_io();
     }

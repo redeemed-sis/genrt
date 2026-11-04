@@ -1,11 +1,19 @@
 use crate::{
-    arch::ActiveContext,
-    sched::{self, CommitResult, WaitCause, WaitToken},
-    sync::{IrqSpinLock, LocalIrqGuard},
+    config::KERNEL_THREAD_CAPACITY,
+    errno::{self, Errno},
+    fs::{
+        backend::{Operation, Reply, Request},
+        fd::FdTable,
+        io::{Endpoint, IoObject},
+    },
+    sched::{self, WaitCause, WaitToken},
+    sync::IrqSpinLock,
 };
+use alloc::sync::Arc;
 use core::{
     fmt::{self, Write},
     sync::atomic::{AtomicBool, Ordering},
+    task::Poll,
 };
 
 #[cfg(not(test))]
@@ -50,6 +58,7 @@ fn console_putc_raw(c: u8) {
 pub(crate) const STDIN_RX_CAPACITY: usize = 256;
 const CONSOLE_TX_CAPACITY: usize = 32 * 1024;
 const CONSOLE_TX_DRAIN_CHUNK: usize = 64;
+const CONSOLE_USER_TX_CHUNK: usize = 256;
 
 struct StdinRx {
     ring: [u8; STDIN_RX_CAPACITY],
@@ -57,8 +66,7 @@ struct StdinRx {
     tail: usize,
     len: usize,
     overflow_count: usize,
-    waiter: Option<WaitToken>,
-    completed: Option<WaitToken>,
+    waiters: [Option<WaitToken>; KERNEL_THREAD_CAPACITY],
 }
 
 impl StdinRx {
@@ -69,27 +77,22 @@ impl StdinRx {
             tail: 0,
             len: 0,
             overflow_count: 0,
-            waiter: None,
-            completed: None,
+            waiters: [None; KERNEL_THREAD_CAPACITY],
         }
     }
 
-    fn push(&mut self, byte: u8) -> Option<WaitToken> {
+    fn push(&mut self, byte: u8) -> [Option<WaitToken>; KERNEL_THREAD_CAPACITY] {
         if self.len == STDIN_RX_CAPACITY {
             // Drop-newest policy: keep already buffered input stable for the
             // blocked reader and count the overflow for diagnostics.
             self.overflow_count = self.overflow_count.saturating_add(1);
-            return None;
+            return [None; KERNEL_THREAD_CAPACITY];
         }
 
         self.ring[self.tail] = byte;
         self.tail = (self.tail + 1) % STDIN_RX_CAPACITY;
         self.len += 1;
-        let token = self.waiter.take();
-        if token.is_some() {
-            self.completed = token;
-        }
-        token
+        core::mem::replace(&mut self.waiters, [None; KERNEL_THREAD_CAPACITY])
     }
 
     fn pop_into(&mut self, out: &mut [u8]) -> usize {
@@ -103,28 +106,25 @@ impl StdinRx {
         copied
     }
 
-    fn is_empty(&self) -> bool {
-        self.len == 0
+    fn poll_read(
+        &mut self,
+        buffer: &mut [u8],
+        wake: Option<WaitToken>,
+    ) -> Poll<Result<usize, Errno>> {
+        if self.len != 0 || buffer.is_empty() {
+            return Poll::Ready(Ok(self.pop_into(buffer)));
+        }
+        let Some(token) = wake else {
+            return Poll::Ready(Err(errno::EAGAIN));
+        };
+        // Recheck and registration share the RX lock with the IRQ producer.
+        self.waiters[token.thread().index()] = Some(token);
+        Poll::Pending
     }
 
-    fn register_waiter(&mut self, waiter: WaitToken) -> bool {
-        if self.completed.is_some() {
-            return false;
-        }
-        match self.waiter {
-            Some(existing) if existing == waiter => true,
-            Some(_) => false,
-            None => {
-                self.waiter = Some(waiter);
-                true
-            }
-        }
-    }
-
-    fn take_completed(&mut self, current: crate::sched::ThreadId) -> Option<WaitToken> {
-        match self.completed {
-            Some(token) if token.thread() == current => self.completed.take(),
-            _ => None,
+    fn cancel(&mut self, token: WaitToken) {
+        if self.waiters[token.thread().index()] == Some(token) {
+            self.waiters[token.thread().index()] = None;
         }
     }
 }
@@ -336,106 +336,131 @@ pub(crate) fn emergency_write(args: fmt::Arguments<'_>) {
     let _ = EmergencyWriter.write_fmt(args);
 }
 
+/// Publish one received UART byte and notify bounded exact readers.
+/// # Arguments
+/// * `byte` - Incoming byte; a full ring drops newest without allocation.
+/// # Returns
+/// Nothing; completes tokens only after releasing the RX lock. IRQ-safe.
 pub fn on_stdin_byte(byte: u8) {
-    let waiter = {
-        let _irq_guard = LocalIrqGuard::save_and_disable();
-        let mut stdin = stdin_mut();
-        stdin.push(byte)
-    };
-
-    if let Some(waiter) = waiter {
+    let waiters = STDIN_RX.lock().push(byte);
+    for waiter in waiters.into_iter().flatten() {
         let _ = sched::complete_wait(waiter, WaitCause::Notified);
     }
 }
 
-pub fn read_stdin(buffer: &mut [u8]) -> usize {
-    if buffer.is_empty() {
-        return 0;
-    }
+struct Uart;
 
-    let current = sched::current_thread_id();
-    let (len, completed) = {
-        let _irq_guard = LocalIrqGuard::save_and_disable();
-        let mut stdin = stdin_mut();
-        let len = stdin.pop_into(buffer);
-        let completed = current.and_then(|thread| stdin.take_completed(thread));
-        (len, completed)
-    };
-    if let Some(token) = completed {
-        match sched::finish_wait(token) {
-            Ok(_) | Err(sched::FinishError::Stale) => {}
-            Err(sched::FinishError::NotCompleted) => {
-                panic!("stdin: consumed before wait completion")
+impl IoObject for Uart {
+    fn poll(&self, request: &mut Request, wake: Option<WaitToken>) -> Poll<Result<Reply, Errno>> {
+        let count = match request.operation {
+            Operation::Read { .. } => match STDIN_RX.lock().poll_read(&mut request.buffer, wake) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(result) => result?,
+            },
+            Operation::Write { .. } => {
+                let mut accepted = 0;
+                // Preserve large writes without extending any IRQ-masked copy.
+                for chunk in request.buffer.chunks(CONSOLE_USER_TX_CHUNK) {
+                    if !try_write_bytes(chunk) {
+                        if accepted == 0 {
+                            return Poll::Ready(Err(errno::EAGAIN));
+                        }
+                        break;
+                    }
+                    accepted += chunk.len();
+                }
+                accepted
             }
+            _ => return Poll::Ready(Err(errno::EINVAL)),
+        };
+        Poll::Ready(Ok(Reply::Io { count, next: 0 }))
+    }
+
+    fn reset(&self, _request: &mut Request, wait: Option<WaitToken>) {
+        if let Some(token) = wait {
+            STDIN_RX.lock().cancel(token);
         }
     }
-    len
+
+    fn transfer_len(&self, read: bool, requested: usize) -> usize {
+        if read {
+            requested.min(STDIN_RX_CAPACITY)
+        } else {
+            requested
+        }
+    }
 }
 
-/// Register and block the current stdin reader if the RX ring is still empty.
-///
-/// The lost-wakeup check, waiter registration, syscall restart, and scheduler
-/// handoff occur under one short local IRQ-disabled section. The operation does
-/// not allocate; when it blocks, control resumes through the scheduler-selected
-/// live context.
-///
-/// # Arguments
-///
-/// * `context` - Exclusive live userspace syscall context to restart and hand
-///   to the scheduler when input is unavailable.
-///
+/// Stage ordinary replaceable UART descriptors 0/1/2 before process publication.
 /// # Returns
-///
-/// Returns `Ok(true)` after registering and blocking, `Ok(false)` when input
-/// became available before registration, or `Err(())` when no current thread
-/// exists or another stdin waiter owns the single waiter slot.
-///
+/// Table owning stdin (read), stdout and stderr (write); allocates reusable
+/// requests in task context, without holding a process lock or blocking.
 /// # Errors
-///
-/// Returns `Err(())` for unavailable scheduler identity or waiter-slot
-/// conflict.
-///
-/// # Panics
-///
-/// Panics when a [`crate::sync::preempt::PreemptGuard`] is active before stdin waiter
-/// registration.
-pub(crate) fn block_current_stdin_read_if_empty(
-    context: &mut ActiveContext<'_>,
-) -> Result<bool, ()> {
-    let prepared = {
-        let _irq_guard = LocalIrqGuard::save_and_disable();
-        let mut stdin = stdin_mut();
-        if !stdin.is_empty() {
-            return Ok(false);
-        }
-
-        crate::sync::preempt::assert_preemption_enabled("stdin waiter registration");
-        let prepared = sched::prepare_wait();
-        let token = prepared.token();
-        if !stdin.register_waiter(token) {
-            let _ = sched::cancel_wait(prepared);
-            return Err(());
-        }
-        prepared
-    };
-
-    // The architecture facade owns the instruction-width and resume-PC detail.
-    // This call occurs before any bytes are copied, so retry is transparent.
-    context.restart_current_syscall();
-    match sched::commit_wait(context, prepared) {
-        CommitResult::Blocked(_) | CommitResult::Early(_) => {}
-        CommitResult::Stale => panic!("stdin: wait became stale before commit"),
+/// `ENOMEM` if endpoint staging cannot be reserved.
+pub(crate) fn stdio() -> Result<FdTable, Errno> {
+    let object: Arc<dyn IoObject> = Arc::new(Uart);
+    let mut table = FdTable::new();
+    for fd in 0..3 {
+        let mut descriptor = Some(Endpoint::descriptor(
+            object.clone(),
+            fd == 0,
+            fd != 0,
+            Request::new(Operation::Sync),
+        )?);
+        table
+            .install(&mut descriptor)
+            .expect("console: stdio slots");
     }
-    Ok(true)
-}
-
-fn stdin_mut() -> crate::sync::IrqSpinLockGuard<'static, StdinRx> {
-    STDIN_RX.lock()
+    Ok(table)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rx_registration_rechecks_data_wakes_bounded_readers_and_cancels_exactly() {
+        let mut rx = StdinRx::new();
+        let cpu = crate::cpu::CpuId::from_index(0).unwrap();
+        let first = WaitToken::for_profile_test(sched::ThreadId::new(0, 1), cpu, 1);
+        let later = WaitToken::for_profile_test(sched::ThreadId::new(0, 1), cpu, 2);
+        let peer = WaitToken::for_profile_test(sched::ThreadId::new(1, 1), cpu, 3);
+        let mut buffer = [0; 2];
+        assert!(rx.poll_read(&mut buffer, Some(first)).is_pending());
+        assert!(rx.poll_read(&mut buffer, Some(peer)).is_pending());
+        let notified = rx.push(b'a'); // IRQ owns bytes, not a chosen consumer.
+        assert_eq!(notified[0], Some(first));
+        assert_eq!(notified[1], Some(peer));
+        assert!(matches!(
+            rx.poll_read(&mut buffer, Some(first)),
+            Poll::Ready(Ok(1))
+        ));
+        assert_eq!(buffer[0], b'a');
+        assert!(rx.poll_read(&mut buffer, Some(peer)).is_pending());
+        rx.cancel(peer);
+        assert_eq!(rx.waiters[1], None);
+        assert!(rx.poll_read(&mut buffer, Some(later)).is_pending());
+        rx.cancel(first); // Old operation cannot cancel the next exact wait.
+        assert_eq!(rx.waiters[0], Some(later));
+        assert_eq!(rx.push(b'b')[0], Some(later));
+        rx.push(b'c'); // Data before registration never leads to Pending.
+        assert!(matches!(
+            rx.poll_read(&mut buffer, Some(first)),
+            Poll::Ready(Ok(2))
+        ));
+        assert_eq!(&buffer, b"bc");
+        assert!(rx.waiters.iter().all(Option::is_none));
+        for _ in 0..STDIN_RX_CAPACITY {
+            rx.push(b'x');
+        }
+        rx.push(b'y');
+        assert_eq!(rx.overflow_count, 1);
+        let mut full = [0; STDIN_RX_CAPACITY];
+        assert_eq!(rx.pop_into(&mut full), STDIN_RX_CAPACITY);
+        assert!(full.iter().all(|b| *b == b'x'));
+        assert_eq!(Uart.transfer_len(false, usize::MAX), usize::MAX);
+        assert_eq!(Uart.transfer_len(true, usize::MAX), STDIN_RX_CAPACITY);
+    }
 
     #[test]
     fn saturated_tx_reports_rejection_without_consuming_any_chunk() {

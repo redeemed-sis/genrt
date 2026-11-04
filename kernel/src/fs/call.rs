@@ -2,7 +2,8 @@
 
 use super::{
     backend::{Kind, NAME_MAX, OpenFlags, Operation, Reply},
-    fd::{Open, Transaction},
+    fd::Open,
+    io::{Descriptor, IoTransaction},
     vfs::{Resolver, namespace},
 };
 use crate::{
@@ -14,14 +15,14 @@ use crate::{
     sync::task::TaskWindow,
     syscall::*,
 };
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 use core::task::Poll;
 
 const DIRENT_BUFFER_BYTES: usize = (19 + NAME_MAX + 1).next_multiple_of(8);
 
 enum Work {
     Open(Box<Open>),
-    Io(Transaction),
+    Io(IoTransaction),
     Resolve(Box<Resolver>),
 }
 
@@ -100,9 +101,9 @@ fn initialize(request: SyscallRequest) -> Result<PendingFileCall, Errno> {
                 SYS_FSYNC => Operation::Sync,
                 _ => Operation::Readdir { offset: 0 },
             };
-            let transaction = Transaction::new(description, operation, count)?;
-            // Output validation uses the actual completed byte/record length,
-            // and happens before offset commit, not before submitting a read.
+            let transaction = IoTransaction::new(description, operation, count)?;
+            // VFS output validates the actual completed length before offset
+            // commit. Consuming endpoints validate before submission below.
             Work::Io(transaction)
         }
         _ => return Err(errno::ENOSYS),
@@ -126,7 +127,7 @@ fn poll(
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(result) => result?,
             };
-            let mut description = Some(description);
+            let mut description = Some(Arc::new(Descriptor::Vfs(description)));
             Poll::Ready(process::install_current_fd(&mut description))
         }
         Work::Resolve(resolver) => {
@@ -155,6 +156,11 @@ fn poll(
             }) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(result) => result?,
+            }
+            if let Some(length) = transaction.consuming_read_len() {
+                // Stream bytes cannot be rolled back like a VFS offset. Validate
+                // before the endpoint consumes input, including after restart.
+                user::validate_user_write_range(request.arg(1), length).map_err(copy_errno)?;
             }
             let reply = match transaction.poll(Some(token)) {
                 Poll::Pending => return Poll::Pending,
