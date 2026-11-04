@@ -37,6 +37,11 @@ subject = "concurrent-append"
 [[steps]]
 action = "expect_case"
 producer = "storage-supervisor"
+subject = "shell-redirection"
+
+[[steps]]
+action = "expect_case"
+producer = "storage-supervisor"
 subject = "persistence"
 
 [[steps]]

@@ -165,6 +165,20 @@ pub(super) fn configure_mounts(directory: &Path) -> Result<()> {
 pub(super) fn verify(directory: &Path) -> Result<()> {
     let image = directory.join("storage-test.raw");
     let spec = format!("{}@@{OFFSET}", image.canonicalize()?.display());
+    for (name, expected) in [
+        ("REDIRECT.TXT", b"first\nsecond\n".as_slice()),
+        ("COPY.TXT", b"first\nsecond\nrecovered\n".as_slice()),
+    ] {
+        let extracted = directory.join(format!("{name}.host.txt"));
+        run(
+            "mcopy",
+            &["-o", "-i", &spec, &format!("::/{name}")],
+            Some(&extracted),
+        )?;
+        if fs::read(&extracted)? != expected {
+            bail!("host extraction differs from production shell output in {name}");
+        }
+    }
     let output = directory.join("persist.host.bin");
     run(
         "mcopy",

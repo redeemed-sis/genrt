@@ -1,4 +1,5 @@
 #include "../../user/c/shell_input.h"
+#include "../../user/c/shell_command.h"
 #include <stdio.h>
 #include <unistd.h>
 
@@ -174,11 +175,39 @@ static int bounds(void) {
     return 0;
 }
 
+static int parsing(void) {
+    struct shell_command command;
+    CHECK(shell_parse("  echo one\ttwo> /mnt/out  ", &command) == SHELL_PARSE_OK);
+    CHECK(command.argc == 3 && command.argv[3] == NULL);
+    CHECK(strcmp(command.argv[0], "echo") == 0 && strcmp(command.argv[2], "two") == 0);
+    CHECK(strcmp(command.output, "/mnt/out") == 0 && !command.append);
+    CHECK(shell_parse("echo>>file after", &command) == SHELL_PARSE_OK);
+    CHECK(command.argc == 2 && strcmp(command.argv[1], "after") == 0 && command.append);
+    CHECK(strcmp(command.output, "file") == 0);
+    CHECK(shell_parse("echo 2 >file", &command) == SHELL_PARSE_OK);
+    const char *invalid[] = {">file", "echo >", "echo >>>file", "echo >a >b", "echo 2>file",
+        "echo 2>>file", "echo > >file", "echo <file", "echo | cat", "echo 'quoted'",
+        "echo \"quoted\"", "echo >file &", "echo;exit", "echo >file\\name"};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        CHECK(shell_parse(invalid[i], &command) == SHELL_PARSE_SYNTAX);
+    }
+    CHECK(shell_parse("a b c d e f g h i j k l m n o p >out", &command) == SHELL_PARSE_OK);
+    CHECK(command.argc == SHELL_ARG_MAX && command.argv[SHELL_ARG_MAX] == NULL);
+    CHECK(shell_parse("a b c d e f g h i j k l m n o p q >out", &command) == SHELL_PARSE_TOO_MANY_ARGS);
+    char maximum[SHELL_LINE_MAX + 1];
+    memset(maximum, 'x', SHELL_LINE_MAX);
+    maximum[SHELL_LINE_MAX] = '\0';
+    CHECK(shell_parse(maximum, &command) == SHELL_PARSE_OK);
+    CHECK(strlen(command.argv[0]) == SHELL_LINE_MAX);
+    return 0;
+}
+
 int main(void) {
     int line = history();
     if (!line) line = terminal();
     if (!line) line = completion();
     if (!line) line = bounds();
+    if (!line) line = parsing();
     if (line) dprintf(STDERR_FILENO, "shell input failed at line %d\n", line);
     return line != 0;
 }

@@ -151,6 +151,59 @@ static void shared_offsets(void) {
     gtrt_pass(PRODUCER, subject);
 }
 
+static void text_file(const char *path, const char *expected, const char *subject) {
+    char bytes[256];
+    int fd = open(path, O_RDONLY);
+    size_t length = strlen(expected);
+    check(fd >= 3 && length <= sizeof(bytes)
+          && read(fd, bytes, sizeof(bytes)) == (ssize_t)length
+          && memcmp(bytes, expected, length) == 0 && fsync(fd) == 0
+          && close(fd) == 0, subject);
+}
+
+static void shell_redirection(int writing) {
+    const char *subject = "shell-redirection";
+    gtrt_case_start(PRODUCER, subject);
+    if (writing) {
+        pid_t child = fork();
+        check(child >= 0, subject);
+        if (child == 0) {
+            int input = open("/.__genrt_test__/storage-redirection.txt", O_RDONLY);
+            if (input < 0 || dup2(input, STDIN_FILENO) != STDIN_FILENO) _exit(1);
+            if (input != STDIN_FILENO) close(input);
+            char *argv[] = {"shell", NULL};
+            execve("/bin/shell", argv, NULL);
+            _exit(126);
+        }
+        int status = -1;
+        check(waitpid(child, &status, 0) == child && WIFEXITED(status)
+              && WEXITSTATUS(status) == 0, subject);
+        /* A child replacing stdout cannot change its parent's endpoint. */
+        check(write(STDOUT_FILENO, "parent console retained\n", 24) == 24, subject);
+    }
+    text_file("/mnt/disk/REDIRECT.TXT", "first\nsecond\n", subject);
+    text_file("/mnt/disk/COPY.TXT", "first\nsecond\nrecovered\n", subject);
+    for (unsigned i = 0; i < 4; i++) {
+        const char *invalid[] = {"/mnt/disk/UNUSED.TXT", "/mnt/disk/OTHER.TXT",
+                                "/mnt/disk/BUILTIN.TXT", "/mnt/disk/EXIT.TXT"};
+        check(open(invalid[i], O_RDONLY) == -GENRT_ENOENT, subject);
+    }
+    /* Production rtbench uses printf rather than echo/cat's direct write. */
+    char bytes[512];
+    int fd = open("/mnt/disk/PRINTF.TXT", O_RDONLY);
+    check(fd >= 3, subject);
+    ssize_t count = read(fd, bytes, sizeof(bytes) - 1);
+    check(count > 0 && count < (ssize_t)sizeof(bytes) - 1, subject);
+    bytes[count] = '\0';
+    const char *prefix = "SUMMARY steps=1 period_ns=1000000 operations=0 ";
+    const char *suffix = " result=0\n";
+    check(strncmp(bytes, prefix, strlen(prefix)) == 0
+          && (size_t)count >= strlen(suffix)
+          && strcmp(bytes + count - strlen(suffix), suffix) == 0
+          && read(fd, bytes, 1) == 0 && fsync(fd) == 0 && close(fd) == 0, subject);
+    gtrt_pass(PRODUCER, subject);
+}
+
 static void concurrent_append(void) {
     const char *subject = "concurrent-append";
     gtrt_case_start(PRODUCER, subject);
@@ -202,6 +255,7 @@ int main(void) {
     writable_io();
     shared_offsets();
     concurrent_append();
+    shell_redirection(writing);
     const char *subject = "persistence";
     gtrt_case_start(PRODUCER, subject);
     int fd = open("/mnt/disk/PERSIST.BIN", writing ? O_CREAT | O_TRUNC | O_WRONLY : O_RDONLY);

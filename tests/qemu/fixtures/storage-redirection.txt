@@ -1,0 +1,14 @@
+echo discarded-long-prefix > /mnt/disk/REDIRECT.TXT
+echo first>/mnt/disk/REDIRECT.TXT
+echo second >> /mnt/disk/REDIRECT.TXT
+cat /mnt/disk/REDIRECT.TXT > /mnt/disk/COPY.TXT
+cat /mnt/disk/REDIRECT.TXT
+rtbench -p 1000000 -n 1 -o 0 > /mnt/disk/PRINTF.TXT
+echo invalid >
+echo invalid > /mnt/disk/UNUSED.TXT > /mnt/disk/OTHER.TXT
+cd /mnt/disk > /mnt/disk/BUILTIN.TXT
+exit > /mnt/disk/EXIT.TXT
+echo denied > /etc/DENIED.TXT
+echo denied > /mnt/disk/missing/FAILED.TXT
+echo recovered >> /mnt/disk/COPY.TXT
+exit

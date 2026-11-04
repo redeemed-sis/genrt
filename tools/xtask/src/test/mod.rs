@@ -354,6 +354,11 @@ fn prepare_test_initramfs(
     let init = match image {
         cases::InitImage::StorageWrite | cases::InitImage::StorageVerify => {
             fs::create_dir_all(&test_namespace)?;
+            workflow::stage_contract_programs(&root, "shell", users)?;
+            fs::copy(
+                "tests/qemu/fixtures/storage-redirection.txt",
+                test_namespace.join("storage-redirection.txt"),
+            )?;
             fs::write(
                 test_namespace.join("storage-phase"),
                 if matches!(image, cases::InitImage::StorageWrite) {

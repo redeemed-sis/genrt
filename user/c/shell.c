@@ -3,8 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 #include "shell_input.h"
+#include "shell_command.h"
 
-#define SHELL_ARG_MAX 16
 #define SHELL_PATH_MAX 128
 
 static const char *const builtins[] = {"cd", "exit"};
@@ -120,34 +120,6 @@ static void complete_input(void) {
     }
 }
 
-static int split_words(char *line, char **argv, int max_args) {
-    int argc = 0;
-    char *p = line;
-
-    while (*p != '\0') {
-        while (*p == ' ' || *p == '\t') {
-            p++;
-        }
-        if (*p == '\0') {
-            break;
-        }
-        if (argc == max_args) {
-            return -1;
-        }
-
-        argv[argc++] = p;
-        while (*p != '\0' && *p != ' ' && *p != '\t') {
-            p++;
-        }
-        if (*p != '\0') {
-            *p++ = '\0';
-        }
-    }
-
-    argv[argc] = NULL;
-    return argc;
-}
-
 static void print_file(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -173,15 +145,23 @@ static void print_file(const char *path) {
 }
 
 static void run_command(char *line) {
-    char *argv[SHELL_ARG_MAX + 1];
+    struct shell_command command;
     char path[SHELL_PATH_MAX];
-    int argc = split_words(line, argv, SHELL_ARG_MAX);
+    enum shell_parse_result parsed = shell_parse(line, &command);
+    int argc = command.argc;
+    char **argv = command.argv;
 
-    if (argc < 0) {
-        printf("%s", "too many args\n");
+    if (parsed != SHELL_PARSE_OK) {
+        dprintf(STDERR_FILENO, "%s", parsed == SHELL_PARSE_TOO_MANY_ARGS
+                ? "too many args\n" : "redirection: malformed or unsupported syntax\n");
         return;
     }
     if (argc == 0) {
+        return;
+    }
+    int print_path = argv[0][0] == '/' && argc == 1 && strncmp(argv[0], "/bin/", 5) != 0;
+    if (command.output && (is_builtin(argv[0]) || print_path)) {
+        dprintf(STDERR_FILENO, "%s", "redirection: unsupported for built-in command\n");
         return;
     }
     if (strcmp(argv[0], "exit") == 0) {
@@ -199,7 +179,7 @@ static void run_command(char *line) {
         return;
     }
 
-    if (argv[0][0] == '/' && argc == 1 && strncmp(argv[0], "/bin/", 5) != 0) {
+    if (print_path) {
         print_file(argv[0]);
         return;
     }
@@ -217,8 +197,22 @@ static void run_command(char *line) {
         return;
     }
     if (pid == 0) {
+        if (command.output) {
+            int flags = O_WRONLY | O_CREAT | (command.append ? O_APPEND : O_TRUNC);
+            int fd = open(command.output, flags);
+            if (fd < 0) {
+                dprintf(STDERR_FILENO, "redirection: open failed (%d)\n", fd);
+                exit(126);
+            }
+            int result = dup2(fd, STDOUT_FILENO);
+            if (fd != STDOUT_FILENO) close(fd);
+            if (result < 0) {
+                dprintf(STDERR_FILENO, "redirection: dup2 failed (%d)\n", result);
+                exit(126);
+            }
+        }
         execve(path, argv, NULL);
-        printf("%s", "exec failed\n");
+        dprintf(STDERR_FILENO, "%s", "exec failed\n");
         exit(127);
     }
 

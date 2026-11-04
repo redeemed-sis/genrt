@@ -277,12 +277,13 @@ fn check_user_support() -> Result<()> {
     for (name, wrap_write) in [
         ("support", true),
         ("shell_input", false),
+        ("shell", false),
         ("rtbench", true),
         ("time", false),
     ] {
         check_user_host_program(directory, name, wrap_write)?;
     }
-    println!("userspace support, shell input, rtbench, and clock host tests passed");
+    println!("userspace support, shell input/redirection, rtbench, and clock host tests passed");
     Ok(())
 }
 
@@ -301,6 +302,9 @@ fn check_user_host_program(directory: &Path, name: &str, wrap_write: bool) -> Re
     ]);
     if wrap_write {
         compiler.arg("-Wl,--wrap=write");
+    }
+    if name == "shell" {
+        compiler.args(["-I", "tests/user/shell_host_include"]);
     }
     if name == "rtbench" {
         compiler.args([
