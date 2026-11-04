@@ -70,8 +70,11 @@ The host support test links portable library modules with `--wrap=write` to
 inject output behavior. Guest builds instead link the common public `write()`
 wrapper using architecture syscall transport and the sleep wrappers; test linker
 options never enter production ELF builds.
-The same host check builds the shell-private input tests without write
-interposition. Production shell history/completion is exercised separately by
+The same host check builds the shell-private input/parser tests without write
+interposition. `tests/user/shell.c` additionally executes the production command
+path with child syscalls substituted by `tests/user/shell_host_include` only in
+that host build, checking redirection flags, parent isolation and error cleanup.
+Production shell history/completion is exercised separately by
 `shell-contract`, whose `/bin` fixtures are explicitly marked test-only.
 
 `check` also builds `tests/user/rtbench.c`, including the actual production

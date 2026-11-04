@@ -65,6 +65,10 @@ cargo xtask test-aarch64 --case vfs-contract
 Only its supervisor, phase input and newly formatted disk are test fixtures.
 It checks mount traversal, host-seeded content, create/read/write/append/truncate,
 multi-cluster I/O, fsync, shared fork offsets and concurrent independent append.
+It also runs the exact production shell with an FD-backed command file,
+checks stdout truncate/append and readback through production utilities, and
+checks redirected printf output. The supervisor syncs the resulting files;
+the verify-only second boot and host extraction check their retained contents.
 The runner powers off and reaps QEMU, extracts/checks the persistent payload
 with mtools, checks both FAT partitions, then adds `/fstab` and boots the same
 disk with an explicit verify-only phase. The first boot checks the absent-file
@@ -97,6 +101,10 @@ identities and bootstrap stacks, stable logical bindings, CPU0-only device
 `userspace-contract` and `shell-contract` use the production kernel with a
 test-only initramfs. `/init` is a supervisor that performs
 `fork -> execve -> waitpid`; only the supervisor can report terminal success.
+Descriptor cases cover dup/dup2, closed/reused stdio, shared offsets, invalid
+and exhausted tables, replacement, and exec inheritance. UART descriptors are
+ordinary entries; the existing nonce challenge remains the real blocking-input
+regression rather than a numeric-fd shortcut.
 The shell case uses the production shell ELF and test-only helper commands. A
 host-generated nonce verifies UART RX, blocking stdin wakeup, argv propagation,
 and command execution without depending on prompts or human-readable output.

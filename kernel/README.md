@@ -18,7 +18,7 @@ hooks.
 | `ipc` | Bounded mailbox buffers, wait queues, and timeout integration |
 | `process` | [Bounded process table and lifecycle](src/process/README.md), address-space/image ownership, fork/exec/wait, cwd/FD access |
 | `block` | Exclusive bounded sector devices and validated MBR partitions |
-| `fs` | Mount-aware VFS, ramfs/FAT32 backends, paths, and shared open descriptions |
+| `fs` | Mount-aware VFS, ramfs/FAT32, shared descriptions and path-independent I/O endpoints |
 | `loader` | Static userspace ELF validation and segment loading |
 | `syscall` | Architecture-neutral syscall behavior and errno mapping |
 | `power` | Linux reboot validation and architecture-neutral terminal power policy |

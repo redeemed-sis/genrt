@@ -23,9 +23,12 @@ main-thread relationships, terminal status, and process wait/consumer metadata.
 corresponding `Thread` owns its `OwnedUserStack` and retains only a non-owning
 `AddressSpaceId`.
 
-FD slots own references to filesystem-independent open descriptions. Fork
-clones those references, sharing file and directory offsets; independent opens
-remain independent. Cwd is a mount-aware directory reference. Exec leaves both
+FD slots own references to VFS open descriptions or non-filesystem I/O objects.
+All slots, including initial UART descriptors 0 through 2, are replaceable.
+Fork clones those references, sharing file/directory offsets and endpoint state;
+independent opens remain independent. Dup2 replaces a destination atomically
+under table ownership and releases its old reference after unlocking.
+Cwd is a mount-aware directory reference. Exec leaves both
 unchanged. Process ownership covers only bounded reference clone/install/take
 operations, never backend callbacks, usercopy, or final destruction. Exit,
 fault, and failed staging detach file resources before task-context cleanup.

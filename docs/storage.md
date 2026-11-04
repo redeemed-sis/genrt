@@ -134,7 +134,7 @@ cargo xtask run-aarch64 --cpus 4 --disk target/data.raw
 ```
 
 Its first partition supplies fstab and mounts at `/mnt/disk`; the second mounts
-readonly at `/mnt/disk/DATA`. In the guest, `cat /mnt/disk/DATA/hello.txt` reads
+read-write at `/mnt/disk/DATA`. In the guest, `cat /mnt/disk/DATA/hello.txt` reads
 the sample file. A `.gitkeep` retains the first partition's mountpoint directory
 in Git; that directory is covered by the second mount. Use a new output path
 if `target/data.raw` already exists.
@@ -188,8 +188,12 @@ The supplied `examples/storage/boot/fstab` contains:
 
 ```fstab
 /dev/disk0p1 /mnt/disk      vfat defaults 0 0
-/dev/disk0p2 /mnt/disk/DATA vfat ro       0 0
+/dev/disk0p2 /mnt/disk/DATA vfat rw       0 0
 ```
+
+Both example partitions permit writes. Use `ro` for a readonly mount instead.
+Editing this source fstab does not update an existing image: stop QEMU and
+replace `/fstab` on its first partition, or create a new image at a new path.
 
 `--label` applies only to the default single-partition mode and cannot accompany
 `--layout`. Both modes refuse existing output paths. Every partition is formatted
@@ -218,8 +222,22 @@ only the explicit `disk-create` command provisions a new one. Without `--disk`, 
 run/debug/release composition remains diskless. The standalone release launcher
 does not attach disks.
 
-The shell can inspect mounted files using `ls /mnt/disk` and `cat`; it does not
-implement redirection. Freestanding C callers use ordinary `open` with
+The shell can inspect mounted files with `ls` and `cat`, and redirect external
+commands' stdout:
+
+```text
+echo first > /mnt/disk/output.txt
+echo second >> /mnt/disk/output.txt
+cat /mnt/disk/output.txt
+```
+
+The child opens with create/truncate or create/append and duplicates the file
+onto stdout before exec. The parent shell retains UART I/O. Only stdout
+redirection for external commands is supported, not builtin redirection,
+pipelines, input/stderr redirection, or quoting. Invalid syntax and failed opens
+are errors. Redirection does not implicitly fsync or make poweroff a flush.
+
+Freestanding C callers use ordinary `open` with
 `O_CREAT`, `O_RDWR`/`O_WRONLY`, `O_TRUNC`, or `O_APPEND`, then read/write and
 `fsync(fd)` before closing. File I/O has no fixed 1024-byte cap. Handle short
 transfers and negative errors; large OFD staging grows fallibly and is reused.
@@ -242,7 +260,13 @@ with two 64 MiB FAT32 partitions starting at sectors 2048 and 133120, with
 host-seeded content. Never point
 the fixture builder at a valuable disk. It is not a general provisioning API.
 Four guest CPUs exercise traversal, long names, writable/multi-cluster files,
-truncate/append coherence, fork-shared offsets and concurrent append.
+truncate/append coherence, fork-shared offsets and concurrent append. A
+controlled command file is installed as the production shell's stdin through
+dup2. The shell redirects production echo/cat writes and rtbench printf output;
+guest assertions inspect file bytes rather than UART prompts. The supervisor
+explicitly fsyncs these files before poweroff. A verify-only restart reads them
+without rerunning the script, and host extraction checks the exact text output
+after both boots.
 
 The first QEMU process has no `/fstab`: it checks fallback placement, writes
 65573 deterministic bytes to `PERSIST.BIN`, fsyncs and powers off. After reaping

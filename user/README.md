@@ -34,6 +34,21 @@ To add a production binary:
 
 ## Interactive shell
 
+External commands support stdout redirection:
+
+```text
+echo first > /mnt/disk/output.txt
+echo second >> /mnt/disk/output.txt
+cat /mnt/disk/output.txt
+```
+
+`>` creates or truncates; `>>` creates or appends. The child opens the target
+and uses dup2 before exec, so the parent retains UART input/output. Redirection
+of builtins, malformed syntax, and opening failures produce explicit errors.
+Only one stdout destination is supported; there are no pipelines, quoting,
+input redirection, or stderr redirection. The target must be on a writable
+mount; the initramfs root remains readonly. See [storage](../docs/storage.md).
+
 The shell keeps the last 16 submitted non-empty commands in a fixed ring.
 Whitespace-only and consecutively identical lines are not added; overflow
 discards the oldest entry. Up/Down (CSI or SS3 arrows) recall commands into an
@@ -173,6 +188,9 @@ does not set the userspace PC.
 
 - Syscall number in `x8`, arguments in `x0..x5`, return in `x0`.
 - Errors are negative errno values.
+- The architecture `syscall.h` exposes `dup` and `dup2`. All 32 slots, including
+  0, 1, and 2, can be closed, reused, and replaced. Open/dup use the lowest free
+  number; duplication shares the underlying VFS position or I/O endpoint.
 - Pathnames, argv/envp, I/O, and directory buffers are bounded.
 - `fork` eagerly copies process memory; `execve` replaces it from ramfs.
 - Forked descriptors share open file descriptions and positions; independent

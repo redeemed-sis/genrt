@@ -256,9 +256,12 @@ Changes that invalidate one require architecture review and an ADR.
   valid while descriptors or cwd refer to them. Dynamic unmount is deferred.
   Mountpoint crossing and conflicts use stable mount/node identity, not path
   spelling; backend aliases cannot bypass a mounted filesystem.
-- Process FD slots own references to open file descriptions, not backend
-  indexes or independent copied positions. Fork shares descriptions and
-  offsets; independent opens do not. Exec preserves descriptor and cwd state.
+- Process FD slots own references to VFS open descriptions or non-filesystem
+  I/O objects, not backend indexes or independent copied positions. Every slot,
+  including initial stdio, is replaceable. Dup2 atomically replaces a validated
+  destination and detaches its old owner for unlocked cleanup. Fork shares
+  descriptions and offsets; independent opens do not. Exec preserves descriptor
+  and cwd state.
 - Backend calls, usercopy, allocation, and final reference destruction occur
   in task context outside process/scheduler locks. Description serialization
   never holds a spinlock across I/O or usercopy.

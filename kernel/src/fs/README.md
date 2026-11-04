@@ -11,6 +11,7 @@ backend is enabled only for controlled tests.
 | `backend` | Stable nodes, metadata, owned requests, and backend completion contract |
 | `vfs` | Boot-built namespace, pinned locations, mount traversal, and resolver state |
 | `fd` | Bounded descriptor table, shared open descriptions, and logical I/O leases |
+| `io` | Unified descriptor targets and reusable path-independent endpoint I/O |
 | `call` | Process-owned syscall restart state, bounded usercopy, and exact waits |
 | `ramfs`, `initramfs` | Readonly archive adapter and deterministic boot indexing |
 | `fat` | Leased FAT32 operations, stable nodes and sector adaptation |
@@ -73,10 +74,18 @@ continue to borrow the original archive, without copying them into VFS storage.
 
 ## Descriptors and lifetimes
 
-Each process retains a fixed 32-entry FD table. Descriptors 0, 1, and 2 preserve
-their console policy; ordinary opens choose the lowest free slot from 3.
-Descriptor references are distinct from open file descriptions, which own access
-mode, backend open state, and file/directory position.
+Each process retains a fixed 32-entry FD table. Entries refer either to VFS open
+descriptions or to I/O objects without a VFS location. A VFS description owns
+access mode, backend open state, and file/directory position; an I/O object
+encapsulates endpoint state and read/write completion. The initial process gets
+UART stdin/stdout/stderr at 0, 1, and 2, but these slots are ordinary replaceable
+entries. Open and dup choose the lowest free slot, including 0 after close.
+
+`dup` shares the source reference. `dup2` validates both numbers and atomically
+replaces the destination, returning the displaced reference for unlocked
+destruction. Valid self-duplication succeeds without changing ownership;
+invalid input leaves the destination intact. Kernel logs use the kernel
+console independently of any process's stdout.
 
 Fork clones description references, intentionally sharing offsets between
 parent and child. Independent opens retain independent positions. Exec preserves
@@ -124,6 +133,14 @@ after notification and consumes the original operation's progress without
 duplicating committed side effects.
 The one-user-thread-per-process model permits one retained filesystem call per
 process; requests are not inherited by fork or carried into a new exec image.
+Non-filesystem endpoints use the same exact-wait/restart lifecycle. UART input
+registers its empty-ring wait before returning Pending; user buffers are
+validated before consuming received bytes. Endpoint dispatch is based on the
+FD entry, never on whether its number happens to be 0, 1, or 2.
+UART reads return at most the natural 256-byte RX capacity. Writes use retained
+staging and enqueue at most 256 bytes per IRQ-masked TX section, returning a
+confirmed prefix only on queue pressure. Large writes do not become silently
+truncated by a new fixed syscall byte limit.
 
 Finite allocation, submission, and destruction may use an IRQ-enabled task
 window while protecting the borrowed live exception frame from preemption.
@@ -133,8 +150,9 @@ retain an `ActiveContext`.
 
 ## Syscalls and verification
 
-`open`, `read`, `write`, `close`, `getdents64`, `chdir`, `getcwd`, and `fsync`
-dispatch through VFS. `SYS_FSYNC=20` adds explicit durability; withdrawn number
+`read` and `write` dispatch through the resolved FD entry; filesystem operations
+continue through VFS. `SYS_DUP=21` and `SYS_DUP2=22` provide descriptor
+duplication. `SYS_FSYNC=20` adds explicit durability; withdrawn number
 19 stays unknown. Writable open flags are supported
 where the backend supports them; ramfs remains readonly. File transfers use
 the full caller-specified count through retained staging; a backend can still
@@ -170,3 +188,5 @@ syscalls, terminal integration, and a page cache remain separate work.
 
 See [ADR-0062](../../../memory/decisions/ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md)
 for ownership and supersession of the earlier ramfs-only descriptor/cwd model.
+See [ADR-0071](../../../memory/decisions/ADR-0071-unified-descriptors-and-shell-redirection.md)
+for unified endpoint references and ordinary stdio slots.

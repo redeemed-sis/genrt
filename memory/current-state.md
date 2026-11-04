@@ -368,7 +368,8 @@ accepted ADRs remain authoritative when details differ.
   `waitpid` supports a specific positive child PID with options `0`.
 - Lower-EL faults terminate the attributed user process and remain joinable;
   current-EL kernel faults stay fatal.
-- The syscall ABI supports `open`, `read`, `write`, `close`, `fsync`, `getdents64`,
+- The syscall ABI supports `open`, `read`, `write`, `close`, `dup`, `dup2`,
+  `fsync`, `getdents64`,
   `chdir`, `getcwd`, `fork`, `execve`, `waitpid`, `sched_setforkaffinity`,
   `sched_getaffinity`, `clock_gettime`, `clock_getres`, `clock_nanosleep`,
   Linux-shaped `reboot`, and `exit` with negative errno returns. Restart and
@@ -440,8 +441,11 @@ accepted ADRs remain authoritative when details differ.
   See [ADR-0067](decisions/ADR-0067-resident-fat-and-canonical-file-handles.md),
   [driver-owned timeouts](decisions/ADR-0068-driver-owned-storage-timeouts.md),
   and the [library comparison](../tests/storage/fat-poc/README.md).
-- Processes have bounded FD tables and mount-aware cwd references. Fork shares
-  open file descriptions and file/directory positions; exec preserves them.
+- Processes have bounded FD tables and mount-aware cwd references. All 32 slots
+  are ordinary references to VFS descriptions or non-filesystem I/O objects,
+  including initial UART stdio. Open and dup select the lowest free slot;
+  dup2 atomically replaces a validated destination. Fork shares descriptions,
+  file/directory positions, and endpoint state; exec preserves them.
   Backend work and final resource destruction run outside process/scheduler
   critical sections. Pending I/O uses exact waits and syscall restart rather
   than blocking beneath a borrowed live frame.
@@ -465,8 +469,14 @@ accepted ADRs remain authoritative when details differ.
   state and directory scanning use fixed storage; the existing 256-byte line
   and 16-argument limits remain. Host editor tests and the production-shell
   QEMU contract cover history, completion, bounds, and escape recovery.
-- PL011 RX interrupts feed a bounded kernel stdin ring. `read(0)` blocks and is
-  restarted after input; line editing and command policy live in userspace.
+- The shell supports external-command stdout `>` and `>>` using child-only
+  open/dup2 before exec. Builtin redirection and malformed syntax are rejected.
+  The parent retains its original UART descriptors. See
+  [ADR-0071](decisions/ADR-0071-unified-descriptors-and-shell-redirection.md).
+- PL011 RX interrupts feed a bounded kernel input ring. A read from its I/O
+  object blocks through the common pending-call lifecycle and restarts after
+  input, regardless of descriptor number; editing and command policy remain
+  userspace-owned.
   Stdin, mailbox, and process owner state use IRQ-safe SMP locks; completion
   occurs after the owner is released. Logging enqueues complete records into a
   bounded allocation-free TX ring and one drainer performs UART polling outside

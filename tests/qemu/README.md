@@ -53,6 +53,8 @@ remain uninstrumented and reject diagnostic kernel markers.
   I/O, independent append/truncate coherence, fsync, shared fork offsets and
   cross-CPU append serialization. Two separate QEMU processes reuse the same
   two-partition image. The first boot checks absent-fstab fallback; the host
+  also verifies production-shell stdout redirection to files through write and
+  printf, with explicit guest fsync and verify-only readback after restart. It
   adds `/fstab` before the verify-only restart, which checks a readonly nested
   mount and cross-volume CPU access. Host mtools extraction/SHA-256 and fsck
   checks of both partitions run after both boots. No user-supplied image is formatted; see
@@ -70,6 +72,8 @@ remain uninstrumented and reject diagnostic kernel markers.
   production `/bin/sleep`, shared support-library boundary checks, and exact
   production `/bin/rtbench` execution plus positive-workload and invalid-CLI
   wait/exit contracts, including verbose output and duplicate verbosity rejection.
+  Descriptor cases exercise dup/dup2, replacement/reuse of stdio, shared offsets,
+  exhaustion, invalid descriptors, and inheritance across fork/exec.
   The registered rtbench invocation uses three 1 ms steps with zero payload
   operations and POSIX absolute sleep. CLI scenarios reject the withdrawn
   `-C` option. Large sample-capacity tests stay on host.

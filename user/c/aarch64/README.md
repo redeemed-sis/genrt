@@ -78,10 +78,20 @@ bounded by `GENRT_PATH_MAX = 4096` bytes excluding NUL.
 
 ## File synchronization and transfer lengths
 
+`dup(int fd)` uses `SYS_DUP=21`; `dup2(int fd, int target)` uses `SYS_DUP2=22`.
+Arguments occupy x0/x1 and success returns the new descriptor in x0. All slots,
+including 0 through 2, are replaceable. Open/dup select the lowest free slot.
+Duplication shares the underlying description/endpoint and VFS position.
+Dup2 validates both numbers before replacement; valid self-duplication is a
+no-op. Invalid descriptors return `-EBADF`, and full-table dup returns `-EMFILE`.
+The replaced reference is released outside the process lock. See
+[ADR-0071](../../../memory/decisions/ADR-0071-unified-descriptors-and-shell-redirection.md).
+
 `fsync(int fd)` in `syscall.h` uses `SYS_FSYNC=20`, with fd in x0 and zero or
 negative errno in x0 on return. It persists the backend's file and filesystem
-metadata, including a block-device flush for FAT32. Std streams and absent
-descriptors return `-EBADF`. Number 19 remains withdrawn/unknown. Closing or
+metadata, including a block-device flush for FAT32. UART endpoints return
+`-EINVAL`; absent descriptors return `-EBADF`. A VFS file installed at 0, 1, or
+2 supports fsync normally. Number 19 remains withdrawn/unknown. Closing or
 powering off does not replace fsync. See [ADR-0065](../../../memory/decisions/ADR-0065-fsync-syscall.md).
 
 File read/write accept the requested count up to the signed result domain;
