@@ -52,6 +52,8 @@ static WAIT_WORKER_STAGE: AtomicUsize = AtomicUsize::new(0);
 static WAIT_CAUSE_A: AtomicUsize = AtomicUsize::new(0);
 static WAIT_CAUSE_B: AtomicUsize = AtomicUsize::new(0);
 static MAILBOX_WAIT_RESULT: AtomicUsize = AtomicUsize::new(0);
+static MAILBOX_WORKER_STAGE: AtomicUsize = AtomicUsize::new(0);
+static MAILBOX_WORKER_STARTED: AtomicU64 = AtomicU64::new(0);
 static TEST_PREEMPT_LOCK: SpinLock<usize> = SpinLock::new(0);
 static PUBLISHED_WAIT_TOKEN: SpinLock<Option<sched::WaitToken>> = SpinLock::new(None);
 
@@ -611,8 +613,10 @@ const fn encode_wait_cause(cause: sched::WaitCause) -> usize {
 
 fn run_mailbox_timed_receive() {
     const CASE: &str = "mailbox-timed-receive";
-    for _ in 0..WAIT_TOKEN_STRESS_CYCLES {
+    for cycle in 0..WAIT_TOKEN_STRESS_CYCLES {
         MAILBOX_WAIT_RESULT.store(0, Ordering::Release);
+        MAILBOX_WORKER_STAGE.store(0, Ordering::Release);
+        MAILBOX_WORKER_STARTED.store(0, Ordering::Release);
         let worker = sched::thread_spawn(
             mailbox_timed_worker,
             ThreadArg::empty(),
@@ -622,7 +626,22 @@ fn run_mailbox_timed_receive() {
         let deadline = crate::time::now_counter().wrapping_add(crate::time::ms_to_counts(250));
         while test_mailbox().waiter_count_for_test() == 0 {
             if crate::time::now_counter() >= deadline {
-                protocol::fail(CASE, "WAITER_PUBLICATION_TIMEOUT");
+                let stage = MAILBOX_WORKER_STAGE.load(Ordering::Acquire);
+                crate::error!(
+                    "mailbox test: cycle={cycle} worker={worker:?} stage={stage} len={} started={} now={}",
+                    test_mailbox().len(),
+                    MAILBOX_WORKER_STARTED.load(Ordering::Acquire),
+                    crate::time::now_counter(),
+                );
+                protocol::fail(
+                    CASE,
+                    match stage {
+                        0 => "WORKER_START_TIMEOUT",
+                        2 => "RECEIVE_COMPLETED_BEFORE_SEND",
+                        3 => "RECEIVE_TIMED_OUT_BEFORE_SEND",
+                        _ => "WAITER_PUBLICATION_TIMEOUT",
+                    },
+                );
             }
             sched::yield_now();
         }
@@ -646,8 +665,15 @@ fn run_mailbox_timed_receive() {
 }
 
 fn mailbox_timed_worker(_arg: ThreadArg) -> usize {
-    let value = test_mailbox().recv_timeout_ms(5_000).unwrap_or(0);
-    MAILBOX_WAIT_RESULT.store(value, Ordering::Release);
+    MAILBOX_WORKER_STARTED.store(crate::time::now_counter(), Ordering::Release);
+    MAILBOX_WORKER_STAGE.store(1, Ordering::Release);
+    match test_mailbox().recv_timeout_ms(5_000) {
+        Ok(value) => {
+            MAILBOX_WAIT_RESULT.store(value, Ordering::Release);
+            MAILBOX_WORKER_STAGE.store(2, Ordering::Release);
+        }
+        Err(_) => MAILBOX_WORKER_STAGE.store(3, Ordering::Release),
+    }
     0
 }
 
