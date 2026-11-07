@@ -1,6 +1,6 @@
 schema = 1
 
-# Boot configuration and the DATA mountpoint.
+# First volume with the DATA mountpoint; fstab is in initramfs/etc/.
 [[partitions]]
 size_mib = 64
 label = "BOOT"

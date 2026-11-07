@@ -12,9 +12,10 @@ without exposing sectors outside the partition. GPT/extended traversal is not
 implemented.
 
 A bounded staging registry moves discovered device owners into the first
-initialization thread in firmware order. On the current QEMU backend the first
-disk supplies boot mount configuration; it is not implicitly the only usable
-disk or evidence of the medium used to load the kernel. Partitions sharing a
+initialization thread in firmware order, then into a permanent registry for
+runtime mount requests. `/dev/diskNpM` selects a discovered disk and original
+primary MBR slot, not an actual devfs node. Device registration selects no
+filesystem or mount policy and does not inspect fstab. Partitions sharing a
 controller reserve one physical owner before FAT work and return it afterward.
 Contention registers exact wait tokens; short locks only move ownership and
 registrations. All allocation, sector I/O, flush and destruction occur outside

@@ -64,14 +64,12 @@ explicit acceptance criteria.
 
 - Add Pi SD controller discovery and a concrete block driver before claiming
   runtime access to the microSD filesystem used by U-Boot.
-- Define an explicit loader/platform boot-medium identity and match it to a
-  probed disk. Prefer that medium for `/fstab`, using its first FAT32 partition;
-  retain first-discovered-disk selection when no boot medium is identified,
-  as in the current QEMU workflow. Do not infer disk identity from RAM addresses
-  or silently choose another disk when an explicitly identified medium is absent.
-- Keep configuration-source selection separate from the partition sources in
-  fstab. Preserve absence-only fallback and the existing namespace ownership
-  rules; see [storage](../storage.md#boot-mount-configuration).
+- If boot-medium-relative selectors are added, define an explicit loader/platform
+  identity and match it to a probed disk. Do not infer disk identity from RAM
+  addresses or silently substitute discovery order. Mount policy now belongs
+  to userspace `/init`, with `/etc/fstab` in initramfs; keep new selector policy
+  separate from device discovery and preserve explicit failure behavior.
+  See [storage](../storage.md#boot-mount-configuration).
 
 Every hardening change needs focused regression evidence and must preserve the
 real-time, architecture, user-fault, and release invariants in `memory/`.

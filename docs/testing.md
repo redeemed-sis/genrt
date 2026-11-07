@@ -62,7 +62,7 @@ cargo xtask test-aarch64 --case vfs-contract
 ```
 
 `storage-contract` uses production block/FAT code and a four-CPU topology.
-Only its supervisor, phase input and newly formatted disk are test fixtures.
+Its supervisor, configuration/phase inputs and newly formatted disk are test fixtures.
 It checks mount traversal, host-seeded content, create/read/write/append/truncate,
 multi-cluster I/O, fsync, shared fork offsets and concurrent independent append.
 It also runs the exact production shell with an FD-backed command file,
@@ -70,10 +70,13 @@ checks stdout truncate/append and readback through production utilities, and
 checks redirected printf output. The supervisor syncs the resulting files;
 the verify-only second boot and host extraction check their retained contents.
 The runner powers off and reaps QEMU, extracts/checks the persistent payload
-with mtools, checks both FAT partitions, then adds `/fstab` and boots the same
-disk with an explicit verify-only phase. The first boot checks the absent-file
-fallback; the second must find the existing payload and the configured readonly
-nested partition. It also checks cross-CPU operations on both volumes sharing
+with mtools, checks both FAT partitions, then boots the same disk with a
+verify-only phase. Both configurations reside in initramfs `/etc/fstab`, not
+on the disk; the exact production initializer mounts them before execing the
+shell. Runtime checks cover invalid mount arguments, partition conflicts,
+concurrent CPU requests, and pinned cwd/FDs across publication. The second
+boot must find the existing payload and configured readonly nested partition.
+It also checks cross-CPU operations on both volumes sharing
 the controller. Host checks repeat after that boot. Install `dosfstools`, `mtools` and
 GNU `timeout`; logs and checksum are retained under the case artifact directory.
 See [storage](storage.md) for commands, budgets and verification limitations.
@@ -105,6 +108,10 @@ Descriptor cases cover dup/dup2, closed/reused stdio, shared offsets, invalid
 and exhausted tables, replacement, and exec inheritance. UART descriptors are
 ordinary entries; the existing nonce challenge remains the real blocking-input
 regression rather than a numeric-fd shortcut.
+The exact production initializer also runs against a controlled fstab whose two
+mount requests fail without a disk; shell exec and normal child exit must still
+succeed. Host initializer tests check individual/all failures, continued entry
+processing and the corresponding stderr warnings.
 The shell case uses the production shell ELF and test-only helper commands. A
 host-generated nonce verifies UART RX, blocking stdin wakeup, argv propagation,
 and command execution without depending on prompts or human-readable output.

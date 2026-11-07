@@ -2,41 +2,49 @@
 
 The mount-aware VFS separates pathname, descriptor, and process policy from
 filesystem backends. The production root is readonly initramfs-backed ramfs;
-optional FAT32 backends mount QEMU partitions according to boot `/fstab`, with
-`/mnt/disk` as the absent-file fallback. A separate writable/generated test
+optional FAT32 backends mount QEMU partitions on explicit userspace requests.
+`/init` reads `/etc/fstab` from initramfs; there is no implicit disk mount.
+A separate writable/generated test
 backend is enabled only for controlled tests.
 
 | Module | Responsibility |
 | --- | --- |
 | `backend` | Stable nodes, metadata, owned requests, and backend completion contract |
-| `vfs` | Boot-built namespace, pinned locations, mount traversal, and resolver state |
+| `vfs` | Runtime mount publication, pinned locations, traversal, and resolver state |
 | `fd` | Bounded descriptor table, shared open descriptions, and logical I/O leases |
 | `io` | Unified descriptor targets and reusable path-independent endpoint I/O |
 | `call` | Process-owned syscall restart state, bounded usercopy, and exact waits |
 | `ramfs`, `initramfs` | Readonly archive adapter and deterministic boot indexing |
 | `fat` | Leased FAT32 operations, stable nodes and sector adaptation |
-| `mounts` | First-disk FAT32 configuration lookup and boot mount policy |
+| `mounts` | Persistent disk registry, partition reservations, and mount transactions |
 | `testfs` (test-only) | Independent writable/generated instances and pending-I/O fixture |
 
 ## Namespace and paths
 
-The first ordinary initialization thread builds and publishes the namespace
-before spawning EL0. Early boot indexes initramfs but performs no disk I/O.
-One global kernel-controlled namespace attaches filesystem instances at existing
+The first ordinary initialization thread publishes a root-only namespace and
+registers discovered block owners before spawning EL0. It does not parse fstab
+or construct FAT filesystems. One global namespace attaches instances at existing
 directories. Mounts and referenced nodes remain stable; dynamic unmount is not
 implemented. Invalid or conflicting registration fails without replacing an
 existing mount.
-The boot namespace permits at most 16 additional mounts beyond its root.
+The namespace permits at most 16 additional mounts beyond its root.
 Mountpoint crossing and conflict checks use filesystem-instance/node identity,
 so FAT case and short-name aliases cannot bypass a mounted filesystem.
 
-Current QEMU storage uses the first discovered disk and its first primary FAT32
-partition to read `/fstab`; this is not a hardware boot-medium identification
-mechanism. Only a missing file selects `/mnt/disk`; a present
-file controls all automatic mounts, including an empty table. Parsing and mount
-application happen before namespace publication. Entries name partitions with
-`/dev/diskNpM` boot selectors, support readonly policy and require existing
-mountpoint directories. See [storage](../../../docs/storage.md) for the format.
+`mount(source, target, type, flags, data)` accepts `/dev/diskNpM`, an absolute
+existing directory, `vfat`/`fat32`, flags zero or `MS_RDONLY`, and NULL data.
+There is no credentials model yet: every process can request global mounts.
+Unmount and root replacement are unsupported. Partition reservation, path
+resolution and filesystem construction are owned restartable task work; no
+spinlock covers callbacks, allocation, device I/O or destruction. Publication
+checks conflicts and inserts the prepared mount under one `MountTable` lock.
+It compares pinned ancestry against current mountpoints, without a generation
+counter. If another mount covered the target, lookup restarts outside the lock;
+unrelated mounts do not cause a retry. Failure never installs a partial mount.
+Existing cwd and OFDs pin their old locations; subsequent fresh pathname
+resolution sees published mounts. Mounts are additive, not a transaction over
+the entire fstab: a later failed entry does not roll back earlier mounts.
+See [storage](../../../docs/storage.md) for configuration and error policy.
 
 Path traversal is component-based, absolute or relative to mount-aware cwd.
 `.` remains in the current directory. At a mounted root, `..` crosses to the

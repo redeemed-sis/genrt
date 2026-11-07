@@ -1,41 +1,29 @@
 # QEMU FAT32 storage
 
 Storage is optional on AArch64 QEMU `virt`. The readonly initramfs remains `/`;
-the first discovered disk and its first primary MBR FAT32 partition provide
-optional boot mount configuration. Without `/fstab` on that partition, it mounts
-at `/mnt/disk`. A missing disk is normal. Invalid selected storage or present
-but invalid configuration fails initialization explicitly. Raspberry Pi SDHOST
-is not implemented.
+`/init` reads `/etc/fstab` from that initramfs and requests runtime FAT32 mounts.
+No disk is mounted implicitly by the kernel. Missing disks produce warnings
+for configured mount requests but do not prevent shell startup.
+Raspberry Pi SDHOST is not implemented.
 
 ## Boot mount configuration
 
-On the current QEMU backend, the first ordinary initialization task discovers
-block devices, reads the first disk's MBR, and opens its first type 0x0b/0x0c
-partition in MBR slot order. It
-looks for `/fstab` at the root of that FAT32 filesystem, not in the initramfs.
-It does not search another partition or disk when the selected one is invalid
-or has no FAT32 partition.
+The kernel publishes a root-only namespace and retains discovered disks before
+starting EL0. It neither opens FAT32 volumes nor reads or parses fstab during
+bootstrap. `/init` validates the entire `/etc/fstab`, applies automatic entries
+in order using `mount()`, then execs `/bin/shell` in the same process.
 
-Configuration-source selection is distinct from the partitions named in fstab:
-
-- QEMU loads the kernel through `-kernel`, not from an attached disk. The first
-  discovered disk therefore supplies configuration by convention.
-- For hardware boot from storage, the requested policy is to use the medium
-  from which the kernel was loaded, then its first FAT32 partition. On a Pi
-  booted from microSD, this means the SD card, not an unrelated first-probed disk.
-  This branch is not implemented: genrt has neither a Pi SD driver nor a
-  loader-to-driver boot-medium identity contract yet. See the
-  [storage bootstrap backlog](roadmap/hardening.md#storage-bootstrap).
-
-Boot-medium identity must come from explicit platform/loader information, not
-the FIT's RAM address or an assumption about device discovery order. The fstab
-entries may still select partitions on other discovered disks.
-
-- If `/fstab` is absent, mount that partition at `/mnt/disk`.
-- If `/fstab` exists, mount its automatic entries in file order. There is no
-  implicit `/mnt/disk` mount; an empty configuration mounts no disk partitions.
-- Read errors, a directory named `fstab`, unsupported fields, and invalid mount
-  targets are errors, not reasons to silently use the fallback.
+- Missing or empty configuration starts with initramfs only, even with a disk.
+- Invalid or unreadable configuration reports an error and stops initialization.
+- A failed `mount()` prints its source, target, line and errno to stderr as a
+  warning. Init still attempts every remaining automatic entry and starts the
+  shell, even when all mounts fail. There is no alternate-disk fallback.
+- Earlier successful mounts remain installed after a later mount failure;
+  there is no whole-fstab rollback or unmount.
+- The default `user/initramfs/etc/fstab` requests `/dev/disk0p1` at `/mnt/disk`
+  and `/dev/disk0p2` at `/mnt/disk/DATA`, both read-write vfat. Use a distinct
+  initramfs source tree to override it; an empty/comments-only file omits mounts.
+- A file named `/fstab` on a FAT32 partition has no special meaning.
 
 The supported six-field format is:
 
@@ -47,13 +35,13 @@ The supported six-field format is:
 
 `disk0` is the first successfully probed block device in firmware discovery
 order. Partition numbers are original primary MBR slots 1 through 4, including
-holes; they are not FAT-only ordinals. These strings identify boot sources and
+holes; they are not FAT-only ordinals. These strings identify mount sources and
 do not imply that a devfs or userspace device nodes exist.
 
 Only FAT32 (`vfat` or `fat32`) is supported. Options are `defaults`, `rw`, `ro`,
 and `noauto`; `defaults` uses read-write access subject to physical write
 protection. `noauto` skips automatic mounting. Both final fields must be zero:
-boot-time dump and fsck are not implemented. The file is limited to 16 KiB and
+automatic dump and fsck are not implemented. The file is limited to 16 KiB and
 16 entries. Duplicate sources are rejected, preventing
 two independent FAT caches from mutating the same partition.
 Blank lines and comments are accepted; octal escapes such as `\040` encode
@@ -61,9 +49,26 @@ spaces within fields. Up to 32 discovered disks can be staged for boot.
 
 Mountpoints must already be directories. In the example, `DATA` must exist on
 the first partition before mounting the second. Parent mounts precede nested
-mounts. Root replacement and dynamic unmount remain unsupported. Discovery and
-configuration reading reuse the first filesystem instance when it is mounted;
-they do not open a second independently cached instance of that partition.
+mounts. Root replacement and dynamic unmount remain unsupported. Partition
+claims prevent competing FAT caches, including simultaneous mount requests.
+
+### Mount syscall
+
+`<sys/mount.h>` declares:
+
+```c
+int mount(const char *source, const char *target, const char *filesystemtype,
+          unsigned long mountflags, const void *data);
+```
+
+This Linux-shaped genrt subset accepts `/dev/diskNpM`, an existing absolute
+directory, `vfat` or `fat32`, flags zero or `MS_RDONLY`, and NULL data. Errors are
+direct negative errno values; unsupported types/options fail explicitly. All
+processes may request global mounts until a credentials model exists.
+The namespace permits 16 additional mounts. Duplicate partitions, duplicate
+targets, root replacement and mounts hiding existing child mounts are rejected.
+Existing cwd/open descriptions retain their old pinned location; fresh absolute
+lookups see the new mount. Unmount, devfs and per-process namespaces are absent.
 
 ## Create a data disk
 
@@ -71,7 +76,10 @@ Run from the repository root:
 
 ```bash
 cargo xtask disk-create --output target/data.raw --size-mib 128 --label GENRT
-cargo xtask run-aarch64 --cpus 4 --disk target/data.raw
+mkdir -p target/storage-root/etc
+printf '/dev/disk0p1 /mnt/disk vfat defaults 0 0\n' > target/storage-root/etc/fstab
+cargo xtask run-aarch64 --cpus 4 --disk target/data.raw \
+  --initramfs-root target/storage-root
 ```
 
 `disk-create` needs `sfdisk` from util-linux (the `fdisk` package on Ubuntu),
@@ -100,7 +108,7 @@ limited to 60 seconds with a further two-second forced-termination grace period.
 
 Without `--layout`, the filesystem is empty: no kernel, initramfs, bootloader,
 fstab, or test files are installed. QEMU loads the kernel separately; without
-fstab genrt mounts the new filesystem at `/mnt/disk`. This is a data image,
+an explicit initramfs fstab genrt leaves it unmounted. This is a data image,
 not bootable Pi media.
 Large FAT volumes retain larger caches in genrt; successful formatting alone
 does not establish that an arbitrary size fits the configured kernel heap.
@@ -114,8 +122,6 @@ mtools_config=$(mktemp)
 printf 'drive g: file="%s" partition=1\n' "$(realpath target/data.raw)" > "$mtools_config"
 MTOOLSRC="$mtools_config" mdir g:/
 MTOOLSRC="$mtools_config" mcopy ./my-file.txt g:/
-# Optional: copy an existing six-field configuration to the partition root.
-MTOOLSRC="$mtools_config" mcopy ./fstab g:/fstab
 rm -- "$mtools_config"
 ```
 
@@ -130,10 +136,12 @@ under `examples/storage/`. From the repository root:
 ```bash
 cargo xtask disk-create --output target/data.raw --size-mib 256 \
   --layout examples/storage/disk.toml
-cargo xtask run-aarch64 --cpus 4 --disk target/data.raw
+cargo xtask run-aarch64 --cpus 4 --disk target/data.raw \
+  --initramfs-root examples/storage/initramfs
 ```
 
-Its first partition supplies fstab and mounts at `/mnt/disk`; the second mounts
+The example initramfs supplies `/etc/fstab`; its first partition mounts at
+`/mnt/disk`, and the second mounts
 read-write at `/mnt/disk/DATA`. In the guest, `cat /mnt/disk/DATA/hello.txt` reads
 the sample file. A `.gitkeep` retains the first partition's mountpoint directory
 in Git; that directory is covered by the second mount. Use a new output path
@@ -146,10 +154,10 @@ optional source directories. The supplied example has this structure:
 examples/storage/
   disk.toml
   boot/
-    fstab
     DATA/.gitkeep
   data/
     hello.txt
+  initramfs/etc/fstab
 ```
 
 The corresponding `disk.toml` is:
@@ -181,10 +189,10 @@ and empty directories are included in sorted order; symlinks within that tree,
 special files, invalid FAT names and case-conflicting names fail creation.
 Source trees must remain unchanged while building. Copied entry timestamps
 are fixed at 1980-01-01 UTC; host timestamps and permissions are not preserved
-or modified. No fstab is generated or rewritten: place the desired file in
-the first source tree.
+or modified. `disk-create` does not generate or install fstab; configuration
+belongs in the separately selected initramfs source tree.
 
-The supplied `examples/storage/boot/fstab` contains:
+The supplied `examples/storage/initramfs/etc/fstab` contains:
 
 ```fstab
 /dev/disk0p1 /mnt/disk      vfat defaults 0 0
@@ -192,8 +200,9 @@ The supplied `examples/storage/boot/fstab` contains:
 ```
 
 Both example partitions permit writes. Use `ro` for a readonly mount instead.
-Editing this source fstab does not update an existing image: stop QEMU and
-replace `/fstab` on its first partition, or create a new image at a new path.
+Editing this source fstab takes effect when the initramfs is rebuilt; the data
+disk need not be recreated or modified. Rebuild a prebuilt `--initramfs`
+separately. Old disk-root fstab files are ignored.
 
 `--label` applies only to the default single-partition mode and cannot accompany
 `--layout`. Both modes refuse existing output paths. Every partition is formatted
@@ -268,12 +277,12 @@ explicitly fsyncs these files before poweroff. A verify-only restart reads them
 without rerunning the script, and host extraction checks the exact text output
 after both boots.
 
-The first QEMU process has no `/fstab`: it checks fallback placement, writes
+The first QEMU process uses an explicit initramfs `/etc/fstab`, writes
 65573 deterministic bytes to `PERSIST.BIN`, fsyncs and powers off. After reaping
 it, xtask extracts the file with `mcopy`, compares all bytes and SHA-256, and runs
-`fsck.fat -n` on copies of both partitions. The host then adds `/fstab` to the
-first partition. A second QEMU process boots the same raw image with a distinct
-verify-only initramfs input; it must read the existing payload and mount the
+`fsck.fat -n` on copies of both partitions. A second QEMU process boots the same
+raw image with a distinct verify-only initramfs configuration; it must read
+the existing payload and mount the
 second partition readonly at `/mnt/disk/EXTRA`. It checks readonly enforcement,
 mount-parent traversal and cross-CPU operations on the two volumes sharing one
 controller. Host checks repeat after the second poweroff.
@@ -314,8 +323,9 @@ power-loss guarantees.
   `Pending` with an exact wait token. Sector calls use the reserved owner without
   holding a spinlock or entering a nested scheduler wait. Different partitions
   retain separate filesystem caches; one partition is mounted only once.
-- The first initialization thread constructs and publishes the namespace before
-  spawning EL0. Runtime FAT calls run with IRQs enabled, outside process,
+- The first initialization thread publishes a root-only namespace before EL0.
+  Userspace requests are the only production FAT mount path.
+  Runtime FAT calls run with IRQs enabled, outside process,
   scheduler, OFD and volume spinlocks. Competing volume users publish exact
   waits and resume through existing syscall restart, without resubmitting work.
 - `resident-fat` 0.3.1 retains the FAT and parsed directories. Each stable node
@@ -367,6 +377,6 @@ See [ADR-0064](../memory/decisions/ADR-0064-qemu-block-storage-and-fat32.md),
 [resident handle ownership](../memory/decisions/ADR-0067-resident-fat-and-canonical-file-handles.md),
 [driver-owned timeouts](../memory/decisions/ADR-0068-driver-owned-storage-timeouts.md),
 [shared DTB and staged probe](../memory/decisions/ADR-0069-shared-runtime-dtb-and-staged-probe.md),
-[boot mount policy](../memory/decisions/ADR-0070-fstab-boot-mounts-and-shared-disks.md),
+[runtime mounts and init](../memory/decisions/ADR-0072-runtime-mounts-and-userspace-init.md),
 [fsync ABI](../memory/decisions/ADR-0065-fsync-syscall.md), and
 [usercopy lengths](../memory/decisions/ADR-0066-usercopy-length-and-owned-io-growth.md).

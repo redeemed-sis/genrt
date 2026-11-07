@@ -110,15 +110,20 @@ Create a separate empty data image explicitly:
 
 ```bash
 cargo xtask disk-create --output target/data.raw --size-mib 128 --label GENRT
-cargo xtask run-aarch64 --cpus 4 --disk target/data.raw
+mkdir -p target/storage-root/etc
+printf '/dev/disk0p1 /mnt/disk vfat defaults 0 0\n' > target/storage-root/etc/fstab
+cargo xtask run-aarch64 --cpus 4 --disk target/data.raw \
+  --initramfs-root target/storage-root
 ```
 
 The size is the entire disk in MiB (minimum 65, default 128). By default, `sfdisk`
 creates one FAT32 partition; `mkfs.fat` chooses cluster size. The parent must
 exist and support hard links; existing output
 entries, including symlinks, are never replaced. Formatting is bounded and
-staged privately before publication. No kernel, initramfs or fstab is installed;
-the normal absent-fstab fallback mounts the partition at `/mnt/disk`.
+staged privately before publication. No kernel, initramfs or fstab is installed.
+Mounts follow `/etc/fstab` entries in initramfs. The default image requests the
+first two partitions of disk0 at `/mnt/disk` and `/mnt/disk/DATA`; absent or
+unsuitable partitions warn on stderr without preventing shell startup.
 See [disk preparation](../../docs/storage.md#create-a-data-disk) for dependencies
 and host-side file copying. `disk-create` does not change test fixture or release
 composition.
@@ -129,8 +134,9 @@ For multiple partitions and initial files, pass
 MiB; only the last size may be omitted to use remaining space. Up to four FAT32
 partitions are supported. Source paths are relative to the TOML file. Sorted
 contents, including dotfiles and empty directories, are copied with fixed FAT
-timestamps before publication. Supply `fstab` in the first partition's source;
-it is not generated implicitly. `--label` and `--layout` are mutually exclusive.
+timestamps before publication. Configuration is separate from the data disk:
+pass `--initramfs-root examples/storage/initramfs` to run with the example
+`/etc/fstab`. It is not generated implicitly. `--label` and `--layout` are mutually exclusive.
 See the [multi-partition example](../../docs/storage.md#multiple-partitions-and-initial-files).
 
 Child ownership includes bounded deadlines, concurrent UART/stderr draining,

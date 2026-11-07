@@ -48,11 +48,12 @@ and enters that saved frame. Generic code neither invokes local interrupt setup
 nor controls DAIF. The scheduler marks each context online immediately before
 the saved frame entry; CPU0 waits sequentially for every exact context. CPU0
 then enters its first selected trap frame.
-The init kernel thread constructs the namespace, optionally discovers/mounts
-QEMU FAT32 storage, reads boot `/fstab` or uses the `/mnt/disk` fallback,
-publishes the namespace, then spawns `/init` and joins it.
-Disk discovery and filesystem I/O therefore run in ordinary IRQ-enabled task
-context, not early bootstrap. See [storage](../docs/storage.md).
+The init kernel thread discovers/registers block owners, publishes a root-only
+namespace, then spawns `/init` and joins it. Userspace init reads `/etc/fstab`
+from initramfs, requests FAT32 mounts and execs `/bin/shell`. No kernel fstab
+parser or automatic `/mnt/disk` fallback remains. Discovery and mount I/O run
+in ordinary IRQ-enabled task context, not early bootstrap.
+See [storage](../docs/storage.md).
 
 The production scheduler starts with exactly two kernel threads: the permanent
 idle thread and one non-idle `kernel_init_thread`. QEMU scenario features replace

@@ -31,7 +31,7 @@ a production-ready or latency-certified operating system.
 - Process-owned TTBR0 address spaces, static AArch64 ELF loading, lower-EL fault
   isolation, and eager-copy `fork`/`execve`/`waitpid`.
 - Mount-aware VFS with a readonly CPIO root, bounded per-process FD tables,
-  shared open descriptions, optional [QEMU FAT32 storage](docs/storage.md), and UART stdin.
+  shared open descriptions, userspace-configured [QEMU FAT32 mounts](docs/storage.md), and UART stdin.
 - Freestanding C shell with stdout redirection and product programs declared by
   `user/c/programs.toml`.
 - POSIX-like monotonic clock observation and relative/absolute sleep APIs,

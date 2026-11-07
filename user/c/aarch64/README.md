@@ -11,7 +11,7 @@ Architecture-neutral [support APIs](../common/README.md) live in
 statically links the common archive; architecture wrappers keep ownership of
 the syscall ABI.
 
-The public `sched.h`, `time.h`, `unistd.h`, and `sys/reboot.h` headers live in
+The public `sched.h`, `time.h`, `unistd.h`, `sys/mount.h`, and `sys/reboot.h` headers live in
 `../include/`. They define architecture-neutral interfaces. `unistd.h` contains
 declarations only; other inline syscall wrappers delegate transport to
 `syscall.h`, selected through the architecture include path.
@@ -66,7 +66,7 @@ terminates the process with `SYS_EXIT`.
 
 ## Path and cwd syscall ABI
 
-The AArch64 syscall wrappers use `x8` for the syscall number and `x0..x2` for
+The AArch64 syscall wrappers use `x8` for the syscall number and `x0..x5` for
 arguments. `chdir(path)` changes the current process cwd. `getcwd(buf, size)`
 invokes a kernel ABI that returns the byte count including the terminating NUL;
 the C wrapper translates success to `buf` and any negative errno to `NULL`.
@@ -77,6 +77,15 @@ directory identity, and successful `execve` preserves it. Relative `open`,
 bounded by `GENRT_PATH_MAX = 4096` bytes excluding NUL.
 
 ## File synchronization and transfer lengths
+
+`mount(source, target, type, flags, data)` uses `SYS_MOUNT=23` and x0 through
+x4 in that order. `<sys/mount.h>` supports `/dev/diskNpM`, absolute existing
+directories, `vfat`/`fat32`, zero or `MS_RDONLY=1`, and NULL data. Success returns
+zero; failures return direct negative errno. Bad pointers yield `-EFAULT`,
+unsupported types `-ENOTSUP`, unsupported flags/data `-EINVAL`, and conflicting
+or repeated mounts `-EBUSY`. The namespace is global; all processes may mount
+until credentials exist. Existing cwd/FDs stay pinned and unmount is absent.
+See [ADR-0072](../../../memory/decisions/ADR-0072-runtime-mounts-and-userspace-init.md).
 
 `dup(int fd)` uses `SYS_DUP=21`; `dup2(int fd, int target)` uses `SYS_DUP2=22`.
 Arguments occupy x0/x1 and success returns the new descriptor in x0. All slots,

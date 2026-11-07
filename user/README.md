@@ -12,7 +12,7 @@ declares source, initramfs install path, contract role, and dynamic case. `xtask
 uses it for compilation, contract staging, release staging, identity checks, and
 coverage reporting.
 
-Current products are the shell and `/bin/echo`, `/bin/cat`, `/bin/ls`,
+Current products are `/init`, `/bin/shell`, `/bin/echo`, `/bin/cat`, `/bin/ls`,
 `/bin/pwd`, `/bin/taskset`, `/bin/sleep`, `/bin/rtbench`, `/bin/reboot`, and
 `/bin/poweroff`.
 Other example C files may be buildable without entering production composition.
@@ -33,6 +33,14 @@ To add a production binary:
 5. run `cargo xtask ci` and release composition checks when applicable.
 
 ## Interactive shell
+
+`/init` is a separate initializer. It reads and validates the complete
+`/etc/fstab` (at most 16 KiB and 16 entries), mounts automatic entries in order,
+then execs `/bin/shell` without changing process identity. Missing or empty
+configuration starts the shell with initramfs only. A failed mount prints a
+warning to stderr and does not skip later entries or shell startup, even if all
+mounts fail. Malformed or unreadable configuration still stops initialization;
+no fallback disk is selected. See [storage](../docs/storage.md#boot-mount-configuration).
 
 External commands support stdout redirection:
 
@@ -181,7 +189,11 @@ per-program library configuration.
 
 `user/initramfs/` contains product data files. `xtask` stages registered ELF
 programs and this data into a deterministic readonly `newc` archive. `/init` is
-the shell by default. The kernel parses the archive and loads ELF segments; QEMU
+the system initializer by default; the shell resides at `/bin/shell`.
+`user/initramfs/etc/fstab` requests read-write vfat mounts of `/dev/disk0p1`
+at `/mnt/disk` and `/dev/disk0p2` at `/mnt/disk/DATA`. Diskless boot continues
+with warnings; use an empty or comments-only fstab to omit these attempts.
+The kernel parses the archive and loads ELF segments; QEMU
 does not set the userspace PC.
 
 ## ABI boundaries
@@ -199,6 +211,10 @@ does not set the userspace PC.
 - An optional QEMU FAT32 mount supports ordinary writable file I/O and
   `fsync(fd)` through `syscall.h`. File requests are not capped at 1024 bytes;
   short results still require the usual retry loop. See [storage](../docs/storage.md).
+- `<sys/mount.h>` exposes the Linux-shaped genrt subset: partition selectors,
+  absolute existing targets, `vfat`/`fat32`, flags zero or `MS_RDONLY`, NULL data.
+  It returns direct negative errno, not libc `errno`. Mount changes are global;
+  no credentials/privilege enforcement or unmount is implemented.
 - `<sched.h>` exposes fixed CPU sets and immutable process-affinity queries.
 - `<sys/reboot.h>` exposes Linux-compatible restart and power-off operations;
   the wrapper hides raw reboot magic values.

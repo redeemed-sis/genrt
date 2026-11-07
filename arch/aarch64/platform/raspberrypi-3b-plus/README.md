@@ -33,7 +33,7 @@ Outputs under `target/raspberrypi-3b-plus/`:
 | `genrt-raspberrypi-3b-plus.elf` | Complete release kernel with symbols |
 | `genrt-raspberrypi-3b-plus.bin` | ARM64 Image, including serialized BSS |
 | `genrt-raspberrypi-3b-plus.dtb` | Repository board tree |
-| `initramfs.cpio` | Production /init shell and /bin programs |
+| `initramfs.cpio` | Production /init initializer, /bin/shell and utilities |
 | `initramfs.manifest.json` | Verified archive inventory |
 | `genrt-raspberrypi-3b-plus.itb` | Kernel + DTB + initramfs; transfer over UART or copy to microSD |
 
@@ -303,7 +303,7 @@ no `saveenv`; remove the generated boot script to undo automatic genrt loading.
 ## Verify runtime
 
 Both loading paths should reach normal kernel initialization, four scheduler
-CPUs, initramfs mount, and the `/init` shell. Logs are diagnostic milestones,
+CPUs, initramfs mount, and `/init` executing `/bin/shell`. Logs are diagnostic milestones,
 not a machine test protocol.
 
 Try individually, waiting for completion:

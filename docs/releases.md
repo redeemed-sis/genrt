@@ -14,6 +14,11 @@ cargo xtask dist --tag v0.0.0-test.1 --output-dir /tmp/genrt-dist
 release kernel and userspace ELF set once. The exact kernel is dynamically run
 with userspace, shell, reboot, and power-off contract initramfs images. Those
 images reuse the same production ELF files later staged into the release image.
+The userspace contract executes the exact `/init` initializer, which reads
+initramfs `/etc/fstab` and execs `/bin/shell`. The default production fstab
+requests the first two disk0 partitions at `/mnt/disk` and `/mnt/disk/DATA`.
+Mount failures warn on stderr and shell startup continues, including diskless
+QEMU and Pi configurations without a supported storage driver.
 The Raspberry Pi kernel is then built separately, with the exact verified
 production initramfs reused from the QEMU release. No userspace is rebuilt
 after its contracts. Pi boot autonomy, production composition, ARM64 header,
