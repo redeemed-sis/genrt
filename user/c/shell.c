@@ -9,6 +9,8 @@
 
 static const char *const builtins[] = {"cd", "exit"};
 static struct shell_input input;
+static unsigned terminal_columns = 80;
+static int terminal_query;
 /* A maximum-length pathname also bounds an individual directory record.
  * Keep the scan buffer off the small userspace runtime stack. */
 static char directory_entries[PATH_MAX + 32] __attribute__((aligned(8)));
@@ -47,17 +49,22 @@ static int is_command_image(const char *name) {
         && header[ELF_IDENT_SIZE + 1] == ELF_EXEC;
 }
 
-/* Stream the immutable /bin directory instead of caching a truncated candidate
- * table. Work is linear in its finite entries; memory is independent of count.
- * Built-ins take precedence over same-named files. No fd survives a scan. */
-static int scan_commands(const char *prefix, struct shell_matches *matches, int display) {
-    for (size_t i = 0; i < sizeof(builtins) / sizeof(builtins[0]); i++) {
-        if (shell_match_add(matches, prefix, builtins[i]) && display) {
-            printf("%s  ", builtins[i]);
+/* Stream entries without a candidate-count cap. Bare commands retain builtin
+ * precedence and ELF filtering; paths use directory kind, never stat or ELF.
+ * At most one directory and one candidate-image fd are open; none escape. */
+static int scan_completion(const struct shell_completion *completion,
+                           struct shell_matches *matches,
+                           void (*visit)(const char *name, int directory)) {
+    if (completion->commands) {
+        for (size_t i = 0; i < sizeof(builtins) / sizeof(builtins[0]); i++) {
+            if (shell_completion_add(matches, &input, completion, builtins[i], 0) && visit) {
+                visit(builtins[i], 0);
+            }
         }
     }
-    int fd = open("/bin", O_RDONLY | O_DIRECTORY);
-    if (fd < 0) return 0;
+    int fd = open(completion->commands ? "/bin" : completion->directory,
+                  O_RDONLY | O_DIRECTORY);
+    if (fd < 0) return completion->commands ? 0 : -1;
     int result = 0;
     for (;;) {
         long count = getdents64(fd, directory_entries, sizeof(directory_entries));
@@ -78,13 +85,22 @@ static int scan_commands(const char *prefix, struct shell_matches *matches, int 
             size_t length = strnlen(entry->d_name, capacity);
             if (length == capacity) { result = -1; break; }
             const char *name = entry->d_name;
-            if (entry->d_type == DT_REG && length != 0
-                && length + sizeof("/bin/") <= SHELL_PATH_MAX
-                && strchr(name, ' ') == NULL && strchr(name, '\t') == NULL
-                && !is_builtin(name) && strncmp(name, prefix, strlen(prefix)) == 0
-                && is_command_image(name)
-                && shell_match_add(matches, prefix, name) && display) {
-                printf("%s  ", name);
+            int directory = entry->d_type == DT_DIR;
+            int usable = length != 0 && length <= SHELL_LINE_MAX
+                && (directory || entry->d_type == DT_REG)
+                && strcmp(name, ".") != 0 && strcmp(name, "..") != 0;
+            for (size_t i = 0; usable && i < length; i++) {
+                if (!shell_name_byte((unsigned char)name[i])) usable = 0;
+            }
+            if (usable && completion->commands) {
+                usable = !directory && length + sizeof("/bin/") <= SHELL_PATH_MAX
+                    && !is_builtin(name)
+                    && strncmp(name, completion->prefix, strlen(completion->prefix)) == 0
+                    && is_command_image(name);
+            }
+            if (usable && shell_completion_add(matches, &input, completion, name, directory)
+                && visit) {
+                visit(name, directory);
             }
             offset += entry->d_reclen;
         }
@@ -94,27 +110,50 @@ static int scan_commands(const char *prefix, struct shell_matches *matches, int 
     return result;
 }
 
-static void show_prompt(void) {
-    printf("\r\033[s> %s", input.line);
+/* Replay a bounded prefix from the refreshed prompt origin. */
+static void position_input(size_t cursor) {
+    char prefix[SHELL_LINE_MAX + 1];
+    memcpy(prefix, input.line, cursor);
+    prefix[cursor] = '\0';
+    printf("\033[u> %s", prefix);
 }
 
 static void redraw_input(void) {
-    // Restore the prompt's saved origin, including when a long line wrapped.
-    // The editor owns the terminal area below that origin until submission.
-    printf("\033[u\033[J> %s", input.line);
+    // Reserve wrapped rows before drawing, then save the possibly scrolled
+    // origin again. A saved screen coordinate alone does not track scrolling.
+    size_t rows = (2 + input.length) / terminal_columns;
+    printf("\033[u\r");
+    for (size_t row = 0; row < rows; row++) printf("\r\n");
+    if (rows) printf("\033[%zuA", rows);
+    printf("\r\033[s\033[J> %s", input.line);
+    if (input.cursor != input.length) position_input(input.cursor);
+}
+
+static void show_prompt(void) {
+    printf("\r\033[s");
+    redraw_input();
+}
+
+static void finish_input(void) {
+    position_input(input.length);
+    printf("%s", "\r\n");
+}
+
+static void show_candidate(const char *name, int directory) {
+    printf("%s%s  ", name, directory ? "/" : "");
 }
 
 static void complete_input(void) {
-    const char *prefix = shell_input_prefix(&input);
-    if (prefix == NULL) return;
+    struct shell_completion completion;
+    if (!shell_input_completion(&input, &completion)) return;
     struct shell_matches matches = {0};
-    if (scan_commands(prefix, &matches, 0) != 0) return;
-    if (shell_input_complete(&input, &matches)) {
+    if (scan_completion(&completion, &matches, NULL) != 0) return;
+    if (shell_input_complete(&input, &completion, &matches)) {
         redraw_input();
     } else if (matches.count > 1) {
-        printf("\n");
+        finish_input();
         struct shell_matches displayed = {0};
-        scan_commands(prefix, &displayed, 1);
+        scan_completion(&completion, &displayed, show_candidate);
         printf("\n");
         show_prompt();
     }
@@ -232,6 +271,10 @@ int main(int argc, char **argv) {
     (void)argv;
 
     printf("%s", "genrt shell\n");
+    // A raw UART needs no TTY ioctl. Standard ANSI terminals report the
+    // clamped bottom-right position; headless/nonresponding peers use 80 cols.
+    terminal_query = 1;
+    printf("\033[s\033[999;999H\033[6n\033[u");
 
     for (;;) {
         shell_input_reset(&input);
@@ -249,12 +292,22 @@ int main(int argc, char **argv) {
             }
 
             enum shell_input_action action = shell_input_feed(&input, (unsigned char)ch);
+            if (action == SHELL_INPUT_GEOMETRY) {
+                if (terminal_query) {
+                    terminal_columns = input.terminal_columns;
+                    terminal_query = 0;
+                    redraw_input();
+                }
+                continue;
+            }
+            if (action != SHELL_INPUT_NONE) terminal_query = 0;
             if (action == SHELL_INPUT_SUBMIT) {
-                printf("%s", "\n");
+                finish_input();
                 break;
             }
             if (action == SHELL_INPUT_APPEND) {
-                write(STDOUT_FILENO, &ch, 1);
+                if ((2 + input.length) % terminal_columns == 0) redraw_input();
+                else write(STDOUT_FILENO, &ch, 1);
             } else if (action == SHELL_INPUT_ERASE) {
                 redraw_input();
             } else if (action == SHELL_INPUT_REDRAW) {

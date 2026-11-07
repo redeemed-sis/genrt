@@ -27,6 +27,15 @@ int main(int argc, char **argv) {
         gtrt_pass(argv[2], argv[2]);
         return 0;
     }
+    // Path completion in arguments preserves both the spelling and later argv.
+    if (argc == 5 && strcmp(argv[1], "path") == 0) {
+        gtrt_case_start(argv[2], argv[2]);
+        if (strcmp(argv[3], argv[4]) != 0) gtrt_fail(argv[2], argv[2], "COMPLETED_PATH");
+        int fd = open("/.__genrt_test__/fixtures/known-content", O_RDONLY);
+        if (fd != 3 || close(fd) != 0) gtrt_fail(argv[2], argv[2], "COMPLETION_FDS");
+        gtrt_pass(argv[2], argv[2]);
+        return 0;
+    }
     // Negative inputs: p rejected <overlong word or too many arguments>.
     // The shell must reject both before exec; reaching this branch is failure.
     if (argc >= 2 && strcmp(argv[1], "rejected") == 0) {

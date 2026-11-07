@@ -12,6 +12,7 @@
 #define O_APPEND 02000
 #define O_DIRECTORY 0200000
 #define DT_REG 8
+#define DT_DIR 4
 #define WIFEXITED(status) (((status) & 0x7f) == 0)
 
 struct genrt_dirent64 {

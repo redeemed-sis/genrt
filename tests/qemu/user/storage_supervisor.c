@@ -248,6 +248,8 @@ static void shell_redirection(int writing) {
     }
     text_file("/mnt/disk/REDIRECT.TXT", "first\nsecond\n", subject);
     text_file("/mnt/disk/COPY.TXT", "first\nsecond\nrecovered\n", subject);
+    text_file("/mnt/disk/COMPLETED.TXT", "completed\n", subject);
+    text_file("/mnt/disk/TAB_COPY.TXT", "completed\n", subject);
     for (unsigned i = 0; i < 4; i++) {
         const char *invalid[] = {"/mnt/disk/UNUSED.TXT", "/mnt/disk/OTHER.TXT",
                                 "/mnt/disk/BUILTIN.TXT", "/mnt/disk/EXIT.TXT"};

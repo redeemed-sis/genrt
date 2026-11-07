@@ -139,6 +139,8 @@ pub(super) fn verify(directory: &Path) -> Result<()> {
     for (name, expected) in [
         ("REDIRECT.TXT", b"first\nsecond\n".as_slice()),
         ("COPY.TXT", b"first\nsecond\nrecovered\n".as_slice()),
+        ("COMPLETED.TXT", b"completed\n".as_slice()),
+        ("TAB_COPY.TXT", b"completed\n".as_slice()),
     ] {
         let extracted = directory.join(format!("{name}.host.txt"));
         run(

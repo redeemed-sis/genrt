@@ -9,6 +9,13 @@ static void type(struct shell_input *input, const char *text) {
     while (*text) shell_input_feed(input, (unsigned char)*text++);
 }
 
+static void set_line(struct shell_input *input, const char *text, size_t cursor) {
+    shell_input_reset(input);
+    input->length = strlen(text);
+    memcpy(input->line, text, input->length + 1);
+    input->cursor = cursor;
+}
+
 static void remember(struct shell_input *input, const char *line) {
     shell_input_reset(input);
     type(input, line);
@@ -27,8 +34,9 @@ static int history(void) {
     remember(&input, "second command");
     CHECK(input.count == 2);
     shell_input_reset(&input);
-    type(&input, "unfinished\033[A");
+    type(&input, "unfinished\033[D\033[D\033[A");
     CHECK(strcmp(input.line, "second command") == 0);
+    CHECK(input.cursor == input.length);
     type(&input, " edited\033[A");
     CHECK(strcmp(input.line, "first command") == 0);
     type(&input, "\033[A");
@@ -37,6 +45,7 @@ static int history(void) {
     CHECK(strcmp(input.line, "second command") == 0);
     type(&input, "\033[B\033[B");
     CHECK(strcmp(input.line, "unfinished") == 0);
+    CHECK(input.cursor == 8);
     // SS3 arrows work too; tokenization must not damage the ring entry.
     type(&input, "\033OA");
     input.line[6] = '\0';
@@ -57,6 +66,40 @@ static int history(void) {
     return 0;
 }
 
+static int editing(void) {
+    struct shell_input input = {0};
+    type(&input, "ac tail\033[D\033OD\033[D\033OD\033[D\033OD");
+    CHECK(input.cursor == 1 && input.length == 7);
+    CHECK(shell_input_feed(&input, 'b') == SHELL_INPUT_REDRAW);
+    CHECK(strcmp(input.line, "abc tail") == 0 && input.cursor == 2);
+    type(&input, "\b\033OC\177");
+    CHECK(strcmp(input.line, "a tail") == 0 && input.cursor == 1);
+    type(&input, "\033[D\033OD\b");
+    CHECK(input.cursor == 0 && strcmp(input.line, "a tail") == 0);
+    for (unsigned i = 0; i < 20; i++) type(&input, "\033[C\033OC");
+    CHECK(input.cursor == input.length);
+    type(&input, "\033[D\033[D");
+    CHECK(shell_input_feed(&input, '\r') == SHELL_INPUT_SUBMIT);
+    CHECK(strcmp(input.line, "a tail") == 0 && input.cursor == 4);
+    CHECK(shell_input_feed(&input, '\n') == SHELL_INPUT_NONE);
+
+    const char *deletes[] = {"\033\177", "\033\b"};
+    for (size_t i = 0; i < 2; i++) {
+        set_line(&input, "cat /one/two/ \t>>rest", 17);
+        type(&input, deletes[i]);
+        CHECK(strcmp(input.line, "cat /one/rest") == 0 && input.cursor == 9);
+        type(&input, deletes[i]);
+        CHECK(strcmp(input.line, "cat /rest") == 0 && input.cursor == 5);
+        set_line(&input, " /\t>>suffix", 5);
+        type(&input, deletes[i]);
+        CHECK(strcmp(input.line, " /\t>>suffix") == 0 && input.cursor == 5);
+        set_line(&input, "word suffix", 4);
+        type(&input, deletes[i]);
+        CHECK(strcmp(input.line, " suffix") == 0 && input.cursor == 0);
+    }
+    return 0;
+}
+
 static int terminal(void) {
     struct shell_input input = {0};
     type(&input, "abc\b\177d");
@@ -70,6 +113,11 @@ static int terminal(void) {
     CHECK(strcmp(input.line, "ad") == 0);
     type(&input, "\033]0;discarded title\a\033Pdiscarded payload\033\\");
     CHECK(strcmp(input.line, "ad") == 0);
+    type(&input, "\033[24;80");
+    CHECK(shell_input_feed(&input, 'R') == SHELL_INPUT_GEOMETRY);
+    CHECK(input.terminal_rows == 24 && input.terminal_columns == 80);
+    type(&input, "\033[;80R\033[10000;80R\033[24;0R");
+    CHECK(strcmp(input.line, "ad") == 0 && input.terminal_columns == 80);
     type(&input, "\033[");
     CHECK(shell_input_feed(&input, '\r') == SHELL_INPUT_SUBMIT);
     CHECK(strcmp(input.line, "ad") == 0);
@@ -94,10 +142,13 @@ static int terminal(void) {
     CHECK(input.overflow && input.length == SHELL_LINE_MAX);
     shell_input_remember(&input);
     CHECK(input.count == 1);
-    type(&input, "\033[A");
+    type(&input, "\033[D\033[D\033[A");
     CHECK(!input.overflow && strcmp(input.line, "saved") == 0);
     type(&input, "\033[B");
     CHECK(input.overflow && input.length == SHELL_LINE_MAX);
+    CHECK(input.cursor == SHELL_LINE_MAX - 2);
+    shell_input_feed(&input, 'z');
+    CHECK(input.length == SHELL_LINE_MAX && input.cursor == SHELL_LINE_MAX - 2);
     type(&input, "\b");
     CHECK(input.overflow); // An overlong submission remains rejected.
     return 0;
@@ -105,43 +156,72 @@ static int terminal(void) {
 
 static int completion(void) {
     struct shell_input input = {0};
+    struct shell_completion context;
     struct shell_matches matches = {0};
     type(&input, "  ec");
-    CHECK(shell_match_add(&matches, shell_input_prefix(&input), "echo"));
-    CHECK(shell_input_complete(&input, &matches));
+    CHECK(shell_input_completion(&input, &context) && context.commands);
+    CHECK(shell_completion_add(&matches, &input, &context, "echo", 0));
+    CHECK(shell_input_complete(&input, &context, &matches));
     CHECK(strcmp(input.line, "  echo ") == 0);
-    CHECK(shell_input_prefix(&input) == NULL);
+    CHECK(shell_input_completion(&input, &context) && !context.commands);
     shell_input_reset(&input);
     type(&input, "g");
+    CHECK(shell_input_completion(&input, &context));
     matches = (struct shell_matches){0};
     CHECK(shell_match_add(&matches, "g", "gtrt-a"));
     CHECK(shell_match_add(&matches, "g", "gtrt-b"));
     CHECK(matches.count == 2 && strcmp(matches.common, "gtrt-") == 0);
-    CHECK(shell_input_complete(&input, &matches));
+    CHECK(shell_input_complete(&input, &context, &matches));
     CHECK(strcmp(input.line, "gtrt-") == 0);
-    CHECK(!shell_input_complete(&input, &matches)); // Caller displays candidates.
+    CHECK(shell_input_completion(&input, &context));
+    CHECK(!shell_input_complete(&input, &context, &matches)); // Caller displays candidates.
     matches = (struct shell_matches){0};
     CHECK(!shell_match_add(&matches, "gtrt-", "elsewhere"));
-    CHECK(!shell_input_complete(&input, &matches));
+    CHECK(!shell_input_complete(&input, &context, &matches));
     CHECK(strcmp(input.line, "gtrt-") == 0);
     CHECK(!shell_match_add(&matches, "", "unsafe\033[A"));
     CHECK(!shell_match_add(&matches, "", "two words"));
+    const char *unsafe[] = {"a<b", "a|b", "a&b", "a;b", "a\"b", "a'b", "a\\b", "a>b", "a/b"};
+    for (size_t i = 0; i < sizeof(unsafe) / sizeof(unsafe[0]); i++) {
+        CHECK(!shell_match_add(&matches, "", unsafe[i]));
+    }
 
-    shell_input_reset(&input);
-    type(&input, "/bin/ec");
-    CHECK(shell_input_prefix(&input) == NULL);
-    shell_input_reset(&input);
-    type(&input, "echo argument");
-    CHECK(shell_input_prefix(&input) == NULL);
+    const struct { const char *line; size_t cursor; const char *directory; const char *prefix; } paths[] = {
+        {"/bin/ec", 7, "/bin/", "ec"}, {"echo argument", 13, ".", "argument"},
+        {"echo>../ou", 10, "../", "ou"}, {"echo >>./ou", 11, "./", "ou"},
+        {"./ec", 4, "./", "ec"}, {"cat /di/file tail", 7, "/", "di"},
+    };
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        set_line(&input, paths[i].line, paths[i].cursor);
+        CHECK(shell_input_completion(&input, &context) && !context.commands);
+        CHECK(strcmp(context.directory, paths[i].directory) == 0);
+        CHECK(strcmp(context.prefix, paths[i].prefix) == 0);
+    }
+    set_line(&input, "cat /dir/file tail", 7);
+    CHECK(shell_input_completion(&input, &context));
+    matches = (struct shell_matches){0};
+    CHECK(!shell_completion_add(&matches, &input, &context, "different", 1));
+    CHECK(!shell_completion_add(&matches, &input, &context, "directory", 0));
+    CHECK(shell_completion_add(&matches, &input, &context, "differ", 1));
+    CHECK(shell_input_complete(&input, &context, &matches));
+    CHECK(strcmp(input.line, "cat /differ/file tail") == 0 && input.cursor == 10);
+    set_line(&input, "echo after", 2);
+    CHECK(shell_input_completion(&input, &context) && context.commands);
+    matches = (struct shell_matches){0};
+    CHECK(shell_completion_add(&matches, &input, &context, "echo", 0));
+    CHECK(!shell_input_complete(&input, &context, &matches)); // No duplicate ho or space.
+
     shell_input_reset(&input);
     for (unsigned i = 0; i < SHELL_LINE_MAX - 2; i++) type(&input, " ");
     type(&input, "ec");
+    CHECK(shell_input_completion(&input, &context));
     matches = (struct shell_matches){0};
     shell_match_add(&matches, "ec", "echo");
-    CHECK(!shell_input_complete(&input, &matches));
+    CHECK(!shell_input_complete(&input, &context, &matches));
     CHECK(input.length == SHELL_LINE_MAX && !input.overflow);
     type(&input, "\b\b\b\b");
-    CHECK(shell_input_complete(&input, &matches));
+    CHECK(shell_input_completion(&input, &context));
+    CHECK(shell_input_complete(&input, &context, &matches));
     CHECK(input.length == SHELL_LINE_MAX); // Exact-fit match, no trailing space.
     CHECK(strcmp(input.line + SHELL_LINE_MAX - 4, "echo") == 0);
     return 0;
@@ -157,15 +237,16 @@ static int bounds(void) {
             shell_input_remember(&input);
             shell_input_reset(&input);
         } else if (action == SHELL_INPUT_COMPLETE) {
-            const char *prefix = shell_input_prefix(&input);
-            if (prefix) {
+            struct shell_completion context;
+            if (shell_input_completion(&input, &context)) {
                 struct shell_matches matches = {0};
-                shell_match_add(&matches, prefix, "cd");
-                shell_match_add(&matches, prefix, "exit");
-                shell_input_complete(&input, &matches);
+                shell_completion_add(&matches, &input, &context, "cd", 0);
+                shell_completion_add(&matches, &input, &context, "exit", 0);
+                shell_input_complete(&input, &context, &matches);
             }
         }
         CHECK(input.length <= SHELL_LINE_MAX && input.line[input.length] == '\0');
+        CHECK(input.cursor <= input.length);
         CHECK(input.count <= SHELL_HISTORY_CAPACITY && input.age <= input.count);
         CHECK(input.next < SHELL_HISTORY_CAPACITY && input.escape_bytes <= SHELL_ESCAPE_MAX);
         for (unsigned slot = 0; slot < SHELL_HISTORY_CAPACITY; slot++) {
@@ -204,6 +285,7 @@ static int parsing(void) {
 
 int main(void) {
     int line = history();
+    if (!line) line = editing();
     if (!line) line = terminal();
     if (!line) line = completion();
     if (!line) line = bounds();

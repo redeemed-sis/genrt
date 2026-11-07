@@ -25,7 +25,8 @@ subject = "shell-exit"
 
 [[steps]]
 action = "send_line"
-value = "cd /.__genrt_test__/bin"
+# A standard terminal geometry reply is control input, not command text.
+value = "\u001b[24;80Rcd /.__genrt_test__/bin"
 
 [[steps]]
 action = "send_line"
@@ -322,7 +323,7 @@ subject = "tab-no-match"
 
 [[steps]]
 action = "send_line"
-# Tab after the first token is a no-op: arguments are not completed.
+# This argument has no matching filesystem entry and stays unchanged.
 value = "gtrt-one completion tab-arguments\t gtrt-one"
 
 [[steps]]
@@ -332,8 +333,8 @@ subject = "tab-arguments"
 
 [[steps]]
 action = "send_line"
-# Tab inside a path is also a no-op; the explicitly typed e finishes the name.
-value = "/bin/gtrt-on\te completion tab-path /bin/gtrt-one"
+# Slash-containing command tokens use filesystem completion.
+value = "/bin/gtrt-on\tcompletion tab-path /bin/gtrt-one"
 
 [[steps]]
 action = "expect_case"
@@ -352,6 +353,143 @@ action = "expect_case"
 producer = "tab-repeated"
 subject = "tab-repeated"
 
+# Cursor editing and path completion preserve the final argv, not just echo.
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record alha\u001b[D\u001b[Dp\u001b[C\u001b[C edit-insert alpha"
+
+[[steps]]
+action = "expect_case"
+producer = "edit-insert"
+subject = "edit-insert"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record alxpha\u001bOD\u001bOD\u001bOD\b\u001bOC\u001bOC\u001bOC edit-backspace alpha"
+
+[[steps]]
+action = "expect_case"
+producer = "edit-backspace"
+subject = "edit-backspace"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record alpha edit-submit alpha\u001b[D\u001b[D"
+
+[[steps]]
+action = "expect_case"
+producer = "edit-submit"
+subject = "edit-submit"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record /mnt/disk/report.txt\u001b\u007f\u001b\b edit-alt-path /mnt/"
+
+[[steps]]
+action = "expect_case"
+producer = "edit-alt-path"
+subject = "edit-alt-path"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record draft\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[A\u001b[Bsaved-\u001b[C\u001b[C\u001b[C\u001b[C\u001b[C edit-draft-cursor saved-draft"
+
+[[steps]]
+action = "expect_case"
+producer = "edit-draft-cursor"
+subject = "edit-draft-cursor"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p record xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx discarded\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b\u007fwrapped\u001b[C\u001b[C\u001b[C\u001b[C\u001b[C\u001b[C\u001b[C\u001b[C\u001b[C\u001b[C\u001b\bedit-wrapped wrapped"
+
+[[steps]]
+action = "expect_case"
+producer = "edit-wrapped"
+subject = "edit-wrapped"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p path path-absolute /.__genrt_test__/fixtures/known-c\t /.__genrt_test__/fixtures/known-content"
+
+[[steps]]
+action = "expect_case"
+producer = "path-absolute"
+subject = "path-absolute"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p path path-relative a\t a"
+
+[[steps]]
+action = "expect_case"
+producer = "path-relative"
+subject = "path-relative"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p path path-parent ../known-c\t ../known-content"
+
+[[steps]]
+action = "expect_case"
+producer = "path-parent"
+subject = "path-parent"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p path path-directory /.__genrt_test__/fixtures/dir\t /.__genrt_test__/fixtures/directory/"
+
+[[steps]]
+action = "expect_case"
+producer = "path-directory"
+subject = "path-directory"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p path path-list \t\tb b"
+
+[[steps]]
+action = "expect_case"
+producer = "path-list"
+subject = "path-list"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p path path-missing absent-z\t absent-z"
+
+[[steps]]
+action = "expect_case"
+producer = "path-missing"
+subject = "path-missing"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/p path path-midline ../k ../known-content\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\u001b[D\t"
+
+[[steps]]
+action = "expect_case"
+producer = "path-midline"
+subject = "path-midline"
+
+[[steps]]
+action = "send_line"
+value = "/bin/gtrt-pa\tb completion path-command-lcp /bin/gtrt-pair-b"
+
+[[steps]]
+action = "expect_case"
+producer = "path-command-lcp"
+subject = "path-command-lcp"
+
+[[steps]]
+action = "send_line"
+value = "../../bin/./p\tcompletion path-command-relative ../../bin/./p"
+
+[[steps]]
+action = "expect_case"
+producer = "path-command-relative"
+subject = "path-command-relative"
+
 [[steps]]
 action = "send_line"
 # Stage 7: cd is one builtin candidate even with a same-named /bin/cd fixture.
@@ -360,7 +498,7 @@ value = "cd /"
 
 [[steps]]
 action = "send_line"
-value = "cd\t/.__genrt_test__/fixtures/directory"
+value = "cd\t/.__genrt_test__/fixtures/dir\t"
 
 [[steps]]
 action = "send_line"

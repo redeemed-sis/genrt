@@ -11,4 +11,6 @@ exit > /mnt/disk/EXIT.TXT
 echo denied > /etc/DENIED.TXT
 echo denied > /mnt/disk/missing/FAILED.TXT
 echo recovered >> /mnt/disk/COPY.TXT
+echo completed>/mnt/di	COMPLETED.TXT
+cat /mnt/disk/COMPL	>/mnt/disk/TAB_COPY.TXT
 exit
