@@ -100,7 +100,10 @@ remain uninstrumented and reject diagnostic kernel markers.
 - `shell-contract`: production kernel and shell plus test-only helpers and a
   host nonce challenge for UART input and command behavior. Arrow/Tab input
   exercises the 16-entry history ring, editing and draft restoration,
-  duplicate suppression, overflow, completion, and escape recovery.
+  duplicate suppression, overflow, and escape recovery. CSI/SS3 Left/Right,
+  insertion/Backspace, both Alt+Backspace encodings, saved draft cursor, wrapped
+  edits, and absolute/relative/argument path completion are checked by probe
+  argv/cwd, including mid-line suffixes and repeated candidate listing.
 - `poweroff-contract`: executes production `/bin/poweroff`, arms
   `TERMINAL ... POWER_OFF`, and accepts only natural successful QEMU shutdown.
 - `reboot-contract`: executes production `/bin/reboot`, arms
@@ -151,6 +154,9 @@ unique/common-prefix/list completion, plus directory/text decoys and a
 same-named builtin collision. No production sample names or directory listing
 text are assertions: probe argv/cwd records prove the editing outcome.
 Repeated Tab scanning also checks that completion does not exhaust the FD table.
+The storage shell script includes literal Tab bytes to complete a mounted FAT
+directory in a redirection and a filename argument. Guest fsync, the verify-only
+restart, and host extraction check both resulting files.
 
 ## Adding or changing a case
 

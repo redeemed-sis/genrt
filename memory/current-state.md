@@ -473,8 +473,12 @@ accepted ADRs remain authoritative when details differ.
   mounts automatic entries and execs `/bin/shell` in the same process. Product
   binaries are declared by `user/c/programs.toml`, including the initializer,
   shell, `sleep`, `reboot`, and `poweroff`.
-- The shell has a fixed 16-entry command history with draft restoration and
-  first-token Tab completion for built-ins and `/bin` ELF commands. Editor
+- The shell has a fixed 16-entry history with draft/cursor restoration,
+  CSI/SS3 Left/Right, cursor-relative insertion/Backspace, and Alt+Backspace
+  word/path-component deletion. Tab retains bare command completion for builtins
+  and `/bin` ELF images and adds streamed filesystem paths in arguments and
+  redirects, preserving typed suffixes. Scroll-aware ANSI redraw reserves rows
+  and uses an initial cursor-position report, with an 80-column fallback. Editor
   state and directory scanning use fixed storage; the existing 256-byte line
   and 16-argument limits remain. Host editor tests and the production-shell
   QEMU contract cover history, completion, bounds, and escape recovery.

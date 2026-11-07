@@ -61,34 +61,50 @@ The shell keeps the last 16 submitted non-empty commands in a fixed ring.
 Whitespace-only and consecutively identical lines are not added; overflow
 discards the oldest entry. Up/Down (CSI or SS3 arrows) recall commands into an
 independent editing buffer. Down past the newest entry restores the draft
-saved by the first Up, including its line-overflow state. Editing a recalled
-command never modifies the stored entry. History is process-private and is
-not persisted; no history files are created.
+saved by the first Up, including its cursor and line-overflow state. Editing a
+recalled command never modifies the stored entry. History is process-private
+and is not persisted; no history files are created.
 
-Tab completes only a bare first command token, including after leading spaces.
-Candidates are `cd`, `exit`, and regular ELF `ET_EXEC` entries under `/bin`.
-The directory ABI has no mode field; completion checks ELF identification/type,
-while `execve` still validates the complete image. Built-ins take precedence
-over same-named files. Candidate names must be printable ASCII without spaces
-or slashes and fit the shell's existing 128-byte execution path buffer.
+Left/Right (CSI or SS3 arrows) move a byte-oriented cursor within the line.
+Printable bytes insert at the cursor; Backspace deletes immediately before it
+without changing the suffix. Alt+Backspace (`ESC DEL` or `ESC BS`) skips
+preceding spaces, tabs, `/` and `>`, then deletes the preceding word or path
+component. Enter submits the whole line regardless of cursor position. History
+recall places the cursor at the end; Down restores the saved draft position.
 
-A unique match is completed with a trailing space if it fits. Multiple matches
-extend the longest common prefix; if it cannot grow, candidates are displayed
-and the input is redrawn. No match leaves the line unchanged. Tab inside an
-argument or a path does nothing. There is no PATH lookup, filename completion,
-quoting, scripting, or arbitrary cursor movement.
+For a bare first command token without `/`, Tab candidates remain `cd`, `exit`,
+and regular ELF `ET_EXEC` entries under `/bin`. The directory ABI has no mode
+field; completion checks ELF identification/type, while `execve` still validates
+the complete image. Built-ins take precedence over same-named files. Candidate
+names must be printable ASCII without unsupported shell separators or quoting;
+command names fit the existing 128-byte execution path buffer.
 
-Input remains byte-oriented with append/backspace editing, a 256-byte line
-limit, and a 16-argument limit. An overlong submitted line is rejected rather
-than executing its truncated prefix. ANSI cursor save/restore and erase are
-used to redraw the input, including wrapped lines. Unknown CSI/SS3 sequences
-are discarded through their final byte; unsupported OSC/DCS strings are
-discarded through BEL or ST. Newline, backspace, and Tab resynchronize partial
-sequences without copying control payloads into commands. CRLF submits once.
+Other tokens use filesystem completion, including command paths, arguments and
+stdout redirection destinations. Absolute and relative paths, `./`, `../`, and
+mounted filesystems use ordinary `open()` and `getdents64()` with no `stat()`.
+Completion preserves the directory prefix and text after the cursor. Inside
+a component, candidates must match both the typed prefix and existing suffix;
+only missing bytes between them are inserted. A unique directory gets `/`;
+a unique file gets a space only at line end when there is room. Multiple
+matches extend the longest common prefix; otherwise candidates are displayed
+and the input/cursor is restored. No match leaves the line unchanged. There
+is no PATH lookup, quoting, scripting, or UTF-8 grapheme-aware editing.
+
+Input retains the 256-byte line limit and 16-argument limit. An overlong
+submitted line is rejected rather than executing its truncated prefix. ANSI
+redraw reserves wrapped rows before drawing and refreshes the saved origin
+after any scrolling; prefix replay restores the cursor. An initial nonblocking
+ANSI cursor-position report discovers columns without a TTY ioctl; headless or
+nonresponding terminals use 80 columns. Reports arriving after editing starts
+are ignored. Listings and Enter first move to the full line's end.
+Unknown CSI/SS3 sequences are discarded through their final byte; unsupported
+OSC/DCS strings are discarded through BEL or ST. Newline, backspace, and Tab
+resynchronize partial sequences without copying control payloads into commands.
+CRLF submits once.
 
 Editor/history state and directory scan storage are fixed-size; no shell heap
-allocation is introduced. Completion streams the immutable `/bin` index, so
-work is linear in its finite entries without a candidate-count truncation.
+allocation is introduced. Completion streams the selected directory, so work
+is linear in its entries without a candidate-count truncation.
 At most one directory fd and one candidate-file fd are open during a scan.
 The shell-private [input helpers](c/shell_input.h) are shared only with host
 tests, not exposed as support-library API. `shell-contract` exercises the exact

@@ -67,7 +67,9 @@ It checks mount traversal, host-seeded content, create/read/write/append/truncat
 multi-cluster I/O, fsync, shared fork offsets and concurrent independent append.
 It also runs the exact production shell with an FD-backed command file,
 checks stdout truncate/append and readback through production utilities, and
-checks redirected printf output. The supervisor syncs the resulting files;
+checks redirected printf output. Literal Tabs also complete a mounted FAT path
+for redirection and a file argument; their exact output files are verified.
+The supervisor syncs the resulting files;
 the verify-only second boot and host extraction check their retained contents.
 The runner powers off and reaps QEMU, extracts/checks the persistent payload
 with mtools, checks both FAT partitions, then boots the same disk with a
@@ -115,10 +117,15 @@ processing and the corresponding stderr warnings.
 The shell case uses the production shell ELF and test-only helper commands. A
 host-generated nonce verifies UART RX, blocking stdin wakeup, argv propagation,
 and command execution without depending on prompts or human-readable output.
-It also feeds arrow keys, Tab, backspace, and partial/unknown escape sequences
-through paced UART input. Test helpers assert resulting argv/cwd for history
-recall/edit/draft restoration, duplicate suppression, ring overflow, completion,
-and recovery after line/argument overflow. Completion-only `/bin` aliases,
+It also feeds CSI/SS3 arrows, Tab, Backspace, both Alt+Backspace encodings, and
+partial/unknown escape sequences through paced UART input. Test helpers assert
+argv/cwd for mid-line editing/submission, history/draft cursor restoration,
+wrapped edits, duplicate suppression, ring overflow, absolute/relative/parent
+paths, argument completion and preserved suffixes. Missing and ambiguous
+matches, repeated listing, and recovery after line/argument overflow remain
+covered. Host tests additionally model finite-height 12- and 80-column screens,
+scrolling, delayed wrapping, stale-tail clearing, and cursor restoration.
+Completion-only `/bin` aliases,
 a directory, and a text file exist solely in the controlled shell image and
 carry explicit test provenance. The product invocation remains the exact
 manifest-declared shell; the fixture names do not become production contracts.
@@ -168,8 +175,11 @@ short, zero-progress, and failed writes to test output behavior independently
 of UART timing. Protocol formatting uses the shared implementation, but the
 protocol and markers themselves are never part of the production archive.
 `tests/user/shell_input.c` additionally checks the production editor's pure
-state transitions, exact line/history bounds, CRLF, escape resynchronization,
-completion prefixes and capacity edges, plus deterministic mixed-byte input.
+state transitions, cursor/draft positions, exact line/history bounds, CRLF,
+escape resynchronization, completion prefixes/suffixes and capacity edges, plus
+deterministic mixed-byte input. The shell host fixture streams more than 100
+entries and checks fd cleanup on errors and repeated completion without a
+candidate-count cap.
 These host tests run in `cargo xtask check` without AArch64 syscall transport.
 `tests/user/rtbench.c` executes the actual utility measurement and reporting
 with controlled public clock observations, sleep transport, and wrapped output.
