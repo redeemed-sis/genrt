@@ -34,6 +34,7 @@ const WAIT_TOKEN_STRESS_CYCLES: usize =
     (crate::config::KERNEL_THREAD_CAPACITY * crate::time::TIMED_EVENT_CAPACITY_PER_THREAD) + 1;
 
 static TEST_MAILBOX: OncePublication<Mailbox<usize>> = OncePublication::new();
+static PREEMPT_GATE: OncePublication<Mailbox<()>> = OncePublication::new();
 static DELIVERY_STAGE: AtomicUsize = AtomicUsize::new(0);
 static DELIVERY_RESULT: AtomicUsize = AtomicUsize::new(0);
 static DELIVERY_ELAPSED_MS: AtomicUsize = AtomicUsize::new(0);
@@ -109,6 +110,9 @@ pub(crate) fn init() {
         .is_err()
     {
         panic!("qemu-test: runtime fixtures initialized twice");
+    }
+    if PREEMPT_GATE.publish(Mailbox::with_capacity(2, 2)).is_err() {
+        panic!("qemu-test: preemption gate initialized twice");
     }
 }
 
@@ -233,7 +237,12 @@ fn coordinator(_arg: ThreadArg) -> usize {
     protocol::pass("mailbox-timed-receive");
 
     protocol::case_start("timer-preemption");
+    if PROGRESS_A.load(Ordering::Acquire) != 0 || PROGRESS_B.load(Ordering::Acquire) != 0 {
+        protocol::fail("timer-preemption", "PEER_RAN_BEFORE_ACTIVATION");
+    }
     PREEMPT_STAGE.store(1, Ordering::Release);
+    preempt_gate().send(());
+    preempt_gate().send(());
     sched::msleep(50);
     PREEMPT_STAGE.store(2, Ordering::Release);
     if PROGRESS_A.load(Ordering::Acquire) == 0 || PROGRESS_B.load(Ordering::Acquire) == 0 {
@@ -383,9 +392,9 @@ fn progress_b(_arg: ThreadArg) -> usize {
 }
 
 fn spin_progress(counter: &AtomicUsize) -> usize {
-    while PREEMPT_STAGE.load(Ordering::Acquire) == 0 {
-        sched::msleep(1);
-    }
+    // Later-phase workers must not inject periodic timer/ready traffic into
+    // the publication scenarios. A dedicated owner gate wakes each once.
+    preempt_gate().recv();
     while PREEMPT_STAGE.load(Ordering::Acquire) == 1 {
         counter.fetch_add(1, Ordering::Relaxed);
         core::hint::spin_loop();
@@ -972,4 +981,8 @@ fn test_mailbox() -> &'static Mailbox<usize> {
     TEST_MAILBOX
         .get()
         .unwrap_or_else(|| panic!("qemu-test: mailbox not initialized"))
+}
+
+fn preempt_gate() -> &'static Mailbox<()> {
+    PREEMPT_GATE.get().expect("preemption gate initialized")
 }

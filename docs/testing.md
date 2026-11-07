@@ -160,6 +160,8 @@ Publication polling samples time before readiness, so a coordinator preempted
 between observations does not reject an already published token or mailbox
 waiter using a stale condition. The 250 ms publication deadline is unchanged;
 mailbox failures retain worker stage and iteration diagnostics.
+Timer-preemption peers wait on a dedicated mailbox until their phase starts;
+inactive peers do not add periodic timer wakeups to the publication scenarios.
 The deferred-wakeup setup retries at most eight times if the worker's deadline
 passes before preemption exclusion is established; deferred-wakeup assertions
 run only after a future deadline is observed under that guard.
