@@ -156,6 +156,10 @@ TTBR0 writes (initial activation and terminal detach), with full frame return
 after each of three reaps. Pure host tests cover fixed expired-buffer transfer,
 direct-wake wait consumption, stale tokens, and existing/remote peers. Existing
 wait races, RR, preemption, process isolation, and SMP sleeps remain gates.
+Publication polling samples time before readiness, so a coordinator preempted
+between observations does not reject an already published token or mailbox
+waiter using a stale condition. The 250 ms publication deadline is unchanged;
+mailbox failures retain worker stage and iteration diagnostics.
 The deferred-wakeup setup retries at most eight times if the worker's deadline
 passes before preemption exclusion is established; deferred-wakeup assertions
 run only after a future deadline is observed under that guard.

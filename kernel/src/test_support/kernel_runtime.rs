@@ -590,6 +590,10 @@ fn run_wait_token_slot_reuse() {
 fn wait_for_published_wait(previous: usize, case: &str) -> (usize, sched::WaitToken) {
     let deadline = crate::time::now_counter().wrapping_add(crate::time::ms_to_counts(250));
     loop {
+        // A handoff may occur between these observations. Check publication
+        // after sampling time so a resumed coordinator does not time out on
+        // a condition that became ready while it was preempted.
+        let timed_out = crate::time::now_counter() >= deadline;
         let observed = WAIT_TOKEN_PUBLISH_COUNT.load(Ordering::Acquire);
         if observed > previous {
             let token = PUBLISHED_WAIT_TOKEN
@@ -597,7 +601,7 @@ fn wait_for_published_wait(previous: usize, case: &str) -> (usize, sched::WaitTo
                 .unwrap_or_else(|| protocol::fail(case, "TOKEN_NOT_PUBLISHED"));
             return (observed, token);
         }
-        if crate::time::now_counter() >= deadline {
+        if timed_out {
             protocol::fail(case, "TOKEN_PUBLICATION_TIMEOUT");
         }
         sched::yield_now();
@@ -624,8 +628,12 @@ fn run_mailbox_timed_receive() {
         )
         .unwrap_or_else(|_| protocol::fail(CASE, "SPAWN"));
         let deadline = crate::time::now_counter().wrapping_add(crate::time::ms_to_counts(250));
-        while test_mailbox().waiter_count_for_test() == 0 {
-            if crate::time::now_counter() >= deadline {
+        loop {
+            let timed_out = crate::time::now_counter() >= deadline;
+            if test_mailbox().waiter_count_for_test() != 0 {
+                break;
+            }
+            if timed_out {
                 let stage = MAILBOX_WORKER_STAGE.load(Ordering::Acquire);
                 crate::error!(
                     "mailbox test: cycle={cycle} worker={worker:?} stage={stage} len={} started={} now={}",
