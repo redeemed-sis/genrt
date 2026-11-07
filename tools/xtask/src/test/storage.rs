@@ -126,35 +126,6 @@ pub(super) fn prepare(directory: &Path) -> Result<PathBuf> {
     crate::qemu::validate_disk(&image)
 }
 
-/// Add boot policy only after reaping and verifying the fallback-mode guest.
-/// # Arguments
-/// * `directory` - Owned case directory containing the stopped guest's image.
-/// # Returns
-/// Success after seeding `/fstab` for a second boot with a readonly nested mount.
-/// # Errors
-/// Filesystem, path, missing tool or bounded subprocess errors.
-pub(super) fn configure_mounts(directory: &Path) -> Result<()> {
-    let image = directory.join("storage-test.raw").canonicalize()?;
-    let spec = format!("{}@@{OFFSET}", image.display());
-    let config = directory.join("fstab");
-    fs::write(
-        &config,
-        b"# Controlled restart mount policy\n\
-          /dev/disk0p1 /mnt/disk vfat defaults 0 0\n\
-          /dev/disk0p2 /mnt/disk/EXTRA fat32 ro 0 0\n",
-    )?;
-    run(
-        "mcopy",
-        &[
-            "-i",
-            &spec,
-            config.to_str().context("non-UTF8 fstab path")?,
-            "::/fstab",
-        ],
-        None,
-    )
-}
-
 /// Independently extract, compare and structurally check the stopped guest disk.
 /// # Arguments
 /// * `directory` - Same owned case directory used by `prepare`, after QEMU reap.

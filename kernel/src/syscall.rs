@@ -44,6 +44,8 @@ pub const SYS_FSYNC: usize = 20;
 pub const SYS_DUP: usize = 21;
 /// Atomically replace a descriptor with a shared reference to another.
 pub const SYS_DUP2: usize = 22;
+/// Attach a FAT32 partition at an existing absolute directory in the namespace.
+pub const SYS_MOUNT: usize = 23;
 
 const CLOCK_MONOTONIC: isize = 1;
 const TIMER_ABSTIME: usize = 1;
@@ -165,7 +167,7 @@ fn dispatch_other(
             sys_getdents64(context, request);
             Ok(())
         }
-        SYS_FSYNC => {
+        SYS_FSYNC | SYS_MOUNT => {
             fs::call::dispatch(context, request);
             Ok(())
         }

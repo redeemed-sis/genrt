@@ -4,6 +4,7 @@ use super::{
     backend::{Kind, NAME_MAX, OpenFlags, Operation, Reply},
     fd::Open,
     io::{Descriptor, IoTransaction},
+    mounts::MountCall,
     vfs::{Resolver, namespace},
 };
 use crate::{
@@ -24,6 +25,7 @@ enum Work {
     Open(Box<Open>),
     Io(IoTransaction),
     Resolve(Box<Resolver>),
+    Mount(Box<MountCall>),
 }
 
 /// Process-owned syscall restart state. Buffers, stages and OFD lease are owned.
@@ -51,6 +53,21 @@ fn flags(raw: usize) -> Result<OpenFlags, Errno> {
 
 fn initialize(request: SyscallRequest) -> Result<PendingFileCall, Errno> {
     let work = match request.number() {
+        SYS_MOUNT => {
+            if request.arg(3) > 1 || request.arg(4) != 0 {
+                return Err(errno::EINVAL);
+            }
+            let source = user::copy_path_cstr_from_user(request.arg(0)).map_err(path_copy_errno)?;
+            let target = user::copy_path_cstr_from_user(request.arg(1)).map_err(path_copy_errno)?;
+            let fstype = user::copy_path_cstr_from_user(request.arg(2)).map_err(path_copy_errno)?;
+            Work::Mount(Box::new(MountCall::new(
+                &source,
+                &target,
+                &fstype,
+                request.arg(3),
+                request.arg(4),
+            )?))
+        }
         SYS_OPEN | SYS_CHDIR | SYS_EXECVE => {
             let open_flags = if request.number() == SYS_OPEN {
                 let flags = flags(request.arg(1))?;
@@ -122,6 +139,7 @@ fn poll(
 ) -> Poll<Result<usize, Errno>> {
     let request = call.request;
     match &mut call.work {
+        Work::Mount(mount) => mount.poll(namespace()?, Some(token)).map_ok(|()| 0),
         Work::Open(open) => {
             let description = match open.poll(namespace()?, Some(token)) {
                 Poll::Pending => return Poll::Pending,

@@ -383,15 +383,21 @@ accepted ADRs remain authoritative when details differ.
   physical region. The kernel mounts it as a readonly ramfs index.
 - A mount-aware VFS owns pathname traversal and dispatch to filesystem
   backends. Ramfs remains the archive-backed readonly root; mounts are
-  kernel-controlled and cannot be dynamically unmounted.
+  published on userspace requests and cannot be dynamically unmounted.
   `Location::poll` selects the backend and node together; retained requests
   contain operation/progress storage, not a duplicate target identity.
-- The first initialization task builds/publishes the namespace before EL0,
-  including optional QEMU virtio-mmio block discovery. The first disk's first
-  primary FAT32 partition supplies `/fstab`; absence mounts it at `/mnt/disk`.
-  Present configuration controls all automatic mounts using `/dev/diskNpM`
-  selectors, existing mountpoints and FAT32 readonly/read-write policy. Empty
-  tables mount nothing; invalid configuration fails rather than falling back.
+- The first initialization task publishes a root-only namespace before EL0,
+  with optional QEMU virtio-mmio discovery and a persistent disk registry.
+  `mount=23` accepts `/dev/diskNpM`, absolute existing directories, `vfat`/`fat32`,
+  flags zero or readonly, and NULL data. SMP-safe additive publication retains
+  old cwd/OFD references and rejects conflicts and duplicate partition caches.
+  `/init` reads `/etc/fstab` from initramfs and execs `/bin/shell` afterward.
+  Missing/empty configuration mounts nothing; malformed or unreadable input
+  stops initialization. The default fstab requests disk0 partitions 1 and 2 at
+  `/mnt/disk` and `/mnt/disk/DATA` with read-write vfat. Mount failures warn on
+  stderr and do not skip later entries or shell startup, even when all fail.
+  No disk-root fstab or fallback remains. See
+  [ADR-0073](decisions/ADR-0073-best-effort-init-mounts.md).
   Partitions share one exclusive physical owner through exact-token reservations,
   never a spinlock spanning I/O. Early boot performs no disk I/O.
   Pi SDHOST and loader-provided boot-medium selection are not implemented; the
@@ -399,13 +405,15 @@ accepted ADRs remain authoritative when details differ.
   [storage bootstrap backlog](../docs/roadmap/hardening.md#storage-bootstrap).
   `--disk` shares attachments with DTB generation;
   diskless command/release composition is unchanged. See [storage](../docs/storage.md)
-  and [ADR-0070](decisions/ADR-0070-fstab-boot-mounts-and-shared-disks.md).
+  and [ADR-0072](decisions/ADR-0072-runtime-mounts-and-userspace-init.md).
 - `cargo xtask disk-create` explicitly provisions a new empty MBR/FAT32 data
   image for QEMU by default. Optional `--layout` schema-1 TOML declares up to
   four primary FAT32 partitions with labels, sizes and source directories;
   the last size may be omitted. Source paths are relative to the manifest.
   Sorted files, dotfiles and empty directories are copied with fixed FAT
-  timestamps; a first-partition source can supply `/fstab` and mountpoints.
+  timestamps; disk source trees supply data and mountpoint directories only.
+  The example fstab is `examples/storage/initramfs/etc/fstab`, selected with
+  `run-aarch64 --initramfs-root examples/storage/initramfs`.
   `sfdisk` chooses alignment; `mkfs.fat` chooses cluster size. The default total
   is 128 MiB.
   Existing output paths are never overwritten;
@@ -461,9 +469,10 @@ accepted ADRs remain authoritative when details differ.
   mounts, pending completion, and process ownership through the same VFS
   interfaces. It is absent from production artifacts. See
   [ADR-0062](decisions/ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md).
-- `/init` is the freestanding shell. Product binaries are declared by
-  `user/c/programs.toml` and installed under `/bin`, including `sleep`,
-  `reboot`, and `poweroff`.
+- `/init` is a separate freestanding initializer; it validates initramfs fstab,
+  mounts automatic entries and execs `/bin/shell` in the same process. Product
+  binaries are declared by `user/c/programs.toml`, including the initializer,
+  shell, `sleep`, `reboot`, and `poweroff`.
 - The shell has a fixed 16-entry command history with draft restoration and
   first-token Tab completion for built-ins and `/bin` ELF commands. Editor
   state and directory scanning use fixed storage; the existing 256-byte line

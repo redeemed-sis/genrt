@@ -1,5 +1,6 @@
 #include "protocol.h"
 #include <string.h>
+#include <sys/mount.h>
 
 #define PRODUCER "storage-supervisor"
 #define SUITE "storage-contract"
@@ -40,13 +41,36 @@ static int read_pattern(int fd, size_t length) {
 static void boot_mount_policy(int writing) {
     const char *subject = "boot-mount-policy";
     gtrt_case_start(PRODUCER, subject);
+    char cwd[64], directory[256] __attribute__((aligned(8)));
+    int covered = open("/mnt/disk", O_RDONLY | O_DIRECTORY);
+    check(covered >= 3 && chdir("/mnt/disk") == 0, subject);
+    check(open("/mnt/disk/SUB/seed.txt", O_RDONLY) == -GENRT_ENOENT, subject);
+    pid_t initializer = fork();
+    check(initializer >= 0, subject);
+    if (initializer == 0) {
+        int input = open("/.__genrt_test__/init-input", O_RDONLY);
+        if (input < 0 || dup2(input, 0) != 0) _exit(125);
+        if (input != 0) close(input);
+        char *argv[] = {"init", NULL};
+        execve("/.__genrt_test__/bin/init", argv, NULL);
+        _exit(126);
+    }
+    int init_status = -1;
+    check(waitpid(initializer, &init_status, 0) == initializer
+          && WIFEXITED(init_status) && WEXITSTATUS(init_status) == 0, subject);
+    /* The covered directory and cwd remain valid rather than being rewritten. */
+    check(getdents64(covered, directory, sizeof(directory)) == 0
+          && close(covered) == 0, subject);
+    check(open("SUB/seed.txt", O_RDONLY) == -GENRT_ENOENT
+          && getcwd(cwd, sizeof(cwd)) != NULL && strcmp(cwd, "/mnt/disk") == 0
+          && chdir("/") == 0, subject);
     const char *extra = "/mnt/disk/EXTRA/seed.txt";
     if (writing) {
         check(open("/mnt/disk/fstab", O_RDONLY) == -2, subject);
         check(open(extra, O_RDONLY) == -2, subject);
     } else {
         char bytes[32], cwd[64];
-        int fd = open("/mnt/disk/fstab", O_RDONLY);
+        int fd = open("/etc/fstab", O_RDONLY);
         check(fd >= 3 && read(fd, bytes, sizeof(bytes)) > 0 && close(fd) == 0, subject);
         fd = open(extra, O_RDONLY);
         check(fd >= 3 && read(fd, bytes, sizeof(bytes)) == 16
@@ -86,6 +110,47 @@ static void boot_mount_policy(int writing) {
         check(close(output) == 0 && waitpid(child, &status, 0) == child
               && WIFEXITED(status) && WEXITSTATUS(status) == 0, subject);
     }
+    gtrt_pass(PRODUCER, subject);
+}
+
+static void runtime_mounts(int writing) {
+    const char *subject = "runtime-mounts";
+    gtrt_case_start(PRODUCER, subject);
+    const char *source = "/dev/disk0p2", *target = "/mnt/disk/EXTRA";
+    check(mount(NULL, target, "vfat", 0, NULL) == -GENRT_EFAULT
+          && mount(source, (const char *)1, "vfat", 0, NULL) == -GENRT_EFAULT
+          && mount(source, target, NULL, 0, NULL) == -GENRT_EFAULT, subject);
+    check(mount(source, target, "ext4", 0, NULL) == -GENRT_ENOTSUP
+          && mount(source, target, "vfat", 2, NULL) == -GENRT_EINVAL
+          && mount(source, target, "vfat", 0, (void *)1) == -GENRT_EINVAL
+          && mount(source, "relative", "vfat", 0, NULL) == -GENRT_EINVAL, subject);
+    check(mount("/dev/disk31p1", target, "vfat", 0, NULL) == -GENRT_ENOENT
+          && mount("/dev/disk0p1", target, "vfat", 0, NULL) == -GENRT_EBUSY, subject);
+    if (writing) {
+        /* A failed attachment must release its claim before the next attempt. */
+        check(mount(source, "/mnt/disk/missing", "vfat", 0, NULL) == -GENRT_ENOENT, subject);
+        check(mount(source, "/mnt/disk/SUB/seed.txt", "vfat", 0, NULL) == -GENRT_ENOTDIR, subject);
+        pid_t children[2];
+        for (unsigned i = 0; i < 2; i++) {
+            check(sched_setforkaffinity((int)i + 1) == 0, subject);
+            children[i] = fork();
+            check(children[i] >= 0, subject);
+            if (children[i] == 0) {
+                int result = mount(source, target, "fat32", MS_RDONLY, NULL);
+                _exit(result == 0 ? 20 : result == -GENRT_EBUSY ? 21 : 22);
+            }
+        }
+        unsigned successes = 0;
+        for (unsigned i = 0; i < 2; i++) {
+            int status = -1;
+            check(waitpid(children[i], &status, 0) == children[i] && WIFEXITED(status), subject);
+            check(WEXITSTATUS(status) == 20 || WEXITSTATUS(status) == 21, subject);
+            successes += WEXITSTATUS(status) == 20;
+        }
+        check(successes == 1, subject);
+    }
+    check(mount(source, target, "vfat", MS_RDONLY, NULL) == -GENRT_EBUSY
+          && open("/mnt/disk/EXTRA/new.txt", O_CREAT | O_WRONLY) == -GENRT_EROFS, subject);
     gtrt_pass(PRODUCER, subject);
 }
 
@@ -251,6 +316,7 @@ int main(void) {
     int writing = strcmp(phase, "write") == 0;
     check(writing || strcmp(phase, "verify") == 0, "phase");
     boot_mount_policy(writing);
+    runtime_mounts(writing);
     mount_paths();
     writable_io();
     shared_offsets();

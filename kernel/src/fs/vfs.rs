@@ -1,21 +1,21 @@
-//! Boot-built global namespace with pinned mounts and parent-aware locations.
+//! Bounded runtime namespace with pinned mounts and parent-aware locations.
 
 use super::backend::{Backend, Kind, NAME_MAX, Node, Operation, Reply, Request};
 use crate::{
     config::GENRT_PATH_MAX,
     errno::{self, Errno},
     sched::WaitToken,
-    sync::OncePublication,
+    sync::{OncePublication, SpinLock},
 };
 use alloc::{sync::Arc, vec::Vec};
 use core::task::Poll;
 
-#[allow(dead_code)] // Additional registration is currently kernel/test controlled.
 const MAX_MOUNTS: usize = 16;
 
 /// A filesystem instance pinned by the namespace and every open location.
 pub(crate) struct Mount {
     pub(super) backend: Arc<dyn Backend>,
+    root: Node,
 }
 
 /// Pinned mount/node reference with immutable canonical namespace ancestry.
@@ -88,17 +88,70 @@ impl Location {
     pub(super) fn backend(&self) -> &dyn Backend {
         &*self.0.mount.backend
     }
+
+    // Compare pinned identities, including self, without filesystem lookup.
+    fn is_ancestor_of(&self, location: &Location) -> bool {
+        let mut current = Some(location);
+        while let Some(location) = current {
+            if Arc::ptr_eq(&self.0.mount, &location.0.mount) && self.node() == location.node() {
+                return true;
+            }
+            current = location.0.parent.as_ref();
+        }
+        false
+    }
 }
 
-/// One namespace, mutable only while exclusively owned during bootstrap.
+/// One namespace with permanent mounts and bounded synchronized publication.
 pub(crate) struct Namespace {
     root: Location,
-    mounts: Vec<Mountpoint>,
+    mounts: SpinLock<MountTable>,
+}
+
+#[derive(Clone)]
+struct MountTable {
+    points: [Option<Arc<Mountpoint>>; MAX_MOUNTS],
+    len: usize,
 }
 
 struct Mountpoint {
     covered: Location,
     mounted: Arc<Mount>,
+}
+
+impl MountTable {
+    // The caller holds the table lock. Only bounded identity checks and an
+    // ownership transfer occur here; prepared storage stays caller-owned on error.
+    fn attach(&mut self, prepared: &mut Option<Arc<Mountpoint>>) -> Result<bool, Errno> {
+        let candidate = prepared.as_ref().unwrap();
+        let target = &candidate.covered;
+        // Another mount may have covered this target or one of its parents
+        // while lookup was unlocked. Resolve again instead of mounting a hidden node.
+        if self
+            .points
+            .iter()
+            .flatten()
+            .any(|point| point.covered.is_ancestor_of(target))
+        {
+            return Ok(false);
+        }
+        for point in self.points.iter().flatten() {
+            if Arc::ptr_eq(&point.mounted.backend, &candidate.mounted.backend) {
+                return Err(errno::EINVAL);
+            }
+            if (Arc::ptr_eq(&point.mounted, &target.0.mount) && target.node() == point.mounted.root)
+                || target.is_ancestor_of(&point.covered)
+            {
+                return Err(errno::EBUSY);
+            }
+        }
+        if self.len == MAX_MOUNTS {
+            return Err(errno::ENOMEM);
+        }
+        self.points[self.len] = prepared.take();
+        self.len += 1;
+        Ok(true)
+    }
 }
 
 static NAMESPACE: OncePublication<Namespace> = OncePublication::new();
@@ -116,7 +169,10 @@ impl Namespace {
         if node.kind != Kind::Directory {
             return Err(errno::ENOTDIR);
         }
-        let mount = Arc::new(Mount { backend });
+        let mount = Arc::new(Mount {
+            backend,
+            root: node,
+        });
         let root = Location(Arc::new(LocationInner {
             mount,
             node,
@@ -125,7 +181,10 @@ impl Namespace {
         }));
         Ok(Self {
             root,
-            mounts: Vec::new(),
+            mounts: SpinLock::new(MountTable {
+                points: [const { None }; MAX_MOUNTS],
+                len: 0,
+            }),
         })
     }
 
@@ -136,7 +195,7 @@ impl Namespace {
         self.root.clone()
     }
 
-    /// Mount a distinct instance on an existing directory during exclusive bootstrap.
+    /// Mount a distinct instance synchronously in task/bootstrap context.
     /// Nested mounts are allowed; ancestor mounts cannot hide earlier mounts.
     /// Mountpoints use mount/node identity so backend aliases cross the same mount.
     /// # Arguments
@@ -147,62 +206,82 @@ impl Namespace {
     /// # Errors
     /// Path/backend errors, `EINVAL` for relative/reused instances, `EBUSY`
     /// for conflicting/root/shadowing mounts, `ENOMEM` for bounded capacity.
-    #[allow(dead_code)]
+    #[cfg(any(test, feature = "qemu-test-vfs"))]
     pub(crate) fn mount(&mut self, path: &[u8], backend: Arc<dyn Backend>) -> Result<(), Errno> {
-        if !path.starts_with(b"/") || backend.root().kind != Kind::Directory {
+        if !path.starts_with(b"/") {
             return Err(errno::EINVAL);
         }
-        if Arc::ptr_eq(&self.root.0.mount.backend, &backend)
-            || self
-                .mounts
-                .iter()
-                .any(|point| Arc::ptr_eq(&point.mounted.backend, &backend))
-        {
+        loop {
+            let mut resolver = Resolver::new(self.root(), path, false)?;
+            let location = match resolver.poll(self, None) {
+                Poll::Ready(result) => result?,
+                Poll::Pending => return Err(errno::ENOTSUP),
+            };
+            if self.attach(location, backend.clone())? {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Count published additional mounts for host assertions.
+    /// # Returns
+    /// Bounded count, without allocation, callbacks or blocking.
+    #[cfg(test)]
+    pub(super) fn mount_count(&self) -> usize {
+        self.mounts.lock().len
+    }
+
+    fn snapshot(&self) -> MountTable {
+        // Only Arc increments occur under this lock. The snapshot's references
+        // (and any final destructors) are released after the guard is gone.
+        self.mounts.lock().clone()
+    }
+
+    /// Validate and atomically publish an already constructed filesystem.
+    /// Conflict checks and insertion share one table lock. Filesystem lookup,
+    /// callbacks, allocation and destruction run outside it.
+    /// # Arguments
+    /// * `location` - Existing target directory, pinned by that resolution.
+    /// * `backend` - New, exclusively reserved filesystem instance.
+    /// # Returns
+    /// `true` after publication; `false` when a mount covered the target's
+    /// pinned ancestry, requiring fresh root-based resolution. Unrelated mounts
+    /// do not require a retry. No partial registration is visible on failure.
+    /// # Errors
+    /// `EINVAL` for reused/invalid instances, `ENOTDIR` for a file target,
+    /// `EBUSY` for root/duplicate/shadowing mounts, `ENOMEM` at capacity.
+    pub(super) fn attach(
+        &self,
+        location: Location,
+        backend: Arc<dyn Backend>,
+    ) -> Result<bool, Errno> {
+        let node = backend.root();
+        if node.kind != Kind::Directory {
             return Err(errno::EINVAL);
         }
-        let mut resolver = Resolver::new(self.root(), path, false)?;
-        let location = match resolver.poll(self, None) {
-            Poll::Ready(result) => result?,
-            Poll::Pending => return Err(errno::ENOTSUP),
-        };
+        if Arc::ptr_eq(&self.root.0.mount.backend, &backend) {
+            return Err(errno::EINVAL);
+        }
         if location.node().kind != Kind::Directory {
             return Err(errno::ENOTDIR);
         }
         if location.0.parent.is_none() {
             return Err(errno::EBUSY);
         }
-        if self.mounts.iter().any(|point| {
-            if Arc::ptr_eq(&point.mounted, &location.0.mount)
-                && location.node() == point.mounted.backend.root()
-            {
-                return true;
-            }
-            // Compare the covered ancestry by identity, not pathname spelling.
-            let mut ancestor = Some(&point.covered);
-            while let Some(current) = ancestor {
-                if Arc::ptr_eq(&current.0.mount, &location.0.mount)
-                    && current.node() == location.node()
-                {
-                    return true;
-                }
-                ancestor = current.0.parent.as_ref();
-            }
-            false
-        }) {
-            return Err(errno::EBUSY);
-        }
-        if self.mounts.len() == MAX_MOUNTS {
-            return Err(errno::ENOMEM);
-        }
-        self.mounts.try_reserve(1).map_err(|_| errno::ENOMEM)?;
-        self.mounts.push(Mountpoint {
+        let mut point = Some(Arc::new(Mountpoint {
             covered: location,
-            mounted: Arc::new(Mount { backend }),
-        });
-        Ok(())
+            mounted: Arc::new(Mount {
+                backend,
+                root: node,
+            }),
+        }));
+        let result = self.mounts.lock().attach(&mut point);
+        // A rejected candidate is destroyed after the table guard is gone.
+        drop(point);
+        result
     }
 
-    /// Publish and freeze the global boot namespace permanently.
+    /// Publish the global namespace permanently; runtime attachments stay bounded.
     /// # Arguments
     /// * `self` - Exclusively constructed namespace.
     /// # Returns
@@ -213,7 +292,13 @@ impl Namespace {
         NAMESPACE.publish(self).map_err(|_| errno::EBUSY)
     }
 
-    fn child(&self, parent: &Location, name: &[u8], node: Node) -> Result<Location, Errno> {
+    fn child(
+        &self,
+        snapshot: &MountTable,
+        parent: &Location,
+        name: &[u8],
+        node: Node,
+    ) -> Result<Location, Errno> {
         let separator = usize::from(parent.path() != b"/");
         let length = parent.path().len() + separator + name.len();
         if name.len() > NAME_MAX || length > GENRT_PATH_MAX {
@@ -228,9 +313,10 @@ impl Namespace {
             absolute.push(b'/');
         }
         absolute.extend_from_slice(name);
-        let mount = self
-            .mounts
+        let mount = snapshot
+            .points
             .iter()
+            .flatten()
             .find(|point| {
                 Arc::ptr_eq(&point.covered.0.mount, &parent.0.mount) && point.covered.node() == node
             })
@@ -239,7 +325,7 @@ impl Namespace {
         let node = if Arc::ptr_eq(&mount, &parent.0.mount) {
             node
         } else {
-            mount.backend.root()
+            mount.root
         };
         Ok(Location(Arc::new(LocationInner {
             mount,
@@ -250,7 +336,7 @@ impl Namespace {
     }
 }
 
-/// Borrow the permanently frozen global namespace.
+/// Borrow the permanently published global namespace.
 /// # Returns
 /// Namespace reference, without allocation or blocking.
 /// # Errors
@@ -261,6 +347,7 @@ pub(crate) fn namespace() -> Result<&'static Namespace, Errno> {
 
 /// Owned component traversal retained over backend waits.
 pub(crate) struct Resolver {
+    topology: Option<MountTable>,
     input: Vec<u8>,
     cursor: usize,
     current: Location,
@@ -303,6 +390,7 @@ impl Resolver {
         let last = input.split(|b| *b == b'/').rfind(|c| !c.is_empty());
         let require_directory = input.ends_with(b"/") || matches!(last, Some(b"." | b".."));
         Ok(Self {
+            topology: None,
             input: input.to_vec(),
             cursor: 0,
             current,
@@ -315,7 +403,8 @@ impl Resolver {
 
     /// Advance traversal or resume its exact backend submission, without sleeping.
     /// # Arguments
-    /// * `namespace` - Frozen namespace being traversed.
+    /// * `namespace` - Published namespace; first poll pins a coherent bounded
+    ///   topology snapshot retained across backend waits.
     /// * `wake` - Prepared token passed to backend submissions.
     /// # Returns
     /// Pinned target, or `Pending` after exact backend wait publication.
@@ -326,6 +415,9 @@ impl Resolver {
         namespace: &Namespace,
         wake: Option<WaitToken>,
     ) -> Poll<Result<Location, Errno>> {
+        if self.topology.is_none() {
+            self.topology = Some(namespace.snapshot());
+        }
         loop {
             if let Some(request) = self.request.as_mut() {
                 let result = match self.current.poll(request, wake) {
@@ -347,7 +439,12 @@ impl Resolver {
                     Err(e) => return Poll::Ready(Err(e)),
                 };
                 self.request = None;
-                self.current = match namespace.child(&self.current, &self.component, node) {
+                self.current = match namespace.child(
+                    self.topology.as_ref().unwrap(),
+                    &self.current,
+                    &self.component,
+                    node,
+                ) {
                     Ok(c) => c,
                     Err(e) => return Poll::Ready(Err(e)),
                 };

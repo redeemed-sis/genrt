@@ -4,6 +4,10 @@
 
 Accepted
 
+Partially superseded by [ADR-0072](ADR-0072-runtime-mounts-and-userspace-init.md)
+for boot-only namespace mutation; pinned locations and descriptor ownership
+remain in force.
+
 Supersedes the ramfs-specific descriptor representation in
 [ADR-0019](ADR-0019-readonly-ramfs-and-fd-table.md), independent fork offsets in
 [ADR-0022](ADR-0022-fork-exec-waitpid-echo.md), directory-description ownership in

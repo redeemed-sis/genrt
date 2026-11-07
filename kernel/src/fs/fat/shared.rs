@@ -37,6 +37,19 @@ impl DiskWaiters {
 }
 
 impl SharedDisk {
+    /// Remove only an abandoned exact physical-disk registration.
+    /// # Arguments
+    /// * `token` - Registration owned by the cancelled mount continuation.
+    /// # Returns
+    /// Nothing; a replaced or already claimed token is left untouched. Bounded
+    /// task-context lock work only, without I/O, allocation or notification.
+    pub(in crate::fs) fn cancel_wait(&self, token: WaitToken) {
+        let mut state = self.state.lock();
+        let waiter = &mut state.waiters[token.thread().index()];
+        if *waiter == Some(token) {
+            *waiter = None;
+        }
+    }
     /// Detach a test wait without invoking the uninitialized host scheduler.
     /// # Arguments
     /// * `index` - Bounded thread slot whose exact registration is inspected.
@@ -45,7 +58,7 @@ impl SharedDisk {
     /// # Panics
     /// Panics if `index` exceeds kernel thread capacity.
     #[cfg(test)]
-    pub(super) fn take_waiter(&self, index: usize) -> Option<WaitToken> {
+    pub(in crate::fs) fn take_waiter(&self, index: usize) -> Option<WaitToken> {
         self.state.lock().waiters[index].take()
     }
 

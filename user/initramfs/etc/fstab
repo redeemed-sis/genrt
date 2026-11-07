@@ -1,0 +1,4 @@
+# /init mounts automatic entries before execing /bin/shell.
+# Failed mounts warn on stderr and do not prevent the shell from starting.
+/dev/disk0p1 /mnt/disk      vfat defaults 0 0
+/dev/disk0p2 /mnt/disk/DATA vfat rw       0 0

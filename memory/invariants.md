@@ -281,8 +281,13 @@ Changes that invalidate one require architecture review and an ADR.
   Large copies/growth run in IRQ-enabled task context, outside owner locks.
   File I/O retains requested lengths; natural bounded directory/stdin/profile
   staging is not a global transfer policy.
-- Namespace construction and optional storage discovery/mounting run in the
-  first ordinary task before publication and EL0. Persistent FAT handles,
+- Root namespace publication and optional storage discovery run in the
+  first ordinary task before EL0. Filesystem configuration belongs to userspace:
+  `/init` reads initramfs `/etc/fstab`; the kernel never parses it or implicitly
+  mounts a disk. Runtime mount publication is bounded and atomic under SMP;
+  callbacks, path resolution, allocation and destruction stay outside its lock.
+  Existing locations remain pinned; fresh traversals observe published mounts.
+  Persistent FAT handles,
   mutation and explicit sync share one logical volume lease, never a held
   spinlock. One canonical file per node shares authoritative metadata across
   independent descriptions; their positions remain VFS-owned. Library sync
@@ -294,9 +299,9 @@ Changes that invalidate one require architecture review and an ADR.
   no disk waits or traversal belong in IRQ/scheduler/timer or RT measurements.
 - Partitions sharing a physical disk reserve its single driver owner before
   filesystem work. Contention publishes exact wait tokens and returns `Pending`;
-  no spinlock spans I/O and no sector callback sleeps. Boot mount configuration
-  never creates competing FAT instances for one partition. Only an absent
-  `/fstab` on the selected first FAT32 partition permits the fallback mount.
+  no spinlock spans I/O and no sector callback sleeps. Runtime mount transactions
+  reserve partition identity before constructing FAT and release failed or
+  cancelled reservations; one partition never has competing FAT caches.
 - Ramfs data remains archive-backed and readonly. Test-only writable/generated
   backends use the same VFS boundary and never enter production composition.
 

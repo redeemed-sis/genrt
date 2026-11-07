@@ -1,9 +1,17 @@
 schema = 1
 
 [[program]]
+name = "init"
+source = "user/c/init.c"
+install = "init"
+contract = "userspace"
+contract_install = ".__genrt_test__/bin/init"
+contract_case = "production-init-exec-smoke"
+
+[[program]]
 name = "shell"
 source = "user/c/shell.c"
-install = "init"
+install = "bin/shell"
 contract = "shell"
 contract_install = "bin/shell"
 contract_case = "shell-exit"

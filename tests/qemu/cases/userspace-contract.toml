@@ -85,6 +85,11 @@ subject = "rtbench-cli-validation"
 [[steps]]
 action = "expect_case"
 producer = "api-supervisor"
+subject = "production-init-exec-smoke"
+
+[[steps]]
+action = "expect_case"
+producer = "api-supervisor"
 subject = "production-echo-exec-smoke"
 
 [[steps]]

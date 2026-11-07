@@ -165,8 +165,8 @@ fn image_bytes(size_mib: u64) -> Result<u64> {
 ///   Only the last size may be omitted.
 /// # Returns
 /// Success after syncing and publishing the image. With no layout, the disk has
-/// one empty partition. Source trees are copied verbatim, including any fstab;
-/// no bootloader or mount configuration is generated implicitly.
+/// one empty partition. Source trees are copied verbatim; no bootloader or
+/// mount configuration is generated. Mount policy comes from initramfs fstab.
 /// # Errors
 /// Invalid size/label/path or TOML/sources, existing destination, filesystem
 /// failures, missing host tools, partitioning/formatting/copy failure
@@ -297,7 +297,7 @@ pub(crate) fn create(
             spec.entries.len()
         );
     }
-    println!("genrt uses /fstab on partition 1 when present; otherwise mounts it at /mnt/disk.");
+    println!("Configure /etc/fstab in initramfs to mount this disk; see docs/storage.md.");
     Ok(())
 }
 

@@ -4,6 +4,10 @@
 
 Accepted
 
+Partially superseded by [ADR-0072](ADR-0072-runtime-mounts-and-userspace-init.md)
+for disk-root fstab, fallback placement and pre-EL0 mount policy. The shared
+physical-disk reservation remains in force.
+
 Partially supersedes [ADR-0064](ADR-0064-qemu-block-storage-and-fat32.md)
 for single-disk staging, exclusive parent consumption by the mounted partition,
 and unconditional `/mnt/disk` placement. The generic block interface, partition

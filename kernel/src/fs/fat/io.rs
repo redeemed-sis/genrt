@@ -109,15 +109,6 @@ impl Disk {
         self.readonly
     }
 
-    /// Apply final boot mount policy before namespace publication.
-    /// # Arguments
-    /// * `readonly` - Requested policy; cannot override physical protection.
-    /// # Returns
-    /// Nothing; cached policy changes only, without I/O or allocation.
-    pub(super) fn set_read_only(&mut self, readonly: bool) {
-        self.readonly = readonly || self.parent.as_ref().is_some_and(|p| p.is_read_only());
-    }
-
     fn ensure_usable(&self) -> Result<(), BlockError> {
         if let Some(error) = self.failure {
             return Err(if error == crate::errno::ETIMEDOUT {

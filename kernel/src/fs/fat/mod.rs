@@ -97,12 +97,40 @@ impl Fat {
     /// # Errors
     /// Geometry/media errors as for mount; `EAGAIN` if the disk is reserved.
     /// Failed mounting returns the physical owner through adapter RAII.
+    #[cfg(test)]
     pub(crate) fn from_partition(
         parent: Arc<SharedDisk>,
         entry: PartitionEntry,
         readonly: bool,
     ) -> Result<Self, Errno> {
         Self::mount(io::Disk::partition(parent, entry, readonly)?)
+    }
+
+    /// Construct a reserved partition's resident filesystem after disk admission.
+    /// Library allocation and I/O run in IRQ-enabled task context, without locks.
+    /// Callers must reserve the source before calling to prevent duplicate caches.
+    /// # Arguments
+    /// * `parent` - Stable physical owner shared by partition volumes.
+    /// * `entry` - Validated primary extent.
+    /// * `readonly` - Additional mount-level write protection.
+    /// * `wake` - Exact prepared token to register on physical contention.
+    /// # Returns
+    /// New filesystem, or `Pending` before any filesystem construction or I/O.
+    /// # Errors
+    /// Geometry, filesystem and device errors; `EAGAIN` only without `wake`.
+    /// Failure returns the physical owner through adapter RAII.
+    pub(super) fn poll_from_partition(
+        parent: Arc<SharedDisk>,
+        entry: PartitionEntry,
+        readonly: bool,
+        wake: Option<WaitToken>,
+    ) -> Poll<Result<Self, Errno>> {
+        let mut disk = io::Disk::partition(parent, entry, readonly)?;
+        match disk.acquire(wake) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => Poll::Ready(Self::mount(disk)),
+        }
     }
 
     fn mount(mut disk: io::Disk) -> Result<Self, Errno> {
@@ -131,25 +159,6 @@ impl Fat {
                 waiters: [None; crate::config::KERNEL_THREAD_CAPACITY],
             }),
         })
-    }
-
-    /// Set mount protection on the configuration volume before publication.
-    /// # Arguments
-    /// * `readonly` - Final fstab/fallback policy; physical protection persists.
-    /// # Returns
-    /// Success after an unlocked, non-I/O policy update; no allocation.
-    /// # Errors
-    /// `EAGAIN` if exclusive bootstrap ownership was violated.
-    pub(super) fn set_read_only(&self, readonly: bool) -> Result<(), Errno> {
-        let mut lease = self.acquire(None).map_err(|_| errno::EAGAIN)?;
-        lease
-            .volume
-            .as_mut()
-            .unwrap()
-            .filesystem
-            .device_mut()
-            .set_read_only(readonly);
-        Ok(())
     }
 
     fn acquire(&self, wake: Option<WaitToken>) -> Result<Lease<'_>, Poll<Result<Reply, Errno>>> {

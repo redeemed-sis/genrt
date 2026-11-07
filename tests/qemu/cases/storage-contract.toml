@@ -17,6 +17,11 @@ subject = "boot-mount-policy"
 [[steps]]
 action = "expect_case"
 producer = "storage-supervisor"
+subject = "runtime-mounts"
+
+[[steps]]
+action = "expect_case"
+producer = "storage-supervisor"
 subject = "mount-paths"
 
 [[steps]]

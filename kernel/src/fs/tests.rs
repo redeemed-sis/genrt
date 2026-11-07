@@ -207,6 +207,145 @@ fn ancestor_mount_cannot_shadow_an_existing_mount() {
 }
 
 #[test]
+fn runtime_mount_keeps_old_locations_and_rejects_stale_publication() {
+    let ns = Namespace::new(Arc::new(
+        MountedRamfs::new(
+            vec![RamFile {
+                path: b"/m/old".to_vec(),
+                data: b"old",
+            }],
+            vec![b"/m/sub".to_vec(), b"/n".to_vec()],
+        )
+        .unwrap(),
+    ))
+    .unwrap();
+    let cwd = resolve(&ns, ns.root(), b"/m").unwrap();
+    let old_file = open(&ns, b"/m/old", flags());
+    let old_dir = open(
+        &ns,
+        b"/m",
+        OpenFlags {
+            directory: true,
+            ..flags()
+        },
+    );
+    let stale_child = resolve(&ns, ns.root(), b"/m/sub").unwrap();
+    assert!(
+        ns.attach(cwd.clone(), Arc::new(TestFs::new("new")))
+            .unwrap()
+    );
+    assert!(!ns.attach(stale_child, root(Vec::new())).unwrap());
+    assert_eq!(read(old_file, 16, true), b"old");
+    assert!(resolve(&ns, cwd.clone(), b"old").is_ok());
+    assert!(matches!(
+        resolve(&ns, ns.root(), b"/m/old"),
+        Err(errno::ENOENT)
+    ));
+    assert!(resolve(&ns, ns.root(), b"/m/dynamic").is_ok());
+    let mut directory = Transaction::new(old_dir, Operation::Readdir { offset: 0 }, 512).unwrap();
+    assert!(
+        matches!(complete(&mut directory), Ok(Reply::Entry(Some(entry))) if entry.name == b"old")
+    );
+    let count = ns.mount_count();
+    let current = resolve(&ns, ns.root(), b"/m").unwrap();
+    assert_eq!(ns.attach(current, root(Vec::new())), Err(errno::EBUSY));
+    assert_eq!(ns.mount_count(), count);
+}
+
+#[test]
+fn concurrent_mounts_publish_once_and_preserve_bounded_capacity() {
+    use std::sync::Barrier;
+    let directories = (0..17)
+        .map(|index| alloc::format!("/d{index}").into_bytes())
+        .collect();
+    let ns = Namespace::new(root(directories)).unwrap();
+    let barrier = Barrier::new(2);
+    let successes = std::thread::scope(|scope| {
+        let attempt = || {
+            let target = resolve(&ns, ns.root(), b"/d0").unwrap();
+            barrier.wait();
+            ns.attach(target, root(Vec::new())).unwrap()
+        };
+        let first = scope.spawn(attempt);
+        let second = scope.spawn(attempt);
+        usize::from(first.join().unwrap()) + usize::from(second.join().unwrap())
+    });
+    assert_eq!(successes, 1);
+    std::thread::scope(|scope| {
+        for index in 1..16 {
+            let ns = &ns;
+            scope.spawn(move || {
+                let path = alloc::format!("/d{index}");
+                let backend = root(Vec::new());
+                let target = resolve(ns, ns.root(), path.as_bytes()).unwrap();
+                assert!(ns.attach(target, backend).unwrap());
+                let file = alloc::format!("{path}/hello");
+                assert_eq!(read(open(ns, file.as_bytes(), flags()), 8, true), b"hello");
+            });
+        }
+    });
+    assert_eq!(ns.mount_count(), 16);
+    let target = resolve(&ns, ns.root(), b"/d16").unwrap();
+    assert_eq!(ns.attach(target, root(Vec::new())), Err(errno::ENOMEM));
+    assert!(matches!(
+        resolve(&ns, ns.root(), b"/d16/hello"),
+        Err(errno::ENOENT)
+    ));
+}
+
+#[test]
+fn resolver_retains_one_topology_snapshot_across_pending() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    struct Paused {
+        ready: AtomicBool,
+        inner: Arc<dyn Backend>,
+    }
+    impl Backend for Paused {
+        fn close(&self, node: Node, state: Option<alloc::boxed::Box<dyn core::any::Any + Send>>) {
+            self.inner.close(node, state);
+        }
+        fn root(&self) -> Node {
+            self.inner.root()
+        }
+        fn poll(
+            &self,
+            target: Node,
+            request: &mut Request,
+            wake: Option<crate::sched::WaitToken>,
+        ) -> Poll<Result<Reply, isize>> {
+            if !self.ready.load(Ordering::Acquire) {
+                return Poll::Pending;
+            }
+            self.inner.poll(target, request, wake)
+        }
+    }
+    let backend = Arc::new(Paused {
+        ready: AtomicBool::new(false),
+        inner: Arc::new(
+            MountedRamfs::new(
+                vec![RamFile {
+                    path: b"/gate/m/old".to_vec(),
+                    data: b"old",
+                }],
+                Vec::new(),
+            )
+            .unwrap(),
+        ),
+    });
+    let ns = Namespace::new(backend.clone()).unwrap();
+    let mut lookup = Resolver::new(ns.root(), b"/gate/m/old", false).unwrap();
+    assert!(lookup.poll(&ns, None).is_pending());
+    backend.ready.store(true, Ordering::Release);
+    let target = resolve(&ns, ns.root(), b"/gate/m").unwrap();
+    assert!(ns.attach(target, root(Vec::new())).unwrap());
+    assert!(matches!(lookup.poll(&ns, None), Poll::Ready(Ok(_))));
+    assert!(matches!(
+        resolve(&ns, ns.root(), b"/gate/m/old"),
+        Err(errno::ENOENT)
+    ));
+}
+
+#[test]
 fn readonly_errors_and_generic_exec_preserve_archive_bytes() {
     let (ns, _, _) = fixture();
     let mut op = Open::new(

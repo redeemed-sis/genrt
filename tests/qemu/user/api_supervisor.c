@@ -14,6 +14,11 @@ static int exec_and_wait(const char *path, char *const argv[], int expected) {
         return 0;
     }
     if (child == 0) {
+        if (strcmp(path, "/.__genrt_test__/bin/init") == 0) {
+            int input = open("/.__genrt_test__/init-input", O_RDONLY);
+            if (input < 0 || dup2(input, 0) != 0) exit(125);
+            if (input != 0) close(input);
+        }
         execve(path, argv, NULL);
         exit(126);
     }

@@ -1,6 +1,13 @@
 schema = 2
 
 [[invocation]]
+program = "init"
+case = "production-init-exec-smoke"
+path = "/.__genrt_test__/bin/init"
+args = ["init"]
+expected_exit = 0
+
+[[invocation]]
 program = "shell"
 case = "shell-exit"
 path = "/bin/shell"

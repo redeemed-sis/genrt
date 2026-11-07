@@ -278,12 +278,15 @@ fn check_user_support() -> Result<()> {
         ("support", true),
         ("shell_input", false),
         ("shell", false),
+        ("init", false),
         ("rtbench", true),
         ("time", false),
     ] {
         check_user_host_program(directory, name, wrap_write)?;
     }
-    println!("userspace support, shell input/redirection, rtbench, and clock host tests passed");
+    println!(
+        "userspace support, init/fstab, shell input/redirection, rtbench, and clock host tests passed"
+    );
     Ok(())
 }
 
@@ -305,6 +308,9 @@ fn check_user_host_program(directory: &Path, name: &str, wrap_write: bool) -> Re
     }
     if name == "shell" {
         compiler.args(["-I", "tests/user/shell_host_include"]);
+    }
+    if name == "init" {
+        compiler.args(["-I", "tests/user/init_host_include"]);
     }
     if name == "rtbench" {
         compiler.args([
@@ -658,12 +664,12 @@ pub(crate) struct BuiltProductionProgram {
 }
 
 impl ProductionUserArtifacts {
-    /// Return the production shell ELF used as release `/init`.
+    /// Return the production initializer ELF used as release `/init`.
     ///
     /// # Returns
     ///
-    /// Returns the already-built shell artifact path.
-    pub(crate) fn shell(&self) -> &Path {
+    /// Returns the already-built initializer artifact path.
+    pub(crate) fn init(&self) -> &Path {
         self.programs
             .iter()
             .find(|program| program.metadata.install() == "init")
@@ -722,7 +728,7 @@ impl BuiltProductionProgram {
 ///
 /// # Returns
 ///
-/// Returns paths to the shell and release `/bin` programs.
+/// Returns paths to the initializer and release `/bin` programs.
 ///
 /// # Errors
 ///
@@ -759,7 +765,7 @@ pub(crate) fn build_production_user_artifacts(
 ///
 /// * `profile` - Selects staging and default output paths.
 /// * `root` - Optional source tree; the repository production root is default.
-/// * `init` - Optional prebuilt `/init`; the production shell is default.
+/// * `init` - Optional prebuilt `/init`; the production initializer is default.
 /// * `output` - Optional archive path.
 /// * `users` - Exact production ELF files to stage without rebuilding.
 ///
@@ -844,7 +850,7 @@ fn build_initramfs_with_provenance(
             validate_user_elf_payload(&path)?;
             path
         }
-        None => users.shell().to_path_buf(),
+        None => users.init().to_path_buf(),
     };
 
     let artifacts = Aarch64Artifacts::new(profile);
@@ -885,7 +891,7 @@ fn build_initramfs_with_provenance(
     Ok(output)
 }
 
-/// Stage product programs assigned to one dynamic contract role.
+/// Stage alternate contract paths; ordinary install paths are staged globally.
 ///
 /// # Arguments
 ///
@@ -905,11 +911,9 @@ pub(crate) fn stage_contract_programs(
     contract: &str,
     users: &ProductionUserArtifacts,
 ) -> Result<()> {
-    for program in users
-        .programs()
-        .iter()
-        .filter(|program| program.contract() == contract)
-    {
+    for program in users.programs().iter().filter(|program| {
+        program.contract() == contract && program.contract_install() != program.install()
+    }) {
         stage_elf(root, root, program.contract_install(), program.elf())?;
     }
     Ok(())

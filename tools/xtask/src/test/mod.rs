@@ -220,7 +220,6 @@ pub(crate) fn run(options: Options) -> Result<()> {
         )?;
         if storage_case && matches!(result.status, runner::Status::Passed) {
             storage::verify(&case_dir)?;
-            storage::configure_mounts(&case_dir)?;
             let mut second_case = case.clone();
             second_case.init = cases::InitImage::StorageVerify;
             let initramfs = prepare_test_initramfs(
@@ -354,6 +353,16 @@ fn prepare_test_initramfs(
     let init = match image {
         cases::InitImage::StorageWrite | cases::InitImage::StorageVerify => {
             fs::create_dir_all(&test_namespace)?;
+            fs::create_dir_all(test_namespace.join("bin"))?;
+            fs::copy(users.init(), test_namespace.join("bin/init"))?;
+            fs::write(test_namespace.join("init-input"), b"exit\n")?;
+            fs::create_dir_all(root.join("etc"))?;
+            let mut fstab = String::from("/dev/disk0p1 /mnt/disk vfat defaults 0 0\n");
+            if matches!(image, cases::InitImage::StorageVerify) {
+                fstab.push_str("/dev/disk0p2 /mnt/disk/EXTRA fat32 ro 0 0\n");
+            }
+            fs::write(root.join("etc/fstab"), fstab)?;
+            provenance.mark_prefix("etc/fstab", crate::initramfs::Origin::TestFixture)?;
             workflow::stage_contract_programs(&root, "shell", users)?;
             fs::copy(
                 "tests/qemu/fixtures/storage-redirection.txt",
@@ -396,6 +405,18 @@ fn prepare_test_initramfs(
         }
         cases::InitImage::UserFault => workflow::build_user_program(profile, "fault_null", true)?,
         cases::InitImage::UserspaceContract => {
+            fs::create_dir_all(&test_namespace)?;
+            fs::write(test_namespace.join("init-input"), b"exit\n")?;
+            // This diskless contract must still reach the production shell
+            // after both explicit mount requests fail.
+            fs::create_dir_all(root.join("etc"))?;
+            fs::write(
+                root.join("etc/fstab"),
+                b"/dev/disk0p1 /mnt/disk vfat defaults 0 0\n\
+                  /dev/disk0p2 /mnt/disk/DATA vfat rw 0 0\n",
+            )?;
+            provenance.mark_prefix("etc/fstab", crate::initramfs::Origin::TestFixture)?;
+            workflow::stage_contract_programs(&root, "userspace", users)?;
             copy_tree(
                 PathBuf::from("tests/qemu/fixtures/initramfs/fixtures").as_path(),
                 &test_namespace.join("fixtures"),
@@ -427,6 +448,7 @@ fn prepare_test_initramfs(
             workflow::stage_contract_programs(&root, "shell", users)?;
             // Only this controlled test image adds /bin completion fixtures.
             // Exact provenance keeps these aliases out of production archives.
+            fs::create_dir_all(root.join("bin"))?;
             for name in ["gtrt-one", "gtrt-pair-a", "gtrt-pair-b", "cd"] {
                 fs::copy(&probe, root.join("bin").join(name))?;
                 provenance.mark_prefix(

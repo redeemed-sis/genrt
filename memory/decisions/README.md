@@ -69,7 +69,7 @@ growth.
 | [0059](ADR-0059-native-counter-sleep-and-active-read-validation.md) | Native counter sleep and active-read validation | Accepted | Syscall/time/VM ownership | - | [0060](ADR-0060-retire-native-counter-sleep-interface.md) (native userspace interface only) |
 | [0060](ADR-0060-retire-native-counter-sleep-interface.md) | Retire native counter-sleep interface | Accepted | Userspace sleep ABI | [0059](ADR-0059-native-counter-sleep-and-active-read-validation.md) (native userspace interface only) | - |
 | [0061](ADR-0061-raspberrypi-fit-release-artifacts.md) | Raspberry Pi FIT release artifacts | Accepted | Release composition and verification scope | - | - |
-| [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) | Mount-aware VFS and shared open file descriptions | Accepted | Filesystem/mount/process/descriptor ownership | [0019](ADR-0019-readonly-ramfs-and-fd-table.md) (descriptor representation), [0022](ADR-0022-fork-exec-waitpid-echo.md) (fork offsets), [0023](ADR-0023-directory-fds-and-getdents64.md) (directory descriptions), [0024](ADR-0024-process-cwd-and-path-resolution.md) (cwd/resolver identities) | - |
+| [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) | Mount-aware VFS and shared open file descriptions | Accepted | Filesystem/mount/process/descriptor ownership | [0019](ADR-0019-readonly-ramfs-and-fd-table.md) (descriptor representation), [0022](ADR-0022-fork-exec-waitpid-echo.md) (fork offsets), [0023](ADR-0023-directory-fds-and-getdents64.md) (directory descriptions), [0024](ADR-0024-process-cwd-and-path-resolution.md) (cwd/resolver identities) | [0072](ADR-0072-runtime-mounts-and-userspace-init.md) (boot-only mutation) |
 
 | [0063](ADR-0063-reusable-open-description-io-storage.md) | Reusable open-description I/O storage | Accepted | Filesystem I/O allocation and request lifetime | - | [0066](ADR-0066-usercopy-length-and-owned-io-growth.md) (1024-byte cap only), [0067](ADR-0067-resident-fat-and-canonical-file-handles.md) (FAT-library allocations only) |
 | [0064](ADR-0064-qemu-block-storage-and-fat32.md) | QEMU block storage and FAT32 ownership | Accepted | Storage/platform/FAT/initialization | - | [0067](ADR-0067-resident-fat-and-canonical-file-handles.md) (library/handles/FAT budgets), [0070](ADR-0070-fstab-boot-mounts-and-shared-disks.md) (boot staging/mount policy) |
@@ -80,8 +80,12 @@ growth.
 
 | [0069](ADR-0069-shared-runtime-dtb-and-staged-probe.md) | Shared runtime DTB and staged driver probing | Accepted | Firmware resources/platform initialization | - | - |
 
-| [0070](ADR-0070-fstab-boot-mounts-and-shared-disks.md) | Fstab boot mounts and shared physical disks | Accepted | Storage/bootstrap/namespace ownership | [0064](ADR-0064-qemu-block-storage-and-fat32.md) (boot staging/mount policy) | - |
+| [0070](ADR-0070-fstab-boot-mounts-and-shared-disks.md) | Fstab boot mounts and shared physical disks | Accepted | Storage/bootstrap/namespace ownership | [0064](ADR-0064-qemu-block-storage-and-fat32.md) (boot staging/mount policy) | [0072](ADR-0072-runtime-mounts-and-userspace-init.md) (fstab/fallback policy) |
 
 | [0071](ADR-0071-unified-descriptors-and-shell-redirection.md) | Unified descriptors and shell output redirection | Accepted | FD ownership/endpoint waits/dup ABI/shell | [0019](ADR-0019-readonly-ramfs-and-fd-table.md) (reserved stdio), [0020](ADR-0020-uart-stdin-and-shell.md) (stdin-specific restart), [0022](ADR-0022-fork-exec-waitpid-echo.md) (shell redirection) | - |
+
+| [0072](ADR-0072-runtime-mounts-and-userspace-init.md) | Runtime mounts and userspace initialization | Accepted | Namespace publication/mount ABI/init policy | [0062](ADR-0062-mount-aware-vfs-and-shared-open-descriptions.md) (boot-only mutation), [0070](ADR-0070-fstab-boot-mounts-and-shared-disks.md) (fstab/fallback policy) | [0073](ADR-0073-best-effort-init-mounts.md) (mount failure/default policy) |
+
+| [0073](ADR-0073-best-effort-init-mounts.md) | Best-effort init mounts | Accepted | Userspace boot/mount failure policy | [0072](ADR-0072-runtime-mounts-and-userspace-init.md) (mount failure/default policy) | - |
 
 Use [`TEMPLATE.md`](TEMPLATE.md) for new decisions.
